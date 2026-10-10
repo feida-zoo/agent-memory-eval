@@ -259,13 +259,19 @@ python -m membench.cli dataset info            # 列举全部 8 个数据集及�
 python -m membench.cli dataset info locomo     # 单个数据集详细介绍（含基准线：如何解读分数）
 ```
 
-内置 JSONL（开箱即用）：`data/office_dataset.jsonl`、`data/sample_dataset.jsonl`、`data/locomo.jsonl`、`data/longmemeval_oracle.jsonl`、`data/longmemeval_s.jsonl`、`data/gatemem_office.jsonl`。
-BEAM 体积过大不内置，按需下载转换：
+内置 JSONL（开箱即用）：`data/office_dataset.jsonl`、`data/sample_dataset.jsonl`（自造演示/冒烟数据）。
+开源数据集全部按需下载，不入库：
 
 ```bash
-python -m membench.cli dataset fetch beam_1m    # 35 chats × ~1M token，约 700 题
-python -m membench.cli dataset fetch beam_10m   # 10 chats × ~10M token，约 200 题（全集终验）
+python -m membench.cli dataset fetch locomo              # 10 个超长对话，1986 题
+python -m membench.cli dataset fetch longmemeval_oracle  # oracle 版 ~5MB 适合冒烟
+python -m membench.cli dataset fetch longmemeval_s       # s 版 ~250MB，公开榜单标准
+python -m membench.cli dataset fetch gatemem_office      # 办公三维（效用/隐私/安全）
+python -m membench.cli dataset fetch beam_1m             # 35 chats × ~1M token，约 700 题
+python -m membench.cli dataset fetch beam_10m            # 10 chats × ~10M token，约 200 题（全集终验）
 ```
+
+fetch 默认下载到 `~/.membench/datasets/`，可用 `--out` 指定目录。下载需要能访问 GitHub / HuggingFace。
 
 手动转换（自选数据源时）：
 

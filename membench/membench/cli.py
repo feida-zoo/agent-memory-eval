@@ -464,6 +464,24 @@ _FETCH_CONFIG: dict[str, tuple[str, int, str]] = {
     "beam_10m": ("10M", 10, "10m"),
 }
 
+#: 简单数据集的下载配置：key -> [(源URL, 本地保存名), ...]（按转换器所需文件列出）。
+#: LoCoMo / LongMemEval / GateMem 都是"下几个文件 + 跑转换器"即可，不需要 BEAM 的多 chat 循环。
+_FETCH_SIMPLE: dict[str, list[tuple[str, str]]] = {
+    "locomo": [
+        ("https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json", "locomo10.json"),
+    ],
+    "longmemeval_oracle": [
+        ("https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json", "longmemeval_oracle.json"),
+    ],
+    "longmemeval_s": [
+        ("https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json", "longmemeval_s_cleaned.json"),
+    ],
+    "gatemem_office": [
+        ("https://raw.githubusercontent.com/rzhub/GateMem/main/bench/data/office/episodes.jsonl", "episodes.jsonl"),
+        ("https://raw.githubusercontent.com/rzhub/GateMem/main/bench/data/office/checkpoints.jsonl", "checkpoints.jsonl"),
+    ],
+}
+
 #: 每个 chat 目录需要下载的文件（相对路径）。
 #: 注意：BEAM 仓库实际结构是 chats/{scale}/{id}/probing_questions/probing_questions.json，
 #: 不是 chats/{scale}/{id}/pq.json（pq.json 是早期版本或本地缓存的命名）。
@@ -529,6 +547,38 @@ def _fetch_beam(name: str, out_dir: Path) -> Path:
     return out_path
 
 
+def _fetch_simple(name: str, out_dir: Path) -> Path:
+    """下载单文件数据集（LoCoMo / LongMemEval / GateMem）并转换为 membench JSONL。"""
+    raw_dir = out_dir / f".{name}_raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    downloaded: dict[str, Path] = {}
+    for url, filename in _FETCH_SIMPLE[name]:
+        dest = raw_dir / filename
+        _download_file(url, dest)
+        downloaded[filename] = dest
+        print(f"[membench] 已下载 {filename}", file=sys.stderr)
+
+    out_path = out_dir / f"{name}.jsonl"
+    if name == "locomo":
+        from membench.data.convert_locomo import convert_locomo
+        stats = convert_locomo(str(downloaded["locomo10.json"]), str(out_path))
+        print(f"[membench] 转换完成: {stats.get('dialogues', '?')} dialogues, {stats.get('questions', '?')} questions")
+    elif name.startswith("longmemeval"):
+        from membench.data.convert_longmemeval import convert_longmemeval
+        src = downloaded.get("longmemeval_s_cleaned.json") or downloaded.get("longmemeval_oracle.json")
+        stats = convert_longmemeval(str(src), str(out_path))
+        print(f"[membench] 转换完成: {stats.get('questions', '?')} questions")
+    elif name == "gatemem_office":
+        from membench.data.convert_gatemem import convert_gatemem
+        stats = convert_gatemem(
+            downloaded["episodes.jsonl"], downloaded["checkpoints.jsonl"], out_path,
+            ignore_privacy_refuse=True,
+        )
+        print(f"[membench] 转换完成: {stats.get('questions', '?')} questions（含 ignore 标记）")
+    return out_path
+
+
 def _cmd_dataset_fetch(args: argparse.Namespace) -> int:
     """dataset fetch：按需下载并转换 status=fetch 的数据集。"""
     from membench.data import info as dataset_info
@@ -547,14 +597,19 @@ def _cmd_dataset_fetch(args: argparse.Namespace) -> int:
     if entry.status == "unavailable":
         print(f"[membench] {entry.key} 暂不可用，无法下载。原因: {entry.features}")
         return 2
-    if entry.key not in _FETCH_CONFIG:
+    if entry.key not in _FETCH_CONFIG and entry.key not in _FETCH_SIMPLE:
         print(f"[membench] {entry.key} 暂无下载配置，请按以下来源手动获取: {entry.source}", file=sys.stderr)
         return 2
 
     out_dir = Path(args.out).expanduser() if args.out else Path.home() / ".membench" / "datasets"
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
-        out_path = _fetch_beam(entry.key, out_dir)
+        if entry.key in _FETCH_CONFIG:
+            out_path = _fetch_beam(entry.key, out_dir)
+        elif entry.key in _FETCH_SIMPLE:
+            out_path = _fetch_simple(entry.key, out_dir)
+        else:
+            raise RuntimeError(f"{entry.key} 暂无下载配置")
     except RuntimeError as exc:
         print(f"[membench] {exc}", file=sys.stderr)
         return 1

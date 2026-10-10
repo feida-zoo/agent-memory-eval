@@ -89,8 +89,8 @@ DATASET_REGISTRY: dict[str, DatasetInfo] = {
     "locomo": DatasetInfo(
         key="locomo",
         name="LoCoMo 超长多会话对话",
-        builtin_file="locomo.jsonl",
-        status="builtin",
+        builtin_file=None,
+        status="fetch",
         source=(
             "LoCoMo（Maharana et al., ACL 2024，arXiv:2402.17753，Snap Research）。"
         ),
@@ -107,13 +107,13 @@ DATASET_REGISTRY: dict[str, DatasetInfo] = {
             "（judge/检索深度不同）需谨慎对比；另有独立审计指出其答案键约 6.4% 错误率，"
             "绝对分仅供参考，重点看相对提升。"
         ),
-        usage="python -m membench.cli run --adapter <你的适配器> --dataset membench/data/locomo.jsonl",
+        usage="python -m membench.cli run --adapter <你的适配器> --dataset ~/.membench/datasets/locomo.jsonl（先 dataset fetch locomo）",
     ),
     "longmemeval_oracle": DatasetInfo(
         key="longmemeval_oracle",
         name="LongMemEval-Oracle 证据会话问答",
-        builtin_file="longmemeval_oracle.jsonl",
-        status="builtin",
+        builtin_file=None,
+        status="fetch",
         source=(
             "LongMemEval（Wu et al., ICLR 2025，arXiv:2410.10813，UCLA），"
             "oracle 变体（每题只给证据会话，隔离检索噪声）。"
@@ -130,13 +130,13 @@ DATASET_REGISTRY: dict[str, DatasetInfo] = {
             "ChatGPT(GPT-4o) 57.7%、Coze 32.9%——oracle 分数显著高于这些是预期，"
             "低于 70% 说明回答/判分管线有问题。"
         ),
-        usage="python -m membench.cli run --adapter <你的适配器> --dataset membench/data/longmemeval_oracle.jsonl",
+        usage="python -m membench.cli run --adapter <你的适配器> --dataset ~/.membench/datasets/longmemeval_oracle.jsonl（先 dataset fetch longmemeval_oracle）",
     ),
     "longmemeval_s": DatasetInfo(
         key="longmemeval_s",
         name="LongMemEval-S 长历史检索压力测试",
-        builtin_file="longmemeval_s.jsonl",
-        status="builtin",
+        builtin_file=None,
+        status="fetch",
         source=(
             "LongMemEval（Wu et al., ICLR 2025，arXiv:2410.10813，UCLA），"
             "S 变体（每题约 50 个历史会话、约 115k token，含真实干扰会话）。"
@@ -153,7 +153,7 @@ DATASET_REGISTRY: dict[str, DatasetInfo] = {
             "Coze 32.9%；与 oracle 变体的分差（oracle - S）≈ 检索/精确率不足的损失，"
             "分差越小说明记忆检索越精准。"
         ),
-        usage="python -m membench.cli run --adapter <你的适配器> --dataset membench/data/longmemeval_s.jsonl",
+        usage="python -m membench.cli run --adapter <你的适配器> --dataset ~/.membench/datasets/longmemeval_s.jsonl（先 dataset fetch longmemeval_s）",
     ),
     "beam_1m": DatasetInfo(
         key="beam_1m",
@@ -202,8 +202,8 @@ DATASET_REGISTRY: dict[str, DatasetInfo] = {
     "gatemem_office": DatasetInfo(
         key="gatemem_office",
         name="GateMem 办公三维记忆基准",
-        builtin_file="gatemem_office.jsonl",
-        status="builtin",
+        builtin_file=None,
+        status="fetch",
         source="GateMem 办公场景记忆基准（arXiv:2606.18829，github.com/rzhub/GateMem；episodes + checkpoints 结构，多 principal 办公环境）。",
         scale="17 episodes / 547 检查点（utility 154 + privacy 171 + safety 222）。",
         features=(
@@ -219,7 +219,7 @@ DATASET_REGISTRY: dict[str, DatasetInfo] = {
             "abstention_accuracy→100%；安全类任何泄露（删除了还答得出）都比 "
             "utility 低分更严重，优先看 abstention_accuracy。"
         ),
-        usage="python -m membench.cli run --adapter <你的适配器> --dataset membench/data/gatemem_office.jsonl",
+        usage="python -m membench.cli run --adapter <你的适配器> --dataset ~/.membench/datasets/gatemem_office.jsonl（先 dataset fetch gatemem_office）",
     ),
     "statemembench": DatasetInfo(
         key="statemembench",
