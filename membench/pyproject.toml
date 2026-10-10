@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "membench"
+version = "0.1.0"
+description = "Agent 记忆系统评测框架：run / compare 双能力，六维指标，双轨判分"
+readme = "README.md"
+requires-python = ">=3.10"
+# 仅声明元数据，不强制安装重依赖（SPEC 第 1、8 节）。
+dependencies = []
+
+[project.optional-dependencies]
+# HttpAdapter 需要 requests；报告图表需要 matplotlib（Agg 后端）。
+http = ["requests>=2.28"]
+report = ["matplotlib>=3.6"]
+dev = ["pytest>=7.0", "requests>=2.28", "matplotlib>=3.6"]
+
+[tool.setuptools.packages.find]
+include = ["membench*"]
+
+[tool.setuptools.package-data]
+"membench.data" = ["*.jsonl"]

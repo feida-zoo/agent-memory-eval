@@ -1,0 +1,11 @@
+__pycache__/
+*.egg-info/
+runs/
+output/
+*.pyc
+.DS_Store
+# 大数据集不入库，用 dataset fetch 按需下载
+membench/data/locomo.jsonl
+membench/data/longmemeval_*.jsonl
+membench/data/gatemem_office.jsonl
+membench/data/beam_*.jsonl

@@ -1,0 +1,93 @@
+"""记忆系统适配器基类与数据传输对象。
+
+定义被测记忆系统接入 membench 的统一契约（SPEC 3.1）：
+任何记忆系统只需实现 ``reset`` / ``ingest`` / ``query`` 三个方法即可接入评测。
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+
+
+@dataclass
+class IngestStats:
+    """一次 ingest 的资源消耗统计。
+
+    Attributes:
+        input_tokens: 写入内容的估算 token 数。
+        llm_calls: ingest 过程中触发的 LLM 调用次数（无则填 0）。
+        latency_ms: ingest 耗时（毫秒）。
+    """
+
+    input_tokens: int = 0
+    llm_calls: int = 0
+    latency_ms: float = 0.0
+
+
+@dataclass
+class QueryResult:
+    """一次 query 的结果与资源消耗。
+
+    Attributes:
+        answer: 系统给出的回答文本。
+        retrieved: 命中的记忆条目原文（用于 Recall@k / 证据命中判定）。
+        latency_ms: 查询耗时（毫秒）。
+        input_tokens: 注入 prompt 的记忆 token 数（估算即可）。
+        output_tokens: 生成回答的 token 数（估算即可）。
+        llm_calls: 查询过程中触发的 LLM 调用次数（无则填 0）。
+    """
+
+    answer: str
+    retrieved: list[str] = field(default_factory=list)
+    latency_ms: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    llm_calls: int = 0
+
+
+class BaseMemoryAdapter(ABC):
+    """记忆系统适配器抽象基类（SPEC 3.1）。
+
+    适配器实现者负责把自家系统的 token / 调用数填入统计字段；
+    填不了的字段填 0（报告中标注 n/a）。
+    """
+
+    name: str = "base"
+
+    @abstractmethod
+    def reset(self) -> None:
+        """清空全部记忆状态。每个 dialogue 开始前调用。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    def ingest(self, messages: list[dict]) -> IngestStats:
+        """写入一段对话。
+
+        Args:
+            messages: 消息列表，形如
+                ``[{"role": "user"|"assistant", "content": str, "timestamp": str|None}]``。
+
+        Returns:
+            IngestStats: 写入过程的资源消耗。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def query(self, question: str) -> QueryResult:
+        """基于已写入的记忆回答问题。
+
+        Args:
+            question: 自然语言问题。
+
+        Returns:
+            QueryResult: 回答文本、命中的记忆条目与资源消耗。
+        """
+        raise NotImplementedError
+
+
+def estimate_tokens(text: str) -> int:
+    """按字符数 / 2 粗估 token 数（中英文混合文本的经验值）。"""
+    if not text:
+        return 0
+    return max(1, len(text) // 2)
