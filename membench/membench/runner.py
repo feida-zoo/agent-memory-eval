@@ -49,6 +49,38 @@ def _judge_result_to_dict(jr: Any) -> dict[str, Any]:
         return {"correct": bool(getattr(jr, "correct", False))}
 
 
+def _select_questions(
+    dialogues: list[Any],
+    shards: int,
+    shard_index: int,
+    limit: Union[int, None],
+) -> list[Any]:
+    """对加载后的题目做确定性分片与截断（先分片再截断）。
+
+    全局题号 ``i``（按 dialogue 顺序、题序展开）满足 ``i % shards == shard_index``
+    的题入选，再取前 ``limit`` 道；不含入选题的 dialogue 整段跳过（ingest 也省掉）。
+    """
+    selected: dict[str, list[Any]] = {}
+    idx = 0
+    n_taken = 0
+    for dialogue in dialogues:
+        for q in dialogue.questions:
+            take = idx % shards == shard_index
+            idx += 1
+            if not take:
+                continue
+            if limit is not None and n_taken >= limit:
+                continue
+            selected.setdefault(str(dialogue.dialogue_id), []).append(q)
+            n_taken += 1
+    out = []
+    for dialogue in dialogues:
+        qs = selected.get(str(dialogue.dialogue_id))
+        if qs:
+            out.append(dataclasses.replace(dialogue, questions=qs))
+    return out
+
+
 class Runner:
     """评测执行器。
 
@@ -67,6 +99,12 @@ class Runner:
         jobs: 题目级并发数（默认 1 串行）。ingest 阶段始终串行；仅
             query+judge 阶段并发，输出顺序与 jobs=1 一致。
             **jobs>1 要求 adapter.query 与 judge 线程安全。**
+        limit: 冒烟模式：只评测（分片后的）前 N 道题；None 表示全量。
+        shards: 分片总数（默认 1 不分片）；按全局题号 ``i % shards == shard_index``
+            确定性分片，与 limit 组合时先分片再截断。
+        shard_index: 本分片序号（从 0 开始，需 < shards）。
+        adapter_meta: 适配器配置自由文本（如 ``"key=value;..."``），原样记入
+            metrics.json 的 ``adapter_meta``。
     """
 
     def __init__(
@@ -79,10 +117,24 @@ class Runner:
         commit: Union[str, None] = None,
         dataset_source: Union[str, None] = None,
         jobs: int = 1,
+        limit: Union[int, None] = None,
+        shards: int = 1,
+        shard_index: int = 0,
+        adapter_meta: Union[str, None] = None,
     ) -> None:
         if jobs < 1:
             raise ValueError(f"jobs 必须 >= 1，当前为 {jobs}")
         self.jobs = int(jobs)
+        if limit is not None and limit < 1:
+            raise ValueError(f"limit 必须 >= 1，当前为 {limit}")
+        if shards < 1:
+            raise ValueError(f"shards 必须 >= 1，当前为 {shards}")
+        if not 0 <= shard_index < shards:
+            raise ValueError(f"shard_index 必须满足 0 <= shard_index < shards，当前为 {shard_index}/{shards}")
+        self.limit = limit
+        self.shards = int(shards)
+        self.shard_index = int(shard_index)
+        self.adapter_meta = adapter_meta
         self.adapter = adapter
         self.dataset_path = dataset_path
         # 默认输出到 skill 的 output/runs/；开发环境（无 SKILL.md）则退到工程根 runs/
@@ -156,15 +208,20 @@ class Runner:
     def run(self) -> str:
         """执行评测，返回 run 目录路径。"""
         dialogues = load_dataset(self.dataset_path)
+        if self.shards > 1 or self.limit is not None:
+            dialogues = _select_questions(dialogues, self.shards, self.shard_index, self.limit)
         adapter_name = str(getattr(self.adapter, "name", self.adapter.__class__.__name__))
         dataset_name = os.path.splitext(os.path.basename(self.dataset_path))[0]
         platform_tag = self.platform or "default"
         now = datetime.now()
         # commit 短哈希进 run_id，避免矩阵评测中同 adapter+platform 同秒撞目录
         commit_tag = f"_{str(self.commit)[:8]}" if self.commit else ""
+        # limit / shard 进 run_id，避免冒烟或分片结果被误当全量结果对比
+        limit_tag = f"_limit{self.limit}" if self.limit is not None else ""
+        shard_tag = f"_shard{self.shard_index}of{self.shards}" if self.shards > 1 else ""
         run_id = (
             f"{adapter_name}_{platform_tag}{commit_tag}_"
-            f"{dataset_name}_{now.strftime('%Y%m%d_%H%M%S')}"
+            f"{dataset_name}{shard_tag}{limit_tag}_{now.strftime('%Y%m%d_%H%M%S')}"
         )
         run_dir = os.path.join(self.out_dir, run_id)
         os.makedirs(run_dir, exist_ok=True)
@@ -222,6 +279,16 @@ class Runner:
                     f"latency={record['latency_ms']:.0f}ms"
                 )
 
+        # 适配器可选的 describe() -> dict：记录其配置/版本等自描述信息；
+        # 调用失败记 None，不中断评测。
+        adapter_describe: Any = None
+        describe_fn = getattr(self.adapter, "describe", None)
+        if callable(describe_fn):
+            try:
+                adapter_describe = describe_fn()
+            except Exception:  # noqa: BLE001 - 自描述信息失败不应中断评测
+                adapter_describe = None
+
         metrics = dict(aggregate(records))
         metrics.update(
             {
@@ -235,6 +302,11 @@ class Runner:
                 "judge": self.judge_name,
                 "n_ignored": n_ignored,
                 "timestamp": now.isoformat(timespec="seconds"),
+                "limit": self.limit,
+                "shards": self.shards,
+                "shard_index": self.shard_index,
+                "adapter_meta": self.adapter_meta,
+                "adapter_describe": adapter_describe,
             }
         )
 

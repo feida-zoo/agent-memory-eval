@@ -267,6 +267,13 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
     n_ignored = int(metrics.get("n_ignored", 0) or 0)
     if n_ignored:
         lines.append(f"- 忽略题数: {n_ignored}（ignore=true，未参与评分）")
+    judge_fallback = metrics.get("judge_fallback")
+    if judge_fallback:
+        fb_count = int(judge_fallback.get("count", 0) or 0)
+        fb_ratio = float(judge_fallback.get("ratio", 0.0) or 0.0)
+        lines.append(
+            f"- LLM judge 回退: {fb_count} 题（{fb_ratio:.1%}，judge=llm-fallback）"
+        )
     lines.append("")
 
     # 1. 摘要表（六维核心指标）
@@ -286,6 +293,16 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
     ]
     lines.append(_md_table(["维度", "指标", "值"], summary_rows))
     lines.append("")
+
+    # LLM judge 回退比例 >5% 时在指标表下方给出警示（判分质量可能退化）。
+    if judge_fallback:
+        fb_ratio = float(judge_fallback.get("ratio", 0.0) or 0.0)
+        if fb_ratio > 0.05:
+            lines.append(
+                f"> ⚠️ LLM judge 回退比例 {fb_ratio:.1%} 超过 5%：大量题目由启发式兜底判分，"
+                "判分质量可能退化，建议复核判分配置（base_url / API key / 模型可用性）后重跑。"
+            )
+            lines.append("")
 
     # 综合评级（质量指标评级点数均值；无可评级指标则不输出）
     overall_rated = overall_rating(overall)

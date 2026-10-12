@@ -88,6 +88,24 @@ def gold_covered(gold: str, prediction: str) -> bool:
     return all(p in pred_n for p in parts)
 
 
+def is_stale(gold_stale: "str | None", gold: str, prediction: str) -> bool:
+    """陈旧判定：旧值命中且新值未命中才算 stale。
+
+    纯子串匹配会把"引用旧值作为变更上下文"的正确更新回答误判为 stale，
+    因此当 gold（新值）也出现在 prediction 中时说明系统已知更新，不判 stale。
+    新值命中口径与判分逻辑一致（``gold_covered`` 片段覆盖，gold 可含元信息）。
+    abstention 题（gold 为哨兵值）不做新值豁免，保持原有判定。
+    """
+    if not gold_stale:
+        return False
+    pred_n = normalize(prediction or "")
+    if normalize(gold_stale) not in pred_n:
+        return False
+    if gold and gold != ABSTAIN_SENTINEL and gold_covered(gold, prediction or ""):
+        return False
+    return True
+
+
 class HeuristicJudge(Judge):
     """启发式判分器：token 包含匹配 + 拒答检测 + 陈旧命中检测。"""
 
@@ -106,8 +124,7 @@ class HeuristicJudge(Judge):
         gold_stale = getattr(question, "gold_stale", None)
 
         abstained = contains_refusal(prediction or "")
-        pred_n = normalize(prediction or "")
-        stale = bool(gold_stale) and normalize(gold_stale) in pred_n
+        stale = is_stale(gold_stale, gold, prediction or "")
 
         # abstention 题：gold 为哨兵值，期望拒答。
         if gold == ABSTAIN_SENTINEL:
@@ -131,7 +148,7 @@ class HeuristicJudge(Judge):
         else:
             reason = f"token_f1={f1:.3f} < {self.f1_threshold} 且 gold 未覆盖"
         if stale:
-            reason += f"；命中过期事实 '{gold_stale}'"
+            reason += f"；命中过期事实 '{gold_stale}' 且未包含更新值"
         return JudgeResult(
             correct=correct,
             abstained_pred=abstained,

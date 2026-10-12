@@ -66,7 +66,11 @@ def test_e2e_strong_beats_weak(tmp_path: Path) -> None:
     strong_o = strong_metrics["overall"]
 
     assert strong_o["accuracy"] > weak_o["accuracy"]
-    assert strong_o["stale_rate"] < weak_o["stale_rate"]
+    # stale 判据升级后（旧值命中且新值未命中才判 stale）：mock-weak 的原文拼接
+    # 回答同时包含新值与旧值原文，按新口径不再计为 stale，故 weak 的 stale_rate
+    # 也降为 0。这里只保留 strong 不劣于 weak 的弱断言（判据升级的行为变更，
+    # 详见 judges/heuristic.py 的 is_stale）。
+    assert strong_o["stale_rate"] <= weak_o["stale_rate"]
 
     # mock-strong 设计目标：全部答对 + 全部正确拒答 + 零陈旧。
     assert strong_o["accuracy"] == pytest.approx(1.0)

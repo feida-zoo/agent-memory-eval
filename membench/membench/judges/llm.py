@@ -23,10 +23,31 @@ import urllib.request
 from membench.data.schema import ABSTAIN_SENTINEL
 
 from .base import Judge, JudgeResult
-from .heuristic import HeuristicJudge, contains_refusal, normalize
+from .heuristic import HeuristicJudge, contains_refusal, is_stale
 
 #: 从模型输出中提取 JSON 对象（允许被包裹在 ```json 代码块或多余文本中）。
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _parse_judge_output(content: str) -> dict:
+    """三级解析模型输出为 JSON dict。
+
+    1. 先尝试 ``json.loads`` 整个输出（模型严格只输出 JSON 时直接成功，
+       避免贪婪正则把前后多余花括号文本一并吞入）；
+    2. 失败再用 ``_JSON_RE`` 抠第一个 JSON 对象尝试解析；
+    3. 再失败抛异常，交由调用方走 llm-fallback 回退路径。
+    """
+    text = (content or "").strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except (ValueError, TypeError):
+        pass
+    match = _JSON_RE.search(text)
+    if not match:
+        raise ValueError(f"模型输出不含 JSON：{content!r}")
+    return json.loads(match.group(0))
 
 #: 判分 prompt：要求模型只输出 JSON。
 _SYSTEM_PROMPT = (
@@ -123,10 +144,7 @@ class LLMJudge(Judge):
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             body = json.loads(resp.read().decode("utf-8"))
         content = body["choices"][0]["message"]["content"]
-        match = _JSON_RE.search(content)
-        if not match:
-            raise ValueError(f"模型输出不含 JSON：{content!r}")
-        parsed = json.loads(match.group(0))
+        parsed = _parse_judge_output(content)
         return bool(parsed["correct"]), str(parsed.get("reason", ""))
 
     # ------------------------------------------------------------------
@@ -140,7 +158,7 @@ class LLMJudge(Judge):
 
         # 拒答 / 陈旧检测保持确定性（与启发式一致），不依赖模型发挥。
         abstained = contains_refusal(prediction or "")
-        stale = bool(gold_stale) and normalize(gold_stale) in normalize(prediction or "")
+        stale = is_stale(gold_stale, gold, prediction or "")
 
         try:
             correct, reason = self._chat(str(question_text), gold, prediction or "")

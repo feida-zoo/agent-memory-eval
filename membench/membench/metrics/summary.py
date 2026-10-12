@@ -53,7 +53,9 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             ``judge``（含 correct / abstained_pred / stale）字段。
 
     Returns:
-        ``{"overall": {...}, "by_category": {category: {"accuracy", "n"}}}``。
+        ``{"overall": {...}, "by_category": {category: {"accuracy", "n"}}}``；
+        使用了 LLM judge 时附加 ``"judge_fallback": {"count", "ratio"}``
+        （``judge=="llm-fallback"`` 的记录占比）。
 
     指标口径：
         - accuracy: ``judge.correct`` 均值。
@@ -104,4 +106,20 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         bucket["accuracy"] = bucket["_correct"] / bucket["n"] if bucket["n"] else 0.0
         del bucket["_correct"]
 
-    return {"overall": overall, "by_category": by_category}
+    result: dict[str, Any] = {"overall": overall, "by_category": by_category}
+
+    # LLM judge 回退统计：任一记录由 llm / llm-fallback 判分时，
+    # 统计 judge=="llm-fallback" 的数量与占比（无 LLM judge 时省略该键）。
+    uses_llm_judge = any(
+        str(_judge(r).get("judge", "")).startswith("llm") for r in records
+    )
+    if uses_llm_judge:
+        n_fallback = sum(
+            1 for r in records if str(_judge(r).get("judge", "")) == "llm-fallback"
+        )
+        result["judge_fallback"] = {
+            "count": n_fallback,
+            "ratio": (n_fallback / n) if n else 0.0,
+        }
+
+    return result

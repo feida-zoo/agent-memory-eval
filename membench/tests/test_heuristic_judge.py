@@ -64,10 +64,11 @@ class TestHeuristicJudge:
         assert result.abstained_pred is True
 
     def test_stale_detection(self) -> None:
+        # 旧值单独出现（未包含新值杭州）→ stale。
         result = self.judge.grade(
             _q(category="knowledge_update", gold_stale="北京"),
             "杭州",
-            "我的狗叫旺财，我之前住在北京，现在搬到杭州了。",
+            "我的狗叫旺财，我之前住在北京。",
         )
         assert result.stale is True
         # gold_stale 未命中则不为 stale。
@@ -77,6 +78,31 @@ class TestHeuristicJudge:
             "根据我的记忆：现在住在杭州市余杭区。",
         )
         assert result2.stale is False
+
+    def test_stale_exempt_when_new_value_present(self) -> None:
+        # 旧值仅作为变更上下文被引用、且新值（gold）同时命中 → 不判 stale。
+        result = self.judge.grade(
+            _q(category="knowledge_update", gold_stale="北京"),
+            "杭州",
+            "我的狗叫旺财，我之前住在北京，现在搬到杭州了。",
+        )
+        assert result.stale is False
+        assert result.correct is True
+        # 多片段 gold 全部被覆盖同样豁免。
+        result2 = self.judge.grade(
+            _q(category="knowledge_update", gold_stale="北京"),
+            "杭州，余杭区",
+            "之前在北京，现在住在杭州余杭区。",
+        )
+        assert result2.stale is False
+        # 新值未完整覆盖（缺"余杭区"）→ 仍判 stale。
+        result3 = self.judge.grade(
+            _q(category="knowledge_update", gold_stale="北京"),
+            "杭州，余杭区",
+            "之前在北京，现在搬到杭州了。",
+        )
+        assert result3.stale is True
+        assert "未包含更新值" in result3.reason
 
     def test_stale_ignored_without_gold_stale(self) -> None:
         result = self.judge.grade(_q(), "杭州", "北京杭州都住过")

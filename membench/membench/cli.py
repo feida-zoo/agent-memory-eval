@@ -7,6 +7,7 @@
     python -m membench.cli evaluate --adapter mock-strong \
         [--judge heuristic] [--platform wx --commit a1b2c3] [--out runs/] \
         [--report-out DIR] [--quick | --beam-10m]
+    python -m membench.cli fuse --runs runs/<shard0>,runs/<shard1> --out runs/<fused>
     python -m membench.cli compare --baseline runs/<run_a> --candidate runs/<run_b> \
         [--acc-threshold 0.02] [--report-out DIR]
     python -m membench.cli matrix --runs "wx@a1b2c3=runs/dir1" "fs@a1b2c3=runs/dir2" ... \
@@ -64,6 +65,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--llm-timeout", type=float, default=None, help="judge=llm 时的请求超时秒数（默认用 judge 内建值 90s）")
     p_run.add_argument("--jobs", type=int, default=1, help="题目级并发数（默认 1；ingest 始终串行，要求 adapter.query 与 judge 线程安全）")
     p_run.add_argument("--client-llm", default=None, help="judge=client 时的 agent 内置 LLM 类路径，如 'my_agent.llm:LLMClient'")
+    p_run.add_argument("--limit", type=int, default=None, help="冒烟模式：只评测（分片后的）前 N 道题，run_id 与 metadata 记录 limit")
+    p_run.add_argument("--adapter-meta", default=None, help='适配器配置自由文本（"key=value;..."），原样记入 metadata["adapter_meta"]')
+    p_run.add_argument("--shards", type=int, default=1, help="数据集分片总数（默认 1 不分片）；按 i %% N == I 确定性分片")
+    p_run.add_argument("--shard-index", type=int, default=0, help="本分片序号（从 0 开始，需 < --shards；与 --limit 组合时先分片再截断）")
     p_run.set_defaults(func=_cmd_run)
 
     # --- compare ---
@@ -75,6 +80,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cmp.add_argument("--latency-warn", type=float, default=0.30, help="latency_p95 上升告警比例（默认 0.30）")
     p_cmp.add_argument("--report-out", default=None, help="额外把报告复制到该目录（带时间戳文件名）")
     p_cmp.set_defaults(func=_cmd_compare)
+
+    # --- fuse ---
+    p_fuse = sub.add_parser("fuse", help="融合同一评测的多个分片 run 为一个完整 run 目录")
+    p_fuse.add_argument("--runs", required=True, help="逗号分隔的分片 run 目录列表（需覆盖全部 shard_index）")
+    p_fuse.add_argument("--out", required=True, help="融合 run 输出目录")
+    p_fuse.set_defaults(func=_cmd_fuse)
 
     # --- matrix ---
     p_mtx = sub.add_parser("matrix", help="多 run 矩阵对比（platform × commit 维度）")
@@ -186,6 +197,14 @@ def _make_judge(args: argparse.Namespace):
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    if args.limit is not None and args.limit < 1:
+        raise SystemExit(f"--limit 必须 >= 1，当前为 {args.limit}")
+    if args.shards < 1:
+        raise SystemExit(f"--shards 必须 >= 1，当前为 {args.shards}")
+    if not 0 <= args.shard_index < args.shards:
+        raise SystemExit(
+            f"--shard-index 必须满足 0 <= I < --shards，当前为 {args.shard_index}/{args.shards}"
+        )
     adapter = _make_adapter(args.adapter)
     judge = _make_judge(args)
     dataset_path, dataset_source = resolve_dataset(args.dataset)
@@ -198,6 +217,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         platform=args.platform,
         commit=args.commit,
         dataset_source=dataset_source,
+        limit=args.limit,
+        shards=args.shards,
+        shard_index=args.shard_index,
+        adapter_meta=args.adapter_meta,
     )
     run_dir = runner.run()
     if args.report_out:
@@ -246,6 +269,21 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         print(f"[membench] 报告已复制: {sub_dir}/")
     # FAIL 时以非零码退出，便于 CI 门禁集成
     return 1 if result["verdict"] == "FAIL" else 0
+
+
+def _cmd_fuse(args: argparse.Namespace) -> int:
+    """fuse：融合多个分片 run；stale 门禁 FAIL 时以非零码退出。"""
+    from membench.fuse import fuse_runs
+
+    run_dirs = [d.strip() for d in args.runs.split(",") if d.strip()]
+    try:
+        result = fuse_runs(run_dirs, args.out)
+    except (ValueError, FileNotFoundError) as exc:
+        raise SystemExit(f"[membench] {exc}")
+    gate = result["gate"]
+    print(f"[membench] 融合完成: {result['n_questions']} 题 -> {result['out_dir']}")
+    print(f"[membench] stale 门禁: {gate['status']} — {gate['detail']}")
+    return 1 if gate["status"] == "FAIL" else 0
 
 
 def _cmd_matrix(args: argparse.Namespace) -> int:
@@ -464,24 +502,6 @@ _FETCH_CONFIG: dict[str, tuple[str, int, str]] = {
     "beam_10m": ("10M", 10, "10m"),
 }
 
-#: 简单数据集的下载配置：key -> [(源URL, 本地保存名), ...]（按转换器所需文件列出）。
-#: LoCoMo / LongMemEval / GateMem 都是"下几个文件 + 跑转换器"即可，不需要 BEAM 的多 chat 循环。
-_FETCH_SIMPLE: dict[str, list[tuple[str, str]]] = {
-    "locomo": [
-        ("https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json", "locomo10.json"),
-    ],
-    "longmemeval_oracle": [
-        ("https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json", "longmemeval_oracle.json"),
-    ],
-    "longmemeval_s": [
-        ("https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json", "longmemeval_s_cleaned.json"),
-    ],
-    "gatemem_office": [
-        ("https://raw.githubusercontent.com/rzhub/GateMem/main/bench/data/office/episodes.jsonl", "episodes.jsonl"),
-        ("https://raw.githubusercontent.com/rzhub/GateMem/main/bench/data/office/checkpoints.jsonl", "checkpoints.jsonl"),
-    ],
-}
-
 #: 每个 chat 目录需要下载的文件（相对路径）。
 #: 注意：BEAM 仓库实际结构是 chats/{scale}/{id}/probing_questions/probing_questions.json，
 #: 不是 chats/{scale}/{id}/pq.json（pq.json 是早期版本或本地缓存的命名）。
@@ -547,38 +567,6 @@ def _fetch_beam(name: str, out_dir: Path) -> Path:
     return out_path
 
 
-def _fetch_simple(name: str, out_dir: Path) -> Path:
-    """下载单文件数据集（LoCoMo / LongMemEval / GateMem）并转换为 membench JSONL。"""
-    raw_dir = out_dir / f".{name}_raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-
-    downloaded: dict[str, Path] = {}
-    for url, filename in _FETCH_SIMPLE[name]:
-        dest = raw_dir / filename
-        _download_file(url, dest)
-        downloaded[filename] = dest
-        print(f"[membench] 已下载 {filename}", file=sys.stderr)
-
-    out_path = out_dir / f"{name}.jsonl"
-    if name == "locomo":
-        from membench.data.convert_locomo import convert_locomo
-        stats = convert_locomo(str(downloaded["locomo10.json"]), str(out_path))
-        print(f"[membench] 转换完成: {stats.get('dialogues', '?')} dialogues, {stats.get('questions', '?')} questions")
-    elif name.startswith("longmemeval"):
-        from membench.data.convert_longmemeval import convert_longmemeval
-        src = downloaded.get("longmemeval_s_cleaned.json") or downloaded.get("longmemeval_oracle.json")
-        stats = convert_longmemeval(str(src), str(out_path))
-        print(f"[membench] 转换完成: {stats.get('questions', '?')} questions")
-    elif name == "gatemem_office":
-        from membench.data.convert_gatemem import convert_gatemem
-        stats = convert_gatemem(
-            downloaded["episodes.jsonl"], downloaded["checkpoints.jsonl"], out_path,
-            ignore_privacy_refuse=True,
-        )
-        print(f"[membench] 转换完成: {stats.get('questions', '?')} questions（含 ignore 标记）")
-    return out_path
-
-
 def _cmd_dataset_fetch(args: argparse.Namespace) -> int:
     """dataset fetch：按需下载并转换 status=fetch 的数据集。"""
     from membench.data import info as dataset_info
@@ -597,19 +585,14 @@ def _cmd_dataset_fetch(args: argparse.Namespace) -> int:
     if entry.status == "unavailable":
         print(f"[membench] {entry.key} 暂不可用，无法下载。原因: {entry.features}")
         return 2
-    if entry.key not in _FETCH_CONFIG and entry.key not in _FETCH_SIMPLE:
+    if entry.key not in _FETCH_CONFIG:
         print(f"[membench] {entry.key} 暂无下载配置，请按以下来源手动获取: {entry.source}", file=sys.stderr)
         return 2
 
     out_dir = Path(args.out).expanduser() if args.out else Path.home() / ".membench" / "datasets"
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
-        if entry.key in _FETCH_CONFIG:
-            out_path = _fetch_beam(entry.key, out_dir)
-        elif entry.key in _FETCH_SIMPLE:
-            out_path = _fetch_simple(entry.key, out_dir)
-        else:
-            raise RuntimeError(f"{entry.key} 暂无下载配置")
+        out_path = _fetch_beam(entry.key, out_dir)
     except RuntimeError as exc:
         print(f"[membench] {exc}", file=sys.stderr)
         return 1

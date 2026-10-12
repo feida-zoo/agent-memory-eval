@@ -20,11 +20,12 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 │   ├── judges/            # HeuristicJudge / LLMJudge
 │   ├── metrics/           # token_f1 / bleu1 / recall@k + 六维汇总
 │   ├── runner.py          # Runner: 执行评测, 写 run 目录
+│   ├── fuse.py            # fuse: 分片 run 合并为完整 run（指标重算 + 门禁）
 │   ├── compare.py         # compare_runs: 两个 run 的 diff + 回归门禁
 │   ├── matrix.py          # compare_matrix: 多 run 矩阵对比（platform × commit）
 │   ├── userdata.py        # 用户测试集管理: install / status / delete / resolve
 │   ├── report.py          # report.md + 图表（matplotlib Agg）+ copy_report 导出
-│   └── cli.py             # CLI: run / compare / matrix / user-data / list-datasets / dataset info|fetch
+│   └── cli.py             # CLI: run / fuse / compare / matrix / user-data / list-datasets / dataset info|fetch
 ├── tests/                 # pytest（含 mock-weak vs mock-strong 端到端）
 └── examples/
     ├── quickstart.py      # 最小接入示例
@@ -88,6 +89,42 @@ python -m membench.cli run --adapter mock-strong \
 始终串行（对话时序与记忆状态敏感），仅 query+judge 阶段并发；`results.jsonl`
 的记录顺序与 `--jobs 1` 完全一致。`--jobs > 1` 要求你的 `adapter.query` 与
 judge 线程安全（内置 mock adapter 与 LLMJudge 均线程安全）。
+
+## 大数据集：冒烟与分片
+
+冒烟（快速验证链路，可选）：`run --limit N` 每个数据集只取前 N 道题。
+run_id 带 `_limit{N}` 后缀、metrics.json 记入 `"limit": N`，冒烟结果不会
+被误当全量结果对比。
+
+数据集级分片（BEAM / LongMemEval 这类大集，可选）：
+
+```bash
+# 分 4 片跑（确定性分片：题目 i 归片 i % 4；可在多台机器上并行）
+python -m membench.cli run --adapter my-sys --dataset data/beam_1m.jsonl --shards 4 --shard-index 0
+...
+python -m membench.cli run --adapter my-sys --dataset data/beam_1m.jsonl --shards 4 --shard-index 3
+
+# 合并为完整 run（校验分片齐全、adapter/dataset 一致、题目无重复；
+# 指标重新计算，stale 门禁对融合结果同样生效，FAIL 时退出码 1）
+python -m membench.cli fuse --runs runs/..._shard0of4,runs/..._shard1of4,... --out runs/beam_1m_full
+```
+
+`--shards` 与 `--limit` 可组合（先分片再截断），用于分片链路的廉价验证。
+
+## 可复现性元数据
+
+metrics.json 的 metadata 除 adapter 名外还可记两类信息，避免换模型后分数漂移无账可查：
+
+- `--adapter-meta "model=deepseek-v3;temp=0"`：自由文本，原样记入 `metadata.adapter_meta`；
+- adapter 定义可选方法 `describe() -> dict` 时，Runner 自动调用并记入 `metadata.adapter_describe`（调用失败记 null，不中断评测）。
+
+建议 ingest/query 的实际驱动模型、温度、检索参数至少以其中一种方式落账。
+
+## 判分健壮性说明
+
+- LLM judge 输出按三级解析：整体 JSON → 抠取首个 JSON 对象 → 回退启发式判分并打 `llm-fallback` 标记。
+- 使用 LLM 判分时，metrics.json 顶层记录 `judge_fallback: {count, ratio}`；报告头部展示回退比例，**ratio > 5% 时报告输出警示行**（判分质量可能退化，建议抽查复核）。
+- stale 红线判定为确定性规则：旧值命中且新值未命中才判 stale（回答中引用旧值作为变更上下文、同时给出新值的，不判陈旧）。
 
 ## 用户测试集管理
 
@@ -204,17 +241,17 @@ Runner(MyAdapter(), "membench/data/sample_dataset.jsonl").run()
 
 ### 适配器持久化（adapter install）
 
-业务适配器（如 `mybiz-prod`）写好一次后即可落盘，之后任何 session 无需重新生成或设环境变量即可使用：
+业务适配器（如 `qwenwork-ohos`）写好一次后即可落盘，之后任何 session 无需重新生成或设环境变量即可使用：
 
 ```bash
 # 落盘到持久化目录（默认 ~/.membench/adapters/，可用 MEMBENCH_ADAPTERS_DIR 覆盖）
-python -m membench.cli adapter install ./mybiz_prod.py [--name mybiz-prod]
+python -m membench.cli adapter install ./qwenwork_ohos.py [--name qwenwork-ohos]
 
 # 查看内置 + 持久化适配器（表格含注册名/类名/安装时间/来源路径）
 python -m membench.cli adapter list
 
 # 删除
-python -m membench.cli adapter remove mybiz_prod
+python -m membench.cli adapter remove qwenwork_ohos
 ```
 
 `adapter install` 只负责校验（语法可解析）+ 落盘 `.py` 与元信息 `.json`，并提示"下次运行时自动加载"；此后每次 `membench` 命令启动都会自动加载持久化目录中的全部 `*.py` 适配器（按文件名排序；单个损坏的适配器仅打印 stderr 警告，不阻塞其他适配器）。
@@ -230,7 +267,7 @@ python -m membench.cli adapter remove mybiz_prod
 | 检索质量 | evidence_recall | 非 abstention 题中，证据子串命中任一检索条目的比例 | ≥ 0.90 |
 | 效率成本 | latency_p50 / p95 | query 延迟分位数（毫秒） | 按系统预算自定 |
 | 效率成本 | avg_input_tokens / avg_llm_calls | 每题平均注入 token 与 LLM 调用数 | 越低越好 |
-| 记忆动态 | stale_rate | knowledge_update 题中命中过期事实的比例 | ≤ 0.03 |
+| 记忆动态 | stale_rate | knowledge_update 题中命中过期事实且未包含更新值的比例 | ≤ 0.03 |
 | 拒答 | abstention_accuracy | abstention 题中正确拒答的比例 | ≥ 0.80 |
 | 可扩展性 | （随数据规模观察上述指标的退化曲线） | 用更大数据集多跑几轮对比 | — |
 
@@ -259,19 +296,13 @@ python -m membench.cli dataset info            # 列举全部 8 个数据集及�
 python -m membench.cli dataset info locomo     # 单个数据集详细介绍（含基准线：如何解读分数）
 ```
 
-内置 JSONL（开箱即用）：`data/office_dataset.jsonl`、`data/sample_dataset.jsonl`（自造演示/冒烟数据）。
-开源数据集全部按需下载，不入库：
+内置 JSONL（开箱即用）：`data/office_dataset.jsonl`、`data/sample_dataset.jsonl`、`data/locomo.jsonl`、`data/longmemeval_oracle.jsonl`、`data/longmemeval_s.jsonl`、`data/gatemem_office.jsonl`。
+BEAM 体积过大不内置，按需下载转换：
 
 ```bash
-python -m membench.cli dataset fetch locomo              # 10 个超长对话，1986 题
-python -m membench.cli dataset fetch longmemeval_oracle  # oracle 版 ~5MB 适合冒烟
-python -m membench.cli dataset fetch longmemeval_s       # s 版 ~250MB，公开榜单标准
-python -m membench.cli dataset fetch gatemem_office      # 办公三维（效用/隐私/安全）
-python -m membench.cli dataset fetch beam_1m             # 35 chats × ~1M token，约 700 题
-python -m membench.cli dataset fetch beam_10m            # 10 chats × ~10M token，约 200 题（全集终验）
+python -m membench.cli dataset fetch beam_1m    # 35 chats × ~1M token，约 700 题
+python -m membench.cli dataset fetch beam_10m   # 10 chats × ~10M token，约 200 题（全集终验）
 ```
-
-fetch 默认下载到 `~/.membench/datasets/`，可用 `--out` 指定目录。下载需要能访问 GitHub / HuggingFace。
 
 手动转换（自选数据源时）：
 
