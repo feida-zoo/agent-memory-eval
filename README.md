@@ -37,10 +37,10 @@ fetch 默认下载到 `~/.membench/datasets/`（可用 `--out` 指定目录）�
 
 | 数据集 | 来源 |
 |---|---|
-| BEAM | [github.com/mohammadtavakoli78/BEAM](https://github.com/mohammadtavakoli78/BEAM)（arXiv:2510.27246） |
-| LoCoMo | [github.com/snap-research/locomo](https://github.com/snap-research/locomo) |
-| LongMemEval | [huggingface.co/datasets/xiaowu0162/longmemeval-cleaned](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned) |
-| GateMem | [github.com/rzhub/GateMem](https://github.com/rzhub/GateMem)（arXiv:2606.18829）/ [Hugging Face](https://huggingface.co/datasets/Ray368/GateMem) |
+| BEAM | [GitHub](https://github.com/mohammadtavakoli78/BEAM) · [arXiv:2510.27246](https://arxiv.org/abs/2510.27246) |
+| LoCoMo | [GitHub](https://github.com/snap-research/locomo) |
+| LongMemEval | [HuggingFace](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned) |
+| GateMem | [GitHub](https://github.com/rzhub/GateMem) · [arXiv:2606.18829](https://arxiv.org/abs/2606.18829) · [HuggingFace](https://huggingface.co/datasets/Ray368/GateMem) |
 
 内置的两个小数据集（`office_dataset.jsonl` / `sample_dataset.jsonl`）是自造的演示/冒烟数据，非开源数据集。
 
