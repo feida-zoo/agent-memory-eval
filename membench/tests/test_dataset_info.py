@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from membench import cli
+from membench.data import fetch as dataset_fetch
 from membench.data import info as dataset_info
 from membench.data.info import (
     DATASET_REGISTRY,
@@ -131,7 +132,7 @@ def test_cli_fetch_builtin_no_network(
     def _boom(*args: object, **kwargs: object) -> None:
         raise AssertionError("builtin 数据集不应触发下载")
 
-    monkeypatch.setattr(cli, "_download_file", _boom)
+    monkeypatch.setattr(dataset_fetch, "_download_file", _boom)
     assert cli.main(["dataset", "fetch", "office"]) == 0
     out = capsys.readouterr().out
     assert "内置" in out
@@ -144,10 +145,10 @@ def test_cli_fetch_unavailable_returns_2(
     def _boom(*args: object, **kwargs: object) -> None:
         raise AssertionError("unavailable 数据集不应触发下载")
 
-    monkeypatch.setattr(cli, "_download_file", _boom)
+    monkeypatch.setattr(dataset_fetch, "_download_file", _boom)
     assert cli.main(["dataset", "fetch", "statemembench"]) == 2
-    out = capsys.readouterr().out
-    assert "暂不可用" in out
+    err = capsys.readouterr().err
+    assert "暂不可用" in err
 
 
 def test_cli_fetch_unknown_name_returns_2(capsys: pytest.CaptureFixture[str]) -> None:
@@ -159,7 +160,9 @@ def test_cli_fetch_beam_with_mocked_download(
 ) -> None:
     """mock 下载：写入最小合法 BEAM 原始文件，走真实 convert_beam_split 转换。"""
 
-    def _fake_download(url: str, dest: Path, retries: int = 3) -> None:
+    def _fake_download(
+        url: str, dest: Path, retries: int = 3, force: bool = False
+    ) -> None:
         if url.endswith("chat.json"):
             payload = [
                 {
@@ -172,9 +175,9 @@ def test_cli_fetch_beam_with_mocked_download(
             payload = {"information_extraction": [{"question": "q?", "answer": "a"}]}
         dest.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
-    monkeypatch.setattr(cli, "_download_file", _fake_download)
+    monkeypatch.setattr(dataset_fetch, "_download_file", _fake_download)
     # 缩小下载规模，避免写 35 份文件
-    monkeypatch.setitem(cli._FETCH_CONFIG, "beam_1m", ("1M", 2, "1m"))
+    monkeypatch.setitem(dataset_fetch._BEAM_CONFIG, "beam_1m", ("1M", 2, "1m"))
 
     assert cli.main(["dataset", "fetch", "beam_1m", "--out", str(tmp_path)]) == 0
     out_path = tmp_path / "beam_1m.jsonl"

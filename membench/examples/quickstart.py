@@ -1,7 +1,7 @@
 """最小接入示例：继承 BaseMemoryAdapter 包装一个假想记忆系统，并跑一次评测。
 
-运行方式（在仓库根目录）：
-    python examples/quickstart.py
+运行方式（在 `membench/` 工程根目录下）：
+    cd membench && python examples/quickstart.py
 
 把 ``FakeMemorySystem`` 换成你自己的记忆系统 SDK，只改 MyAdapter 里的三行调用即可。
 """

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -268,6 +269,42 @@ def builtin_path(key: str) -> Path | None:
     if info.builtin_file is None:
         return None
     return _DATA_DIR / info.builtin_file
+
+
+def datasets_dir() -> Path:
+    """按需下载数据集的落盘目录（``MEMBENCH_DATASETS_DIR`` > ``~/.membench/datasets``）。"""
+    env = os.environ.get("MEMBENCH_DATASETS_DIR")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".membench" / "datasets"
+
+
+def resolve_available_path(key: str) -> Path | None:
+    """解析某数据集当前可用的文件路径（内置文件优先，其次按需下载目录）。
+
+    查找顺序：
+
+    1. ``membench/data/<builtin_file>``（若注册表标了内置文件名且文件存在）；
+    2. ``datasets_dir()/<key>.jsonl``（``dataset fetch`` 的落盘位置）。
+
+    Args:
+        key: 数据集键。
+
+    Returns:
+        可用文件路径；两处都不存在时返回 None（调用方据此提示先 ``dataset fetch``）。
+
+    Raises:
+        KeyError: key 未知。
+    """
+    info = get_dataset_info(key)
+    if info.builtin_file is not None:
+        path = _DATA_DIR / info.builtin_file
+        if path.is_file():
+            return path
+    fetched = datasets_dir() / f"{key}.jsonl"
+    if fetched.is_file():
+        return fetched
+    return None
 
 
 def _first_sentences(text: str, n: int) -> str:

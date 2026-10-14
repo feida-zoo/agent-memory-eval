@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from .adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
+from .agent_loop import AgentLoopAdapter, run_tool_loop
 from .data.schema import Dataset, Dialogue, Question, load_dataset
 from .runner import Runner
 
@@ -21,6 +22,8 @@ __all__ = [
     "BaseMemoryAdapter",
     "IngestStats",
     "QueryResult",
+    "AgentLoopAdapter",
+    "run_tool_loop",
     "Dataset",
     "Dialogue",
     "Question",

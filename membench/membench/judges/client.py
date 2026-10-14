@@ -25,10 +25,11 @@ stale/abstention 两个红线指标在本实现中始终由规则判定，不受
 
 from __future__ import annotations
 
-import importlib
 import json
 import re
 from typing import Any, Callable, Union
+
+from membench.llm_ref import import_from_path
 
 from .base import Judge, JudgeResult
 from .heuristic import HeuristicJudge, contains_refusal
@@ -82,12 +83,8 @@ class ClientLLMJudge(Judge):
     # ------------------------------------------------------------------
     @staticmethod
     def _import_from_path(spec: str) -> Any:
-        if ":" not in spec:
-            raise ValueError(f"类路径格式应为 'module:ClassName'，收到: {spec!r}")
-        module_name, attr = spec.split(":", 1)
-        module = importlib.import_module(module_name)
-        obj = getattr(module, attr)
-        return obj() if isinstance(obj, type) else obj
+        """委托 :func:`membench.llm_ref.import_from_path`（保留历史调用点）。"""
+        return import_from_path(spec)
 
     def _call(self, prompt: str) -> str:
         c = self._client

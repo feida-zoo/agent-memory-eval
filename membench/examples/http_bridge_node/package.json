@@ -1,0 +1,15 @@
+{
+  "name": "membench-http-bridge-node",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "membench HTTP bridge 参考模板：把 Node/Electron 系统的库内记忆能力暴露为 /reset|/ingest|/query 三端点",
+  "//": "依赖不预装：按需 npm i（唯一需要的是 esbuild，仅打包用）",
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "node bridge.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.23.0"
+  }
+}

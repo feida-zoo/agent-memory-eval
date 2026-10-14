@@ -299,6 +299,16 @@ def test_report_contents(
         raise AssertionError("报告中未出现 评价（评分） 样式")
     assert "参与数据集" in report
     assert "## 分数据集明细" in report
+    # 数据集范围行（反馈 4：先确认本次实际评测的数据集 key 与来源）
+    assert "数据集范围" in report
+    assert "a（user-specified）" in report
+    # 报告目录下复制了各数据集 run 副本，链接指向相对路径 runs/<run_id>/report.md
+    report_dir = Path(summary["_eval_dir"])
+    assert summary["experiment_dir"] == str(report_dir)
+    for rel in summary["runs"].values():
+        assert rel.startswith("runs/")
+        assert (report_dir / rel / "report.md").is_file()
+    assert "(runs/" in report
     # B 不参与 stale_rate，明细表中应显示 "—"
     detail_section = report.split("## 分数据集明细")[1]
     assert "—" in detail_section
@@ -332,12 +342,21 @@ def test_cli_quick_and_beam10m_mutually_exclusive() -> None:
     assert exc_info.value.code == 2
 
 
+def _stub_fetched(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """让公开集解析到虚构路径（离线环境无下载），使 plan_datasets 继续后续检查。"""
+    monkeypatch.setattr(
+        "membench.evaluate.resolve_available_path",
+        lambda key: tmp_path / f"{key}.jsonl",
+    )
+
+
 def test_cli_beam_missing_systemexit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """无 --quick 且 BEAM 缺失 -> SystemExit 提示 dataset fetch beam_1m。"""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))  # BEAM 必然不存在
     monkeypatch.setenv("MEMBENCH_USER_DATA_DIR", str(tmp_path / "no_user_data"))
+    _stub_fetched(monkeypatch, tmp_path)
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["evaluate", "--adapter", "mock-strong", "--judge", "heuristic"])
     assert "fetch beam_1m" in str(exc_info.value)
@@ -349,8 +368,11 @@ def test_cli_quick_skips_beam_check(
     """--quick 不检查 BEAM 文件存在，且清单中无 BEAM 槽位。"""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("MEMBENCH_USER_DATA_DIR", str(tmp_path / "no_user_data"))
+    _stub_fetched(monkeypatch, tmp_path)
     specs = plan_datasets(quick=True)
     assert [s.key for s in specs] == ["office", "locomo", "longmemeval_oracle", "gatemem_office"]
+    # 公开集统一标注 fetch 来源（不再被当内置集）。
+    assert all(s.source == "fetch" for s in specs[1:])
 
     # CLI 层面：--quick 时不触发 SystemExit（stub 掉真正评测避免跑内置大数据集）。
     captured: dict[str, object] = {}
@@ -366,3 +388,26 @@ def test_cli_quick_skips_beam_check(
     assert rc == 0
     assert captured["quick"] is True
     assert captured["beam_10m"] is False
+
+
+def test_plan_datasets_missing_fetch_systemexit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """公开集未下载（resolve_available_path 返回 None）-> SystemExit 提示 dataset fetch。"""
+    monkeypatch.setattr("membench.evaluate.resolve_available_path", lambda key: None)
+    with pytest.raises(SystemExit) as exc_info:
+        plan_datasets(quick=True)
+    msg = str(exc_info.value)
+    assert "dataset fetch" in msg
+    assert "locomo" in msg
+
+
+def test_plan_datasets_missing_lme_s_systemexit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--include-lme-s 且 LongMemEval-S 未下载 -> SystemExit 提示 fetch longmemeval_s。"""
+    monkeypatch.setattr(
+        "membench.evaluate.resolve_available_path",
+        lambda key: None if key == "longmemeval_s" else tmp_path / f"{key}.jsonl",
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        plan_datasets(quick=True, include_lme_s=True)
+    assert "dataset fetch longmemeval_s" in str(exc_info.value)

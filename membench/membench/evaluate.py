@@ -1,12 +1,15 @@
 """evaluate：对多个数据集依次运行评测，跨数据集宏平均融合出综合评分报告。
 
 流程：
-    plan_datasets 规划数据集清单（办公域槽位 + 固定内置集 + BEAM 槽位）
+    plan_datasets 规划数据集清单（办公域槽位 + 按需下载公开集 + BEAM 槽位）
     -> 每个数据集用 Runner 各跑一次（adapter 实例复用，reset 由 Runner 内部负责）
     -> 读取各 run_dir 的 metrics.json
     -> 宏平均融合六项质量指标（按能力标注决定参与集）
     -> 办公域 stale 门禁（一票否决）
-    -> 写 runs/evaluate_<时间戳>/evaluate_report.md
+    -> 报告目录（report_out 缺省时 <out_dir>/evaluate_<ts>/，
+       指定时 <report_out>/eval_<adapter>_<platform>_<ts>/）内写
+       evaluate_report.md + evaluate_summary.json，并把各数据集 run 目录
+       复制进该目录的 runs/ 下，使报告与 run 数据就近归属、自包含。
 
 融合口径（宏平均）：
     - accuracy / token_f1 / bleu1：所有数据集参与；
@@ -25,9 +28,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Union
 
+from membench import layout, paths
+from membench.data.info import resolve_available_path
 from membench.data.schema import load_dataset
 from membench.ratings import format_metric, overall_rating
-from membench.report import _md_table, copy_report
+from membench.report import _md_table
 from membench.runner import Runner
 from membench.userdata import resolve_dataset
 
@@ -44,17 +49,17 @@ QUALITY_METRICS: tuple[str, ...] = (
 #: 办公域 stale 门禁阈值：办公域槽位数据集 stale_rate 超过该值即一票否决。
 STALE_GATE_THRESHOLD: float = 0.03
 
-#: 固定参与全量评估的内置数据集（相对 membench 包目录解析）。
-#: longmemeval_s 体积大（~268MB）、ingest 成本高，默认不入全量；
-#: 用 --include-lme-s 显式开启（与 oracle 同题，分差反映检索/精确率损失）。
-_BUILTIN_DATASETS: tuple[tuple[str, str], ...] = (
-    ("locomo", "locomo.jsonl"),
-    ("longmemeval_oracle", "longmemeval_oracle.jsonl"),
-    ("gatemem_office", "gatemem_office.jsonl"),
+#: 默认参与全量评估的按需下载公开集（键，顺序即评测顺序）。
+#: 这些集没有内置文件，须先 dataset fetch 到下载目录，用统一入口解析路径。
+_FETCH_DATASETS: tuple[str, ...] = (
+    "locomo",
+    "longmemeval_oracle",
+    "gatemem_office",
 )
 
-#: 可选内置集：--include-lme-s 时追加。
-_LME_S_DATASET: tuple[str, str] = ("longmemeval_s", "longmemeval_s.jsonl")
+#: 可选公开集：--include-lme-s 时追加。体积大（~268MB）、ingest 成本高，默认不入全量；
+#: 与 oracle 同题，分差反映检索/精确率损失。
+_LME_S_KEY = "longmemeval_s"
 
 
 @dataclass
@@ -93,9 +98,15 @@ class DatasetResult:
     capabilities: dict[str, bool] = field(default_factory=dict)
 
 
-def _builtin_data_dir() -> Path:
-    """内置数据集目录（membench/data/）。"""
-    return Path(__file__).resolve().parent / "data"
+def _fetch_spec(key: str) -> DatasetSpec:
+    """解析按需下载公开集的可用路径；缺失时报错提示先运行 dataset fetch。"""
+    path = resolve_available_path(key)
+    if path is None:
+        raise SystemExit(
+            f"数据集 {key} 尚未下载，请先运行: "
+            f"python -m membench.cli dataset fetch {key}"
+        )
+    return DatasetSpec(key=key, name=key, path=str(path), source="fetch")
 
 
 def _beam_path(beam_10m: bool) -> Path:
@@ -110,9 +121,13 @@ def plan_datasets(
     """规划全量评估的数据集清单。
 
     槽位顺序：办公域槽位（resolve_dataset 优先级：用户集 > 内置 office）
-    -> 固定内置集（locomo / longmemeval_oracle / gatemem_office）
+    -> 按需下载公开集（locomo / longmemeval_oracle / gatemem_office）
     -> 可选：longmemeval_s（--include-lme-s 时追加）
     -> BEAM 槽位（--quick 时跳过；--beam-10m 时换成 10m 集）。
+
+    四个公开集都没有内置文件，统一经 ``data.info.resolve_available_path``
+    解析可用路径（内置文件优先，其次 dataset fetch 下载目录）；解析不到即
+    报错提示先下载，避免拿"路径不存在"的空集当基准、污染可比性。
 
     Args:
         quick: True 时跳过 BEAM 槽位（不检查文件是否存在）。
@@ -123,7 +138,8 @@ def plan_datasets(
         DatasetSpec 列表。
 
     Raises:
-        SystemExit: 非 quick 模式且 BEAM 文件不存在时，提示先运行 dataset fetch。
+        SystemExit: 任一按需下载公开集解析不到路径，或非 quick 模式且 BEAM
+            文件不存在时，提示先运行 dataset fetch。
     """
     specs: list[DatasetSpec] = []
 
@@ -140,29 +156,13 @@ def plan_datasets(
         )
     )
 
-    # 固定内置集。
-    data_dir = _builtin_data_dir()
-    for key, filename in _BUILTIN_DATASETS:
-        specs.append(
-            DatasetSpec(
-                key=key,
-                name=key,
-                path=str(data_dir / filename),
-                source="builtin",
-            )
-        )
+    # 按需下载的公开集（缺失即报错，不静默跳过）。
+    for key in _FETCH_DATASETS:
+        specs.append(_fetch_spec(key))
 
     # 可选：LongMemEval-S（大体积、高成本，默认不入全量）。
     if include_lme_s:
-        key, filename = _LME_S_DATASET
-        specs.append(
-            DatasetSpec(
-                key=key,
-                name=key,
-                path=str(data_dir / filename),
-                source="builtin",
-            )
-        )
+        specs.append(_fetch_spec(_LME_S_KEY))
 
     # BEAM 槽位。
     if not quick:
@@ -310,11 +310,14 @@ def run_datasets(
     platform: Union[str, None] = None,
     commit: Union[str, None] = None,
     jobs: int = 1,
+    driver_llm: Union[str, None] = None,
+    adapter_version: Union[str, None] = None,
 ) -> list[DatasetResult]:
     """对每个数据集用 Runner 各跑一次，收集 metrics.json。
 
     adapter 实例跨数据集复用同一个（reset 由 Runner 内部负责）；
     每个数据集新建 Runner。jobs 透传给 Runner 的题目级并发参数。
+    driver_llm / adapter_version 透传给 Runner，记入每个 run 的元数据。
     """
     results: list[DatasetResult] = []
     for spec in specs:
@@ -327,6 +330,8 @@ def run_datasets(
             platform=platform,
             commit=commit,
             dataset_source=spec.source,
+            driver_llm=driver_llm,
+            adapter_version=adapter_version,
         )
         run_dir = runner.run()
         with open(os.path.join(run_dir, "metrics.json"), encoding="utf-8") as f:
@@ -353,7 +358,13 @@ def write_evaluate_report(
     fused: dict[str, dict[str, Any]],
     gate: dict[str, Any],
 ) -> str:
-    """生成 evaluate_report.md（中文），返回报告路径。"""
+    """生成 evaluate_report.md（中文），写入报告目录并返回报告路径。
+
+    Args:
+        eval_dir: 报告目录。各数据集 run 副本已复制到其 ``runs/<run_id>/`` 下，
+            故报告中的 run 链接使用相对该目录的 ``runs/<run_id>/report.md``。
+        results: 各数据集评测结果（spec 提供数据集范围、来源与路径）。
+    """
     gate_status = str(gate["status"])
     overall_fused = {
         k: v["value"] for k, v in fused.items() if v["value"] is not None
@@ -383,6 +394,8 @@ def write_evaluate_report(
         ["platform", str(platform or "default")],
         ["commit", str(commit or "n/a")],
         ["时间戳", timestamp.isoformat(timespec="seconds")],
+        # 数据集范围：本次实际评测的 key 与来源，便于"先确认数据集范围"（反馈 4）。
+        ["数据集范围", "、".join(f"{r.spec.key}（{r.spec.source}）" for r in results) or "（无）"],
     ]
     lines.append(_md_table(["项目", "值"], config_rows))
     lines.append("")
@@ -444,11 +457,11 @@ def write_evaluate_report(
     )
     lines.append("")
 
-    # 各数据集 run 目录链接
+    # 各数据集 run 目录链接（指向报告目录下复制后的 runs/<run_id>/）
     lines.append("## 各数据集 run 目录")
     lines.append("")
     for r in results:
-        rel = os.path.relpath(r.run_dir, eval_dir)
+        rel = f"runs/{os.path.basename(os.path.normpath(r.run_dir))}"
         lines.append(f"- {r.spec.name}: [{rel}]({rel}/report.md)")
     lines.append("")
 
@@ -470,32 +483,31 @@ def evaluate(
     report_out: Union[str, None] = None,
     specs: Union[list[DatasetSpec], None] = None,
     jobs: int = 1,
+    driver_llm: Union[str, None] = None,
+    adapter_version: Union[str, None] = None,
 ) -> int:
     """执行全量评估：多数据集依次评测 + 宏平均融合 + 门禁 + 报告。
 
     Args:
         adapter: 适配器实例（跨数据集复用，Runner 内部负责 reset）。
         judge: judge 名字符串或 Judge 实例（与 Runner 约定一致）。
-        out_dir: run 与 evaluate 报告的父目录；None 时默认 skill/output/runs/。
+        out_dir: run 数据与缺省报告目录的父目录；None 时默认 paths.runs_dir()。
         platform: 平台标签。commit: commit 标签。
         quick: 跳过 BEAM 槽位。beam_10m: BEAM 槽位用 10m 集。
         include_lme_s: 追加 LongMemEval-S 变体（大体积、高成本）。
-        report_out: 额外把报告复制到该目录。
+        report_out: 报告根目录。给定后报告落
+            ``<report_out>/eval_<adapter>_<platform>_<ts>/``；None 时落
+            ``<out_dir>/evaluate_<ts>/``。两种情况都把各数据集 run 目录复制进
+            报告目录的 ``runs/`` 下（自包含，便于就近归属与搬移）。
         specs: 显式数据集清单（默认 None 时按 quick/beam_10m/include_lme_s 调 plan_datasets）。
+        driver_llm: 驱动被测系统的 LLM 标识，透传给每个 run 的元数据（默认 None）。
+        adapter_version: 适配器实现版本标识，透传给每个 run 的元数据（默认 None）。
 
     Returns:
         进程退出码：门禁 FAIL 为 1，否则 0（与 compare 一致）。
     """
     if out_dir is None:
-        pkg_dir = os.path.dirname(os.path.abspath(__file__))  # membench/membench/
-        proj_root = os.path.dirname(pkg_dir)  # membench/（工程根）
-        skill_root = os.path.dirname(proj_root)  # skill 根目录
-        # 检测是否在 skill 环境：skill 根目录应有 SKILL.md
-        if os.path.isfile(os.path.join(skill_root, "SKILL.md")):
-            out_dir = os.path.join(skill_root, "output", "runs")
-        else:
-            # 开发/独立环境：退到工程根 runs/
-            out_dir = os.path.join(proj_root, "runs")
+        out_dir = paths.runs_dir()
 
     if specs is None:
         specs = plan_datasets(quick=quick, beam_10m=beam_10m, include_lme_s=include_lme_s)
@@ -511,48 +523,61 @@ def evaluate(
         )
 
     now = datetime.now()
-    eval_dir = os.path.join(out_dir, f"evaluate_{now.strftime('%Y%m%d_%H%M%S')}")
-    os.makedirs(eval_dir, exist_ok=True)
+    # 报告目录：显式 report_out 时用自包含的 eval_<adapter>_<platform>_<ts>/；
+    # 否则保持历史位置 <out_dir>/evaluate_<ts>/（不引入新的测试副作用）。
+    if report_out:
+        report_dir = layout.experiment_path(
+            report_out, layout.subdir_for(adapter_name, platform, layout.ts_now(now))
+        )
+    else:
+        report_dir = os.path.join(out_dir, f"evaluate_{now.strftime('%Y%m%d_%H%M%S')}")
+        os.makedirs(report_dir, exist_ok=True)
 
     results = run_datasets(
-        adapter, judge, specs, out_dir, platform=platform, commit=commit, jobs=jobs
+        adapter,
+        judge,
+        specs,
+        out_dir,
+        platform=platform,
+        commit=commit,
+        jobs=jobs,
+        driver_llm=driver_llm,
+        adapter_version=adapter_version,
     )
     fused = fuse_metrics(results)
     gate = evaluate_gate(results)
 
+    # 把各数据集 run 目录复制进报告目录的 runs/ 下，使报告与 run 数据就近归属、可整体搬移；
+    # 报告里的链接据此指向 runs/<run_id>/report.md。
+    copied_runs = layout.copy_runs_into(
+        os.path.join(report_dir, "runs"), [r.run_dir for r in results]
+    )
+
     report_path = write_evaluate_report(
-        eval_dir, adapter_name, judge_name, platform, commit, now, results, fused, gate
+        report_dir, adapter_name, judge_name, platform, commit, now, results, fused, gate
     )
 
     # 汇总 JSON，便于程序化消费。
     summary = {
-        "eval_dir": eval_dir,
+        "eval_dir": report_dir,
+        "experiment_dir": report_dir,
         "adapter": adapter_name,
         "judge": judge_name,
         "platform": platform or "default",
         "commit": commit,
         "timestamp": now.isoformat(timespec="seconds"),
         "datasets": [r.spec.key for r in results],
+        "runs": {
+            r.spec.key: os.path.relpath(d, report_dir)
+            for r, d in zip(results, copied_runs)
+        },
         "fused": fused,
         "gate": gate,
     }
-    with open(os.path.join(eval_dir, "evaluate_summary.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(report_dir, "evaluate_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     print(f"[membench] 门禁结论: {gate['status']} — {gate['detail']}")
     print(f"[membench] 报告: {report_path}")
-
-    if report_out:
-        ts = now.strftime("%y%m%d_%H%M%S")
-        # 每次全量评估一个独立子目录；各数据集的 run 目录仅在报告里保留链接，不复制（体积大）
-        sub_dir = os.path.join(report_out, f"evaluate_{ts}")
-        copy_report(
-            report_path,
-            sub_dir,
-            "evaluate_report.md",
-            "",
-            extra_files=[os.path.join(eval_dir, "evaluate_summary.json")],
-        )
-        print(f"[membench] 报告已复制: {sub_dir}/")
 
     return 1 if gate["status"] == "FAIL" else 0

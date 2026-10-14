@@ -1,19 +1,31 @@
-"""membench 命令行入口：run / compare / matrix / user-data / list-datasets。
+"""membench 命令行入口：run / evaluate / fuse / compare / matrix / doctor /
+adapter / user-data / dataset / list-datasets。
 
 用法（SPEC 第 6 节）：
     python -m membench.cli run --adapter mock-strong \
-        [--dataset membench/data/sample_dataset.jsonl] --judge heuristic --out runs/ \
-        [--platform wx --commit a1b2c3] [--report-out DIR]
+        [--dataset membench/data/sample_dataset.jsonl] --judge heuristic [--out runs/] \
+        [--platform wx --commit a1b2c3] [--driver-llm gpt-4o] \
+        [--adapter-version a1b2c3] [--report-out DIR]
     python -m membench.cli evaluate --adapter mock-strong \
         [--judge heuristic] [--platform wx --commit a1b2c3] [--out runs/] \
-        [--report-out DIR] [--quick | --beam-10m]
+        [--driver-llm gpt-4o] [--adapter-version a1b2c3] \
+        [--report-out DIR] [--quick | --beam-10m] [--include-lme-s]
     python -m membench.cli fuse --runs runs/<shard0>,runs/<shard1> --out runs/<fused>
     python -m membench.cli compare --baseline runs/<run_a> --candidate runs/<run_b> \
-        [--acc-threshold 0.02] [--report-out DIR]
+        [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
+        [--require-comparable] [--tag <label>] [--report-out DIR]
     python -m membench.cli matrix --runs "wx@a1b2c3=runs/dir1" "fs@a1b2c3=runs/dir2" ... \
-        [--report-out DIR]
+        [--out DIR] [--report-out DIR]
+    python -m membench.cli doctor --target http://127.0.0.1:8787 \
+        [--timeout 10.0] [--api-key K]
+    python -m membench.cli adapter install <adapter.py> | list | remove <name>
     python -m membench.cli user-data install <jsonl路径> | status | delete
+    python -m membench.cli dataset info [<key>] | dataset fetch <key> [--out DIR]
     python -m membench.cli list-datasets
+
+--report-out 统一语义：实验目录（``eval_*`` / ``ab_*`` / ``matrix_*``）的
+父目录；缺省时用 paths.output_root()（MEMBENCH_OUTPUT_DIR > skill 的 output/ >
+工程根）。一次实验一个自包含子目录（报告 + 对应 run 副本就近归属）。
 """
 
 from __future__ import annotations
@@ -21,14 +33,12 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime
-from pathlib import Path
 from typing import Optional, Sequence
 
+from membench import layout, paths
 from membench.adapters import ADAPTERS
 from membench.compare import compare_runs
 from membench.matrix import compare_matrix
-from membench.report import copy_report
 from membench.runner import Runner
 from membench.userdata import (
     delete_user_dataset,
@@ -58,7 +68,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--out", default=None, help="run 输出父目录（默认 skill/output/runs/）")
     p_run.add_argument("--platform", default=None, help="平台标签（如 wx / fs），记入 run_id 与元数据")
     p_run.add_argument("--commit", default=None, help="commit 标签（如 a1b2c3），记入元数据")
-    p_run.add_argument("--report-out", default=None, help="额外把报告复制到该目录（带时间戳文件名）")
+    p_run.add_argument("--driver-llm", default=None, help="驱动被测系统的 LLM 标识（如 gpt-4o），记入元数据供 compare 可比性校验")
+    p_run.add_argument("--adapter-version", default=None, help="适配器实现版本/commit，记入元数据供 compare 可比性校验")
+    p_run.add_argument("--report-out", default=None, help="实验目录父目录：产出 <DIR>/eval_<adapter>_<platform>_<ts>/（报告+metrics+run 副本）")
     p_run.add_argument("--llm-base-url", default=None, help="judge=llm 时的 OpenAI 兼容 base_url")
     p_run.add_argument("--llm-api-key", default=None, help="judge=llm 时的 API key")
     p_run.add_argument("--llm-model", default=None, help="judge=llm 时的模型名")
@@ -78,7 +90,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cmp.add_argument("--acc-threshold", type=float, default=0.02, help="accuracy 允许最大下降（默认 0.02）")
     p_cmp.add_argument("--stale-threshold", type=float, default=0.02, help="stale_rate 允许最大上升（默认 0.02）")
     p_cmp.add_argument("--latency-warn", type=float, default=0.30, help="latency_p95 上升告警比例（默认 0.30）")
-    p_cmp.add_argument("--report-out", default=None, help="额外把报告复制到该目录（带时间戳文件名）")
+    p_cmp.add_argument("--require-comparable", action="store_true", help="strict 可比性：关键维度不一致或无法核验时门禁 FAIL")
+    p_cmp.add_argument("--tag", default=None, help="A/B 实验目录标签（缺省由两个 run_id 拼成 <a>_vs_<b>）")
+    p_cmp.add_argument("--report-out", default=None, help="实验目录父目录：产出 <DIR>/ab_<tag>_<ts>/（A/B 各自带 runs/ 副本 + compare_report.md）")
     p_cmp.set_defaults(func=_cmd_compare)
 
     # --- fuse ---
@@ -95,8 +109,8 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="+",
         help='带标签的 run 目录，形如 "platform@commit=runs/dir"（label 也接受任意字符串）',
     )
-    p_mtx.add_argument("--out", default=None, help="matrix 产物输出目录（默认 skill/output/matrix_<时间戳>）")
-    p_mtx.add_argument("--report-out", default=None, help="额外把报告复制到该目录（带时间戳文件名）")
+    p_mtx.add_argument("--out", default=None, help="matrix 产物输出目录（缺省 matrix_<时间戳>/）")
+    p_mtx.add_argument("--report-out", default=None, help="实验目录父目录：产出 <DIR>/matrix_<ts>/（--out 优先于本参数）")
     p_mtx.set_defaults(func=_cmd_matrix)
 
     # --- user-data ---
@@ -117,7 +131,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--platform", default=None, help="平台标签（如 wx / fs），记入 run_id 与元数据")
     p_ev.add_argument("--commit", default=None, help="commit 标签（如 a1b2c3），记入元数据")
     p_ev.add_argument("--out", default=None, help="run 与 evaluate 报告输出父目录（默认 skill/output/runs/）")
-    p_ev.add_argument("--report-out", default=None, help="额外把报告复制到该目录（带时间戳文件名）")
+    p_ev.add_argument("--driver-llm", default=None, help="驱动被测系统的 LLM 标识（如 gpt-4o），记入每个 run 的元数据")
+    p_ev.add_argument("--adapter-version", default=None, help="适配器实现版本/commit，记入每个 run 的元数据")
+    p_ev.add_argument("--report-out", default=None, help="实验目录父目录：产出 <DIR>/eval_<adapter>_<platform>_<ts>/")
     ev_group = p_ev.add_mutually_exclusive_group()
     ev_group.add_argument("--quick", action="store_true", help="快速模式：跳过 BEAM 槽位（不检查 BEAM 文件是否存在）")
     ev_group.add_argument("--beam-10m", action="store_true", help="BEAM 槽位使用 beam_10m.jsonl（默认 beam_1m.jsonl）")
@@ -153,10 +169,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ds_info = ds_sub.add_parser("info", help="介绍数据集；不传 name 时概览全部支持的数据集")
     p_ds_info.add_argument("name", nargs="?", default=None, help="数据集 key（可选；未知 key 列出全部可用 key）")
     p_ds_info.set_defaults(func=_cmd_dataset_info)
-    p_ds_fetch = ds_sub.add_parser("fetch", help="下载并转换需按需获取的数据集（如 beam_1m / beam_10m）")
+    p_ds_fetch = ds_sub.add_parser("fetch", help="下载并转换需按需获取的数据集（locomo / longmemeval_* / gatemem_office / beam_*）")
     p_ds_fetch.add_argument("name", help="数据集 key（仅支持 status=fetch 的条目）")
-    p_ds_fetch.add_argument("--out", default=None, help="输出目录（默认 ~/.membench/datasets/）")
+    p_ds_fetch.add_argument("--out", default=None, help="输出目录（默认 MEMBENCH_DATASETS_DIR 或 ~/.membench/datasets/）")
     p_ds_fetch.set_defaults(func=_cmd_dataset_fetch)
+
+    # --- doctor ---
+    p_doc = sub.add_parser("doctor", help="探测被测服务是否符合 HttpAdapter 契约（reset/ingest/query 三端点）")
+    p_doc.add_argument("--target", required=True, help="被测服务根地址，如 http://127.0.0.1:8787")
+    p_doc.add_argument("--timeout", type=float, default=10.0, help="单次请求超时秒数（默认 10.0）")
+    p_doc.add_argument("--api-key", default=None, help="非空时给每个请求加 Authorization: Bearer <key>")
+    p_doc.set_defaults(func=_cmd_doctor)
 
     return parser
 
@@ -221,26 +244,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
         shards=args.shards,
         shard_index=args.shard_index,
         adapter_meta=args.adapter_meta,
+        driver_llm=args.driver_llm,
+        adapter_version=args.adapter_version,
+        report_out=args.report_out,
     )
     run_dir = runner.run()
-    if args.report_out:
-        ts = datetime.now().strftime("%y%m%d_%H%M%S")
-        platform_tag = args.platform or "default"
-        # 每次评测一个独立子目录，避免多次评测产物混在同一目录
-        sub_dir = os.path.join(
-            args.report_out, f"eval_{adapter.name}_{platform_tag}_{ts}"
-        )
-        copy_report(
-            os.path.join(run_dir, "report.md"),
-            sub_dir,
-            "report.md",
-            "",
-            extra_files=[
-                os.path.join(run_dir, "results.jsonl"),
-                os.path.join(run_dir, "metrics.json"),
-            ],
-        )
-        print(f"[membench] 报告已复制: {sub_dir}/")
+    # report_out 时 Runner 已自建 <DIR>/eval_<adapter>_<platform>_<ts>/ 并复制 run 副本
     print(f"[membench] 完成: {run_dir}")
     return 0
 
@@ -252,21 +261,13 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         acc_threshold=args.acc_threshold,
         stale_threshold=args.stale_threshold,
         latency_warn=args.latency_warn,
+        require_comparable=args.require_comparable,
+        out_dir=args.report_out,
+        tag=args.tag,
     )
+    # compare_runs 已打印 verdict / 逐门禁 / 不可比原因 / 报告路径；此处补实验目录便于脚本消费
     print(f"[membench] verdict: {result['verdict']}")
-    if args.report_out:
-        ts = datetime.now().strftime("%y%m%d_%H%M%S")
-        # 每次对比一个独立子目录
-        sub_dir = os.path.join(
-            args.report_out, f"compare_{result['run_a']}_{result['run_b']}_{ts}"
-        )
-        copy_report(
-            os.path.join(result["compare_dir"], "compare_report.md"),
-            sub_dir,
-            "compare_report.md",
-            "",
-        )
-        print(f"[membench] 报告已复制: {sub_dir}/")
+    print(f"[membench] compare_dir: {result['compare_dir']}")
     # FAIL 时以非零码退出，便于 CI 门禁集成
     return 1 if result["verdict"] == "FAIL" else 0
 
@@ -298,19 +299,11 @@ def _cmd_matrix(args: argparse.Namespace) -> int:
 
     if args.out:
         out_dir = args.out
+    elif args.report_out:
+        # report_out 语义统一为实验目录父目录
+        out_dir = layout.experiment_path(args.report_out, layout.matrix_subdir())
     else:
-        # 默认输出到 skill/output/matrix_<时间戳>/；开发环境退到工程根 runs/
-        pkg_dir = os.path.dirname(os.path.abspath(__file__))  # membench/membench/
-        proj_root = os.path.dirname(pkg_dir)  # membench/（工程根）
-        skill_root = os.path.dirname(proj_root)  # skill 根目录
-        if os.path.isfile(os.path.join(skill_root, "SKILL.md")):
-            out_dir = os.path.join(
-                skill_root, "output", f"matrix_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            )
-        else:
-            out_dir = os.path.join(
-                proj_root, "runs", f"matrix_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            )
+        out_dir = layout.experiment_path(paths.output_root(), layout.matrix_subdir())
     result = compare_matrix(labeled_runs, out_dir)
     worst = "PASS"
     for pair in result["pairwise"]:
@@ -320,15 +313,6 @@ def _cmd_matrix(args: argparse.Namespace) -> int:
             worst = "WARN"
     print(f"[membench] matrix verdict: {worst}")
     print(f"[membench] report: {result['report_path']}")
-    if args.report_out:
-        ts = datetime.now().strftime("%y%m%d_%H%M%S")
-        dest = copy_report(
-            result["report_path"],
-            args.report_out,
-            f"matrix_report_{ts}.md",
-            ts,
-        )
-        print(f"[membench] 报告已复制: {dest}")
     return 0
 
 
@@ -449,6 +433,8 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
         include_lme_s=args.include_lme_s,
         report_out=args.report_out,
         jobs=args.jobs,
+        driver_llm=args.driver_llm,
+        adapter_version=args.adapter_version,
     )
 
 
@@ -493,82 +479,14 @@ def _cmd_dataset_info(args: argparse.Namespace) -> int:
     return 0
 
 
-#: BEAM 原始数据在 GitHub raw 上的基础 URL。
-_BEAM_RAW_BASE = "https://raw.githubusercontent.com/mohammadtavakoli78/BEAM/main/"
-
-#: status=fetch 条目的下载配置：key -> (远端子目录, chat 数, convert_beam 的 scale 标识)。
-_FETCH_CONFIG: dict[str, tuple[str, int, str]] = {
-    "beam_1m": ("1M", 35, "1m"),
-    "beam_10m": ("10M", 10, "10m"),
-}
-
-#: 每个 chat 目录需要下载的文件（相对路径）。
-#: 注意：BEAM 仓库实际结构是 chats/{scale}/{id}/probing_questions/probing_questions.json，
-#: 不是 chats/{scale}/{id}/pq.json（pq.json 是早期版本或本地缓存的命名）。
-_BEAM_CHAT_FILES = ("chat.json", "probing_questions/probing_questions.json")
-
-
-def _download_file(url: str, dest: Path, retries: int = 3) -> None:
-    """下载单个文件（重试 retries 次）；已存在且可解析为 JSON 时跳过（断点续传）。"""
-    import json
-    import urllib.request
-
-    if dest.is_file():
-        try:
-            json.loads(dest.read_text(encoding="utf-8"))
-            return  # 已下载且完整，跳过
-        except (OSError, ValueError):
-            pass  # 损坏的半成品，重新下载
-    last_exc: Optional[BaseException] = None
-    for attempt in range(1, retries + 1):
-        try:
-            with urllib.request.urlopen(url, timeout=120) as resp:
-                dest.write_bytes(resp.read())
-            return
-        except Exception as exc:  # noqa: BLE001 - 网络错误统一重试
-            last_exc = exc
-            print(f"[membench] 下载失败（第 {attempt}/{retries} 次）: {url}: {exc}", file=sys.stderr)
-    raise RuntimeError(f"下载失败（已重试 {retries} 次）: {url}: {last_exc}")
-
-
-def _fetch_beam(name: str, out_dir: Path) -> Path:
-    """下载 BEAM 某规模原始数据并转换为 membench JSONL，返回输出文件路径。"""
-    subdir, n_chats, scale = _FETCH_CONFIG[name]
-    raw_dir = out_dir / f".{name}_raw"
-    for i in range(1, n_chats + 1):
-        chat_dir = raw_dir / str(i)
-        chat_dir.mkdir(parents=True, exist_ok=True)
-        # chat.json 直接下载
-        _download_file(
-            f"{_BEAM_RAW_BASE}chats/{subdir}/{i}/chat.json",
-            chat_dir / "chat.json",
-        )
-        # probing_questions 在子目录里，下载后保存到 chat_dir 根（转换器期望的位置）
-        _download_file(
-            f"{_BEAM_RAW_BASE}chats/{subdir}/{i}/probing_questions/probing_questions.json",
-            chat_dir / "probing_questions.json",
-        )
-        print(f"[membench] 已下载 chat {i}/{n_chats}", file=sys.stderr)
-
-    try:
-        from membench.data.convert_beam import convert_beam_split
-    except ImportError as exc:
-        raise SystemExit(
-            f"[membench] 转换模块 membench.data.convert_beam 不可用（可能尚未就绪）: {exc}。"
-            f"原始数据已下载到 {raw_dir}，稍后可重试。"
-        )
-
-    out_path = out_dir / f"{name}.jsonl"
-    stats = convert_beam_split(raw_dir, scale, out_path)
-    print(
-        f"[membench] 转换完成: {stats['dialogues']} dialogues, {stats['questions']} questions"
-        f"（跳过 {stats['skipped']} 个损坏 chat）"
-    )
-    return out_path
-
-
 def _cmd_dataset_fetch(args: argparse.Namespace) -> int:
-    """dataset fetch：按需下载并转换 status=fetch 的数据集。"""
+    """dataset fetch：按需下载并转换 status=fetch 的数据集。
+
+    下载+转换实现集中在 ``membench.data.fetch``（已有完整产物则跳过，幂等），CLI 只做
+    参数校验与退出码映射：内置数据集无需下载（提示路径，退出码 0）；
+    未知 key / 暂不可用 -> 2（并给出可手动获取的来源）；下载失败 -> 1。
+    """
+    from membench.data import fetch as dataset_fetch
     from membench.data import info as dataset_info
 
     try:
@@ -580,25 +498,42 @@ def _cmd_dataset_fetch(args: argparse.Namespace) -> int:
     if entry.status == "builtin":
         path = dataset_info.builtin_path(entry.key)
         print(f"[membench] {entry.key} 为内置数据集，无需下载: {path}")
-        print(f"[membench] 直接运行: python -m membench.cli run --adapter <你的适配器> --dataset {path}")
+        print(
+            f"[membench] 运行示例: python -m membench.cli run "
+            f"--adapter <你的适配器> --dataset {path}"
+        )
         return 0
-    if entry.status == "unavailable":
-        print(f"[membench] {entry.key} 暂不可用，无法下载。原因: {entry.features}")
-        return 2
-    if entry.key not in _FETCH_CONFIG:
-        print(f"[membench] {entry.key} 暂无下载配置，请按以下来源手动获取: {entry.source}", file=sys.stderr)
+
+    if not dataset_fetch.is_fetchable(entry.key):
+        label = {"unavailable": "暂不可用"}.get(entry.status, entry.status)
+        print(
+            f"[membench] {entry.key} {label}，不支持按需下载；"
+            f"可手动获取来源: {entry.source}",
+            file=sys.stderr,
+        )
         return 2
 
-    out_dir = Path(args.out).expanduser() if args.out else Path.home() / ".membench" / "datasets"
-    out_dir.mkdir(parents=True, exist_ok=True)
     try:
-        out_path = _fetch_beam(entry.key, out_dir)
-    except RuntimeError as exc:
+        out_path = dataset_fetch.fetch_dataset(entry.key, args.out)
+    except KeyError as exc:  # 注册表标了 fetch 但下载后端未登记
+        print(f"[membench] {exc}", file=sys.stderr)
+        return 2
+    except RuntimeError as exc:  # 下载源未确证或下载失败
         print(f"[membench] {exc}", file=sys.stderr)
         return 1
     print(f"[membench] 数据集已就绪: {out_path}")
     print(f"[membench] 运行示例: python -m membench.cli run --adapter <你的适配器> --dataset {out_path}")
     return 0
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """doctor：探测被测服务 reset/ingest/query 三端点是否符合 HttpAdapter 契约。"""
+    from membench.doctor import check_target
+
+    result = check_target(args.target, timeout=args.timeout, api_key=args.api_key)
+    for check in result["checks"]:
+        print(f"[membench] doctor {check['name']}: {check['status']} — {check['detail']}")
+    return 0 if result["ok"] else 1
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

@@ -30,10 +30,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Union
 
-from membench.data.schema import load_dataset
+from membench import layout
+from membench.data.schema import dataset_fingerprint, load_dataset
 from membench.judges import get_judge
 from membench.metrics import aggregate
 from membench.metrics.text import bleu1, recall_at_k, token_f1
+from membench.paths import runs_dir
 from membench.report import render_run_report
 
 
@@ -105,6 +107,15 @@ class Runner:
         shard_index: 本分片序号（从 0 开始，需 < shards）。
         adapter_meta: 适配器配置自由文本（如 ``"key=value;..."``），原样记入
             metrics.json 的 ``adapter_meta``。
+        driver_llm: 驱动被测系统的 LLM 标识（如模型名），记入 metrics.json
+            供 compare 的可比性前置校验；缺省 None。
+        judge_model: 判分模型标识；缺省 None 时若 judge 对象带非空 ``.model``
+            属性则自动取该值。
+        adapter_version: 适配器实现版本标识，记入 metrics.json；缺省 None。
+        report_out: 非空时，评测结束后把本次实验产物 materialize 到
+            ``<report_out>/eval_<adapter>_<platform>_<ts>/``（报告 + metrics +
+            结果 + run 副本），并把 ``experiment_dir`` 写回 metrics.json；
+            缺省 None 时不额外落盘。
     """
 
     def __init__(
@@ -121,6 +132,10 @@ class Runner:
         shards: int = 1,
         shard_index: int = 0,
         adapter_meta: Union[str, None] = None,
+        driver_llm: Union[str, None] = None,
+        judge_model: Union[str, None] = None,
+        adapter_version: Union[str, None] = None,
+        report_out: Union[str, None] = None,
     ) -> None:
         if jobs < 1:
             raise ValueError(f"jobs 必须 >= 1，当前为 {jobs}")
@@ -137,19 +152,11 @@ class Runner:
         self.adapter_meta = adapter_meta
         self.adapter = adapter
         self.dataset_path = dataset_path
-        # 默认输出到 skill 的 output/runs/；开发环境（无 SKILL.md）则退到工程根 runs/
-        if out_dir is None:
-            pkg_dir = os.path.dirname(os.path.abspath(__file__))  # membench/membench/
-            proj_root = os.path.dirname(pkg_dir)  # membench/（工程根）
-            skill_root = os.path.dirname(proj_root)  # skill 根目录（或开发环境的 project 父目录）
-            # 检测是否在 skill 环境：skill 根目录应有 SKILL.md
-            if os.path.isfile(os.path.join(skill_root, "SKILL.md")):
-                self.out_dir = os.path.join(skill_root, "output", "runs")
-            else:
-                # 开发/独立环境：退到工程根 runs/
-                self.out_dir = os.path.join(proj_root, "runs")
-        else:
-            self.out_dir = out_dir
+        self.driver_llm = driver_llm
+        self.adapter_version = adapter_version
+        self.report_out = report_out
+        # 默认 run 落 paths.runs_dir()（skill 环境 output/runs/，开发环境工程根 runs/）
+        self.out_dir = out_dir if out_dir is not None else runs_dir()
         self.platform = platform
         self.commit = commit
         # 显式向 Runner 传 dataset_path 即视为 user-specified
@@ -160,6 +167,8 @@ class Runner:
         else:
             self.judge = judge
             self.judge_name = getattr(judge, "name", judge.__class__.__name__)
+        # judge_model 缺省时从 judge 对象的 .model 自动补全（非空才算）
+        self.judge_model = judge_model or getattr(self.judge, "model", None) or None
 
     # ------------------------------------------------------------------
     def _eval_question(
@@ -307,6 +316,11 @@ class Runner:
                 "shard_index": self.shard_index,
                 "adapter_meta": self.adapter_meta,
                 "adapter_describe": adapter_describe,
+                "schema_version": "0.2",
+                "driver_llm": self.driver_llm,
+                "judge_model": self.judge_model,
+                "adapter_version": self.adapter_version,
+                "dataset_fingerprint": dataset_fingerprint(self.dataset_path),
             }
         )
 
@@ -318,6 +332,20 @@ class Runner:
             json.dump(metrics, f, ensure_ascii=False, indent=2)
 
         render_run_report(run_dir, records, metrics)
+
+        if self.report_out:
+            exp_dir = layout.experiment_path(
+                self.report_out,
+                layout.subdir_for(adapter_name, platform_tag, layout.ts_now(now)),
+            )
+            layout.materialize_run_experiment(exp_dir, run_dir)
+            # 实验目录自描述：把归属目录写回 metrics.json（run 与实验目录各存一份）
+            metrics["experiment_dir"] = exp_dir
+            with open(os.path.join(run_dir, "metrics.json"), "w", encoding="utf-8") as f:
+                json.dump(metrics, f, ensure_ascii=False, indent=2)
+            with open(os.path.join(exp_dir, "metrics.json"), "w", encoding="utf-8") as f:
+                json.dump(metrics, f, ensure_ascii=False, indent=2)
+            print(f"[membench] 实验目录: {exp_dir}")
 
         overall = metrics.get("overall", {})
         print(

@@ -20,7 +20,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -217,3 +219,30 @@ def load_dataset(path: str | Path) -> list[Dialogue]:
                 raise _err(p, lineno, f"非法 JSON：{exc}") from exc
             dialogues.append(_parse_dialogue(raw, p, lineno))
     return dialogues
+
+
+def dataset_fingerprint(path: str | Path) -> dict:
+    """数据集指纹：内容 sha256（前 16 位十六进制）+ 字节数 + 文件 basename。
+
+    用于 A/B 可比性前置校验（接入侧反馈 1）：数据集变了但没重跑基线时，
+    ``compare`` 能凭指纹机检发现，而不是静默给 PASS。
+
+    Args:
+        path: 数据集 JSONL 路径。
+
+    Returns:
+        ``{"sha256": str|None, "bytes": int|None, "name": str}``；文件不存在时
+        ``sha256`` / ``bytes`` 为 None（不抛异常，交由调用方决定严重性）。
+    """
+    p = Path(path)
+    if not p.is_file():
+        return {"sha256": None, "bytes": None, "name": p.name}
+    digest = hashlib.sha256()
+    with p.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return {
+        "sha256": digest.hexdigest()[:16],
+        "bytes": os.path.getsize(p),
+        "name": p.name,
+    }

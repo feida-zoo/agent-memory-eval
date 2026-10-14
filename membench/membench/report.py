@@ -209,6 +209,13 @@ def _fmt(value: Any) -> str:
     return str(value)
 
 
+def _fmt_opt(value: Any) -> str:
+    """可选值格式化：None / 空串显示为 ``n/a``，其余转字符串。"""
+    if value is None or value == "":
+        return "n/a"
+    return str(value)
+
+
 def _md_cell(text: Any) -> str:
     """转义 markdown 表格单元格内容：换行折叠为 <br>，竖线转义。
 
@@ -249,12 +256,18 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
     # 0. 评测配置（硬需求：必须位于标题之后、正文第一段之前）
     lines.append("## 评测配置")
     lines.append("")
+    fingerprint = metrics.get("dataset_fingerprint") or {}
+    fp_sha = fingerprint.get("sha256") if isinstance(fingerprint, dict) else None
     config_rows = [
         ["测试集路径", f"`{metrics.get('dataset_path', metrics.get('dataset', 'n/a'))}`"],
         ["测试集来源", str(metrics.get("dataset_source", "n/a"))],
         ["平台", str(metrics.get("platform", "default"))],
         ["commit", str(metrics.get("commit") or "n/a")],
         ["判分器", str(metrics.get("judge", "n/a"))],
+        ["驱动 LLM", _fmt_opt(metrics.get("driver_llm"))],
+        ["判分模型", _fmt_opt(metrics.get("judge_model"))],
+        ["adapter 版本", _fmt_opt(metrics.get("adapter_version"))],
+        ["数据集指纹", _fmt_opt(fp_sha)],
     ]
     lines.append(_md_table(["项目", "值"], config_rows))
     lines.append("")
@@ -412,8 +425,13 @@ def write_compare_report_md(
     diffs: dict[str, Any],
     gates: list[dict[str, Any]],
     verdict: str,
+    comparability: "dict[str, Any] | None" = None,
 ) -> str:
-    """生成 compare_report.md：逐指标 diff 表 + 门禁结论（中文）。"""
+    """生成 compare_report.md：逐指标 diff 表 + 门禁结论（中文）。
+
+    ``comparability`` 非 None 时附加「可比性前置校验」小节：逐维度对照表 +
+    不可比原因列表，说明 A/B 是否具备结果归因的前提。
+    """
     id_a = str(metrics_a.get("run_id", "A"))
     id_b = str(metrics_b.get("run_id", "B"))
 
@@ -453,6 +471,36 @@ def write_compare_report_md(
     lines.append(_md_table(["门禁", "状态", "", "说明"], gate_rows or [["(无)", "", "", ""]]))
     lines.append("")
 
+    if comparability is not None:
+        lines.append("## 可比性前置校验")
+        lines.append("")
+        checks = comparability.get("checks", []) or []
+        comp_rows = []
+        for c in checks:
+            same = c.get("same")
+            same_txt = "是" if same else ("否" if same is False else "—")
+            comp_rows.append(
+                [
+                    str(c.get("dimension", "")),
+                    _fmt_opt(c.get("a")),
+                    _fmt_opt(c.get("b")),
+                    same_txt,
+                    str(c.get("detail", "")),
+                ]
+            )
+        lines.append(
+            _md_table(["维度", "A", "B", "是否一致", "说明"], comp_rows or [["(无)", "", "", "", ""]])
+        )
+        lines.append("")
+        lines.append("### 不可比原因")
+        lines.append("")
+        reasons = comparability.get("reasons", []) or []
+        if reasons:
+            lines.extend(f"- {r}" for r in reasons)
+        else:
+            lines.append("（无可比性问题）")
+        lines.append("")
+
     out_path = os.path.join(out_dir, "compare_report.md")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -466,6 +514,7 @@ def render_compare_report(
     diffs: dict[str, Any],
     gates: list[dict[str, Any]],
     verdict: str,
+    comparability: "dict[str, Any] | None" = None,
 ) -> None:
     """生成 compare 目录下的 compare_report.md 与 fig_metric_diff.png。"""
     os.makedirs(out_dir, exist_ok=True)
@@ -476,7 +525,7 @@ def render_compare_report(
         str(metrics_b.get("run_id", "B")),
         os.path.join(out_dir, "fig_metric_diff.png"),
     )
-    write_compare_report_md(out_dir, metrics_a, metrics_b, diffs, gates, verdict)
+    write_compare_report_md(out_dir, metrics_a, metrics_b, diffs, gates, verdict, comparability)
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +573,8 @@ def copy_report(
         src_img = os.path.join(src_dir, ref)
         new_name = f"{ts_prefix}_{os.path.basename(ref)}" if ts_prefix else os.path.basename(ref)
         dest_img = os.path.join(dest_dir, new_name)
-        if os.path.isfile(src_img):
+        # 就地复制（如 A/B 实验把 compare_report 再落一次）时源=目标，跳过以免 SameFileError
+        if os.path.isfile(src_img) and os.path.abspath(src_img) != os.path.abspath(dest_img):
             shutil.copyfile(src_img, dest_img)
         return f"{prefix}{new_name}{suffix}"
 

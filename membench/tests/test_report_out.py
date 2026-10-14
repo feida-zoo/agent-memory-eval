@@ -1,8 +1,10 @@
-"""报告中文化与 --report-out 子目录化测试。
+"""报告中文化与 --report-out 自包含实验目录测试（冻结契约）。
 
 - category / 效率统计指标名的中文显示映射（未知 category 原样显示）；
-- run / compare / evaluate 的 --report-out 每次评测创建独立时间戳子目录；
-- 不传 --report-out 时行为不变。
+- run --report-out DIR -> DIR/eval_<adapter>_<platform>_<ts>/：报告+图表+run 副本；
+- compare --report-out DIR -> DIR/ab_<tag>_<ts>/：A/B 各自 runs/ 副本 + 对比报告；
+- evaluate(report_out=DIR) -> DIR/eval_<adapter>_<platform>_<ts>/：报告+summary+run 副本；
+- 不传 --report-out 时 run 只在 run 目录内产出、runs/ 父目录无散落文件。
 """
 
 from __future__ import annotations
@@ -106,12 +108,19 @@ def test_report_known_category_mapping(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# --report-out 子目录化
+# --report-out 自包含实验目录（冻结契约）
 # ---------------------------------------------------------------------------
 
 
+def _latest_subdir(parent: Path) -> Path:
+    """返回 parent 下唯一的子目录（多于/少于一个即失败）。"""
+    subs = [p for p in parent.iterdir() if p.is_dir()]
+    assert len(subs) == 1, f"期望唯一子目录，实际 {[p.name for p in subs]}"
+    return subs[0]
+
+
 def test_cli_run_report_out_subdir(tmp_path: Path) -> None:
-    """run --report-out：创建 eval_<adapter>_<platform>_<ts>/ 子目录并含五个产物。"""
+    """run --report-out：DIR/eval_mock-strong_default_<ts>/ 含报告、图表与 run 副本。"""
     out = tmp_path / "out"
     rc = cli.main(
         [
@@ -129,25 +138,28 @@ def test_cli_run_report_out_subdir(tmp_path: Path) -> None:
         ]
     )
     assert rc == 0
-    subs = [p for p in out.iterdir() if p.is_dir()]
-    assert len(subs) == 1
-    assert subs[0].name.startswith("eval_mock-strong_default_")
+    exp_dir = _latest_subdir(out)
+    assert exp_dir.name.startswith("eval_mock-strong_default_")
     for fname in (
         "report.md",
+        "metrics.json",
         "fig_category_accuracy.png",
         "fig_latency_hist.png",
-        "results.jsonl",
-        "metrics.json",
     ):
-        assert (subs[0] / fname).is_file(), f"缺少 {fname}"
+        assert (exp_dir / fname).is_file(), f"缺少 {fname}"
     # 子目录内的 report.md 图片引用为原文件名（同目录）
-    report = (subs[0] / "report.md").read_text(encoding="utf-8")
+    report = (exp_dir / "report.md").read_text(encoding="utf-8")
     assert "](fig_category_accuracy.png)" in report
     assert "](fig_latency_hist.png)" in report
+    # run 副本自包含：runs/<run_id>/ 里有自己的报告/指标/逐题结果
+    run_copies = [p for p in (exp_dir / "runs").iterdir() if p.is_dir()]
+    assert len(run_copies) == 1, "缺少 runs/<run_id>/ 副本"
+    for fname in ("report.md", "metrics.json", "results.jsonl"):
+        assert (run_copies[0] / fname).is_file(), f"run 副本缺少 {fname}"
 
 
 def test_cli_compare_report_out_subdir(tmp_path: Path) -> None:
-    """compare --report-out：创建 compare_<runA>_<runB>_<ts>/ 子目录。"""
+    """compare --report-out：DIR/ab_<tag>_<ts>/ 含 A/B run 副本与对比报告。"""
     run_a = _run(tmp_path / "a")
     run_b = _run(tmp_path / "b")
     out = tmp_path / "out"
@@ -163,11 +175,16 @@ def test_cli_compare_report_out_subdir(tmp_path: Path) -> None:
         ]
     )
     assert rc == 0
-    subs = [p for p in out.iterdir() if p.is_dir()]
-    assert len(subs) == 1
-    assert subs[0].name.startswith("compare_")
-    assert (subs[0] / "compare_report.md").is_file()
-    assert (subs[0] / "fig_metric_diff.png").is_file()
+    ab_dir = _latest_subdir(out)
+    assert ab_dir.name.startswith("ab_")
+    assert (ab_dir / "compare_report.md").is_file()
+    assert (ab_dir / "fig_metric_diff.png").is_file()
+    # A / B 各自带自包含的 runs/<run_id>/ 副本
+    for arm in ("A", "B"):
+        run_copies = [p for p in (ab_dir / arm / "runs").iterdir() if p.is_dir()]
+        assert len(run_copies) == 1, f"{arm} 缺少 run 副本"
+        assert (run_copies[0] / "report.md").is_file()
+        assert (run_copies[0] / "metrics.json").is_file()
 
 
 class _StubAdapter(BaseMemoryAdapter):
@@ -186,8 +203,8 @@ class _StubAdapter(BaseMemoryAdapter):
         return QueryResult(answer="周五", retrieved=[])
 
 
-def test_evaluate_report_out_subdir(tmp_path: Path) -> None:
-    """evaluate(report_out=...)：创建 evaluate_<ts>/ 子目录，含 evaluate_report.md。"""
+def _mini_dataset(tmp_path: Path) -> Path:
+    """写一个单题迷你数据集并返回路径。"""
     ds = tmp_path / "mini.jsonl"
     ds.write_text(
         json.dumps(
@@ -209,6 +226,12 @@ def test_evaluate_report_out_subdir(tmp_path: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
+    return ds
+
+
+def test_evaluate_report_out_subdir(tmp_path: Path) -> None:
+    """evaluate(report_out=...)：DIR/eval_<adapter>_<platform>_<ts>/ 含报告、summary 与 run 副本。"""
+    ds = _mini_dataset(tmp_path)
     out = tmp_path / "out"
     rc = evaluate(
         _StubAdapter(),
@@ -220,20 +243,23 @@ def test_evaluate_report_out_subdir(tmp_path: Path) -> None:
         report_out=str(out),
     )
     assert rc == 0
-    subs = [p for p in out.iterdir() if p.is_dir()]
-    assert len(subs) == 1
-    assert subs[0].name.startswith("evaluate_")
-    assert (subs[0] / "evaluate_report.md").is_file()
-    assert (subs[0] / "evaluate_summary.json").is_file()
+    exp_dir = _latest_subdir(out)
+    assert exp_dir.name.startswith("eval_stub_default_")
+    assert (exp_dir / "evaluate_report.md").is_file()
+    assert (exp_dir / "evaluate_summary.json").is_file()
+    run_copies = [p for p in (exp_dir / "runs").iterdir() if p.is_dir()]
+    assert len(run_copies) == 1, "缺少 runs/<run_id>/ 副本"
+    for fname in ("report.md", "metrics.json", "results.jsonl"):
+        assert (run_copies[0] / fname).is_file(), f"run 副本缺少 {fname}"
 
 
 def test_no_report_out_behavior_unchanged(tmp_path: Path) -> None:
-    """不传 --report-out：只在 run_dir 下生成产物，不创建额外目录。"""
+    """不传 --report-out：只在 run_dir 下生成产物，runs 父目录无散落文件。"""
     run_dir = _run(tmp_path)
     assert (run_dir / "report.md").is_file()
     assert (run_dir / "results.jsonl").is_file()
     assert (run_dir / "metrics.json").is_file()
-    # runs 父目录下只有该 run 目录，无散落的报告/图片
+    # runs 父目录下只有 run 目录，无散落的报告/图片
     stray = [p for p in (tmp_path / "runs").iterdir() if p.is_file()]
     assert stray == []
 

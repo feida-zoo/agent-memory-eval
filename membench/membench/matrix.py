@@ -21,6 +21,7 @@ import json
 import os
 from typing import Any
 
+from membench import layout
 from membench.compare import _eval_gates, _load_metrics
 from membench.report import PALETTE, _md_table, _setup_fonts
 
@@ -242,6 +243,9 @@ def compare_matrix(labeled_runs: list[tuple[str, str]], out_dir: str) -> dict[st
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     result["result_path"] = result_path
+
+    # 各臂 run 副本落 out_dir/runs/<label>/，使矩阵实验目录自包含
+    layout.materialize_matrix_experiment(out_dir, labeled_runs)
 
     print(f"[membench] matrix: {len(labels)} runs -> {out_dir}")
     return result

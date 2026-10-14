@@ -11,13 +11,14 @@ from membench.data import SAMPLE_DATASET_PATH, load_dataset
 from membench.data.schema import ABSTAIN_SENTINEL, CATEGORIES, Dataset, Dialogue, Question
 
 
+@pytest.fixture(scope="module")
+def dialogues() -> list[Dialogue]:
+    """内置示例数据集（module 级，避免每次测试重复加载）。"""
+    return load_dataset(SAMPLE_DATASET_PATH)
+
+
 class TestSampleDataset:
     """内置示例数据集必须满足 SPEC 第 5 节的规模与覆盖要求。"""
-
-    @classmethod
-    @pytest.fixture(scope="class")
-    def dialogues(cls) -> list[Dialogue]:
-        return load_dataset(SAMPLE_DATASET_PATH)
 
     def test_scale(self, dialogues: list[Dialogue]) -> None:
         questions = [q for d in dialogues for q in d.questions]
