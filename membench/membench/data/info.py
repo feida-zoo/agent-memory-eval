@@ -61,7 +61,7 @@ DATASET_REGISTRY: dict[str, DatasetInfo] = {
         name="内置办公域黄金集",
         builtin_file="office_dataset.jsonl",
         status="builtin",
-        source="membench 自建合成（面向 WorkBuddy 类通用办公 agent）。",
+        source="membench 自建合成（面向通用办公助手类 agent）。",
         scale="20 对话 / 86 题 / 7 类题型全覆盖。",
         features=(
             "含 gold_stale 标注，可测 stale_rate（陈旧召回）；含 abstention 题；"

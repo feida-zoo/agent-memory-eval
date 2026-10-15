@@ -56,12 +56,35 @@ def _select_questions(
     shards: int,
     shard_index: int,
     limit: Union[int, None],
+    shard_by: str = "question",
 ) -> list[Any]:
     """对加载后的题目做确定性分片与截断（先分片再截断）。
 
-    全局题号 ``i``（按 dialogue 顺序、题序展开）满足 ``i % shards == shard_index``
-    的题入选，再取前 ``limit`` 道；不含入选题的 dialogue 整段跳过（ingest 也省掉）。
+    ``shard_by="question"``：全局题号 ``i``（按 dialogue 顺序、题序展开）满足
+    ``i % shards == shard_index`` 的题入选，再取前 ``limit`` 道；不含入选题的
+    dialogue 整段跳过（ingest 也省掉）。
+
+    ``shard_by="dialogue"``：全局对话序号 ``d``（按数据集顺序）满足
+    ``d % shards == shard_index`` 的**整段对话**入选，保留其全部题目，再取前
+    ``limit`` 道。分片之间 ingest 互不重复——适合"几乎每个对话都有题"的
+    ingest 密集型数据集（如 BEAM-1M），避免题目级分片造成的 ingest 成本 ×N。
     """
+    if shard_by == "dialogue":
+        out: list[Any] = []
+        n_taken = 0
+        for d_idx, dialogue in enumerate(dialogues):
+            if d_idx % shards != shard_index:
+                continue
+            questions = dialogue.questions
+            if limit is not None:
+                if n_taken >= limit:
+                    break
+                questions = questions[: limit - n_taken]
+            if questions:
+                out.append(dataclasses.replace(dialogue, questions=questions))
+                n_taken += len(questions)
+        return out
+
     selected: dict[str, list[Any]] = {}
     idx = 0
     n_taken = 0
@@ -102,9 +125,12 @@ class Runner:
             query+judge 阶段并发，输出顺序与 jobs=1 一致。
             **jobs>1 要求 adapter.query 与 judge 线程安全。**
         limit: 冒烟模式：只评测（分片后的）前 N 道题；None 表示全量。
-        shards: 分片总数（默认 1 不分片）；按全局题号 ``i % shards == shard_index``
-            确定性分片，与 limit 组合时先分片再截断。
+        shards: 分片总数（默认 1 不分片）；与 limit 组合时先分片再截断。
         shard_index: 本分片序号（从 0 开始，需 < shards）。
+        shard_by: 分片维度（默认 ``"question"``）——``"question"`` 按全局题号
+            ``i % shards == shard_index`` 分片；``"dialogue"`` 整段选取
+            ``d % shards == shard_index`` 的对话、保留其全部题目，分片间
+            ingest 互不重复，适合"几乎每个对话都有题"的 ingest 密集型数据集。
         adapter_meta: 适配器配置自由文本（如 ``"key=value;..."``），原样记入
             metrics.json 的 ``adapter_meta``。
         driver_llm: 驱动被测系统的 LLM 标识（如模型名），记入 metrics.json
@@ -131,6 +157,7 @@ class Runner:
         limit: Union[int, None] = None,
         shards: int = 1,
         shard_index: int = 0,
+        shard_by: Union[str, None] = None,
         adapter_meta: Union[str, None] = None,
         driver_llm: Union[str, None] = None,
         judge_model: Union[str, None] = None,
@@ -146,6 +173,9 @@ class Runner:
             raise ValueError(f"shards 必须 >= 1，当前为 {shards}")
         if not 0 <= shard_index < shards:
             raise ValueError(f"shard_index 必须满足 0 <= shard_index < shards，当前为 {shard_index}/{shards}")
+        self.shard_by = shard_by or "question"
+        if self.shard_by not in ("question", "dialogue"):
+            raise ValueError(f"shard_by 必须是 'question' 或 'dialogue'，当前为 {self.shard_by!r}")
         self.limit = limit
         self.shards = int(shards)
         self.shard_index = int(shard_index)
@@ -218,16 +248,23 @@ class Runner:
         """执行评测，返回 run 目录路径。"""
         dialogues = load_dataset(self.dataset_path)
         if self.shards > 1 or self.limit is not None:
-            dialogues = _select_questions(dialogues, self.shards, self.shard_index, self.limit)
+            dialogues = _select_questions(
+                dialogues, self.shards, self.shard_index, self.limit, self.shard_by
+            )
         adapter_name = str(getattr(self.adapter, "name", self.adapter.__class__.__name__))
         dataset_name = os.path.splitext(os.path.basename(self.dataset_path))[0]
         platform_tag = self.platform or "default"
         now = datetime.now()
         # commit 短哈希进 run_id，避免矩阵评测中同 adapter+platform 同秒撞目录
         commit_tag = f"_{str(self.commit)[:8]}" if self.commit else ""
-        # limit / shard 进 run_id，避免冒烟或分片结果被误当全量结果对比
+        # limit / shard 进 run_id，避免冒烟或分片结果被误当全量结果对比；
+        # dialogue 分片用 _dshard 标记，与题目级分片区分
         limit_tag = f"_limit{self.limit}" if self.limit is not None else ""
-        shard_tag = f"_shard{self.shard_index}of{self.shards}" if self.shards > 1 else ""
+        if self.shards > 1:
+            mode = "dshard" if self.shard_by == "dialogue" else "shard"
+            shard_tag = f"_{mode}{self.shard_index}of{self.shards}"
+        else:
+            shard_tag = ""
         run_id = (
             f"{adapter_name}_{platform_tag}{commit_tag}_"
             f"{dataset_name}{shard_tag}{limit_tag}_{now.strftime('%Y%m%d_%H%M%S')}"
@@ -314,6 +351,7 @@ class Runner:
                 "limit": self.limit,
                 "shards": self.shards,
                 "shard_index": self.shard_index,
+                "shard_by": self.shard_by,
                 "adapter_meta": self.adapter_meta,
                 "adapter_describe": adapter_describe,
                 "schema_version": "0.2",

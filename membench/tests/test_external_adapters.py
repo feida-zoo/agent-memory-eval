@@ -10,6 +10,20 @@ import pytest
 from membench.adapters import ADAPTERS, load_external_adapters
 
 
+@pytest.fixture(autouse=True)
+def _isolate_adapters_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """隔离持久化适配器目录，任何测试不得依赖/受本机 ``~/.membench/adapters`` 影响。
+
+    ``load_external_adapters()`` 第一阶段总会扫描持久化目录；本机若执行过
+    ``adapter install``（如接入方持久化的业务适配器），未隔离的"无副作用"
+    断言会因额外注册而失败（且仅在先于其他触发加载的用例执行时暴露，
+    属顺序依赖缺陷）。
+    """
+    empty = tmp_path / "adapters"
+    empty.mkdir()
+    monkeypatch.setenv("MEMBENCH_ADAPTERS_DIR", str(empty))
+
+
 @pytest.fixture()
 def _plugin_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """把 tmp_path 注入 sys.path，并清理已导入的插件模块名。"""
@@ -56,8 +70,28 @@ def test_missing_module_system_exit(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_env_not_set_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
-    """未设环境变量时无副作用。"""
+    """无任何外部适配器来源（无环境变量、持久化目录为空）时无副作用。"""
     monkeypatch.delenv("MEMBENCH_ADAPTER_MODULES", raising=False)
     before = dict(ADAPTERS)
     load_external_adapters()
     assert dict(ADAPTERS) == before
+
+
+def test_persisted_dir_adapters_are_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """持久化目录中的 ``*.py`` 会被 load_external_adapters 注册（隔离目录内自证机制）。"""
+    adir = tmp_path / "adapters-with-one"
+    adir.mkdir()
+    (adir / "biz_persisted.py").write_text(
+        "from membench.adapters import ADAPTERS, MockStrongAdapter\n"
+        "ADAPTERS['biz-persisted'] = MockStrongAdapter\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MEMBENCH_ADAPTERS_DIR", str(adir))
+    monkeypatch.delenv("MEMBENCH_ADAPTER_MODULES", raising=False)
+    try:
+        load_external_adapters()
+        assert "biz-persisted" in ADAPTERS
+    finally:
+        ADAPTERS.pop("biz-persisted", None)

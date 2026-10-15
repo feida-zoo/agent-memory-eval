@@ -3,7 +3,7 @@
 ``membench run --shards N --shard-index I`` 产生的各分片 run 可通过
 ``membench fuse --runs dir1,dir2,... --out DIR`` 融合：
 
-- 校验各 run 的 adapter / dataset / shards 一致，且 shard_index 恰好覆盖 0..N-1；
+- 校验各 run 的 adapter / dataset / shards / shard_by 一致，且 shard_index 恰好覆盖 0..N-1；
 - 合并 results.jsonl（按 qid 去重校验，简单拼接保持传入顺序）；
 - 复用 ``metrics.summary.aggregate`` 重新计算指标，复用 report 渲染完整报告；
 - 门禁判定（stale 一票否决）对融合结果同样生效：存在 knowledge_update 题
@@ -111,6 +111,11 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
                 raise _err(f"{key} 不一致: {first.get(key)!r} vs {m.get(key)!r}（{d}）")
         if int(m.get("shards") or 1) != int(first.get("shards") or 1):
             raise _err(f"shards 不一致: {first.get('shards')!r} vs {m.get('shards')!r}（{d}）")
+        if (m.get("shard_by") or "question") != (first.get("shard_by") or "question"):
+            raise _err(
+                f"shard_by 不一致: {first.get('shard_by') or 'question'} vs "
+                f"{m.get('shard_by') or 'question'}（{d}）"
+            )
 
     shards = int(first.get("shards") or 1)
     if shards < 2:
@@ -148,6 +153,7 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
             "limit": None,
             "shards": shards,
             "shard_index": None,
+            "shard_by": first.get("shard_by") or "question",
             "fused": True,
             "fused_from": [str(m.get("run_id", d)) for m, d in zip(metas, run_dirs)],
         }

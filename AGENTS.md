@@ -65,7 +65,7 @@ docs/                     # 深度研究报告 + 配图
 4. **数据集政策**：仓库**不内置**开源大数据集。`office_dataset.jsonl` / `sample_dataset.jsonl` 是自造演示集；`locomo` / `longmemeval_*` / `gatemem_office` / `beam_*` 一律 `dataset fetch` 到 `~/.membench/datasets/`。
    - `membench/.gitignore` 已忽略这些文件：**绝不**加入 git，也绝不让它们进入 skill 包（`skill/build_skill.py` 自带自检，混入即报错）。
 5. **改 CLI 要三处同步**：`cli.py` 的参数定义、`cli.py` 顶部 docstring 用法、`membench/README.md`；`skill/src/SKILL.md` 里有命令示例时同样同步。
-6. **`--shards` 的边界**：按题目分片（`i % N == shard_index`）对「每个对话都有题」的 ingest 密集型数据集会重复 ingest（成本 ×N，反而更慢）；这类数据集应改为按 dialogue 切分数据集文件、多进程各起独立实例。
+6. **`--shards` 的分片维度**：默认按题目分片（`i % N == shard_index`）。对「几乎每个对话都有题」的 ingest 密集型数据集（office / BEAM-1M），题目级分片会让每片仍对全部对话 ingest（成本 ×N）——用 `--shard-by dialogue`（整段对话归片、分片间不重复 ingest），再用 `fuse` 融合。两种维度都能融合，但**混维融合会被 fuse 拒绝**。
 
 ## skill 打包
 

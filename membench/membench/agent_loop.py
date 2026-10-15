@@ -1,9 +1,13 @@
 """共享 agent tool-call 循环：ingest 与 query 复用同一套驱动逻辑。
 
-接入方的 Python 适配器与 TS bridge 在实现 ``ingest``（喂会话让 LLM 调记忆
-写入工具落库）与 ``query``（让 LLM 调检索工具作答）时，本会是同一套骨架：
-拼 prompt / 调模型 / 分发工具 / 累计 usage / 回填证据。本模块把这段循环下沉
-为可复用 API：
+接入方的 **Python** 适配器在实现 ``ingest``（喂会话让 LLM 调记忆写入工具
+落库）与 ``query``（让 LLM 调检索工具作答）时，两段是同一套骨架：拼 prompt /
+调模型 / 分发工具 / 累计 usage / 回填证据。本模块把这段循环下沉为可复用 API。
+
+**适用边界**：仅面向"写入/读取函数与 LLM 客户端都能在 **Python 侧**调用"的
+接入方。非 Python 系统（Node/Electron）的 tool-call 循环必须运行在被测进程
+内，membench 无法复用——这类接入走 ``HttpAdapter`` 三端点契约（循环留在
+bridge 内，见 ``examples/http_bridge_node/``）。
 
 - :func:`run_tool_loop`：纯函数，跑一轮 tool-call 循环，返回结构化结果；
 - :class:`AgentLoopAdapter`：把该循环接到 membench 三方法契约（``reset`` /
@@ -441,7 +445,8 @@ class AgentLoopAdapter(BaseMemoryAdapter):
 
     接入方只需给出 ``llm_client`` 与工具定义，membench 负责循环、统计
     （:class:`IngestStats` / :class:`QueryResult`）与 ``retrieved`` 回填。
-    同一套实现同时服务 Python 适配器与 TS bridge，避免各写一遍 tool-call 骨架。
+    同一套循环服务 Python 适配器的 ingest 与 query，避免各写一遍 tool-call
+    骨架。非 Python 系统（Node/Electron）的循环运行在其自身进程内，本类不适用。
 
     Attributes:
         name: 注册名（默认 ``"agent-loop"``，可由构造参数覆盖）。

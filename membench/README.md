@@ -10,7 +10,7 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 
 - **六维指标**：正确性、检索质量、效率成本、记忆动态（知识更新/陈旧召回）、拒答、可扩展性。
 - **判分双轨**：启发式判分（默认，零成本、确定性）+ LLM-as-Judge（可选，OpenAI 兼容接口，失败自动回退启发式）。
-- **适配器插件化**：被测系统实现 3 个方法即可接入；内置 mock / transcript / http 参考适配器，若被测系统的记忆能力本身就是"LLM + 工具调用"，直接用 `AgentLoopAdapter` 复用循环。
+- **适配器插件化**：被测系统实现 3 个方法即可接入；内置 mock / transcript / http 参考适配器，若被测系统的记忆能力本身就是"LLM + 工具调用"且能在 Python 侧调用写入/读取函数，直接用 `AgentLoopAdapter` 复用循环（非 Python 系统见 HTTP 接入路径）。
 
 ## 目录结构
 
@@ -109,19 +109,23 @@ run_id 带 `_limit{N}` 后缀、metrics.json 记入 `"limit": N`，冒烟结果�
 ```bash
 # 先下载（落 ~/.membench/datasets/beam_1m.jsonl）：
 #   python -m membench.cli dataset fetch beam_1m
-# 分 4 片跑（确定性分片：题目 i 归片 i % 4；可在多台机器上并行）
-python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/beam_1m.jsonl --shards 4 --shard-index 0
+# 按对话分 4 片（整段对话归片 d % 4，分片间不重复 ingest；可在多台机器上并行）
+python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/beam_1m.jsonl --shards 4 --shard-index 0 --shard-by dialogue
 ...
-python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/beam_1m.jsonl --shards 4 --shard-index 3
+python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/beam_1m.jsonl --shards 4 --shard-index 3 --shard-by dialogue
 
-# 合并为完整 run（校验分片齐全、adapter/dataset 一致、题目无重复；
+# 合并为完整 run（校验分片齐全、adapter/dataset/shard 维度一致、题目无重复；
 # 指标重新计算，stale 门禁对融合结果同样生效，FAIL 时退出码 1）
-python -m membench.cli fuse --runs runs/..._shard0of4,runs/..._shard1of4,... --out runs/beam_1m_full
+python -m membench.cli fuse --runs runs/..._dshard0of4,runs/..._dshard1of4,... --out runs/beam_1m_full
 ```
 
 `--shards` 与 `--limit` 可组合（先分片再截断），用于分片链路的廉价验证。
 
-**`--shards` 的适用边界（重要）**：`--shards` 按**题目**分片（全局题号 `i % N == shard_index`），不含入选题的对话整段跳过（ingest 也省掉）。对题目分散在（几乎）全部对话上的 ingest 密集型数据集（如内置 office：20 对话 / 86 题，几乎每个对话都有题），每个分片仍会对几乎全部对话 ingest → ingest 成本 ×N，反而更慢；这类数据集应改为**按 dialogue 切分数据集文件**、多进程各起独立被测实例。只有"少量超长对话承载大量题"的集（BEAM / LongMemEval）才靠 `--shards` 真正省下 ingest。
+**分片维度怎么选（`--shard-by`，重要）**：
+
+- `--shard-by question`（默认）按全局题号 `i % N == shard_index` 分片；不含入选题的对话整段跳过（ingest 也省掉）。适合"少量超长对话承载大量题"、能整块跳过对话的场景。
+- `--shard-by dialogue` 整段选取 `d % N == shard_index` 的对话、保留其全部题目，**分片之间 ingest 互不重复**。"几乎每个对话都有题"的 ingest 密集型数据集（内置 office：20 对话 / 86 题；BEAM-1M：35 对话 × 20 题）必须用它——题目级分片会让每个分片仍对全部对话 ingest，成本 ×N，分片反而更慢。
+- 两种维度的分片都能用 `fuse` 融合回完整 run，但不许混维融合（fuse 会明确报错）。
 
 ## 可复现性元数据
 
@@ -330,6 +334,8 @@ python -m membench.cli doctor --target http://127.0.0.1:8787 [--timeout 10.0] [-
 
 若被测系统的 ingest（喂会话让 LLM 调写入工具落库）与 query（让 LLM 调检索工具作答）本身就是**同一套 tool-call 骨架**（拼 prompt → 调模型 → 分发工具 → 累计 usage → 回填证据），不要各写一遍，直接用 `membench.agent_loop.AgentLoopAdapter`，只给 `{llm_client, tools}`：
 
+> **仅适用 Python 侧**：LLM 客户端与工具 handler 都必须是 Python 可调用对象；非 Python（Node/Electron）系统的 tool-call 循环留在其自身进程内，membench 无法复用，走路径二的 HTTP 接入。
+
 ```python
 from membench.agent_loop import AgentLoopAdapter
 from membench.runner import Runner
@@ -355,17 +361,17 @@ Runner(adapter, "membench/data/office_dataset.jsonl", judge="heuristic",
 
 ### 适配器持久化（adapter install）
 
-业务适配器（如 `qwenwork-ohos`）写好一次后即可落盘，之后任何 session 无需重新生成或设环境变量即可使用：
+业务适配器（如 `my-office-adapter`）写好一次后即可落盘，之后任何 session 无需重新生成或设环境变量即可使用：
 
 ```bash
 # 落盘到持久化目录（默认 ~/.membench/adapters/，可用 MEMBENCH_ADAPTERS_DIR 覆盖）
-python -m membench.cli adapter install ./qwenwork_ohos.py [--name qwenwork-ohos]
+python -m membench.cli adapter install ./my_office_adapter.py [--name my-office-adapter]
 
 # 查看内置 + 持久化适配器（表格含注册名/类名/安装时间/来源路径）
 python -m membench.cli adapter list
 
 # 删除
-python -m membench.cli adapter remove qwenwork_ohos
+python -m membench.cli adapter remove my-office-adapter
 ```
 
 `adapter install` 只负责校验（语法可解析）+ 落盘 `.py` 与元信息 `.json`，并提示"下次运行时自动加载"；此后每次 `membench` 命令启动都会自动加载持久化目录中的全部 `*.py` 适配器（按文件名排序；单个损坏的适配器仅打印 stderr 警告，不阻塞其他适配器）。
@@ -493,7 +499,7 @@ A: 当前 Runner 为顺序执行（记忆系统有状态，顺序最安全）。
 
 ## 办公 Agent 专用黄金集（office_dataset.jsonl）
 
-针对 WorkBuddy 类通用办公助手内置的领域数据集：20 个对话、86 题，覆盖二十类办公场景——项目截止日变更、会议决议追溯、写作风格偏好、日程与联系人变动、敏感信息拒答（红线题）、跨周待办跟踪、自动化流程偏好、长跨度谈判时间线、供应商合同、招聘面试、事故复盘、客户投诉升级、年度预算、流程偏好回滚、差旅报销规则、同名项目干扰、凭证保密、远程办公制度、发布计划、OKR 协作。
+针对通用办公助手类 Agent 内置的领域数据集：20 个对话、86 题，覆盖二十类办公场景——项目截止日变更、会议决议追溯、写作风格偏好、日程与联系人变动、敏感信息拒答（红线题）、跨周待办跟踪、自动化流程偏好、长跨度谈判时间线、供应商合同、招聘面试、事故复盘、客户投诉升级、年度预算、流程偏好回滚、差旅报销规则、同名项目干扰、凭证保密、远程办公制度、发布计划、OKR 协作。
 
 ```bash
 python -m membench.cli run --adapter my-system --dataset membench/data/office_dataset.jsonl --out runs/

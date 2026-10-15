@@ -20,7 +20,7 @@ docs/                        # 深度研究报告与方法论文档（1 篇研�
 ```bash
 cd membench
 pip install -e .                 # 只装包本身（核心 CLI 纯标准库）
-python -m pytest tests/          # 全量回归（350 项）
+python -m pytest tests/          # 全量回归（358 项）
 python -m membench.cli run --adapter mock-strong --dataset membench/data/sample_dataset.jsonl
 ```
 

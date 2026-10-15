@@ -1,7 +1,7 @@
 ---
 name: agent-memory-eval
 description: >
-  对有源码的 Agent（尤其是 WorkBuddy/千问办公/豆包工作类通用办公 Agent）进行记忆系统评测与优化迭代的工程化技能。
+  对有源码的 Agent（尤其是通用办公助手类 Agent）进行记忆系统评测与优化迭代的工程化技能。
   内置 membench 评测工程（adapter 协议 + 六维指标 + 回归门禁 + 报告生成）与办公域黄金测试集。
   触发场景：评测/测试 Agent 的记忆系统、记忆能力打分、记忆系统优化前后对比（A/B）、
   两个 commit 的记忆回归对比、多平台（如企微/飞书/钉钉接入）记忆表现对比、平台×commit 矩阵对比、
@@ -242,6 +242,7 @@ adapter = AgentLoopAdapter(
 - `llm_client` 可为对象 / 可调用 / `"module:ClassName"` 类路径；`tools` 元素为 `{"name","schema","handler"}`。
 - membench 负责循环、`IngestStats`/`QueryResult` 统计与 `retrieved` 回填（检索类工具名含 `retrieve`/`search`/`recall` 即被识别；不满足时传自定义 `retrieved_from`）。
 - 把实例交给 Runner API 即可评测（见 `membench/examples/quickstart.py` 的用法）。
+- **适用边界**：仅当被测系统的写入/读取函数与 LLM 客户端能在 **Python 侧**调用时适用；非 Python 系统（Node/Electron）的 tool-call 循环必须留在被测进程内，membench 无法复用——走 HttpAdapter 三端点（见下一节）。
 
 ### HTTP bridge 与 doctor（非 Python 系统）
 
@@ -262,11 +263,12 @@ python -m membench.cli doctor --target <url>     # 连通性 + 三端点契约�
 - `compare` 新增 `--require-comparable` / `--tag`：前者做可比性前置校验（关键维度不一致 → 不可比，禁止当 A/B），后者决定 `ab_<tag>_<ts>/` 目录名。
 - 数据集指纹 `membench.data.schema.dataset_fingerprint(path) -> {"sha256", "bytes", "name"}`；可用 `membench.data.info.resolve_available_path(key)` 解析某数据集当前可用路径（内置优先，其次 `datasets_dir()`）。
 
-### `--shards` 的适用边界
+### `--shards` 的分片维度
 
-- `--shards N --shard-index I` 按**题目**分片（`i % N == I`），配 `fuse` 融合同一评测的多个分片 run。
-- **但对"每个对话都有题"的 ingest 密集型数据集（如 office：每题一个 dialogue），每个分片仍要对全部对话 ingest → ingest 成本 ×N，反而更慢。**
-- 这类数据集应**按 dialogue 切分数据集文件**、多进程各起独立被测实例，而不是用 `--shards`。
+- `--shards N --shard-index I` 配 `fuse` 融合同一评测的多个分片 run；`--shard-by` 决定分片维度。
+- `--shard-by question`（默认）按**全局题号**分片（`i % N == I`），不含入选题的对话整段跳过——适合"少量超长对话承载大量题"的集，ingest 真省。
+- `--shard-by dialogue` 按**对话整段**分片（`d % N == I`），分片之间 ingest 互不重复——"几乎每个对话都有题"的 ingest 密集型数据集（如 office、BEAM-1M）**必须用这个**；用题目级分片会让每个分片仍对全部对话 ingest，成本 ×N 反而更慢。
+- 两种维度都能用 `fuse` 融合，但**不许混维融合**（fuse 会明确报错）。
 
 ## 结果解读准则
 

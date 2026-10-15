@@ -51,7 +51,9 @@ def _stale_dataset(path: Path) -> Path:
     return path
 
 
-def _shard_run(tmp_path: Path, name: str, adapter, shards: int, shard_index: int) -> str:
+def _shard_run(
+    tmp_path: Path, name: str, adapter, shards: int, shard_index: int, shard_by: str = "question"
+) -> str:
     runner = Runner(
         adapter,
         str(SAMPLE_DATASET_PATH),
@@ -59,6 +61,7 @@ def _shard_run(tmp_path: Path, name: str, adapter, shards: int, shard_index: int
         out_dir=str(tmp_path / name),
         shards=shards,
         shard_index=shard_index,
+        shard_by=shard_by,
     )
     return runner.run()
 
@@ -159,3 +162,26 @@ def test_fuse_stale_gate_fail(tmp_path: Path) -> None:
 def test_fuse_missing_metrics_file(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         fuse_runs([str(tmp_path / "nonexistent")], str(tmp_path / "fused"))
+
+
+def test_fuse_dialogue_shards_matches_full_run(tmp_path: Path) -> None:
+    """dialogue 分片的两个分片可融合为与全量一致的完整 run。"""
+    d0 = _shard_run(tmp_path, "d0", MockStrongAdapter(), 2, 0, shard_by="dialogue")
+    d1 = _shard_run(tmp_path, "d1", MockStrongAdapter(), 2, 1, shard_by="dialogue")
+    _, full_metrics, full_records = _full_run(tmp_path, "full", MockStrongAdapter())
+
+    result = fuse_runs([d0, d1], str(tmp_path / "fused"))
+    assert result["n_questions"] == len(full_records)
+    assert result["metrics"]["shard_by"] == "dialogue"
+    assert result["metrics"]["shards"] == 2
+    assert result["metrics"]["overall"]["accuracy"] == pytest.approx(
+        full_metrics["overall"]["accuracy"]
+    )
+
+
+def test_fuse_rejects_mixed_shard_by(tmp_path: Path) -> None:
+    """题目级分片与 dialogue 分片混合融合 → 明确报错（不允许混维）。"""
+    q0 = _shard_run(tmp_path, "q0", MockStrongAdapter(), 2, 0, shard_by="question")
+    d1 = _shard_run(tmp_path, "d1", MockStrongAdapter(), 2, 1, shard_by="dialogue")
+    with pytest.raises(ValueError, match="shard_by 不一致"):
+        fuse_runs([q0, d1], str(tmp_path / "fused"))

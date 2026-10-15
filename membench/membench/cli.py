@@ -81,6 +81,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--adapter-meta", default=None, help='适配器配置自由文本（"key=value;..."），原样记入 metadata["adapter_meta"]')
     p_run.add_argument("--shards", type=int, default=1, help="数据集分片总数（默认 1 不分片）；按 i %% N == I 确定性分片")
     p_run.add_argument("--shard-index", type=int, default=0, help="本分片序号（从 0 开始，需 < --shards；与 --limit 组合时先分片再截断）")
+    p_run.add_argument("--shard-by", choices=["question", "dialogue"], default="question", help="分片维度：question 按题目（默认）；dialogue 整段选取对话、分片间不重复 ingest，适合几乎每个对话都有题的数据集（如 BEAM）")
     p_run.set_defaults(func=_cmd_run)
 
     # --- compare ---
@@ -243,6 +244,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         limit=args.limit,
         shards=args.shards,
         shard_index=args.shard_index,
+        shard_by=args.shard_by,
         adapter_meta=args.adapter_meta,
         driver_llm=args.driver_llm,
         adapter_version=args.adapter_version,
