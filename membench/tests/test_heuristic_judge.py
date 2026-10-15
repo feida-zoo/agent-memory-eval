@@ -104,6 +104,31 @@ class TestHeuristicJudge:
         assert result3.stale is True
         assert "未包含更新值" in result3.reason
 
+    def test_stale_exempt_when_new_value_paraphrased(self) -> None:
+        # 接入侧反馈（office 集 knowledge_update 题）：回答正确给出新值、但
+        # 改写/paraphrase 了表述，同时把旧值作为变更上下文提及，不应判 stale。
+        # d10_q1：gold="下周一下午"，回答改写为"周一下午/9-14"。
+        r1 = self.judge.grade(
+            _q(category="knowledge_update", gold_stale="周四下午"),
+            "下周一下午",
+            "何斌的面试最终改到了 2026-09-14（周一下午），原定于 2026-09-07 那周的周四下午，9 月 9 日改期至下周一即 9 月 14 日下午。",
+        )
+        assert r1.stale is False
+        # d11_q1：gold 含"流量高峰打满"，回答改写为"高峰打满"。
+        r2 = self.judge.grade(
+            _q(category="knowledge_update", gold_stale="Redis集群主从切换抖动"),
+            "连接池配置把最大连接数从500改成了50，流量高峰打满",
+            "最终根因是连接池配置把最大连接数从 500 改成了 50，导致高峰打满；最初怀疑的 Redis 集群主从切换抖动并非根因。",
+        )
+        assert r2.stale is False
+        # 仍判 stale 的对照：只提旧值、新值完全没出现。
+        r3 = self.judge.grade(
+            _q(category="knowledge_update", gold_stale="周四下午"),
+            "下周一下午",
+            "何斌的面试在周四下午。",
+        )
+        assert r3.stale is True
+
     def test_stale_ignored_without_gold_stale(self) -> None:
         result = self.judge.grade(_q(), "杭州", "北京杭州都住过")
         assert result.stale is False

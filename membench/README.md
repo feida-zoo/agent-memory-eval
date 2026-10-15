@@ -388,6 +388,8 @@ python -m membench.cli adapter remove my-office-adapter
 | 效率成本 | latency_p50 / p95 | query 延迟分位数（毫秒） | 按系统预算自定 |
 | 效率成本 | avg_input_tokens / avg_llm_calls | 每题平均注入 token 与 LLM 调用数 | 越低越好 |
 | 记忆动态 | stale_rate | knowledge_update 题中命中过期事实且未包含更新值的比例 | ≤ 0.03 |
+
+> 注：stale 的"包含更新值"接受两种口径——gold 片段逐字覆盖，或 gold 内容 token 召回 ≥ 0.8（容忍同义改写，如"下周一下午"→"周一下午"）。旧值仅作为变更上下文被引用、且新值已正确给出时不计为 stale。
 | 拒答 | abstention_accuracy | abstention 题中正确拒答的比例 | ≥ 0.80 |
 | 可扩展性 | （随数据规模观察上述指标的退化曲线） | 用更大数据集多跑几轮对比 | — |
 

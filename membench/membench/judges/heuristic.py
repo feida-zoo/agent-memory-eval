@@ -4,7 +4,8 @@
 - 常规题：``token_f1(gold, prediction) >= 0.5`` 判 correct；
   另外当 gold 按标点切分后的每个片段都被 prediction 完整覆盖时
   （token 完全命中，可容忍模板化长回答），同样判 correct。
-- stale：``gold_stale`` 出现在 prediction 中 → ``stale=True``。
+- stale：``gold_stale`` 出现在 prediction 中 → ``stale=True``；
+  若 gold（新值）也命中（片段覆盖或 token 召回达标），说明系统已知更新，豁免。
 - abstention 题（gold 为 ``"<ABSTAIN>"`` 或 category 为 abstention）：
   prediction 含拒答信号词 → ``abstained_pred=True``，且以此判定 correct。
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import re
 
+from membench.adapters.mock import content_tokens
 from membench.data.schema import ABSTAIN_SENTINEL
 from membench.metrics.text import token_f1
 
@@ -76,6 +78,12 @@ def contains_refusal(prediction: str) -> bool:
     return any(sig in pred_lower for sig in REFUSAL_SIGNALS)
 
 
+#: 新值命中豁免的 token 召回阈值：gold 的内容 token 中至少该比例出现在
+#: prediction 里，即视为"系统已知更新"。阈值取 0.8：既容忍同义改写
+#: （如"下周一下午"→"周一下午"），又能挡住"只命中个别字词"的伪命中。
+_GOLD_RECALL_THRESHOLD: float = 0.8
+
+
 def gold_covered(gold: str, prediction: str) -> bool:
     """gold 按标点切分后，每个非空片段是否都是 prediction 的子串。"""
     pred_n = normalize(prediction)
@@ -88,21 +96,41 @@ def gold_covered(gold: str, prediction: str) -> bool:
     return all(p in pred_n for p in parts)
 
 
+def gold_recall_hit(gold: str, prediction: str, threshold: float = _GOLD_RECALL_THRESHOLD) -> bool:
+    """gold 的内容 token 召回率是否达标（容忍同义改写的新值命中口径）。
+
+    与 ``gold_covered`` 的逐字子串不同，这里按 token 多集算召回：
+    回答把新值换了说法（如"下周一下午"→"周一下午"、"流量高峰打满"→"高峰打满"）
+    也能命中。gold 过短（< 4 个内容 token）时阈值收紧为 1.0，避免
+    短 gold 被个别字词误命中。
+    """
+    gold_toks = content_tokens(gold or "")
+    if not gold_toks:
+        return False
+    pred_toks = content_tokens(prediction or "")
+    if not pred_toks:
+        return False
+    hit = len(gold_toks & pred_toks) / len(gold_toks)
+    effective = 1.0 if len(gold_toks) < 4 else threshold
+    return hit >= effective
+
+
 def is_stale(gold_stale: "str | None", gold: str, prediction: str) -> bool:
     """陈旧判定：旧值命中且新值未命中才算 stale。
 
     纯子串匹配会把"引用旧值作为变更上下文"的正确更新回答误判为 stale，
-    因此当 gold（新值）也出现在 prediction 中时说明系统已知更新，不判 stale。
-    新值命中口径与判分逻辑一致（``gold_covered`` 片段覆盖，gold 可含元信息）。
-    abstention 题（gold 为哨兵值）不做新值豁免，保持原有判定。
+    因此当 gold（新值）也命中时不判 stale。新值命中接受两种口径：
+    ``gold_covered`` 片段覆盖（逐字），或 ``gold_recall_hit`` token 召回达标
+    （容忍同义改写）。abstention 题（gold 为哨兵值）不做新值豁免，保持原有判定。
     """
     if not gold_stale:
         return False
     pred_n = normalize(prediction or "")
     if normalize(gold_stale) not in pred_n:
         return False
-    if gold and gold != ABSTAIN_SENTINEL and gold_covered(gold, prediction or ""):
-        return False
+    if gold and gold != ABSTAIN_SENTINEL:
+        if gold_covered(gold, prediction or "") or gold_recall_hit(gold, prediction or ""):
+            return False
     return True
 
 
