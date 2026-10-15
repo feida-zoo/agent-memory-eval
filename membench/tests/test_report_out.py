@@ -101,10 +101,10 @@ def test_report_known_category_mapping(tmp_path: Path) -> None:
     ):
         assert zh in md
     # 验收基线对照表为「中文 label（英文 key）」格式
-    assert "正确性（accuracy）" in md
-    assert "检索质量（evidence_recall）" in md
-    assert "记忆动态（stale_rate）" in md
-    assert "拒答（abstention_accuracy）" in md
+    assert "正确率（accuracy）" in md
+    assert "证据召回率（evidence_recall）" in md
+    assert "陈旧率（stale_rate）" in md
+    assert "拒答准确率（abstention_accuracy）" in md
 
 
 # ---------------------------------------------------------------------------

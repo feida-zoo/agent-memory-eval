@@ -184,6 +184,10 @@ def format_metric(key: str, value: Any) -> str:
     如 ``"优秀（0.923）"``；不可评级指标返回原数值的格式化字符串
     （float 保留 3 位，其余原样，与 report 的 ``_fmt`` 口径一致）。
 
+    ``None`` 与 ``"n/a"`` 一律视为"未定义"，返回 ``"未定义"`` 而非
+    ``"None"`` / ``"n/a"`` 字串，避免业务方把"数据集没标 evidence"误读
+    为"系统召回率为 0"。
+
     Args:
         key: 指标名。
         value: 指标数值（允许非数值，如 "n/a"）。
@@ -191,6 +195,10 @@ def format_metric(key: str, value: Any) -> str:
     Returns:
         报告单元格字符串。
     """
+    if value is None:
+        return "未定义"
+    if isinstance(value, str) and value.strip().lower() in ("n/a", "none", "null", ""):
+        return "未定义"
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         label = rate_metric(key, float(value))
         if label is not None:

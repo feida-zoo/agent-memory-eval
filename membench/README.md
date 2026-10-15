@@ -72,6 +72,25 @@ python -m membench.cli evaluate --adapter <a> --beam-10m   # 用 BEAM-10M 替换
 python -m membench.cli evaluate --adapter <a> --include-lme-s  # 追加 LongMemEval-S（大体积，与 oracle 分差反映检索/精确率损失）
 ```
 
+## 双臂多数据集融合 A/B 对比
+
+`evaluate-compare` 一次跑两套 adapter × 多数据集，直接产出**逐数据集 diff + 跨数据集融合 diff + 门禁 + 对比图**，落 `<报告父目录>/ab_<tag>_<ts>/` 自包含结构（A/B 两侧各自带各数据集 run 副本 + compare_report.md + 两张对比图）：
+
+```bash
+python -m membench.cli evaluate-compare \
+    --baseline-adapter <adapter_A> --candidate-adapter <adapter_B> \
+    --judge llm --report-out <报告父目录> --tag "优化前vs优化后"
+
+# 同样支持 --quick / --beam-10m / --include-lme-s；两侧可分别指定 driver_llm / adapter_version
+python -m membench.cli evaluate-compare \
+    --baseline-adapter A --candidate-adapter B \
+    --driver-llm-a gpt-4o --driver-llm-b gpt-4o-mini \
+    --adapter-version-a v1 --adapter-version-b v2 \
+    --quick
+```
+
+门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **双臂融合 diff 表** + **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）。
+
 融合口径（重要，读总分前必读）：
 
 - **宏平均**：六项质量指标（accuracy/token_f1/bleu1/evidence_recall/abstention_accuracy/stale_rate）先在各数据集内算分，再跨集等权平均；**指标只在具备对应标注能力的数据集上参与**——无 gold_stale 的集（locomo/longmemeval）不参与 stale_rate，无 evidence 标注的集（longmemeval/beam）不参与 evidence_recall，无 abstention 题的集不参与 abstention_accuracy。绝不用"记 0"稀释。

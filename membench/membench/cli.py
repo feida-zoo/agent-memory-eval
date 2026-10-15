@@ -1,5 +1,5 @@
-"""membench 命令行入口：run / evaluate / fuse / compare / matrix / doctor /
-adapter / user-data / dataset / list-datasets。
+"""membench 命令行入口：run / evaluate / evaluate-compare / fuse / compare /
+matrix / doctor / adapter / user-data / dataset / list-datasets。
 
 用法（SPEC 第 6 节）：
     python -m membench.cli run --adapter mock-strong \
@@ -10,6 +10,12 @@ adapter / user-data / dataset / list-datasets。
         [--judge heuristic] [--platform wx --commit a1b2c3] [--out runs/] \
         [--driver-llm gpt-4o] [--adapter-version a1b2c3] \
         [--report-out DIR] [--quick | --beam-10m] [--include-lme-s]
+    python -m membench.cli evaluate-compare --baseline-adapter A --candidate-adapter B \
+        [--judge heuristic] [--platform wx --commit a1b2c3] [--out runs/] \
+        [--driver-llm-a gpt-4o] [--adapter-version-a a1b2c3] \
+        [--driver-llm-b gpt-4o-mini] [--adapter-version-b d4e5f6] \
+        [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
+        [--report-out DIR] [--tag <label>] [--quick | --beam-10m] [--include-lme-s]
     python -m membench.cli fuse --runs runs/<shard0>,runs/<shard1> --out runs/<fused>
     python -m membench.cli compare --baseline runs/<run_a> --candidate runs/<run_b> \
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
@@ -146,6 +152,38 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--jobs", type=int, default=1, help="题目级并发数（默认 1；ingest 始终串行，要求 adapter.query 与 judge 线程安全）")
     p_ev.add_argument("--client-llm", default=None, help="judge=client 时的 agent 内置 LLM 类路径，如 'my_agent.llm:LLMClient'")
     p_ev.set_defaults(func=_cmd_evaluate)
+
+    # --- evaluate-compare ---
+    p_ev_cmp = sub.add_parser(
+        "evaluate-compare",
+        help="双臂（baseline vs candidate）× 多数据集融合 A/B 对比；产出 ab_<tag>_<ts>/",
+    )
+    p_ev_cmp.add_argument("--baseline-adapter", required=True, help="基线适配器名")
+    p_ev_cmp.add_argument("--candidate-adapter", required=True, help="候选适配器名")
+    p_ev_cmp.add_argument("--judge", default="heuristic", choices=["heuristic", "llm", "client"], help="判分器（默认 heuristic）")
+    p_ev_cmp.add_argument("--platform", default=None, help="平台标签（如 wx / fs），记入两侧 run 元数据")
+    p_ev_cmp.add_argument("--commit", default=None, help="commit 标签，记入两侧 run 元数据")
+    p_ev_cmp.add_argument("--out", default=None, help="run 输出父目录（默认 paths.runs_dir()）")
+    p_ev_cmp.add_argument("--driver-llm-a", default=None, help="基线侧的 driver LLM 标识")
+    p_ev_cmp.add_argument("--driver-llm-b", default=None, help="候选侧的 driver LLM 标识")
+    p_ev_cmp.add_argument("--adapter-version-a", default=None, help="基线侧 adapter 版本/commit")
+    p_ev_cmp.add_argument("--adapter-version-b", default=None, help="候选侧 adapter 版本/commit")
+    p_ev_cmp.add_argument("--acc-threshold", type=float, default=0.02, help="accuracy 允许最大下降（融合维度，默认 0.02）")
+    p_ev_cmp.add_argument("--stale-threshold", type=float, default=0.02, help="stale_rate 允许最大上升（融合维度，默认 0.02）")
+    p_ev_cmp.add_argument("--latency-warn", type=float, default=0.30, help="latency_p95 相对上升告警比例（融合维度，默认 0.30）")
+    p_ev_cmp.add_argument("--tag", default=None, help="A/B 实验目录标签（缺省由两个 adapter 名拼成）")
+    p_ev_cmp.add_argument("--report-out", default=None, help="实验目录父目录：产出 <DIR>/ab_<tag>_<ts>/")
+    ev_cmp_group = p_ev_cmp.add_mutually_exclusive_group()
+    ev_cmp_group.add_argument("--quick", action="store_true", help="跳过 BEAM 槽位（不检查 BEAM 文件是否存在）")
+    ev_cmp_group.add_argument("--beam-10m", action="store_true", help="BEAM 槽位使用 beam_10m.jsonl")
+    p_ev_cmp.add_argument("--include-lme-s", action="store_true", help="追加 LongMemEval-S 变体")
+    p_ev_cmp.add_argument("--llm-base-url", default=None, help="judge=llm 时的 OpenAI 兼容 base_url")
+    p_ev_cmp.add_argument("--llm-api-key", default=None, help="judge=llm 时的 API key")
+    p_ev_cmp.add_argument("--llm-model", default=None, help="judge=llm 时的模型名")
+    p_ev_cmp.add_argument("--llm-timeout", type=float, default=None, help="judge=llm 时的请求超时秒数（默认 90s）")
+    p_ev_cmp.add_argument("--jobs", type=int, default=1, help="题目级并发数（默认 1）")
+    p_ev_cmp.add_argument("--client-llm", default=None, help="judge=client 时的 agent 内置 LLM 类路径")
+    p_ev_cmp.set_defaults(func=_cmd_evaluate_compare)
 
     # --- adapter ---
     p_ad = sub.add_parser("adapter", help="业务适配器持久化管理（install / list / remove）")
@@ -438,6 +476,39 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
         driver_llm=args.driver_llm,
         adapter_version=args.adapter_version,
     )
+
+
+def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
+    """双臂（baseline vs candidate）× 多数据集融合 A/B 对比。"""
+    from membench.evaluate_compare import evaluate_compare
+
+    if args.jobs < 1:
+        raise SystemExit(f"--jobs 必须 >= 1，当前为 {args.jobs}")
+    baseline_adapter = _make_adapter(args.baseline_adapter)
+    candidate_adapter = _make_adapter(args.candidate_adapter)
+    judge = _make_judge(args)
+    result = evaluate_compare(
+        baseline_adapter,
+        candidate_adapter,
+        judge,
+        out_dir=args.out,
+        platform=args.platform,
+        commit=args.commit,
+        quick=args.quick,
+        beam_10m=args.beam_10m,
+        include_lme_s=args.include_lme_s,
+        report_out=args.report_out,
+        tag=args.tag,
+        jobs=args.jobs,
+        driver_llm_baseline=args.driver_llm_a,
+        driver_llm_candidate=args.driver_llm_b,
+        adapter_version_baseline=args.adapter_version_a,
+        adapter_version_candidate=args.adapter_version_b,
+        acc_threshold=args.acc_threshold,
+        stale_threshold=args.stale_threshold,
+        latency_warn=args.latency_warn,
+    )
+    return 1 if result["verdict"] == "FAIL" else 0
 
 
 def _cmd_list_datasets(args: argparse.Namespace) -> int:

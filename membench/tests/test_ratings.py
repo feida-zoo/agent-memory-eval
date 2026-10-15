@@ -256,9 +256,9 @@ def test_continuous_points(key: str, value: float, expected: float | None) -> No
 
 
 def test_overall_rating_sensitive_to_within_bucket_improvement() -> None:
-    """接入侧反馈回归：档内改进（不跨档）应反映到综合评级点数上。
+    """回归：档内改进（不跨档）应反映到综合评级点数上。
 
-    反馈案例：accuracy 0.647→0.715（+6.8pt）、abstention 0.476→0.567（+9.1pt），
+    案例：accuracy 0.647→0.715（+6.8pt）、abstention 0.476→0.567（+9.1pt），
     六项指标无一跨档，旧口径下综合评级同为"中等（1.7/4.0）"，看不出提升。
     新口径（连续点数）下，综合评级分数应有可见上升。
     """
@@ -299,10 +299,13 @@ def test_format_metric_rated() -> None:
 
 
 def test_format_metric_unrated() -> None:
-    """不可评级指标返回原数值格式化字符串。"""
+    """不可评级指标返回原数值格式化字符串；None / 'n/a' 一律返回「未定义」。"""
     assert format_metric("latency_p50_ms", 123.4567) == "123.457"
     assert format_metric("n_questions", 100) == "100"
-    assert format_metric("accuracy", "n/a") == "n/a"
+    # 缺失值统一渲染为「未定义」，业务方不会误读为 0。
+    assert format_metric("accuracy", None) == "未定义"
+    assert format_metric("accuracy", "n/a") == "未定义"
+    assert format_metric("evidence_recall", "None") == "未定义"
 
 
 # ---------------------------------------------------------------------------
@@ -352,9 +355,12 @@ def test_write_run_report_md_contains_ratings(tmp_path) -> None:
     assert "优秀（0.920）" in content  # accuracy = 0.92
     assert "（0." in content
 
-    # 效率成本指标保持原数值呈现，不带评价
+    # 效率成本指标保持原数值呈现，不带评价；指标列展示「中文（key）」双标
     assert "123" not in content
-    assert "| 效率成本 | latency_p50_ms | 100.000 |" in content
+    assert "| 效率成本 | 延迟 P50（latency_p50_ms） | 100.000 |" in content
+    assert "证据召回率（evidence_recall）" in content  # 摘要表的中文化列名
+    assert "陈旧率（stale_rate）" in content
+    assert "拒答准确率（abstention_accuracy）" in content
 
     # 分题型准确率表同样带评价
     assert "| 单跳（single_hop） | 优秀（0.920） | 1 |" in content

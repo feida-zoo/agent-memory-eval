@@ -32,7 +32,7 @@ from membench import layout, paths
 from membench.data.info import resolve_available_path
 from membench.data.schema import load_dataset
 from membench.ratings import format_metric, overall_rating
-from membench.report import _md_table, fig_dataset_overview
+from membench.report import _md_table, fig_dataset_overview, metric_label
 from membench.runner import Runner
 from membench.userdata import resolve_dataset
 
@@ -394,7 +394,7 @@ def write_evaluate_report(
         ["platform", str(platform or "default")],
         ["commit", str(commit or "n/a")],
         ["时间戳", timestamp.isoformat(timespec="seconds")],
-        # 数据集范围：本次实际评测的 key 与来源，便于"先确认数据集范围"（反馈 4）。
+        # 数据集范围：本次实际评测的 key 与来源，便于"先确认数据集范围"。
         ["数据集范围", "、".join(f"{r.spec.key}（{r.spec.source}）" for r in results) or "（无）"],
     ]
     lines.append(_md_table(["项目", "值"], config_rows))
@@ -426,11 +426,13 @@ def write_evaluate_report(
     for metric in QUALITY_METRICS:
         entry = fused[metric]
         if entry["value"] is None:
-            value_str = "—"
+            value_str = "未定义"
+            participants_str = "（无参与集）"
         else:
             value_str = format_metric(metric, entry["value"])
+            participants_str = "、".join(entry["participants"]) or "（无参与集）"
         fused_rows.append(
-            [metric, value_str, "、".join(entry["participants"]) or "（无参与集）"]
+            [metric_label(metric), value_str, participants_str]
         )
     lines.append(_md_table(["指标", "融合值", "参与数据集"], fused_rows))
     lines.append("")
@@ -444,16 +446,22 @@ def write_evaluate_report(
         overall = r.metrics.get("overall", {})
         row = [r.spec.name, str(overall.get("n_questions", "n/a"))]
         for metric in quality_cols:
-            if participates(r.capabilities, metric) and metric in overall:
+            if participates(r.capabilities, metric) and metric in overall and overall[metric] is not None:
                 row.append(format_metric(metric, overall[metric]))
             else:
-                row.append("—")
+                row.append("未定义")
         detail_rows.append(row)
     lines.append(
         _md_table(
-            ["数据集", "n_questions"] + quality_cols,
+            ["数据集", metric_label("n_questions")] + [metric_label(m) for m in quality_cols],
             detail_rows or [["(无)"] + [""] * (len(quality_cols) + 1)],
         )
+    )
+    lines.append("")
+    # 列说明：避免业务方把「未定义」误读为「召回率为 0」
+    lines.append(
+        "<sub>表中「未定义」表示该数据集未标注对应能力（如 evidence / gold_stale / "
+        "abstention 题），不参与该指标计算；融合值也不会因 0 而被拉低。</sub>"
     )
     lines.append("")
 
@@ -478,7 +486,7 @@ def write_evaluate_report(
         eff_rows.append(row)
     lines.append(
         _md_table(
-            ["数据集"] + eff_cols,
+            ["数据集"] + [metric_label(m) for m in eff_cols],
             eff_rows or [["(无)"] + [""] * len(eff_cols)],
         )
     )

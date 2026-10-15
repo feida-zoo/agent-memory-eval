@@ -105,7 +105,7 @@ class TestHeuristicJudge:
         assert "未包含更新值" in result3.reason
 
     def test_stale_exempt_when_new_value_paraphrased(self) -> None:
-        # 接入侧反馈（office 集 knowledge_update 题）：回答正确给出新值、但
+        # office 集 knowledge_update 题：回答正确给出新值、但
         # 改写/paraphrase 了表述，同时把旧值作为变更上下文提及，不应判 stale。
         # d10_q1：gold="下周一下午"，回答改写为"周一下午/9-14"。
         r1 = self.judge.grade(

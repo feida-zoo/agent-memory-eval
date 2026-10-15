@@ -4,6 +4,8 @@ runs/
 output/
 *.pyc
 .DS_Store
+.venv/
+.pytest_cache/
 # 大数据集不入库，用 dataset fetch 按需下载
 membench/data/locomo.jsonl
 membench/data/longmemeval_*.jsonl

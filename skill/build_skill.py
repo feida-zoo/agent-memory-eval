@@ -61,7 +61,7 @@ FIXED_DATE_TIME = (1980, 1, 1, 0, 0, 0)
 SOURCE_DIRS = ("skill/src", "membench", "docs")
 
 #: 需要整目录排除的目录名（membench 来源）。
-EXCLUDE_DIR_NAMES = frozenset({"__pycache__", ".pytest_cache", "runs", "output"})
+EXCLUDE_DIR_NAMES = frozenset({"__pycache__", ".pytest_cache", ".venv", "venv", "node_modules", "runs", "output"})
 #: 目录名以这些后缀结尾时整目录排除（覆盖 ``*.egg-info``）。
 EXCLUDE_DIR_SUFFIXES = (".egg-info",)
 #: 文件名匹配这些 glob 时排除。
@@ -76,6 +76,10 @@ EXCLUDE_DATA_GLOBS = (
 
 #: 包内自检：这些路径前缀下不得出现被排除的数据集文件名。
 DATA_DIR_REL = "membench/membench/data"
+
+#: 包内自检：禁止出现的目录名（构建/运行环境产物；不进包）。
+#: 例如 .venv/ 会让 skill 包从 ~MB 涨到 ~50 MB（解释器 + site-packages）。
+EXCLUDE_DIR_NAMES_FORBIDDEN = ("__pycache__", ".pytest_cache", ".venv", "venv", "node_modules", "runs", "output")
 
 
 def _posix(*parts: str) -> str:
@@ -227,14 +231,26 @@ def build(included: Iterable[Tuple[str, str]], out_path: str) -> Tuple[int, int,
 
 
 def check_zip(out_path: str) -> List[str]:
-    """包内自检：返回违规条目（data 目录下出现被排除数据集）列表。"""
+    """包内自检：返回违规条目列表。
+
+    - data 目录下出现被排除数据集（locomo / longmemeval_* / gatemem_office / beam_*）；
+    - membench 来源下出现被禁止进包的目录（.venv / __pycache__ / runs / output 等）——
+      ``skill/src/output/.gitkeep`` 之类的占位文件不在此列。
+    """
     bad: List[str] = []
     with zipfile.ZipFile(out_path) as zf:
         for name in zf.namelist():
+            parts = name.split("/")
             if f"/{DATA_DIR_REL}/" in f"/{name}" or name.startswith(DATA_DIR_REL + "/"):
-                base = name.rsplit("/", 1)[-1]
+                base = parts[-1]
                 if _is_excluded_data(base):
                     bad.append(name)
+            # membench 来源前缀：membench/<...>；在此范围内才检查禁止目录
+            if len(parts) >= 2 and parts[1] == "membench":
+                for part in parts[2:-1]:
+                    if part in EXCLUDE_DIR_NAMES_FORBIDDEN:
+                        bad.append(name)
+                        break
     return bad
 
 

@@ -48,7 +48,7 @@ CATEGORY_ZH: dict[str, str] = {
     "open_ended": "开放问答（open_ended）",
 }
 
-# 效率统计表的指标显示名（中文，单位保留）。
+#: 效率统计表的指标显示名（中文，单位保留）。
 METRIC_ZH: dict[str, str] = {
     "query latency mean (ms)": "查询延迟均值（ms）",
     "query latency p50 (ms)": "查询延迟 p50（ms）",
@@ -59,18 +59,63 @@ METRIC_ZH: dict[str, str] = {
     "avg llm calls / query": "平均 LLM 调用次数 / 题",
 }
 
+#: 全量指标 key -> 中文显示名。
+#: 缺失键回退原 key；report 默认渲染用「中文（key）」双标形式以兼顾可读性
+#: 与可检索性。指标 key 在数据层与导出接口保持不变，仅渲染层做本地化。
+#: 单位（ms / Token）随 with_key=False 调用方或值单元格附带，避免与双标
+#: 「中文（key）」结构重复（如「延迟 P50（ms）（latency_p50_ms）」）。
+METRIC_LABEL_ZH: dict[str, str] = {
+    "accuracy": "正确率",
+    "token_f1": "Token F1",
+    "bleu1": "BLEU-1",
+    "evidence_recall": "证据召回率",
+    "abstention_accuracy": "拒答准确率",
+    "stale_rate": "陈旧率",
+    "latency_p50_ms": "延迟 P50",
+    "latency_p95_ms": "延迟 P95",
+    "avg_input_tokens": "平均输入 Token",
+    "avg_output_tokens": "平均输出 Token",
+    "avg_llm_calls": "平均 LLM 调用次数",
+    "avg_ingest_latency_ms": "平均记忆写入耗时",
+    "n_questions": "题目数",
+    "n_ignored": "忽略题数",
+    "mean_points": "综合点数",
+}
+
 
 def category_display(cat: str) -> str:
     """category 的显示名：已知题型返回「中文（英文）」，未知题型原样返回。"""
     return CATEGORY_ZH.get(cat, cat)
 
 
+def metric_label(key: str, with_key: bool = True) -> str:
+    """指标的显示名。
+
+    Args:
+        key: 指标 key（数据层不变）。
+        with_key: True 时返回「中文（key）」双标形式（默认，便于检索/调试）；
+            False 时仅返回中文名（图表轴标签等紧凑场景用）。
+
+    Returns:
+        显示名字符串；未知 key 原样返回。
+    """
+    zh = METRIC_LABEL_ZH.get(key)
+    if zh is None:
+        return str(key)
+    return f"{zh}（{key}）" if with_key else zh
+
+
+def metric_labels(keys: Iterable[str], with_key: bool = True) -> list[str]:
+    """批量取指标的显示名（缺值过滤掉，但保留顺序）。"""
+    return [metric_label(k, with_key=with_key) for k in keys if k]
+
+
 # 验收基线（report.md 对照表）：(指标 key, 展示名「中文（英文 key）」, 目标描述, 判定函数)
 BASELINES: list[tuple[str, str, str, Any]] = [
-    ("accuracy", "正确性（accuracy）", ">= 0.85", lambda v: v >= 0.85),
-    ("evidence_recall", "检索质量（evidence_recall）", ">= 0.90", lambda v: v >= 0.90),
-    ("stale_rate", "记忆动态（stale_rate）", "<= 0.03", lambda v: v <= 0.03),
-    ("abstention_accuracy", "拒答（abstention_accuracy）", ">= 0.80", lambda v: v >= 0.80),
+    ("accuracy", metric_label("accuracy"), ">= 0.85", lambda v: v >= 0.85),
+    ("evidence_recall", metric_label("evidence_recall"), ">= 0.90", lambda v: v >= 0.90),
+    ("stale_rate", metric_label("stale_rate"), "<= 0.03", lambda v: v <= 0.03),
+    ("abstention_accuracy", metric_label("abstention_accuracy"), ">= 0.80", lambda v: v >= 0.80),
 ]
 
 # compare 分组条形图使用的质量指标（均为 [0,1] 区间，可同图比较）
@@ -220,7 +265,7 @@ def fig_metric_diff(
             colors_b.append(PALETTE[1])
     ax.bar([i + width / 2 for i in x], vals_b, width, label=label_b, color=colors_b)
     ax.set_xticks(x)
-    ax.set_xticklabels(keys, rotation=20, ha="right")
+    ax.set_xticklabels([metric_label(k, with_key=False) for k in keys], rotation=20, ha="right")
     ax.set_ylim(0, 1.0)
     ax.set_ylabel("value")
     ax.set_title("质量指标 (A vs B)")
@@ -233,7 +278,7 @@ def fig_metric_diff(
     ax2.bar([i - width / 2 for i in x2], eff_a, width, label=label_a, color=PALETTE[0])
     ax2.bar([i + width / 2 for i in x2], eff_b, width, label=label_b, color=PALETTE[1])
     ax2.set_xticks(x2)
-    ax2.set_xticklabels(eff_keys, rotation=20, ha="right")
+    ax2.set_xticklabels([metric_label(k, with_key=False) for k in eff_keys], rotation=20, ha="right")
     ax2.set_ylabel("cost (units differ)")
     ax2.set_title("效率成本 (A vs B)")
     ax2.legend()
@@ -287,13 +332,17 @@ def fig_dataset_overview(
 ) -> str:
     """evaluate 用：各数据集质量指标与效率成本分组条形图。
 
+    缺失的指标（如数据集未标注 evidence 时 ``evidence_recall`` 无意义）留空
+    不画柱——避免业务方误读为"召回率为 0"；仅绘制至少一个数据集实际产出
+    该指标的列。
+
     Args:
         datasets: ``[(数据集显示名, 该集 overall 指标字典), ...]``。
         out_path: 输出 png 路径。
     """
     _setup_fonts()
-    q_keys = [k for k in DIFF_METRICS if any(k in ov for _, ov in datasets)]
-    eff_keys = [k for k in EFFICIENCY_DIFF_METRICS if any(k in ov for _, ov in datasets)]
+    q_keys = [k for k in DIFF_METRICS if any(k in ov and ov.get(k) is not None for _, ov in datasets)]
+    eff_keys = [k for k in EFFICIENCY_DIFF_METRICS if any(k in ov and ov.get(k) is not None for _, ov in datasets)]
 
     fig, (ax, ax2) = plt.subplots(
         1, 2, figsize=(max(12, 1.4 * max(len(q_keys), len(eff_keys), 1)), 4.8)
@@ -301,11 +350,11 @@ def fig_dataset_overview(
     width = min(0.8 / max(len(datasets), 1), 0.38)
     x = list(range(len(q_keys)))
     for di, (name, ov) in enumerate(datasets):
-        vals = [float(ov.get(k, 0.0)) for k in q_keys]
+        vals = [float(ov.get(k)) if ov.get(k) is not None else float("nan") for k in q_keys]
         offset = (di - (len(datasets) - 1) / 2) * width
         ax.bar([i + offset for i in x], vals, width, label=name, color=PALETTE[di % len(PALETTE)])
     ax.set_xticks(x)
-    ax.set_xticklabels(q_keys, rotation=20, ha="right")
+    ax.set_xticklabels([metric_label(k, with_key=False) for k in q_keys], rotation=20, ha="right")
     ax.set_ylim(0, 1.0)
     ax.set_ylabel("value")
     ax.set_title("各数据集质量指标")
@@ -313,11 +362,11 @@ def fig_dataset_overview(
 
     x2 = list(range(len(eff_keys)))
     for di, (name, ov) in enumerate(datasets):
-        vals = [float(ov.get(k, 0.0)) for k in eff_keys]
+        vals = [float(ov.get(k)) if ov.get(k) is not None else float("nan") for k in eff_keys]
         offset = (di - (len(datasets) - 1) / 2) * width
         ax2.bar([i + offset for i in x2], vals, width, label=name, color=PALETTE[di % len(PALETTE)])
     ax2.set_xticks(x2)
-    ax2.set_xticklabels(eff_keys, rotation=20, ha="right")
+    ax2.set_xticklabels([metric_label(k, with_key=False) for k in eff_keys], rotation=20, ha="right")
     ax2.set_ylabel("cost (units differ)")
     ax2.set_title("各数据集效率成本")
     ax2.legend(fontsize=8)
@@ -423,16 +472,16 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
     lines.append("## 摘要（六维核心指标）")
     lines.append("")
     summary_rows = [
-        ["正确性", "accuracy", format_metric("accuracy", overall.get("accuracy", "n/a"))],
-        ["正确性", "token_f1", format_metric("token_f1", overall.get("token_f1", "n/a"))],
-        ["正确性", "bleu1", format_metric("bleu1", overall.get("bleu1", "n/a"))],
-        ["检索质量", "evidence_recall", format_metric("evidence_recall", overall.get("evidence_recall", "n/a"))],
-        ["效率成本", "latency_p50_ms", _fmt(overall.get("latency_p50_ms", "n/a"))],
-        ["效率成本", "latency_p95_ms", _fmt(overall.get("latency_p95_ms", "n/a"))],
-        ["效率成本", "avg_input_tokens", _fmt(overall.get("avg_input_tokens", "n/a"))],
-        ["效率成本", "avg_llm_calls", _fmt(overall.get("avg_llm_calls", "n/a"))],
-        ["记忆动态", "stale_rate", format_metric("stale_rate", overall.get("stale_rate", "n/a"))],
-        ["拒答", "abstention_accuracy", format_metric("abstention_accuracy", overall.get("abstention_accuracy", "n/a"))],
+        ["正确性", metric_label("accuracy"), format_metric("accuracy", overall.get("accuracy", "n/a"))],
+        ["正确性", metric_label("token_f1"), format_metric("token_f1", overall.get("token_f1", "n/a"))],
+        ["正确性", metric_label("bleu1"), format_metric("bleu1", overall.get("bleu1", "n/a"))],
+        ["检索质量", metric_label("evidence_recall"), format_metric("evidence_recall", overall.get("evidence_recall", "n/a"))],
+        ["效率成本", metric_label("latency_p50_ms"), _fmt(overall.get("latency_p50_ms", "n/a"))],
+        ["效率成本", metric_label("latency_p95_ms"), _fmt(overall.get("latency_p95_ms", "n/a"))],
+        ["效率成本", metric_label("avg_input_tokens"), _fmt(overall.get("avg_input_tokens", "n/a"))],
+        ["效率成本", metric_label("avg_llm_calls"), _fmt(overall.get("avg_llm_calls", "n/a"))],
+        ["记忆动态", metric_label("stale_rate"), format_metric("stale_rate", overall.get("stale_rate", "n/a"))],
+        ["拒答", metric_label("abstention_accuracy"), format_metric("abstention_accuracy", overall.get("abstention_accuracy", "n/a"))],
     ]
     lines.append(_md_table(["维度", "指标", "值"], summary_rows))
     lines.append("")
@@ -588,7 +637,7 @@ def write_compare_report_md(
     rows = []
     for key in sorted(diffs.keys()):
         d = diffs[key]
-        rows.append([key, _fmt(d.get("a", "n/a")), _fmt(d.get("b", "n/a")), _fmt(d.get("diff", "n/a"))])
+        rows.append([metric_label(key), _fmt(d.get("a", "n/a")), _fmt(d.get("b", "n/a")), _fmt(d.get("diff", "n/a"))])
     lines.append(_md_table(["指标", "A (基线)", "B (候选)", "diff"], rows or [["(无)", "", "", ""]]))
     lines.append("")
     lines.append("![关键指标对比](fig_metric_diff.png)")

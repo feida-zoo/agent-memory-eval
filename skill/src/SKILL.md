@@ -15,7 +15,7 @@ description: >
 本技能封装 membench 评测工程（`membench/`，自带 README 与测试），覆盖**接入 → 评测 → 对比 → 优化闭环**的完整工作流。
 **所有评测报告必须输出到本 skill 的 `output/` 目录，文件名带 `_YYMMDD_hhmmss` 时间戳后缀，报告开头注明所用测试集（membench 自动生成，勿删）。**
 
-## ⛔ 两个强制检查点（反馈 4；不得跳过）
+## ⛔ 两个强制检查点（不得跳过）
 
 1. **任何优化/改动完成后，先询问用户是否执行 A/B 对比，不得径自开跑。** 你是"提方案并按用户确认执行"的角色，不是"自动改完就自信跑分"的角色。
 2. **启动 A/B 前，先与用户确认数据集范围（单集 / 多集 / 全量）、A/B 分组（基线 vs 候选）与平台/标签。** 数据集口径不一致、平台/标签错配，都会让对比结论不可归因。
@@ -146,6 +146,15 @@ python -m membench.cli evaluate --adapter <adapter> --judge llm --report-out ../
 python -m membench.cli evaluate --adapter <adapter> --quick      # 跳过 BEAM，分钟级日常回归
 python -m membench.cli evaluate --adapter <adapter> --beam-10m   # 1M 换成 10M 全集终验
 python -m membench.cli evaluate --adapter <adapter> --include-lme-s  # 追加 LongMemEval-S（检索/精确率压力测试）
+```
+
+用户问"两版系统 A/B 对比一下、跨数据集一次出结论"时用 `evaluate-compare`：两套 adapter × 同一组数据集，分别跑完后产出**逐数据集 diff + 跨数据集融合 diff + 门禁 + 对比图**，落 `<报告父目录>/ab_<tag>_<ts>/` 自包含结构：
+
+```bash
+python -m membench.cli evaluate-compare \
+    --baseline-adapter <adapter_A> --candidate-adapter <adapter_B> \
+    --judge llm --report-out ../output/ --tag "优化前vs优化后"
+# 两侧可分别指定 driver_llm / adapter-version 供 compare 可比性前置校验
 ```
 
 > **全量评估前必须先 fetch 用到的按需下载数据集**（locomo / longmemeval_oracle / gatemem_office / beam_1m 等），否则会报错提示先 `dataset fetch <key>`。命令：`python -m membench.cli dataset fetch <key>`（落 `~/.membench/datasets/`）。

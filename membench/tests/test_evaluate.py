@@ -299,18 +299,18 @@ def test_report_contents(
         raise AssertionError("报告中未出现 评价（评分） 样式")
     assert "参与数据集" in report
     assert "## 分数据集明细" in report
-    # 反馈 5：效率成本段 + 报告配图
+    # 效率成本段 + 报告配图
     assert "## 效率成本（分数据集）" in report
     assert "avg_output_tokens" in report
     assert "avg_ingest_latency_ms" in report
     assert (Path(summary["_eval_dir"]) / "fig_dataset_overview.png").is_file()
     assert "](fig_dataset_overview.png)" in report
-    # 综合评级保留两位小数（反馈 5：不强行截断到一位）
+    # 综合评级保留两位小数（不强行截断到一位）
     import re
 
     m = re.search(r"综合评级：\S+（(\d+\.\d+)/4.0）", report)
     assert m is not None and len(m.group(1).split(".")[1]) == 2
-    # 数据集范围行（反馈 4：先确认本次实际评测的数据集 key 与来源）
+    # 数据集范围行：先确认本次实际评测的数据集 key 与来源
     assert "数据集范围" in report
     assert "a（user-specified）" in report
     # 报告目录下复制了各数据集 run 副本，链接指向相对路径 runs/<run_id>/report.md
@@ -320,9 +320,10 @@ def test_report_contents(
         assert rel.startswith("runs/")
         assert (report_dir / rel / "report.md").is_file()
     assert "(runs/" in report
-    # B 不参与 stale_rate，明细表中应显示 "—"
+    # B 不参与 stale_rate，明细表中应显示 "未定义"（避免业务方把 "未定义"
+    # 误读为 "0% 召回"，统一用 "未定义" 取代 "—" 占位）。
     detail_section = report.split("## 分数据集明细")[1]
-    assert "—" in detail_section
+    assert "未定义" in detail_section
 
 
 def test_fuse_metrics_empty_participants() -> None:

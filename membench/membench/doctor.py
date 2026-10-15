@@ -1,6 +1,6 @@
 """接入自检：按序探测被测服务三端点是否符合 HttpAdapter 契约。
 
-面向"Node/Electron 等非 Python 系统用 HTTP bridge 接入"的场景（接入侧反馈 6）：
+面向"Node/Electron 等非 Python 系统用 HTTP bridge 接入"的场景：
 在跑一次完整评测之前，先用 :func:`check_target` 确认被测服务确实实现了
 ``POST /reset|/ingest|/query`` 且字段类型对齐
 :class:`membench.adapters.http.HttpAdapter`，避免把适配器/契约问题误判成
