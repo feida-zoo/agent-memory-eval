@@ -8,6 +8,10 @@
 单指标阈值在模块内以数据表 :data:`METRIC_THRESHOLDS` 定义，便于后续调整。
 效率成本类指标（latency / tokens / llm_calls / n_questions）依赖部署环境，
 强制定性会误导，故不参与评级（:func:`rate_metric` 返回 ``None``）。
+
+综合评级使用 :func:`continuous_points` 的连续点数（1.0~4.0），
+在阈值边界处与离散点数一致，但档内随数值线性变化，
+使"档内改进"也能反映到综合评级上。
 """
 
 from __future__ import annotations
@@ -18,7 +22,8 @@ __all__ = [
     "LABELS",
     "LABEL_POINTS",
     "METRIC_THRESHOLDS",
-    "OVERALL_LABEL_POINTS",
+    "OVERALL_THRESHOLDS",
+    "continuous_points",
     "rate_metric",
     "rating_points",
     "overall_rating",
@@ -92,19 +97,65 @@ def rating_points(label: str) -> int:
     return LABEL_POINTS[label]
 
 
+def continuous_points(key: str, value: float) -> float | None:
+    """对单个指标给出连续点数（1.0~4.0），保留档内位置信息。
+
+    与 :func:`rate_metric` 的离散标签在阈值边界处取值一致
+    （如 accuracy 0.60→2.0、0.75→3.0、0.90→4.0），但档内随数值线性变化，
+    使综合评级对"档内改进"敏感（如 accuracy 0.647→0.715 会从 2.31 升到 2.77）。
+
+    分段线性映射（以 accuracy 为例，阈值 0.90/0.75/0.60）：
+        v >= 0.90        → 4.0
+        0.75 <= v < 0.90 → 3.0 + (v-0.75)/0.15  ∈ [3.0, 4.0)
+        0.60 <= v < 0.75 → 2.0 + (v-0.60)/0.15  ∈ [2.0, 3.0)
+        v < 0.60         → 1.0 + v/0.60          ∈ [1.0, 2.0)
+    lower 方向（stale_rate）对称处理。
+
+    Args:
+        key: 指标名。
+        value: 指标数值。
+
+    Returns:
+        [1.0, 4.0] 的连续点数；不可评级的指标返回 ``None``。
+    """
+    spec = METRIC_THRESHOLDS.get(key)
+    if spec is None:
+        return None
+    direction, thresholds = spec
+    v = float(value)
+    t_excellent, t_good, t_medium = (t for t, _ in thresholds)
+    if direction == "higher":
+        if v >= t_excellent:
+            return 4.0
+        if v >= t_good:
+            return 3.0 + (v - t_good) / (t_excellent - t_good)
+        if v >= t_medium:
+            return 2.0 + (v - t_medium) / (t_good - t_medium)
+        return 1.0 + v / t_medium
+    else:  # lower is better
+        if v <= t_excellent:
+            return 4.0
+        if v <= t_good:
+            return 3.0 + (t_good - v) / (t_good - t_excellent)
+        if v <= t_medium:
+            return 2.0 + (t_medium - v) / (t_medium - t_good)
+        return 1.0 + (1.0 - v) / (1.0 - t_medium)
+
+
 def overall_rating(overall: dict[str, Any]) -> tuple[str, float] | None:
     """对 overall 汇总给出综合评级。
 
     取 overall 中"存在且可评级"的质量指标
     （accuracy / token_f1 / bleu1 / evidence_recall /
-    abstention_accuracy / stale_rate）各自的评级点数均值，
+    abstention_accuracy / stale_rate）各自的**连续点数**均值
+    （:func:`continuous_points`，档内随数值线性变化），
     均值 >= 3.5 优秀、>= 2.5 良好、>= 1.5 中等，否则较差。
 
     Args:
         overall: 汇总指标字典（aggregate 输出的 ``metrics["overall"]``）。
 
     Returns:
-        ``(标签, 点数均值)``；overall 中不存在任何可评级指标时返回 ``None``。
+        ``(标签, 连续点数均值)``；overall 中不存在任何可评级指标时返回 ``None``。
     """
     points: list[float] = []
     for key in METRIC_THRESHOLDS:
@@ -114,9 +165,9 @@ def overall_rating(overall: dict[str, Any]) -> tuple[str, float] | None:
             value = float(overall[key])
         except (TypeError, ValueError):
             continue
-        label = rate_metric(key, value)
-        if label is not None:
-            points.append(float(rating_points(label)))
+        pts = continuous_points(key, value)
+        if pts is not None:
+            points.append(pts)
     if not points:
         return None
     mean = sum(points) / len(points)

@@ -80,7 +80,7 @@ python -m membench.cli evaluate --adapter <a> --include-lme-s  # 追加 LongMemE
 - **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**）时落 `DIR/eval_<adapter>_<platform>_<ts>/`，内含 `evaluate_report.md`、`evaluate_summary.json` 与 `runs/<各数据集 run_id>/`（自包含）；不传时保持历史位置 `<out_dir>/evaluate_<ts>/`。
 
 run 产物（`runs/<run_id>/`）：`results.jsonl`（逐题原始记录）、`metrics.json`、`report.md`、`fig_category_accuracy.png`、`fig_latency_hist.png`。
-report.md 中质量指标以 **"评价（评分）"** 呈现（如 `优秀（0.923）`，四级：优秀/良好/中等/较差），开头附 **综合评级**（六项质量指标评级点数均值，阈值 3.5/2.5/1.5）；效率成本指标不参与评级（依赖部署环境）。评级规则见 `membench/ratings.py` 的 `METRIC_THRESHOLDS` 表，可按团队标准调整。
+report.md 中质量指标以 **"评价（评分）"** 呈现（如 `优秀（0.923）`，四级：优秀/良好/中等/较差），开头附 **综合评级**（六项质量指标连续点数均值，1.0~4.0，档内随数值线性变化，阈值 3.5/2.5/1.5）；效率成本指标不参与评级（依赖部署环境）。评级规则见 `membench/ratings.py` 的 `METRIC_THRESHOLDS` 表，可按团队标准调整。
 compare 产物（`output_root()/ab_<tag>_<ts>/`，见「产物布局」）：A/B 各自带 run 副本 + `compare_report.md` + `fig_metric_diff.png`。
 
 使用 LLM 判分（可选）：

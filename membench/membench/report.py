@@ -317,7 +317,7 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
             )
             lines.append("")
 
-    # 综合评级（质量指标评级点数均值；无可评级指标则不输出）
+    # 综合评级（质量指标连续点数均值；无可评级指标则不输出）
     overall_rated = overall_rating(overall)
     if overall_rated is not None:
         label, mean_points = overall_rated
@@ -325,8 +325,8 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
         lines.append("")
         lines.append(
             "<sub>评级规则：取六项质量指标（accuracy / token_f1 / bleu1 / "
-            "evidence_recall / abstention_accuracy / stale_rate）的评级点数"
-            "（优秀=4、良好=3、中等=2、较差=1）均值，阈值 3.5 / 2.5 / 1.5；"
+            "evidence_recall / abstention_accuracy / stale_rate）的连续点数"
+            "（1.0~4.0，档内随数值线性变化）均值，阈值 3.5 / 2.5 / 1.5；"
             "效率成本指标不参与评级。</sub>"
         )
         lines.append("")

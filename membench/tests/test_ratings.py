@@ -159,7 +159,7 @@ def test_rating_points_invalid_label() -> None:
 
 
 def test_overall_rating_mixed_metrics() -> None:
-    """混合指标：accuracy 0.92(4) + bleu1 0.35(2) -> 均值 3.0 -> 良好。"""
+    """混合指标：accuracy 0.92(4.0) + bleu1 0.35(2.33) -> 均值 3.17 -> 良好。"""
     overall = {
         "accuracy": 0.92,
         "bleu1": 0.35,
@@ -169,7 +169,8 @@ def test_overall_rating_mixed_metrics() -> None:
     result = overall_rating(overall)
     assert result is not None
     label, mean = result
-    assert mean == pytest.approx(3.0)
+    # accuracy 0.92 >= 0.90 → 4.0；bleu1 0.35 在 [0.30,0.45) 档内 → 2.333
+    assert mean == pytest.approx((4.0 + 2.0 + 0.05 / 0.15) / 2)
     assert label == "良好"
 
 
@@ -211,6 +212,78 @@ def test_overall_rating_skips_non_numeric() -> None:
     assert overall_rating({"accuracy": "n/a"}) is None
     result = overall_rating({"accuracy": "n/a", "bleu1": 0.5})
     assert result is not None and result[0] == "良好"
+
+
+# ---------------------------------------------------------------------------
+# continuous_points：档内连续点数
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        # accuracy 阈值边界：与离散点数精确一致
+        ("accuracy", 0.90, 4.0),
+        ("accuracy", 0.75, 3.0),
+        ("accuracy", 0.60, 2.0),
+        ("accuracy", 0.0, 1.0),
+        # accuracy 档内线性
+        ("accuracy", 0.825, 3.5),   # 良好档中点
+        ("accuracy", 0.675, 2.5),   # 中等档中点
+        ("accuracy", 0.30, 1.5),    # 较差档中点
+        # stale_rate 阈值边界
+        ("stale_rate", 0.03, 4.0),
+        ("stale_rate", 0.10, 3.0),
+        ("stale_rate", 0.20, 2.0),
+        ("stale_rate", 1.0, 1.0),
+        # stale_rate 档内线性
+        ("stale_rate", 0.065, 3.5),  # 良好档中点
+        ("stale_rate", 0.15, 2.5),   # 中等档中点
+        ("stale_rate", 0.60, 1.5),   # 较差档中点
+        # 不可评级指标
+        ("latency_p50_ms", 100.0, None),
+    ],
+)
+def test_continuous_points(key: str, value: float, expected: float | None) -> None:
+    """连续点数：阈值边界与离散一致，档内线性插值。"""
+    from membench.ratings import continuous_points
+
+    result = continuous_points(key, value)
+    if expected is None:
+        assert result is None
+    else:
+        assert result == pytest.approx(expected, abs=1e-6)
+
+
+def test_overall_rating_sensitive_to_within_bucket_improvement() -> None:
+    """接入侧反馈回归：档内改进（不跨档）应反映到综合评级点数上。
+
+    反馈案例：accuracy 0.647→0.715（+6.8pt）、abstention 0.476→0.567（+9.1pt），
+    六项指标无一跨档，旧口径下综合评级同为"中等（1.7/4.0）"，看不出提升。
+    新口径（连续点数）下，综合评级分数应有可见上升。
+    """
+    before = {
+        "accuracy": 0.647,
+        "token_f1": 0.60,
+        "bleu1": 0.35,
+        "evidence_recall": 0.75,
+        "abstention_accuracy": 0.476,
+        "stale_rate": 0.10,
+    }
+    after = {
+        "accuracy": 0.715,
+        "token_f1": 0.60,
+        "bleu1": 0.35,
+        "evidence_recall": 0.75,
+        "abstention_accuracy": 0.567,
+        "stale_rate": 0.10,
+    }
+    r_before = overall_rating(before)
+    r_after = overall_rating(after)
+    assert r_before is not None and r_after is not None
+    # 标签不变（都没跨档），但点数应上升
+    assert r_before[0] == r_after[0]
+    assert r_after[1] > r_before[1]
 
 
 # ---------------------------------------------------------------------------
