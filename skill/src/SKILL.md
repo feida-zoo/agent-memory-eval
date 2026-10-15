@@ -186,7 +186,7 @@ python -m membench.cli compare --baseline runs/<旧commit的run> --candidate run
 诊断（读 report.md：六维指标 / 分题型 / 失败样例 Top10 / 门禁 → 结论"问题出在哪"）
   → 优化建议（可执行方向清单，按收益排序）
   → 优化 plan（拆成单变量改动、排优先级、界定验收指标）
-  → subagent 执行（用 subagent 落地单个改动）
+  → 执行（落地单个改动；范围明确且独立时才交 subagent，默认当前会话执行）
   → AB 对比（消融 + 可比性前置校验）
   → 优化报告（方案 + 可归因效果，落 ab_<tag>_<ts>/optimization_report.md）
 ```
@@ -196,7 +196,7 @@ python -m membench.cli compare --baseline runs/<旧commit的run> --candidate run
 | 1 诊断 | 读基线 `report.md`（六维指标、by_category、失败样例 Top10、门禁），对照 `optimize_loop.md` 的"现象→短板维度"表定位 | 诊断结论（问题维度 + 证据） | — |
 | 2 优化建议 | 给出可执行方向清单，按预期收益排序 | 建议清单 | — |
 | 3 优化 plan | 每条拆成**单变量**改动、排优先级、界定验收指标（含门禁阈值） | plan（一人一步） | — |
-| 4 执行 | 用 subagent 落地单个改动（只改一处） | 代码改动 | **⛔ 检查点①：改完后先问用户是否跑 A/B** |
+| 4 执行 | 落地单个改动（只改一处；默认当前会话执行，范围明确且独立时才用 subagent） | 代码改动 | **⛔ 检查点①：改完后先问用户是否跑 A/B** |
 | 5 AB 对比 | 固定模型/harness、只切优化开关；先 `--require-comparable` 校验再 `compare` | `ab_<tag>_<ts>/` | **⛔ 检查点②：跑前先确认数据集范围、A/B 分组与平台/标签** |
 | 6 优化报告 | 记录方案 + 可归因效果（含门禁结论） | `ab_<tag>_<ts>/optimization_report.md` | — |
 

@@ -5,7 +5,7 @@
 闭环六阶段：
 
 ```
-诊断 → 优化建议 → 优化 plan → subagent 执行 → AB 对比 → 优化报告
+诊断 → 优化建议 → 优化 plan → 执行 → AB 对比 → 优化报告
 ```
 
 配套材料：入门教程 `membench/examples/optimize_loop.md`；对比与可比性见 `references/compare_workflows.md`。
@@ -76,11 +76,11 @@
 
 ---
 
-## 阶段 4：subagent 执行——落地单个改动
+## 阶段 4：执行——落地单个改动
 
 **输入**：阶段 3 的 plan 中的一条改动。
 
-**动作**：用 subagent 落地这一条改动（只改一处），改完自测跑通：
+**动作**：落地这一条改动（只改一处），改完自测跑通：
 
 ```bash
 cd <skill目录>/membench
@@ -89,6 +89,13 @@ python -m membench.cli run --adapter <adapter> --dataset <同一数据集> --jud
 
 - 基线 run 请提前备份（如 `cp -r runs/<run_a> runs/baseline_v1`），防止被覆盖。
 - 改动过程中如顺手改了别处，**回退**——多变量会让 AB 结论失效。
+
+**执行方式（subagent 不是默认动作，按改动性质决定）**：
+
+- 改动范围明确、独立、能一次说清（如"把 `ingest` 的追加改成同主题 UPDATE，并补单测"）→ 可以交给 subagent 并行落地；
+- 需要反复对照上下文、与用户确认细节、或改动面很小（几行）→ 直接在当前会话改更省——subagent 的上下文交接成本可能比改动本身还高。
+
+默认在当前会话执行；执行方式不改变本阶段的纪律（单变量）与检查点。
 
 **产物**：代码改动 + 候选 run。
 
