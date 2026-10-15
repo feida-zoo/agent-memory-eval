@@ -3,7 +3,8 @@
 图表统一低饱和配色；尽量自动探测中文字体以避免乱码。
 公共入口：
 - :func:`render_run_report`     单个 run 的 report.md + fig_category_accuracy.png + fig_latency_hist.png
-- :func:`render_compare_report` compare_report.md + fig_metric_diff.png
+- :func:`render_compare_report` compare_report.md + fig_metric_diff.png（质量+效率）+ fig_category_diff.png（分题型）
+- :func:`fig_dataset_overview`  evaluate 报告用：各数据集质量 + 效率分组条形图
 - :func:`copy_report`           --report-out：把报告连带引用图片复制到指定目录
 """
 
@@ -53,6 +54,8 @@ METRIC_ZH: dict[str, str] = {
     "query latency p50 (ms)": "查询延迟 p50（ms）",
     "query latency p95 (ms)": "查询延迟 p95（ms）",
     "avg input tokens / query": "平均输入 token / 题",
+    "avg output tokens / query": "平均输出 token / 题",
+    "avg ingest latency (ms)": "平均 ingest 耗时（ms）",
     "avg llm calls / query": "平均 LLM 调用次数 / 题",
 }
 
@@ -70,7 +73,7 @@ BASELINES: list[tuple[str, str, str, Any]] = [
     ("abstention_accuracy", "拒答（abstention_accuracy）", ">= 0.80", lambda v: v >= 0.80),
 ]
 
-# compare 分组条形图使用的关键指标（均为 [0,1] 区间，可同图比较）
+# compare 分组条形图使用的质量指标（均为 [0,1] 区间，可同图比较）
 DIFF_METRICS: list[str] = [
     "accuracy",
     "token_f1",
@@ -79,6 +82,19 @@ DIFF_METRICS: list[str] = [
     "abstention_accuracy",
     "stale_rate",
 ]
+
+#: 效率成本指标（compare 图第二子图；单位各异，仅看相对高低，值标签直接标注）。
+EFFICIENCY_DIFF_METRICS: list[str] = [
+    "latency_p50_ms",
+    "latency_p95_ms",
+    "avg_input_tokens",
+    "avg_output_tokens",
+    "avg_llm_calls",
+]
+
+#: A/B 变化高亮阈值：质量指标 diff 绝对值超过该值即视为"明显"优化/劣化，
+#: 与 compare 门禁默认阈值（--acc-threshold / --stale-threshold 0.02）同口径。
+HIGHLIGHT_THRESHOLD: float = 0.02
 
 _FONTS_READY = False
 
@@ -172,26 +188,140 @@ def fig_metric_diff(
     label_b: str,
     out_path: str,
 ) -> str:
-    """compare 用：关键指标 A vs B 分组条形图。"""
+    """compare 用：A vs B 分组条形图，左质量指标、右效率成本。
+
+    质量子图对"明显变化"高亮：diff（B-A，stale_rate 反向）绝对值
+    > :data:`HIGHLIGHT_THRESHOLD` 时 B 条染绿（优化）/ 红（劣化），
+    其余保持默认色。效率子图单位各异，仅看相对高低并直接标注数值。
+    """
     _setup_fonts()
     keys = [k for k in DIFF_METRICS if k in overall_a and k in overall_b]
     vals_a = [float(overall_a.get(k, 0.0)) for k in keys]
     vals_b = [float(overall_b.get(k, 0.0)) for k in keys]
 
-    x = list(range(len(keys)))
+    eff_keys = [k for k in EFFICIENCY_DIFF_METRICS if k in overall_a and k in overall_b]
+    eff_a = [float(overall_a.get(k, 0.0)) for k in eff_keys]
+    eff_b = [float(overall_b.get(k, 0.0)) for k in eff_keys]
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(max(12, 1.4 * len(keys)), 4.8))
     width = 0.38
-    fig, ax = plt.subplots(figsize=(max(8, 1.4 * len(keys)), 4.5))
+    x = list(range(len(keys)))
     ax.bar([i - width / 2 for i in x], vals_a, width, label=label_a, color=PALETTE[0])
-    ax.bar([i + width / 2 for i in x], vals_b, width, label=label_b, color=PALETTE[1])
+    colors_b = []
+    for k, va, vb in zip(keys, vals_a, vals_b):
+        diff = vb - va
+        if k == "stale_rate":
+            diff = -diff  # 越低越好，反向计"改进量"
+        if diff > HIGHLIGHT_THRESHOLD:
+            colors_b.append("#2e8b57")  # 明显优化
+        elif diff < -HIGHLIGHT_THRESHOLD:
+            colors_b.append("#cc3333")  # 明显劣化
+        else:
+            colors_b.append(PALETTE[1])
+    ax.bar([i + width / 2 for i in x], vals_b, width, label=label_b, color=colors_b)
     ax.set_xticks(x)
     ax.set_xticklabels(keys, rotation=20, ha="right")
     ax.set_ylim(0, 1.0)
     ax.set_ylabel("value")
-    ax.set_title("关键指标对比 (A vs B)")
+    ax.set_title("质量指标 (A vs B)")
     ax.legend()
     for i, (va, vb) in enumerate(zip(vals_a, vals_b)):
         ax.text(i - width / 2, va + 0.01, f"{va:.2f}", ha="center", fontsize=8)
         ax.text(i + width / 2, vb + 0.01, f"{vb:.2f}", ha="center", fontsize=8)
+
+    x2 = list(range(len(eff_keys)))
+    ax2.bar([i - width / 2 for i in x2], eff_a, width, label=label_a, color=PALETTE[0])
+    ax2.bar([i + width / 2 for i in x2], eff_b, width, label=label_b, color=PALETTE[1])
+    ax2.set_xticks(x2)
+    ax2.set_xticklabels(eff_keys, rotation=20, ha="right")
+    ax2.set_ylabel("cost (units differ)")
+    ax2.set_title("效率成本 (A vs B)")
+    ax2.legend()
+    for i, (va, vb) in enumerate(zip(eff_a, eff_b)):
+        ax2.text(i - width / 2, va, f"{va:.0f}", ha="center", va="bottom", fontsize=7)
+        ax2.text(i + width / 2, vb, f"{vb:.0f}", ha="center", va="bottom", fontsize=7)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
+
+
+def fig_category_diff(
+    by_category_a: dict[str, dict[str, Any]],
+    by_category_b: dict[str, dict[str, Any]],
+    label_a: str,
+    label_b: str,
+    out_path: str,
+) -> str:
+    """compare 用：分题型准确率 A vs B 横向分组条形图。"""
+    _setup_fonts()
+    cats = sorted(set(by_category_a) | set(by_category_b))
+    accs_a = [float(by_category_a.get(c, {}).get("accuracy", 0.0)) for c in cats]
+    accs_b = [float(by_category_b.get(c, {}).get("accuracy", 0.0)) for c in cats]
+
+    y = list(range(len(cats)))
+    height = 0.38
+    fig, ax = plt.subplots(figsize=(8, max(3.0, 0.6 * len(cats) + 1.5)))
+    ax.barh([i + height / 2 for i in y], accs_a, height, label=label_a, color=PALETTE[0])
+    ax.barh([i - height / 2 for i in y], accs_b, height, label=label_b, color=PALETTE[1])
+    ax.set_yticks(y)
+    ax.set_yticklabels([category_display(c) for c in cats])
+    ax.invert_yaxis()
+    ax.set_xlim(0, 1.0)
+    ax.set_xlabel("accuracy")
+    ax.set_title("分题型准确率对比 (A vs B)")
+    ax.legend()
+    for i, (va, vb) in enumerate(zip(accs_a, accs_b)):
+        ax.text(min(va + 0.01, 0.95), i + height / 2, f"{va:.2f}", va="center", fontsize=8)
+        ax.text(min(vb + 0.01, 0.95), i - height / 2, f"{vb:.2f}", va="center", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
+
+
+def fig_dataset_overview(
+    datasets: list[tuple[str, dict[str, Any]]],
+    out_path: str,
+) -> str:
+    """evaluate 用：各数据集质量指标与效率成本分组条形图。
+
+    Args:
+        datasets: ``[(数据集显示名, 该集 overall 指标字典), ...]``。
+        out_path: 输出 png 路径。
+    """
+    _setup_fonts()
+    q_keys = [k for k in DIFF_METRICS if any(k in ov for _, ov in datasets)]
+    eff_keys = [k for k in EFFICIENCY_DIFF_METRICS if any(k in ov for _, ov in datasets)]
+
+    fig, (ax, ax2) = plt.subplots(
+        1, 2, figsize=(max(12, 1.4 * max(len(q_keys), len(eff_keys), 1)), 4.8)
+    )
+    width = min(0.8 / max(len(datasets), 1), 0.38)
+    x = list(range(len(q_keys)))
+    for di, (name, ov) in enumerate(datasets):
+        vals = [float(ov.get(k, 0.0)) for k in q_keys]
+        offset = (di - (len(datasets) - 1) / 2) * width
+        ax.bar([i + offset for i in x], vals, width, label=name, color=PALETTE[di % len(PALETTE)])
+    ax.set_xticks(x)
+    ax.set_xticklabels(q_keys, rotation=20, ha="right")
+    ax.set_ylim(0, 1.0)
+    ax.set_ylabel("value")
+    ax.set_title("各数据集质量指标")
+    ax.legend(fontsize=8)
+
+    x2 = list(range(len(eff_keys)))
+    for di, (name, ov) in enumerate(datasets):
+        vals = [float(ov.get(k, 0.0)) for k in eff_keys]
+        offset = (di - (len(datasets) - 1) / 2) * width
+        ax2.bar([i + offset for i in x2], vals, width, label=name, color=PALETTE[di % len(PALETTE)])
+    ax2.set_xticks(x2)
+    ax2.set_xticklabels(eff_keys, rotation=20, ha="right")
+    ax2.set_ylabel("cost (units differ)")
+    ax2.set_title("各数据集效率成本")
+    ax2.legend(fontsize=8)
+
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
@@ -321,7 +451,7 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
     overall_rated = overall_rating(overall)
     if overall_rated is not None:
         label, mean_points = overall_rated
-        lines.append(f"**综合评级：{label}（{mean_points:.1f}/4.0）**")
+        lines.append(f"**综合评级：{label}（{mean_points:.2f}/4.0）**")
         lines.append("")
         lines.append(
             "<sub>评级规则：取六项质量指标（accuracy / token_f1 / bleu1 / "
@@ -356,6 +486,8 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
         [METRIC_ZH["query latency p50 (ms)"], _fmt(overall.get("latency_p50_ms", "n/a"))],
         [METRIC_ZH["query latency p95 (ms)"], _fmt(overall.get("latency_p95_ms", "n/a"))],
         [METRIC_ZH["avg input tokens / query"], _fmt(overall.get("avg_input_tokens", "n/a"))],
+        [METRIC_ZH["avg output tokens / query"], _fmt(overall.get("avg_output_tokens", "n/a"))],
+        [METRIC_ZH["avg ingest latency (ms)"], _fmt(overall.get("avg_ingest_latency_ms", "n/a"))],
         [METRIC_ZH["avg llm calls / query"], _fmt(overall.get("avg_llm_calls", "n/a"))],
     ]
     lines.append(_md_table(["指标", "值"], eff_rows))
@@ -444,11 +576,11 @@ def write_compare_report_md(
     lines.append(f"- 基线 A: `{id_a}`")
     rated_a = overall_rating(metrics_a.get("overall", {}))
     if rated_a is not None:
-        lines.append(f"- A 综合评级：{rated_a[0]}（{rated_a[1]:.1f}/4.0）")
+        lines.append(f"- A 综合评级：{rated_a[0]}（{rated_a[1]:.2f}/4.0）")
     lines.append(f"- 候选 B: `{id_b}`")
     rated_b = overall_rating(metrics_b.get("overall", {}))
     if rated_b is not None:
-        lines.append(f"- B 综合评级：{rated_b[0]}（{rated_b[1]:.1f}/4.0）")
+        lines.append(f"- B 综合评级：{rated_b[0]}（{rated_b[1]:.2f}/4.0）")
     lines.append("")
 
     lines.append("## 逐指标 diff（B - A）")
@@ -460,6 +592,8 @@ def write_compare_report_md(
     lines.append(_md_table(["指标", "A (基线)", "B (候选)", "diff"], rows or [["(无)", "", "", ""]]))
     lines.append("")
     lines.append("![关键指标对比](fig_metric_diff.png)")
+    lines.append("")
+    lines.append("![分题型准确率对比](fig_category_diff.png)")
     lines.append("")
 
     lines.append("## 门禁明细")
@@ -516,7 +650,8 @@ def render_compare_report(
     verdict: str,
     comparability: "dict[str, Any] | None" = None,
 ) -> None:
-    """生成 compare 目录下的 compare_report.md 与 fig_metric_diff.png。"""
+    """生成 compare 目录下的 compare_report.md 与两张对比图
+    （fig_metric_diff.png 质量+效率、fig_category_diff.png 分题型）。"""
     os.makedirs(out_dir, exist_ok=True)
     fig_metric_diff(
         metrics_a.get("overall", {}),
@@ -524,6 +659,13 @@ def render_compare_report(
         str(metrics_a.get("run_id", "A")),
         str(metrics_b.get("run_id", "B")),
         os.path.join(out_dir, "fig_metric_diff.png"),
+    )
+    fig_category_diff(
+        metrics_a.get("by_category", {}),
+        metrics_b.get("by_category", {}),
+        str(metrics_a.get("run_id", "A")),
+        str(metrics_b.get("run_id", "B")),
+        os.path.join(out_dir, "fig_category_diff.png"),
     )
     write_compare_report_md(out_dir, metrics_a, metrics_b, diffs, gates, verdict, comparability)
 

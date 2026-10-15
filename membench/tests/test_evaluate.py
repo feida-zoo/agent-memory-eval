@@ -299,6 +299,17 @@ def test_report_contents(
         raise AssertionError("报告中未出现 评价（评分） 样式")
     assert "参与数据集" in report
     assert "## 分数据集明细" in report
+    # 反馈 5：效率成本段 + 报告配图
+    assert "## 效率成本（分数据集）" in report
+    assert "avg_output_tokens" in report
+    assert "avg_ingest_latency_ms" in report
+    assert (Path(summary["_eval_dir"]) / "fig_dataset_overview.png").is_file()
+    assert "](fig_dataset_overview.png)" in report
+    # 综合评级保留两位小数（反馈 5：不强行截断到一位）
+    import re
+
+    m = re.search(r"综合评级：\S+（(\d+\.\d+)/4.0）", report)
+    assert m is not None and len(m.group(1).split(".")[1]) == 2
     # 数据集范围行（反馈 4：先确认本次实际评测的数据集 key 与来源）
     assert "数据集范围" in report
     assert "a（user-specified）" in report

@@ -179,6 +179,7 @@ def test_cli_compare_report_out_subdir(tmp_path: Path) -> None:
     assert ab_dir.name.startswith("ab_")
     assert (ab_dir / "compare_report.md").is_file()
     assert (ab_dir / "fig_metric_diff.png").is_file()
+    assert (ab_dir / "fig_category_diff.png").is_file()
     # A / B 各自带自包含的 runs/<run_id>/ 副本
     for arm in ("A", "B"):
         run_copies = [p for p in (ab_dir / arm / "runs").iterdir() if p.is_dir()]

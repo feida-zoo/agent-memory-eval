@@ -131,8 +131,8 @@ python -m membench.cli run --adapter <adapter> --dataset ~/.membench/datasets/lo
 | 命令 | 产物目录 | 内含 |
 |---|---|---|
 | `run --report-out DIR` | `DIR/eval_<adapter>_<platform>_<ts>/` | `report.md`、`metrics.json`、`fig_*.png`、`runs/<run_id>/`（自包含） |
-| `evaluate --report-out DIR` | `DIR/eval_<adapter>_<platform>_<ts>/` | `evaluate_report.md`、`evaluate_summary.json`、`runs/<各数据集 run_id>/` |
-| `compare --report-out DIR` | `DIR/ab_<tag>_<ts>/` | `A/{report.md,metrics.json,fig_*.png,runs/}`、`B/{...}`、`compare_report.md`（+`fig_metric_diff.png`）、可选 `optimization_report.md` |
+| `evaluate --report-out DIR` | `DIR/eval_<adapter>_<platform>_<ts>/` | `evaluate_report.md`、`evaluate_summary.json`、`fig_dataset_overview.png`、`runs/<各数据集 run_id>/` |
+| `compare --report-out DIR` | `DIR/ab_<tag>_<ts>/` | `A/{report.md,metrics.json,fig_*.png,runs/}`、`B/{...}`、`compare_report.md`（+`fig_metric_diff.png`、`fig_category_diff.png`）、可选 `optimization_report.md` |
 | `matrix --report-out DIR` | `DIR/matrix_<ts>/` | 矩阵报告、`matrix_result.json`、配图、`runs/<label>/` |
 
 不传 `--report-out` 时，runs 默认落到 `<skill目录>/output/runs/`（skill 环境）或工程根 `runs/`（开发环境）。命名 helper（`membench.layout.subdir_for` / `ab_subdir` / `matrix_subdir`）是公开可复用 API，不必自己重写约定。
@@ -272,7 +272,7 @@ python -m membench.cli doctor --target <url>     # 连通性 + 三端点契约�
 
 ## 结果解读准则
 
-- 报告中的质量指标以 **"评价（评分）"** 形式呈现（如 `优秀（0.923）`），四级：优秀 / 良好 / 中等 / 较差；报告开头有 **综合评级**（六项质量指标评级点数均值，满分 4.0）。效率成本指标（延迟/token/调用次数）依赖部署环境，不参与评级。各数据集特有的分数参照区间用 `dataset info <key>` 查询。
+- 报告中的质量指标以 **"评价（评分）"** 形式呈现（如 `优秀（0.923）`），四级：优秀 / 良好 / 中等 / 较差；报告开头有 **综合评级**（六项质量指标连续点数均值，1.0~4.0，档内随数值线性变化，满分 4.0）。效率成本指标（延迟/token/调用次数）依赖部署环境，不参与评级。各数据集特有的分数参照区间用 `dataset info <key>` 查询。
 - 办公 Agent 的**一票否决指标是 `stale_rate`**（陈旧召回，目标 ≤0.03）；红线指标是 `abstention_accuracy`（PII/凭证拒答，目标 =1.0）。
 - 先看 report.md 的"失败样例 Top10"定位短板题型，再决定优化方向；每次优化只改一个变量。
 - 背景知识与指标方法论见 `docs/Agent记忆系统深度研究报告.md` 第 4 章。

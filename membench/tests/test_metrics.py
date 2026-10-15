@@ -167,6 +167,8 @@ class TestAggregate:
             "latency_p50_ms",
             "latency_p95_ms",
             "avg_input_tokens",
+            "avg_output_tokens",
+            "avg_ingest_latency_ms",
             "avg_llm_calls",
             "n_questions",
         }
@@ -188,11 +190,18 @@ class TestAggregate:
             percentile([10, 20, 30, 40, 50, 60], 95)
         )
         assert overall["avg_input_tokens"] == pytest.approx(10.0)
+        assert overall["avg_output_tokens"] == pytest.approx(5.0)
+        assert overall["avg_ingest_latency_ms"] == pytest.approx(1.0)
         assert overall["avg_llm_calls"] == pytest.approx(0.0)
         assert overall["n_questions"] == 6
 
         by_cat = metrics["by_category"]
-        assert by_cat["single_hop"] == {"accuracy": pytest.approx(0.5), "n": 2}
+        # by_category 附 token_f1 均值（_record 固定 0.5）。
+        assert by_cat["single_hop"] == {
+            "accuracy": pytest.approx(0.5),
+            "token_f1": pytest.approx(0.5),
+            "n": 2,
+        }
         assert by_cat["knowledge_update"]["n"] == 2
         assert by_cat["abstention"]["accuracy"] == pytest.approx(0.5)
 

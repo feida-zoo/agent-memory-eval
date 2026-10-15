@@ -77,11 +77,11 @@ python -m membench.cli evaluate --adapter <a> --include-lme-s  # 追加 LongMemE
 - **宏平均**：六项质量指标（accuracy/token_f1/bleu1/evidence_recall/abstention_accuracy/stale_rate）先在各数据集内算分，再跨集等权平均；**指标只在具备对应标注能力的数据集上参与**——无 gold_stale 的集（locomo/longmemeval）不参与 stale_rate，无 evidence 标注的集（longmemeval/beam）不参与 evidence_recall，无 abstention 题的集不参与 abstention_accuracy。绝不用"记 0"稀释。
 - **门禁一票否决独立于总分**：办公域槽位 stale_rate > 0.03 → 总评"不达标"，退出码 1（可接 CI），无论综合评级多高。
 - **按需下载的公开集必须先 fetch**：`locomo` / `longmemeval_oracle` / `gatemem_office` / `beam_1m`（或 `beam_10m`）都没有内置文件，`evaluate` 从 `~/.membench/datasets/` 解析可用路径，缺失时报错提示先 `python -m membench.cli dataset fetch <key>`（`--quick` 不检查 BEAM 槽位）。judge=heuristic 跑 BEAM 会警告（rubric 型题目规则判分失真，建议 llm/client）。
-- **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**）时落 `DIR/eval_<adapter>_<platform>_<ts>/`，内含 `evaluate_report.md`、`evaluate_summary.json` 与 `runs/<各数据集 run_id>/`（自包含）；不传时保持历史位置 `<out_dir>/evaluate_<ts>/`。
+- **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**）时落 `DIR/eval_<adapter>_<platform>_<ts>/`，内含 `evaluate_report.md`、`evaluate_summary.json`、`fig_dataset_overview.png` 与 `runs/<各数据集 run_id>/`（自包含）；不传时保持历史位置 `<out_dir>/evaluate_<ts>/`。
 
 run 产物（`runs/<run_id>/`）：`results.jsonl`（逐题原始记录）、`metrics.json`、`report.md`、`fig_category_accuracy.png`、`fig_latency_hist.png`。
 report.md 中质量指标以 **"评价（评分）"** 呈现（如 `优秀（0.923）`，四级：优秀/良好/中等/较差），开头附 **综合评级**（六项质量指标连续点数均值，1.0~4.0，档内随数值线性变化，阈值 3.5/2.5/1.5）；效率成本指标不参与评级（依赖部署环境）。评级规则见 `membench/ratings.py` 的 `METRIC_THRESHOLDS` 表，可按团队标准调整。
-compare 产物（`output_root()/ab_<tag>_<ts>/`，见「产物布局」）：A/B 各自带 run 副本 + `compare_report.md` + `fig_metric_diff.png`。
+compare 产物（`output_root()/ab_<tag>_<ts>/`，见「产物布局」）：A/B 各自带 run 副本 + `compare_report.md` + `fig_metric_diff.png`（质量指标高亮明显变化 + 效率成本）+ `fig_category_diff.png`（分题型准确率对比）。
 
 使用 LLM 判分（可选）：
 

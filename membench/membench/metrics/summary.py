@@ -63,8 +63,11 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         - abstention_accuracy: abstention 题上 ``judge.abstained_pred`` 均值。
         - stale_rate: knowledge_update 题上 ``judge.stale`` 均值。
         - latency_p50_ms / latency_p95_ms: ``latency_ms`` 分位数（线性插值）。
+        - avg_input_tokens / avg_output_tokens: 每题输入 / 输出 token 均值。
+        - avg_ingest_latency_ms: 每题 ingest 侧耗时均值（"记记忆"本身的开销）。
         - avg_llm_calls: 每题 ``llm_calls + ingest_llm_calls`` 均值
           （ingest 成本按 runner 的记录归属口径计入）。
+        - by_category 除 accuracy 外附带 token_f1 均值（分题型质量）。
     """
     n = len(records)
 
@@ -89,6 +92,8 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         "latency_p50_ms": percentile((r.get("latency_ms", 0.0) for r in records), 50),
         "latency_p95_ms": percentile((r.get("latency_ms", 0.0) for r in records), 95),
         "avg_input_tokens": _mean(r.get("input_tokens", 0) for r in records),
+        "avg_output_tokens": _mean(r.get("output_tokens", 0) for r in records),
+        "avg_ingest_latency_ms": _mean(r.get("ingest_latency_ms", 0.0) for r in records),
         "avg_llm_calls": _mean(
             float(r.get("llm_calls", 0)) + float(r.get("ingest_llm_calls", 0))
             for r in records
@@ -99,12 +104,15 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     by_category: dict[str, dict[str, Any]] = {}
     for rec in records:
         cat = str(rec.get("category", "unknown"))
-        bucket = by_category.setdefault(cat, {"_correct": 0.0, "n": 0})
+        bucket = by_category.setdefault(cat, {"_correct": 0.0, "_f1": 0.0, "n": 0})
         bucket["_correct"] += 1.0 if _judge(rec).get("correct") else 0.0
+        bucket["_f1"] += float(rec.get("token_f1", 0.0))
         bucket["n"] += 1
     for cat, bucket in by_category.items():
         bucket["accuracy"] = bucket["_correct"] / bucket["n"] if bucket["n"] else 0.0
+        bucket["token_f1"] = bucket["_f1"] / bucket["n"] if bucket["n"] else 0.0
         del bucket["_correct"]
+        del bucket["_f1"]
 
     result: dict[str, Any] = {"overall": overall, "by_category": by_category}
 

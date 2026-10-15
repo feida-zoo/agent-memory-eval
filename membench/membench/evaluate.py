@@ -32,7 +32,7 @@ from membench import layout, paths
 from membench.data.info import resolve_available_path
 from membench.data.schema import load_dataset
 from membench.ratings import format_metric, overall_rating
-from membench.report import _md_table
+from membench.report import _md_table, fig_dataset_overview
 from membench.runner import Runner
 from membench.userdata import resolve_dataset
 
@@ -408,13 +408,13 @@ def write_evaluate_report(
     # 综合评级
     if rated is not None:
         label, mean_points = rated
-        lines.append(f"**综合评级：{label}（{mean_points:.1f}/4.0）**")
+        lines.append(f"**综合评级：{label}（{mean_points:.2f}/4.0）**")
         lines.append("")
         lines.append(
             "<sub>评级规则：先对六项质量指标（accuracy / token_f1 / bleu1 / "
             "evidence_recall / abstention_accuracy / stale_rate）做跨数据集宏平均融合"
-            "（指标仅在具备对应能力标注的数据集上参与），再取融合值的评级点数"
-            "（优秀=4、良好=3、中等=2、较差=1）均值，阈值 3.5 / 2.5 / 1.5；"
+            "（指标仅在具备对应能力标注的数据集上参与），再取融合值的连续点数"
+            "（1.0~4.0，档内随数值线性变化）均值，阈值 3.5 / 2.5 / 1.5；"
             "效率成本指标不参与评级。门禁为一票否决，独立于本评级。</sub>"
         )
         lines.append("")
@@ -435,15 +435,15 @@ def write_evaluate_report(
     lines.append(_md_table(["指标", "融合值", "参与数据集"], fused_rows))
     lines.append("")
 
-    # 分数据集明细表
+    # 分数据集明细表（质量 + 效率成本）
     lines.append("## 分数据集明细")
     lines.append("")
-    detail_cols = ["accuracy", "stale_rate", "abstention_accuracy", "evidence_recall"]
+    quality_cols = ["accuracy", "token_f1", "bleu1", "stale_rate", "abstention_accuracy", "evidence_recall"]
     detail_rows = []
     for r in results:
         overall = r.metrics.get("overall", {})
         row = [r.spec.name, str(overall.get("n_questions", "n/a"))]
-        for metric in detail_cols:
+        for metric in quality_cols:
             if participates(r.capabilities, metric) and metric in overall:
                 row.append(format_metric(metric, overall[metric]))
             else:
@@ -451,10 +451,39 @@ def write_evaluate_report(
         detail_rows.append(row)
     lines.append(
         _md_table(
-            ["数据集", "n_questions"] + detail_cols,
-            detail_rows or [["(无)", "", "", "", "", ""]],
+            ["数据集", "n_questions"] + quality_cols,
+            detail_rows or [["(无)"] + [""] * (len(quality_cols) + 1)],
         )
     )
+    lines.append("")
+
+    # 效率成本（分数据集）
+    lines.append("## 效率成本（分数据集）")
+    lines.append("")
+    eff_cols = [
+        "latency_p50_ms",
+        "latency_p95_ms",
+        "avg_input_tokens",
+        "avg_output_tokens",
+        "avg_ingest_latency_ms",
+        "avg_llm_calls",
+    ]
+    eff_rows = []
+    for r in results:
+        overall = r.metrics.get("overall", {})
+        row = [r.spec.name]
+        for metric in eff_cols:
+            v = overall.get(metric)
+            row.append(f"{float(v):.1f}" if isinstance(v, (int, float)) else "—")
+        eff_rows.append(row)
+    lines.append(
+        _md_table(
+            ["数据集"] + eff_cols,
+            eff_rows or [["(无)"] + [""] * len(eff_cols)],
+        )
+    )
+    lines.append("")
+    lines.append("![各数据集质量与效率](fig_dataset_overview.png)")
     lines.append("")
 
     # 各数据集 run 目录链接（指向报告目录下复制后的 runs/<run_id>/）
@@ -468,6 +497,12 @@ def write_evaluate_report(
     out_path = os.path.join(eval_dir, "evaluate_report.md")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+
+    # 报告配图：各数据集质量 + 效率分组条形图
+    fig_dataset_overview(
+        [(r.spec.name, r.metrics.get("overall", {})) for r in results],
+        os.path.join(eval_dir, "fig_dataset_overview.png"),
+    )
     return out_path
 
 
