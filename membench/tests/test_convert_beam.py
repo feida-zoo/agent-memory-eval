@@ -112,21 +112,25 @@ def test_convert_beam_dialogue_structure(tmp_path: Path) -> None:
 
 
 def test_convert_beam_category_mapping(tmp_path: Path) -> None:
+    """BEAM 10 类按 1:1 直传，question.category 保留 BEAM 原始 key
+    （信息抽取/多 session 推理/事件排序/时序推理/知识更新/矛盾消解/指令遵循/
+    偏好遵循/摘要/拒答）；不再合并到 membench 7 类通用约定。
+    """
     chat_dir = _write_chat(tmp_path, "1")
     dialogue = convert_beam(chat_dir, scale="1m", chat_id="1")
     by_qid = {q["qid"]: q for q in dialogue["questions"]}
 
     expected = {
-        "beam_1m_1_information_extraction_1": "single_hop",
-        "beam_1m_1_multi_session_reasoning_1": "multi_hop",
-        "beam_1m_1_event_ordering_1": "temporal",
-        "beam_1m_1_temporal_reasoning_1": "temporal",
+        "beam_1m_1_information_extraction_1": "information_extraction",
+        "beam_1m_1_multi_session_reasoning_1": "multi_session_reasoning",
+        "beam_1m_1_event_ordering_1": "event_ordering",
+        "beam_1m_1_temporal_reasoning_1": "temporal_reasoning",
         "beam_1m_1_knowledge_update_1": "knowledge_update",
         "beam_1m_1_knowledge_update_2": "knowledge_update",
-        "beam_1m_1_contradiction_resolution_1": "knowledge_update",
-        "beam_1m_1_instruction_following_1": "preference",
-        "beam_1m_1_preference_following_1": "preference",
-        "beam_1m_1_summarization_1": "open_ended",
+        "beam_1m_1_contradiction_resolution_1": "contradiction_resolution",
+        "beam_1m_1_instruction_following_1": "instruction_following",
+        "beam_1m_1_preference_following_1": "preference_following",
+        "beam_1m_1_summarization_1": "summarization",
         "beam_1m_1_abstention_1": "abstention",
     }
     assert {qid: q["category"] for qid, q in by_qid.items()} == expected
@@ -204,7 +208,10 @@ def test_convert_beam_split(tmp_path: Path) -> None:
     assert stats["skipped"] == 1
     assert stats["questions"] == 22
     assert stats["categories"]["abstention"] == 2
-    assert stats["categories"]["knowledge_update"] == 6  # ku 2×2 + contradiction 1×2
+    # knowledge_update / contradiction_resolution 分开统计：
+    # knowledge_update 2 题/chat × 2 chat = 4；contradiction_resolution 1 题/chat × 2 chat = 2
+    assert stats["categories"]["knowledge_update"] == 4
+    assert stats["categories"]["contradiction_resolution"] == 2
 
     # 输出可被 schema.load_dataset 加载
     dialogues = load_dataset(out)

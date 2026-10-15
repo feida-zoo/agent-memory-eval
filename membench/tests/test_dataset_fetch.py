@@ -307,11 +307,11 @@ def test_fetch_gatemem_end_to_end(
     assert len(questions) == 4
     by_id = {q.qid: q for q in questions}
     # 单用户转换：privacy-refuse 题被标记 ignore
-    assert by_id["ck_refuse"].category == "abstention"
+    assert by_id["ck_refuse"].category == "privacy_refuse"
     assert by_id["ck_refuse"].ignore is True
-    assert by_id["ck_utility"].category == "single_hop"
+    assert by_id["ck_utility"].category == "utility_answer"
     assert by_id["ck_utility"].gold_answer == "221,000 USD"
-    assert by_id["ck_safety"].category == "abstention"
+    assert by_id["ck_safety"].category == "safety_no_memory"
     assert by_id["ck_safety"].ignore is False
 
 
@@ -328,7 +328,8 @@ def test_fetch_beam_minimal(
     dialogues = load_dataset(out)
     assert len(dialogues) == 1
     assert len(dialogues[0].questions) == 1
-    assert dialogues[0].questions[0].category == "single_hop"
+    # BEAM 1:1 直传，第一类（information_extraction）保留原 key。
+    assert dialogues[0].questions[0].category == "information_extraction"
 
 
 # ---------------------------------------------------------------------------

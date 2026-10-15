@@ -15,7 +15,8 @@
     - accuracy / token_f1 / bleu1：所有数据集参与；
     - evidence_recall：仅 has_evidence（任一题目有 evidence 标注）的数据集参与；
     - stale_rate：仅 has_stale（任一题目有 gold_stale 标注）的数据集参与；
-    - abstention_accuracy：仅 has_abstention（任一题目 category=="abstention"）的数据集参与；
+    - abstention_accuracy：仅 has_abstention（任一题目为拒答题：category 为
+      abstention 或 gold 为拒答哨兵值）的数据集参与；
     融合值 = 参与集该指标 overall 值的算术平均。
 """
 
@@ -30,7 +31,7 @@ from typing import Any, Union
 
 from membench import layout, paths
 from membench.data.info import resolve_available_path
-from membench.data.schema import load_dataset
+from membench.data.schema import is_abstention, load_dataset
 from membench.ratings import format_metric, overall_rating
 from membench.report import _md_table, fig_dataset_overview, metric_label
 from membench.runner import Runner
@@ -189,11 +190,11 @@ def scan_capabilities(path: Union[str, Path]) -> dict[str, bool]:
     """扫描数据集题目，得到能力标注。
 
     ignore=true 的题不参与评分，扫描时排除——能力标注基于实际参与
-    评分的题判断（例如全部 abstention 题都被忽略时 has_abstention=False）。
+    评分的题判断（例如全部拒答题都被忽略时 has_abstention=False）。
 
     Returns:
         ``{"has_evidence": any(q.evidence), "has_stale": any(q.gold_stale),
-        "has_abstention": any(category=="abstention")}``（均不含忽略题）。
+        "has_abstention": any(is_abstention(...))}``（均不含忽略题）。
     """
     dialogues = load_dataset(path)
     has_evidence = False
@@ -207,7 +208,7 @@ def scan_capabilities(path: Union[str, Path]) -> dict[str, bool]:
                 has_evidence = True
             if q.gold_stale:
                 has_stale = True
-            if q.category == "abstention":
+            if is_abstention(q.category, q.gold_answer):
                 has_abstention = True
     return {
         "has_evidence": has_evidence,

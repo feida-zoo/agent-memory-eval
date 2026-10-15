@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
+from membench.data.schema import is_abstention
+
 __all__ = ["percentile", "aggregate"]
 
 
@@ -48,8 +50,8 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     Args:
         records: results.jsonl 风格的记录列表，每条含
-            ``category / evidence_hit / token_f1 / bleu1 / latency_ms /
-            input_tokens / llm_calls / ingest_llm_calls`` 以及
+            ``category / gold_answer / evidence_hit / token_f1 / bleu1 /
+            latency_ms / input_tokens / llm_calls / ingest_llm_calls`` 以及
             ``judge``（含 correct / abstained_pred / stale）字段。
 
     Returns:
@@ -59,8 +61,9 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     指标口径：
         - accuracy: ``judge.correct`` 均值。
-        - evidence_recall: ``evidence_hit`` 均值（仅非 abstention 题）。
-        - abstention_accuracy: abstention 题上 ``judge.abstained_pred`` 均值。
+        - evidence_recall: ``evidence_hit`` 均值（仅非拒答题）。
+        - abstention_accuracy: 拒答题（category 为 abstention 或 gold 为拒答
+          哨兵值，见 ``schema.is_abstention``）上 ``judge.abstained_pred`` 均值。
         - stale_rate: knowledge_update 题上 ``judge.stale`` 均值。
         - latency_p50_ms / latency_p95_ms: ``latency_ms`` 分位数（线性插值）。
         - avg_input_tokens / avg_output_tokens: 每题输入 / 输出 token 均值。
@@ -74,8 +77,13 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     def _judge(rec: dict[str, Any]) -> dict[str, Any]:
         return rec.get("judge", {}) or {}
 
-    non_abstention = [r for r in records if r.get("category") != "abstention"]
-    abstention = [r for r in records if r.get("category") == "abstention"]
+    def _is_abstention_rec(rec: dict[str, Any]) -> bool:
+        return is_abstention(
+            str(rec.get("category", "")), str(rec.get("gold_answer", ""))
+        )
+
+    non_abstention = [r for r in records if not _is_abstention_rec(r)]
+    abstention = [r for r in records if _is_abstention_rec(r)]
     knowledge_update = [r for r in records if r.get("category") == "knowledge_update"]
 
     overall = {

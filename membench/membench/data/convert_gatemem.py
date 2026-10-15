@@ -25,14 +25,14 @@ checkpoints（每行一个 checkpoint，即一道挂接在某 episode 上的评�
      "judge_spec": {"include": [str, ...], "not_include": [str, ...], "notes": str},
      "leak_targets": [...]}
 
-checkpoint -> membench question 映射表：
+checkpoint -> membench question 映射表（1:1 直传，保留原始语义）：
 
-    (utility, answer)          -> single_hop
+    (utility, answer)          -> utility_answer
                                   gold_answer = judge_spec.include 以 "; " 拼接
-    (privacy, refuse)          -> abstention（gold_answer = "<ABSTAIN>"）
-    (privacy, answer_redacted) -> single_hop
+    (privacy, refuse)          -> privacy_refuse（gold_answer = "<ABSTAIN>"）
+    (privacy, answer_redacted) -> privacy_answer_redacted
                                   gold_answer = judge_spec.include 以 "; " 拼接
-    (safety,  no_memory)       -> abstention（gold_answer = "<ABSTAIN>"；
+    (safety,  no_memory)       -> safety_no_memory（gold_answer = "<ABSTAIN>"；
                                   对话中含删除请求，系统处理后不应再记得）
 
 其他 (query_type, expected_action) 组合：跳过并计数，转换结束后打印警告。
@@ -78,12 +78,17 @@ from pathlib import Path
 #: abstention 题的 gold_answer 哨兵值。
 ABSTAIN_SENTINEL = "<ABSTAIN>"
 
-#: (query_type, expected_action) -> membench category；None 表示 abstention 哨兵题。
+#: (query_type, expected_action) -> question.category（1:1 直传）
+#: 旧的"utility_answer + privacy_answer_redacted → single_hop / privacy_refuse + safety_no_memory →
+#: abstention"合并会丢诊断信息——privacy 和 safety 在 gatemem 里语义不同，
+#: 前者考"权限语义下该不该拒"，后者考"删除后是否还记"，必须分开。
+#: 现在按 (query_type, expected_action) 4 类原样写进 question.category；
+#: ``membench.data.schema.CATEGORIES`` 是软约定不再校验。
 _ACTION_MAP = {
-    ("utility", "answer"): "single_hop",
-    ("privacy", "refuse"): "abstention",
-    ("privacy", "answer_redacted"): "single_hop",
-    ("safety", "no_memory"): "abstention",
+    ("utility", "answer"): "utility_answer",
+    ("privacy", "refuse"): "privacy_refuse",
+    ("privacy", "answer_redacted"): "privacy_answer_redacted",
+    ("safety", "no_memory"): "safety_no_memory",
 }
 
 #: role 归一化：assistant 侧关键词（子串匹配，均为小写）。
@@ -154,7 +159,10 @@ def _convert_checkpoint(cp: dict, ignore_privacy_refuse: bool = False) -> dict |
         "category": category,
         "evidence": [],
     }
-    if category == "abstention":
+    # category 不再合并，"拒答类"题改为按 key 判定——
+    # ``(privacy, refuse)`` 与 ``(safety, no_memory)`` 都期望系统拒答，
+    # gold_answer 设为 abstention 哨兵。
+    if key in (("privacy", "refuse"), ("safety", "no_memory")):
         question["gold_answer"] = ABSTAIN_SENTINEL
     else:
         include = (cp.get("judge_spec") or {}).get("include") or []

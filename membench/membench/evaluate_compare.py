@@ -48,6 +48,7 @@ from membench.report import (
     PALETTE,
     _md_table,
     _setup_fonts,
+    category_display,
     metric_label,
     metric_labels,
 )
@@ -445,6 +446,55 @@ def _write_evaluate_compare_report(
     lines.append("")
     lines.append("![逐数据集准确率差值](fig_per_dataset_diff.png)")
     lines.append("")
+
+    # 1.5 逐数据集 by_category diff：每个数据集按其 raw category 集合分别画
+    # A vs B 准确率与 Δ；不同数据集的 category 互不合并
+    # （BEAM 10 类、gatemem 4 类、locomo 5 类、longmemeval 6 类各自保留）。
+    lines.append("## 逐数据集题型 diff（B - A）")
+    lines.append("")
+    lines.append(
+        "<sub>每个数据集按各自的 raw category 列出 A/B 准确率与差值；"
+        "category 集合按数据集设计意图保留（BEAM 10 类 / gatemem 4 类 / "
+        "locomo 5 类 / longmemeval 6 类），不跨数据集强行合并。</sub>"
+    )
+    lines.append("")
+    for arm in arms:
+        a_by_cat = arm.baseline.get("by_category", {})
+        b_by_cat = arm.candidate.get("by_category", {})
+        if not a_by_cat and not b_by_cat:
+            continue
+        all_cats = sorted(set(a_by_cat) | set(b_by_cat))
+        header = ["题型（category）", "n", "A 准确率", "B 准确率", "Δ"]
+        rows_bc: list[list[str]] = []
+        for cat in all_cats:
+            a_entry = a_by_cat.get(cat, {})
+            b_entry = b_by_cat.get(cat, {})
+            n_a = int(a_entry.get("n", 0))
+            n_b = int(b_entry.get("n", 0))
+            n = n_a or n_b
+            acc_a = float(a_entry.get("accuracy", 0.0)) if n_a else None
+            acc_b = float(b_entry.get("accuracy", 0.0)) if n_b else None
+            if acc_a is None and acc_b is None:
+                continue
+            if acc_a is None:
+                diff_str = "—"
+                a_str = "—"
+                b_str = f"{acc_b:.3f}" if acc_b is not None else "—"
+            elif acc_b is None:
+                a_str = f"{acc_a:.3f}"
+                b_str = "—"
+                diff_str = "—"
+            else:
+                diff_str = f"{acc_b - acc_a:+.3f}"
+                a_str = f"{acc_a:.3f}"
+                b_str = f"{acc_b:.3f}"
+            rows_bc.append([category_display(cat), str(n), a_str, b_str, diff_str])
+        if not rows_bc:
+            continue
+        lines.append(f"### {arm.spec.name}")
+        lines.append("")
+        lines.append(_md_table(header, rows_bc))
+        lines.append("")
 
     # 2. 融合 diff
     lines.append("## 跨数据集融合 diff（B - A）")

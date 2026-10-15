@@ -88,6 +88,14 @@ class TestClientLLMJudge:
         r2 = judge.grade(q, "<ABSTAIN>", "狗狗今年3岁。")
         assert r2.correct is False and r2.abstained_pred is False
 
+    def test_abstention_sentinel_rules_based(self) -> None:
+        """gold 为拒答哨兵值即走规则判定，不要求 category=="abstention"。"""
+        judge = ClientLLMJudge(_EchoClient())
+        q = _Q(category="privacy_refuse")
+        r = judge.grade(q, "<ABSTAIN>", "我不知道，相关信息不在我的记忆中。")
+        assert r.correct is True and r.abstained_pred is True
+        assert "规则判定" in r.reason
+
     def test_malformed_llm_output_falls_back(self) -> None:
         class _GarbageClient:
             def chat(self, prompt: str) -> str:

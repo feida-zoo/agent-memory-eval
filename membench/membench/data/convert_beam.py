@@ -22,20 +22,15 @@ chat.json 为 batch 列表，每个 batch 形如::
 对应输出中的一个 session。
 
 probing_questions.json 为 dict，key 为 10 种题型，value 为题目列表。
-题型 -> membench category 映射表：
+题型 key 1:1 直传为 question.category（不做多对一归并）：
 
-    information_extraction   -> single_hop
-    multi_session_reasoning  -> multi_hop
-    event_ordering           -> temporal
-    temporal_reasoning       -> temporal
-    knowledge_update         -> knowledge_update（potential_confusion 非空
-                                字符串时填入 gold_stale）
-    contradiction_resolution -> knowledge_update
-    instruction_following    -> preference
-    preference_following     -> preference
-    summarization            -> open_ended
-    abstention               -> abstention（gold_answer 固定 "<ABSTAIN>"，
-                                忽略原始 answer/ideal_response 字段）
+    information_extraction / multi_session_reasoning / event_ordering /
+    temporal_reasoning / knowledge_update / contradiction_resolution /
+    instruction_following / preference_following / summarization / abstention
+
+其中 knowledge_update 题在 potential_confusion 非空字符串时填入 gold_stale；
+abstention 题 gold_answer 固定 "<ABSTAIN>"（忽略原始 answer/ideal_response
+字段）。
 
 不同题型的答案字段名不同，按优先级取第一个非空字段：
 ``answer`` -> ``ideal_answer`` -> ``ideal_response`` -> ``ideal_summary``
@@ -63,17 +58,20 @@ import json
 import sys
 from pathlib import Path
 
-#: BEAM 题型 -> membench category
+#: BEAM 题型 -> membench category（1:1 直传，不再合并）
+#: 旧的"event_ordering/temporal_reasoning 合并到 temporal"等聚合会丢诊断信息；
+#: 现在按 BEAM paper 的 10 类原样写进 question.category，``metrics.json["by_category"]``
+#: 自然得到 10 个独立 key。``membench.data.schema.CATEGORIES`` 是软约定不再校验。
 QUESTION_TYPE_MAP = {
-    "information_extraction": "single_hop",
-    "multi_session_reasoning": "multi_hop",
-    "event_ordering": "temporal",
-    "temporal_reasoning": "temporal",
+    "information_extraction": "information_extraction",
+    "multi_session_reasoning": "multi_session_reasoning",
+    "event_ordering": "event_ordering",
+    "temporal_reasoning": "temporal_reasoning",
     "knowledge_update": "knowledge_update",
-    "contradiction_resolution": "knowledge_update",
-    "instruction_following": "preference",
-    "preference_following": "preference",
-    "summarization": "open_ended",
+    "contradiction_resolution": "contradiction_resolution",
+    "instruction_following": "instruction_following",
+    "preference_following": "preference_following",
+    "summarization": "summarization",
     "abstention": "abstention",
 }
 

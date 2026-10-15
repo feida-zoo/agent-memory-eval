@@ -225,6 +225,33 @@ def test_scan_capabilities(mini_datasets: dict[str, Path]) -> None:
     }
 
 
+def test_scan_capabilities_sentinel_reject_category(tmp_path: Path) -> None:
+    """category 非 abstention、gold 为哨兵值也算拒答题（raw category 数据集）。"""
+    path = _write_dataset(
+        tmp_path / "sentinel.jsonl",
+        [
+            {
+                "dialogue_id": "d1",
+                "sessions": [_session()],
+                "questions": [
+                    {
+                        "qid": "q1",
+                        "question": "同事的家庭住址？",
+                        "gold_answer": "<ABSTAIN>",
+                        "category": "privacy_refuse",
+                        "evidence": [],
+                    }
+                ],
+            }
+        ],
+    )
+    assert scan_capabilities(path) == {
+        "has_evidence": False,
+        "has_stale": False,
+        "has_abstention": True,
+    }
+
+
 def test_fusion_macro_average(
     tmp_path: Path,
     mini_datasets: dict[str, Path],

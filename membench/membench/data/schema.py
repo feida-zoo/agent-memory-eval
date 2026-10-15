@@ -26,7 +26,12 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-#: 题目类别全集（SPEC 3.2，共 7 种）。
+#: 题目类别"软约定"全集（SPEC 3.2，7 种）。
+#: 不同数据集设计意图不同，category 集合本来就该不重合——locomo 5 /
+#: longmemeval 6 / gatemem 4 / BEAM 10 各自保留自己的 raw category；
+#: loader 不再硬校验 ∈ CATEGORIES。CATEGORIES 仍保留为"通用约定"用于
+#: adapter 文档、check_comparability 等需要"列出 membench 通用类型"的
+#: 公共逻辑；convert 阶段不再做多对一合并。
 CATEGORIES: tuple[str, ...] = (
     "single_hop",
     "multi_hop",
@@ -39,6 +44,17 @@ CATEGORIES: tuple[str, ...] = (
 
 #: abstention 题的 gold_answer 哨兵值：表示期望系统拒答。
 ABSTAIN_SENTINEL = "<ABSTAIN>"
+
+
+def is_abstention(category: str, gold_answer: str) -> bool:
+    """是否「期望拒答」题：category 为 abstention 或 gold 为哨兵值。
+
+    数据集保留原始题型后（如 gatemem 的 privacy_refuse / safety_no_memory），
+    拒答判定不能再只认 ``category == "abstention"``——一律以 gold 哨兵值为准，
+    category 仅作兼容兜底。
+    """
+    return category == "abstention" or gold_answer == ABSTAIN_SENTINEL
+
 
 #: 消息允许的 role 取值。
 _VALID_ROLES = ("user", "assistant")
@@ -117,12 +133,11 @@ def _parse_question(raw: object, path: Path, lineno: int) -> Question:
         if key not in raw:
             raise _err(path, lineno, f"question 缺少必填字段 '{key}'")
     category = raw["category"]
-    if category not in CATEGORIES:
-        raise _err(
-            path,
-            lineno,
-            f"非法 category '{category}'，合法取值为 {list(CATEGORIES)}",
-        )
+    if not isinstance(category, str) or not category.strip():
+        raise _err(path, lineno, "category 必须是非空字符串")
+    # 注：不再硬校验 category ∈ CATEGORIES。
+    # 各数据集（BEAM 10 类 / gatemem 4 类 / locomo 5 类 / longmemeval 6 类）
+    # 保留自己的 raw category；CATEGORIES 仅作"通用约定"用于公共逻辑。
     evidence = raw["evidence"]
     if not isinstance(evidence, list) or not all(isinstance(e, str) for e in evidence):
         raise _err(path, lineno, "evidence 必须是字符串列表")
@@ -224,7 +239,7 @@ def load_dataset(path: str | Path) -> list[Dialogue]:
 def dataset_fingerprint(path: str | Path) -> dict:
     """数据集指纹：内容 sha256（前 16 位十六进制）+ 字节数 + 文件 basename。
 
-    用于 A/B 可比性前置校验（接入侧反馈 1）：数据集变了但没重跑基线时，
+    用于 A/B 可比性前置校验：数据集变了但没重跑基线时，
     ``compare`` 能凭指纹机检发现，而不是静默给 PASS。
 
     Args:

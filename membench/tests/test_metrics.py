@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from membench.data.schema import ABSTAIN_SENTINEL
 from membench.metrics import (
     aggregate,
     bleu1,
@@ -204,6 +205,19 @@ class TestAggregate:
         }
         assert by_cat["knowledge_update"]["n"] == 2
         assert by_cat["abstention"]["accuracy"] == pytest.approx(0.5)
+
+    def test_abstention_sentinel_category(self) -> None:
+        """拒答题按 gold 哨兵值识别：category 非 abstention 也计入拒答桶。
+
+        数据集保留 raw category 后（如 gatemem 的 privacy_refuse），拒答判定
+        以 gold_answer 为准；同时该题从 evidence_recall 分母中排除。
+        """
+        refuse = _record("privacy_refuse", True, abstained=True)
+        refuse["gold_answer"] = ABSTAIN_SENTINEL
+        metrics = aggregate([refuse, _record("single_hop", True)])
+        overall = metrics["overall"]
+        assert overall["abstention_accuracy"] == pytest.approx(1.0)
+        assert overall["evidence_recall"] == pytest.approx(1.0)
 
     def test_empty_records(self) -> None:
         metrics = aggregate([])

@@ -29,6 +29,7 @@ import json
 import re
 from typing import Any, Callable, Union
 
+from membench.data.schema import is_abstention
 from membench.llm_ref import import_from_path
 
 from .base import Judge, JudgeResult
@@ -104,7 +105,7 @@ class ClientLLMJudge(Judge):
         gold_stale = str(getattr(question, "gold_stale", "") or "")
 
         # 红线指标一律规则判定，不交给（可能与被测系统同源的）LLM
-        if category == "abstention":
+        if is_abstention(category, gold):
             abstained = contains_refusal(prediction or "")
             return JudgeResult(
                 correct=abstained,
@@ -112,7 +113,7 @@ class ClientLLMJudge(Judge):
                 stale=False,
                 score=1.0 if abstained else 0.0,
                 judge=self.name,
-                reason="abstention 题按规则判定（拒答信号词匹配）",
+                reason="拒答题按规则判定（拒答信号词匹配）",
             )
 
         stale = bool(gold_stale) and gold_stale in (prediction or "")

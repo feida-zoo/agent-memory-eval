@@ -119,11 +119,31 @@ class TestLoadDatasetValidation:
             load_dataset(path)
 
     def test_invalid_category(self, tmp_path: Path) -> None:
+        """category 必须是非空字符串；非 CATEGORIES 之一的"自定义" category 现在也允许
+        （BEAM / gatemem 等数据集保留自己的 raw category 集合）。"""
         bad = self._valid_dialogue()
         bad["questions"][0]["category"] = "not_a_category"
         path = self._write(tmp_path, [json.dumps(bad)])
+        # 旧：category 必须在 CATEGORIES 之内 → ValueError。
+        # 新：任意非空字符串都接受；空串 / 非字符串才报错。
+        dialogues = load_dataset(path)
+        assert dialogues[0].questions[0].category == "not_a_category"
+
+    def test_empty_category_rejected(self, tmp_path: Path) -> None:
+        """空串 / 非字符串 category 仍报错（保留的唯一硬约束）。"""
+        bad = self._valid_dialogue()
+        bad["questions"][0]["category"] = ""
+        path = self._write(tmp_path, [json.dumps(bad)])
         with pytest.raises(ValueError, match=r":1:.*category"):
             load_dataset(path)
+
+    def test_custom_beam_category_accepted(self, tmp_path: Path) -> None:
+        """BEAM 原始 10 类（不在 CATEGORIES 7 个之内）现在可加载。"""
+        bad = self._valid_dialogue()
+        bad["questions"][0]["category"] = "temporal_reasoning"  # BEAM 原始类型
+        path = self._write(tmp_path, [json.dumps(bad)])
+        dialogues = load_dataset(path)
+        assert dialogues[0].questions[0].category == "temporal_reasoning"
 
     def test_invalid_json_line(self, tmp_path: Path) -> None:
         path = self._write(tmp_path, ["{not json"])

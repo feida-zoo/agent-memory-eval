@@ -297,6 +297,11 @@ def test_evaluate_compare_writes_ab_layout(mini_datasets, scripts, tmp_path) -> 
     assert "**门禁结论：" in md
     assert "跨数据集融合 diff" in md
     assert "逐数据集关键指标 diff" in md
+    # by_category diff 段按数据集分别渲染（数据集小标题 + 中文题型名，不跨集合并）
+    assert "逐数据集题型 diff" in md
+    assert "### A（办公）" in md
+    assert "单跳（single_hop）" in md
+    assert "拒答（abstention）" in md
     # 中文化指标名出现在报告中
     assert "正确率（accuracy）" in md
     assert "证据召回率（evidence_recall）" in md

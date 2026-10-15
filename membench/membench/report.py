@@ -37,8 +37,11 @@ from .ratings import format_metric, overall_rating, rate_metric
 PALETTE: list[str] = ["#3b6ea5", "#c9a86a", "#5e8c61", "#8f8f8f", "#b03a2e"]
 
 # 分题型 category 显示名映射（仅显示层；数据层 category 值保持不变）。
-# 查不到的未知 category 原样显示，向后兼容自定义题型。
+# 不同数据集保留自己的 raw category，不再做多对一合并，故 CATEGORY_ZH
+# 扩到 7 通用 + 7 BEAM 增量 + 4 gatemem 增量；查不到的未知 category
+# 原样显示，向后兼容自定义题型。
 CATEGORY_ZH: dict[str, str] = {
+    # membench 通用 7 类（locomo / longmemeval / office 也用这些 key）
     "single_hop": "单跳（single_hop）",
     "multi_hop": "多跳（multi_hop）",
     "temporal": "时间推理（temporal）",
@@ -46,6 +49,20 @@ CATEGORY_ZH: dict[str, str] = {
     "abstention": "拒答（abstention）",
     "preference": "偏好（preference）",
     "open_ended": "开放问答（open_ended）",
+    # BEAM 原始 10 类（1:1 直传后保留）
+    "information_extraction": "信息抽取（information_extraction）",
+    "multi_session_reasoning": "多 session 推理（multi_session_reasoning）",
+    "event_ordering": "事件排序（event_ordering）",
+    "temporal_reasoning": "时序推理（temporal_reasoning）",
+    "contradiction_resolution": "矛盾消解（contradiction_resolution）",
+    "instruction_following": "指令遵循（instruction_following）",
+    "preference_following": "偏好遵循（preference_following）",
+    "summarization": "摘要（summarization）",
+    # gatemem 4 类（按 query_type + expected_action 拆分）
+    "utility_answer": "实用-应答（utility_answer）",
+    "privacy_refuse": "隐私-拒答（privacy_refuse）",
+    "privacy_answer_redacted": "隐私-脱敏应答（privacy_answer_redacted）",
+    "safety_no_memory": "安全-不再记（safety_no_memory）",
 }
 
 #: 效率统计表的指标显示名（中文，单位保留）。

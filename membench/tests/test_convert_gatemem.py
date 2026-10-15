@@ -97,6 +97,9 @@ def test_convert_gatemem_dialogue_structure(tmp_path: Path) -> None:
 
 
 def test_convert_gatemem_category_mapping(tmp_path: Path) -> None:
+    """gatemem (query_type, expected_action) 4 类按 1:1 直传——
+    隐私-拒答与安全-不再记语义不同（前者考权限、后者考删除），合并到 abstention
+    会丢诊断信息；现在 category 用 `<query_type>_<expected_action>` 形态保留。"""
     ep_path, cp_path = _write_inputs(tmp_path)
     out = tmp_path / "out.jsonl"
     stats = convert_gatemem(ep_path, cp_path, out)
@@ -104,19 +107,24 @@ def test_convert_gatemem_category_mapping(tmp_path: Path) -> None:
     dialogues = load_dataset(out)
     by_qid = {q.qid: q for d in dialogues for q in d.questions}
 
-    assert by_qid["ck_utility"].category == "single_hop"
+    assert by_qid["ck_utility"].category == "utility_answer"
     assert by_qid["ck_utility"].gold_answer == "221,000 USD; 9%"  # include 以 "; " 拼接
-    assert by_qid["ck_redacted"].category == "single_hop"
+    assert by_qid["ck_redacted"].category == "privacy_answer_redacted"
     assert by_qid["ck_redacted"].gold_answer == "是同一个保险账户"
-    assert by_qid["ck_refuse"].category == "abstention"
-    assert by_qid["ck_safety"].category == "abstention"
+    assert by_qid["ck_refuse"].category == "privacy_refuse"
+    assert by_qid["ck_safety"].category == "safety_no_memory"
 
     # 未知组合 + 孤儿 checkpoint 被跳过并计数
     assert "ck_unknown" not in by_qid
     assert "ck_orphan" not in by_qid
     assert stats["skipped"] == 2
     assert stats["questions"] == 4
-    assert stats["categories"] == {"single_hop": 2, "abstention": 2}
+    assert stats["categories"] == {
+        "utility_answer": 1,
+        "privacy_answer_redacted": 1,
+        "privacy_refuse": 1,
+        "safety_no_memory": 1,
+    }
 
 
 def test_convert_gatemem_abstention_sentinel(tmp_path: Path) -> None:
