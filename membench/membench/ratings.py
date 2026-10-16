@@ -1,6 +1,7 @@
 """评级系统：在数值分数之外给出定性评价（优秀/良好/中等/较差）。
 
-评价以"评价（评分）"形式呈现，如 ``优秀（0.923）``。
+评价以"评价（百分比）"形式呈现，如 ``优秀（92.3%）``——比率型指标统一
+按百分比展示具体值，避免只给一个看不出量级的分数。
 
 四级评价及点数映射：
     优秀 = 4、良好 = 3、中等 = 2、较差 = 1。
@@ -23,11 +24,14 @@ __all__ = [
     "LABEL_POINTS",
     "METRIC_THRESHOLDS",
     "OVERALL_THRESHOLDS",
+    "RATE_METRICS",
     "continuous_points",
+    "format_metric",
+    "format_metric_delta",
+    "format_metric_value",
     "rate_metric",
     "rating_points",
     "overall_rating",
-    "format_metric",
 ]
 
 # 四级评价标签（由优到劣）
@@ -53,6 +57,13 @@ METRIC_THRESHOLDS: dict[str, tuple[str, list[tuple[float, str]]]] = {
     "evidence_recall": ("higher", [(0.95, "优秀"), (0.85, "良好"), (0.70, "中等")]),
     "abstention_accuracy": ("higher", [(0.90, "优秀"), (0.80, "良好"), (0.60, "中等")]),
     "stale_rate": ("lower", [(0.03, "优秀"), (0.10, "良好"), (0.20, "中等")]),
+}
+
+# 比率型指标（[0,1]，报告中以百分比展示具体值）：六项可评级质量指标 +
+# 两项诊断指标（严格检索召回率@5 / 过度拒答率——展示但不参与评级）。
+RATE_METRICS: frozenset[str] = frozenset(METRIC_THRESHOLDS) | {
+    "recall_at_5",
+    "over_refusal_rate",
 }
 
 # 综合评级阈值：对可评级质量指标的点数取均值后按此映射为标签。
@@ -177,16 +188,13 @@ def overall_rating(overall: dict[str, Any]) -> tuple[str, float] | None:
     return LABELS[-1], mean
 
 
-def format_metric(key: str, value: Any) -> str:
-    """把指标值格式化为报告呈现字符串。
+def format_metric_value(key: str, value: Any) -> str:
+    """指标值的纯数值呈现（不带评价标签）。
 
-    可评级指标返回 ``"评价（评分）"``（评分保留 3 位小数），
-    如 ``"优秀（0.923）"``；不可评级指标返回原数值的格式化字符串
-    （float 保留 3 位，其余原样，与 report 的 ``_fmt`` 口径一致）。
-
-    ``None`` 与 ``"n/a"`` 一律视为"未定义"，返回 ``"未定义"`` 而非
-    ``"None"`` / ``"n/a"`` 字串，避免业务方把"数据集没标 evidence"误读
-    为"系统召回率为 0"。
+    比率型指标（:data:`RATE_METRICS`）以百分比呈现，如 ``"92.3%"``；其余
+    指标保留 3 位小数（与 report 的 ``_fmt`` 口径一致）；``None`` 与
+    ``"n/a"`` 一律视为"未定义"（避免把"数据集没标 evidence"误读为"召回率
+    为 0"）。
 
     Args:
         key: 指标名。
@@ -200,10 +208,44 @@ def format_metric(key: str, value: Any) -> str:
     if isinstance(value, str) and value.strip().lower() in ("n/a", "none", "null", ""):
         return "未定义"
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        label = rate_metric(key, float(value))
-        if label is not None:
-            return f"{label}（{float(value):.3f}）"
+        if key in RATE_METRICS:
+            return f"{float(value) * 100:.1f}%"
         if isinstance(value, float):
             return f"{value:.3f}"
         return str(value)
     return str(value)
+
+
+def format_metric(key: str, value: Any) -> str:
+    """把指标值格式化为报告呈现字符串（值 + 可选评价标签）。
+
+    比率型指标以百分比呈现具体值：可评级指标返回 ``"评价（百分比）"``
+    （如 ``"优秀（92.3%）"``），不可评级的诊断指标（如 recall_at_5）直接
+    返回百分比；其余指标返回 ``format_metric_value`` 的格式化数值。
+
+    Args:
+        key: 指标名。
+        value: 指标数值（允许非数值，如 "n/a"）。
+
+    Returns:
+        报告单元格字符串。
+    """
+    value_str = format_metric_value(key, value)
+    if value_str == "未定义":
+        return value_str
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        label = rate_metric(key, float(value))
+        if label is not None:
+            return f"{label}（{value_str}）"
+    return value_str
+
+
+def format_metric_delta(key: str, value: Any) -> str:
+    """指标差值（B - A）呈现：比率型指标用百分点（``"+2.3pt"``），
+    其余保留 3 位小数（``"+0.023"``）；``None`` 返回 ``"n/a"``。"""
+    if value is None:
+        return "n/a"
+    v = float(value)
+    if key in RATE_METRICS:
+        return f"{v * 100:+.1f}pt"
+    return f"{v:+.3f}"

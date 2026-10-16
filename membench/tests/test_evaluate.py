@@ -312,20 +312,22 @@ def test_report_contents(
     mini_datasets: dict[str, Path],
     script: dict[str, tuple[str, list[str]]],
 ) -> None:
-    """报告含综合评级、"评价（评分）"样式与"参与数据集"列。"""
+    """报告含综合评级、"评价（百分比）"样式与"参与数据集"列。"""
     summary = _run_evaluate(tmp_path, mini_datasets, script)
     report = (Path(summary["_eval_dir"]) / "evaluate_report.md").read_text(encoding="utf-8")
 
     assert "**综合评级：" in report
     assert "/4.0）**" in report
-    # "评价（评分）"样式，如 优秀（1.000）
+    # "评价（百分比）"样式，如 优秀（100.0%）
     for label in ("优秀（", "良好（", "中等（", "较差（"):
         if label in report:
             break
     else:  # pragma: no cover - 防御性断言
-        raise AssertionError("报告中未出现 评价（评分） 样式")
+        raise AssertionError("报告中未出现 评价（百分比） 样式")
+    assert "%）" in report
     assert "参与数据集" in report
     assert "## 分数据集明细" in report
+    assert "## 诊断指标（不参与评级）" in report
     # 效率成本段 + 报告配图
     assert "## 效率成本（分数据集）" in report
     assert "avg_output_tokens" in report

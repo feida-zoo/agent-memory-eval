@@ -103,10 +103,12 @@ class ClientLLMJudge(Judge):
     def grade(self, question: Any, gold: str, prediction: str) -> JudgeResult:
         category = str(getattr(question, "category", "") or "")
         gold_stale = str(getattr(question, "gold_stale", "") or "")
+        # 拒答信号逐题判定：拒答红线指标与"过度拒答率"诊断都需要它；普通题
+        # 也照算（不再恒 False），口径与 heuristic / llm judge 保持一致。
+        abstained = contains_refusal(prediction or "")
 
         # 红线指标一律规则判定，不交给（可能与被测系统同源的）LLM
         if is_abstention(category, gold):
-            abstained = contains_refusal(prediction or "")
             return JudgeResult(
                 correct=abstained,
                 abstained_pred=abstained,
@@ -131,7 +133,7 @@ class ClientLLMJudge(Judge):
             parsed = self._parse(raw)
             return JudgeResult(
                 correct=bool(parsed["correct"]),
-                abstained_pred=False,
+                abstained_pred=abstained,
                 stale=stale,
                 score=1.0 if parsed["correct"] else 0.0,
                 judge=self.name,

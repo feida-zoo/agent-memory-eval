@@ -89,17 +89,17 @@ python -m membench.cli evaluate-compare \
     --quick
 ```
 
-门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **逐数据集题型 diff** + **双臂融合 diff 表** + **per-dataset 门禁明细**（单数据集 spike 不被融合平均抹平）+ **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）；指标"未计算"统一记 `null`，与真实 0 区分。旧版 run 的 capabilities 未落账时报告会按数据集/逐题记录自动推断并在头部标注来源。
+门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **逐数据集题型 diff** + **双臂融合 diff 表** + **per-dataset 门禁明细**（单数据集 spike 不被融合平均抹平）+ **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）；比率型指标以百分比呈现（如 `81.5%`），差值为百分点（如 `+2.3pt`）。指标"未计算"统一记 `null`，与真实 0 区分；诊断指标（检索召回率@5 / 过度拒答率）在 diff 与对照表中可见但不参与评级。旧版 run 的 capabilities 未落账时报告会按数据集/逐题记录自动推断并在头部标注来源。
 
 融合口径（重要，读总分前必读）：
 
-- **宏平均**：六项质量指标（accuracy/token_f1/bleu1/evidence_recall/abstention_accuracy/stale_rate）先在各数据集内算分，再跨集等权平均；**指标只在具备对应标注能力的数据集上参与**——无 gold_stale 的集（locomo/longmemeval）不参与 stale_rate，无 evidence 标注的集（longmemeval/beam）不参与 evidence_recall，无 abstention 题的集不参与 abstention_accuracy。绝不用"记 0"稀释。
+- **宏平均**：六项质量指标（accuracy/token_f1/bleu1/evidence_recall/abstention_accuracy/stale_rate）先在各数据集内算分，再跨集等权平均；**指标只在具备对应标注能力的数据集上参与**——无 gold_stale 的集（locomo/longmemeval）不参与 stale_rate，无 evidence 标注的集（longmemeval/beam）不参与 evidence_recall，无 abstention 题的集不参与 abstention_accuracy。绝不用"记 0"稀释。此外**诊断指标**（检索召回率@5 需 has_evidence；过度拒答率全数据集参与）同样跨集融合展示，但不参与综合评级与门禁。
 - **门禁一票否决独立于总分**：办公域槽位 stale_rate > 0.03 → 总评"不达标"，退出码 1（可接 CI），无论综合评级多高。
 - **按需下载的公开集必须先 fetch**：`locomo` / `longmemeval_oracle` / `gatemem_office` / `beam_1m`（或 `beam_10m`）都没有内置文件，`evaluate` 从 `~/.membench/datasets/` 解析可用路径，缺失时报错提示先 `python -m membench.cli dataset fetch <key>`（`--quick` 不检查 BEAM 槽位）。judge=heuristic 跑 BEAM 会警告（rubric 型题目规则判分失真，建议 llm/client）。
 - **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**）时落 `DIR/eval_<adapter>_<platform>_<ts>/`，内含 `evaluate_report.md`、`evaluate_summary.json`、`fig_dataset_overview.png` 与 `runs/<各数据集 run_id>/`（自包含）；不传时保持历史位置 `<out_dir>/evaluate_<ts>/`。
 
 run 产物（`runs/<run_id>/`）：`results.jsonl`（逐题原始记录）、`metrics.json`、`report.md`、`fig_category_accuracy.png`、`fig_latency_hist.png`。
-report.md 中质量指标以 **"评价（评分）"** 呈现（如 `优秀（0.923）`，四级：优秀/良好/中等/较差），开头附 **综合评级**（六项质量指标连续点数均值，1.0~4.0，档内随数值线性变化，阈值 3.5/2.5/1.5）；效率成本指标不参与评级（依赖部署环境）。评级规则见 `membench/ratings.py` 的 `METRIC_THRESHOLDS` 表，可按团队标准调整。
+report.md 中比率型指标以 **"评价（百分比）"** 呈现（如 `优秀（92.3%）`，四级：优秀/良好/中等/较差），开头附 **综合评级**（六项质量指标连续点数均值，1.0~4.0，档内随数值线性变化，阈值 3.5/2.5/1.5）；效率成本指标不参与评级（依赖部署环境）；**诊断指标**（检索召回率@5、过度拒答率）仅展示与归因，不参与评级——前者是前 5 条检索的证据覆盖率，后者是非拒答题的误拒比例，与 `evidence_recall` / `abstention_accuracy` 配合分诊（检索 vs 生成、漏拒 vs 误拒）。评级规则见 `membench/ratings.py` 的 `METRIC_THRESHOLDS` 表，可按团队标准调整。
 compare 产物（`output_root()/ab_<tag>_<ts>/`，见「产物布局」）：A/B 各自带 run 副本 + `compare_report.md` + `fig_metric_diff.png`（质量指标高亮明显变化 + 效率成本）+ `fig_category_diff.png`（分题型准确率对比）。
 
 使用 LLM 判分（可选）：

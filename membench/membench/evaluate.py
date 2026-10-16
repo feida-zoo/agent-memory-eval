@@ -47,6 +47,12 @@ QUALITY_METRICS: tuple[str, ...] = (
     "stale_rate",
 )
 
+#: 诊断指标（展示但不参与综合评级与门禁）：严格检索召回率@5 与过度拒答率。
+DIAGNOSTIC_METRICS: tuple[str, ...] = ("recall_at_5", "over_refusal_rate")
+
+#: 融合指标集：六项质量指标 + 两项诊断指标（宏平均口径一致）。
+FUSED_METRICS: tuple[str, ...] = QUALITY_METRICS + DIAGNOSTIC_METRICS
+
 #: 办公域 stale 门禁阈值：办公域槽位数据集 stale_rate 超过该值即一票否决。
 STALE_GATE_THRESHOLD: float = 0.03
 
@@ -208,6 +214,8 @@ _PARTICIPATION_RULES: dict[str, Union[str, None]] = {
     "evidence_recall": "has_evidence",
     "stale_rate": "has_stale",
     "abstention_accuracy": "has_abstention",
+    "recall_at_5": "has_evidence",
+    "over_refusal_rate": None,
 }
 
 
@@ -220,7 +228,7 @@ def participates(capabilities: dict[str, bool], metric: str) -> bool:
 
 
 def fuse_metrics(results: list[DatasetResult]) -> dict[str, dict[str, Any]]:
-    """跨数据集宏平均融合六项质量指标。
+    """跨数据集宏平均融合六项质量指标 + 两项诊断指标。
 
     Args:
         results: 各数据集的评测结果。
@@ -230,7 +238,7 @@ def fuse_metrics(results: list[DatasetResult]) -> dict[str, dict[str, Any]]:
         某指标无任何参与集时 value 为 None。
     """
     fused: dict[str, dict[str, Any]] = {}
-    for metric in QUALITY_METRICS:
+    for metric in FUSED_METRICS:
         values: list[float] = []
         names: list[str] = []
         for res in results:
@@ -432,7 +440,7 @@ def write_evaluate_report(
     lines.append("## 融合指标（跨数据集宏平均）")
     lines.append("")
     fused_rows = []
-    for metric in QUALITY_METRICS:
+    for metric in FUSED_METRICS:
         entry = fused[metric]
         if entry["value"] is None:
             value_str = "未定义"
@@ -444,6 +452,11 @@ def write_evaluate_report(
             [metric_label(metric), value_str, participants_str]
         )
     lines.append(_md_table(["指标", "融合值", "参与数据集"], fused_rows))
+    lines.append("")
+    lines.append(
+        "<sub>注：检索召回率@5 与过度拒答率为诊断指标（展示与归因用），"
+        "不参与综合评级与门禁。</sub>"
+    )
     lines.append("")
 
     # 分数据集明细表（质量 + 效率成本）
@@ -471,6 +484,39 @@ def write_evaluate_report(
     lines.append(
         "<sub>表中「未定义」表示该数据集未标注对应能力（如 evidence / gold_stale / "
         "abstention 题），不参与该指标计算；融合值也不会因 0 而被拉低。</sub>"
+    )
+    lines.append("")
+
+    # 诊断指标明细（不参与评级）：严格检索召回、过度拒答、忽略题、判分回退
+    lines.append("## 诊断指标（不参与评级）")
+    lines.append("")
+    diag_rows = []
+    for r in results:
+        overall = r.metrics.get("overall", {})
+        row = [r.spec.name]
+        for metric in DIAGNOSTIC_METRICS:
+            if participates(r.capabilities, metric) and overall.get(metric) is not None:
+                row.append(format_metric(metric, overall[metric]))
+            else:
+                row.append("未定义")
+        row.append(str(r.metrics.get("n_ignored", 0)))
+        fb = r.metrics.get("judge_fallback") or {}
+        if fb:
+            row.append(f"{int(fb.get('count', 0))}（{float(fb.get('ratio', 0.0)):.1%}）")
+        else:
+            row.append("—")
+        diag_rows.append(row)
+    lines.append(
+        _md_table(
+            ["数据集", *(metric_label(m) for m in DIAGNOSTIC_METRICS), "忽略题数", "LLM judge 回退"],
+            diag_rows or [["(无)", *[""] * (len(DIAGNOSTIC_METRICS) + 2)]],
+        )
+    )
+    lines.append("")
+    lines.append(
+        "<sub>诊断指标仅用于分诊与归因，不参与综合评级与门禁；「检索召回率@5」"
+        "仅在有 evidence 标注的数据集上计算（前 5 条检索的证据条目覆盖率），"
+        "「过度拒答率」为非拒答题上出现拒答信号的比例。</sub>"
     )
     lines.append("")
 

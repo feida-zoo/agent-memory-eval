@@ -56,7 +56,7 @@ from membench.report import (
     metric_label,
     metric_labels,
 )
-from membench.ratings import format_metric, overall_rating
+from membench.ratings import format_metric, format_metric_delta, format_metric_value, overall_rating
 
 
 @dataclass
@@ -597,7 +597,16 @@ def _write_evaluate_compare_report(
     # 1. 逐数据集 diff（关键指标）
     lines.append("## 逐数据集关键指标 diff（B - A）")
     lines.append("")
-    diff_keys = ["accuracy", "token_f1", "bleu1", "evidence_recall", "abstention_accuracy", "stale_rate"]
+    diff_keys = [
+        "accuracy",
+        "token_f1",
+        "bleu1",
+        "evidence_recall",
+        "abstention_accuracy",
+        "stale_rate",
+        "recall_at_5",
+        "over_refusal_rate",
+    ]
     header = ["数据集", *metric_labels(diff_keys)]
     rows: list[list[str]] = []
     for row in per_dataset:
@@ -606,7 +615,7 @@ def _write_evaluate_compare_report(
         cells: list[str] = [spec.name]
         for k in diff_keys:
             d = diffs.get(k)
-            cells.append(f"{float(d['diff']):+.3f}" if d else "—")
+            cells.append(format_metric_delta(k, d["diff"]) if d else "—")
         rows.append(cells)
     lines.append(_md_table(header, rows or [["(无)", *[""] * len(diff_keys)]]))
     lines.append("")
@@ -645,15 +654,15 @@ def _write_evaluate_compare_report(
             if acc_a is None:
                 diff_str = "—"
                 a_str = "—"
-                b_str = f"{acc_b:.3f}" if acc_b is not None else "—"
+                b_str = f"{acc_b * 100:.1f}%" if acc_b is not None else "—"
             elif acc_b is None:
-                a_str = f"{acc_a:.3f}"
+                a_str = f"{acc_a * 100:.1f}%"
                 b_str = "—"
                 diff_str = "—"
             else:
-                diff_str = f"{acc_b - acc_a:+.3f}"
-                a_str = f"{acc_a:.3f}"
-                b_str = f"{acc_b:.3f}"
+                diff_str = f"{(acc_b - acc_a) * 100:+.1f}pt"
+                a_str = f"{acc_a * 100:.1f}%"
+                b_str = f"{acc_b * 100:.1f}%"
             rows_bc.append([category_display(cat), str(n), a_str, b_str, diff_str])
         if not rows_bc:
             continue
@@ -670,9 +679,9 @@ def _write_evaluate_compare_report(
         fused_rows.append(
             [
                 metric_label(k),
-                f"{d['a']:.3f}",
-                f"{d['b']:.3f}",
-                f"{d['diff']:+.3f}",
+                format_metric_value(k, d["a"]),
+                format_metric_value(k, d["b"]),
+                format_metric_delta(k, d["diff"]),
             ]
         )
     if fused_rows:
@@ -696,29 +705,50 @@ def _write_evaluate_compare_report(
         lines.append("（无可评估的门禁项——任一侧融合值缺失）")
     lines.append("")
 
-    # 4. 双臂融合指标完整表（含参与集）
+    # 4. 双臂融合指标完整表（含参与集与差值）
     lines.append("## 双臂融合指标对照")
     lines.append("")
     fused_full_rows: list[list[str]] = []
-    for metric in ["accuracy", "token_f1", "bleu1", "evidence_recall", "abstention_accuracy", "stale_rate"]:
+    for metric in [
+        "accuracy",
+        "token_f1",
+        "bleu1",
+        "evidence_recall",
+        "abstention_accuracy",
+        "stale_rate",
+        "recall_at_5",
+        "over_refusal_rate",
+    ]:
         a_entry = fused_baseline.get(metric, {})
         b_entry = fused_candidate.get(metric, {})
-        a_str = format_metric(metric, a_entry.get("value")) if a_entry.get("value") is not None else "未定义"
-        b_str = format_metric(metric, b_entry.get("value")) if b_entry.get("value") is not None else "未定义"
+        a_val = a_entry.get("value")
+        b_val = b_entry.get("value")
+        a_str = format_metric(metric, a_val) if a_val is not None else "未定义"
+        b_str = format_metric(metric, b_val) if b_val is not None else "未定义"
+        if a_val is None or b_val is None:
+            delta_str = "—"
+        else:
+            delta_str = format_metric_delta(metric, b_val - a_val)
         fused_full_rows.append(
             [
                 metric_label(metric),
                 a_str,
                 b_str,
+                delta_str,
                 "、".join(a_entry.get("participants", [])) or "（无）",
                 "、".join(b_entry.get("participants", [])) or "（无）",
             ]
         )
     lines.append(
         _md_table(
-            ["指标", "A 融合", "B 融合", "A 参与集", "B 参与集"],
+            ["指标", "A 融合", "B 融合", "Δ（B - A）", "A 参与集", "B 参与集"],
             fused_full_rows,
         )
+    )
+    lines.append("")
+    lines.append(
+        "<sub>检索召回率@5 与过度拒答率为诊断指标（展示与归因用），"
+        "不参与综合评级与门禁。</sub>"
     )
     lines.append("")
 
@@ -743,10 +773,19 @@ def _write_evaluate_compare_report(
         lines.append(_md_table(["数据集", "verdict", "", "触发明细"], rows_pd))
         lines.append("")
 
-    # 5. 各数据集完整指标（含参与能力标注）
+    # 5. 各数据集完整指标（含参与能力标注与诊断指标）
     lines.append("## 各数据集完整指标（参考）")
     lines.append("")
-    q_cols = ["accuracy", "token_f1", "bleu1", "stale_rate", "abstention_accuracy", "evidence_recall"]
+    q_cols = [
+        "accuracy",
+        "token_f1",
+        "bleu1",
+        "evidence_recall",
+        "abstention_accuracy",
+        "stale_rate",
+        "recall_at_5",
+        "over_refusal_rate",
+    ]
     header_q = ["数据集", "臂", *metric_labels(q_cols)]
     detail_rows: list[list[str]] = []
     for arm in arms:
@@ -754,8 +793,7 @@ def _write_evaluate_compare_report(
             ov = metrics_dict.get("overall", {})
             row = [arm.spec.name, side_label]
             for m in q_cols:
-                v = ov.get(m)
-                row.append(f"{float(v):.3f}" if isinstance(v, (int, float)) and v is not None else "未定义")
+                row.append(format_metric_value(m, ov.get(m)))
             detail_rows.append(row)
     lines.append(_md_table(header_q, detail_rows))
     lines.append("")

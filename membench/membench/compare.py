@@ -27,15 +27,22 @@ from membench.report import render_compare_report
 
 # 参与逐指标 diff 的 overall 指标（排除计数项）
 _DIFF_KEYS: list[str] = [
+    # 质量指标（参与评级）
     "accuracy",
     "token_f1",
     "bleu1",
     "evidence_recall",
     "abstention_accuracy",
     "stale_rate",
+    # 诊断指标（不参与评级）
+    "recall_at_5",
+    "over_refusal_rate",
+    # 效率成本
     "latency_p50_ms",
     "latency_p95_ms",
     "avg_input_tokens",
+    "avg_output_tokens",
+    "avg_ingest_latency_ms",
     "avg_llm_calls",
 ]
 

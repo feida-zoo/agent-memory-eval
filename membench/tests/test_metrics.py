@@ -173,7 +173,9 @@ class TestAggregate:
             "token_f1",
             "bleu1",
             "evidence_recall",
+            "recall_at_5",
             "abstention_accuracy",
+            "over_refusal_rate",
             "stale_rate",
             "latency_p50_ms",
             "latency_p95_ms",
@@ -194,6 +196,9 @@ class TestAggregate:
         assert overall["abstention_accuracy"] == pytest.approx(0.5)
         # knowledge_update 题上 stale 均值：1/2。
         assert overall["stale_rate"] == pytest.approx(0.5)
+        # 诊断指标：非拒答题上 recall@5 均值 1.0；过度拒答率 0（无拒答信号）。
+        assert overall["recall_at_5"] == pytest.approx(1.0)
+        assert overall["over_refusal_rate"] == pytest.approx(0.0)
         assert overall["latency_p50_ms"] == pytest.approx(
             percentile([10, 20, 30, 40, 50, 60], 50)
         )
@@ -228,6 +233,20 @@ class TestAggregate:
         overall = metrics["overall"]
         assert overall["abstention_accuracy"] == pytest.approx(1.0)
         assert overall["evidence_recall"] == pytest.approx(1.0)
+
+    def test_diagnostic_metrics_semantics(self) -> None:
+        """诊断指标：recall_at_5 仅 has_evidence 数据集参与；无非拒答题时
+        over_refusal_rate 为 None。"""
+        refuse = _record("abstention", True, abstained=True)
+        metrics = aggregate([refuse])
+        assert metrics["overall"]["recall_at_5"] is None
+        assert metrics["overall"]["over_refusal_rate"] is None
+
+        mem = _record("single_hop", True)
+        mem["recall@5"] = 0.4
+        metrics = aggregate([refuse, mem])
+        assert metrics["overall"]["recall_at_5"] == pytest.approx(0.4)
+        assert metrics["overall"]["over_refusal_rate"] == pytest.approx(0.0)
 
     def test_empty_records(self) -> None:
         # 空 records 时 _mean 返 None（区分"未计算"与"真实 0"），

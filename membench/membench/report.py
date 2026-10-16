@@ -31,7 +31,13 @@ def _require_plt() -> None:
     if plt is None:
         raise RuntimeError(_MPL_HINT)
 
-from .ratings import format_metric, overall_rating, rate_metric
+from .ratings import (
+    format_metric,
+    format_metric_delta,
+    format_metric_value,
+    overall_rating,
+    rate_metric,
+)
 
 # 统一低饱和配色（SPEC 第 7 节）
 PALETTE: list[str] = ["#3b6ea5", "#c9a86a", "#5e8c61", "#8f8f8f", "#b03a2e"]
@@ -97,6 +103,8 @@ METRIC_LABEL_ZH: dict[str, str] = {
     "n_questions": "题目数",
     "n_ignored": "忽略题数",
     "mean_points": "综合点数",
+    "recall_at_5": "检索召回率@5",
+    "over_refusal_rate": "过度拒答率",
 }
 
 
@@ -198,7 +206,7 @@ BASELINES: list[tuple[str, str, str, Any]] = [
     ("abstention_accuracy", metric_label("abstention_accuracy"), ">= 0.80", lambda v: v >= 0.80),
 ]
 
-# compare 分组条形图使用的质量指标（均为 [0,1] 区间，可同图比较）
+#: 质量指标（参与评级）与诊断指标（不参与评级）的分组展示口径。
 DIFF_METRICS: list[str] = [
     "accuracy",
     "token_f1",
@@ -206,6 +214,8 @@ DIFF_METRICS: list[str] = [
     "evidence_recall",
     "abstention_accuracy",
     "stale_rate",
+    "recall_at_5",
+    "over_refusal_rate",
 ]
 
 #: 效率成本指标（compare 图第二子图；单位各异，仅看相对高低，值标签直接标注）。
@@ -214,6 +224,7 @@ EFFICIENCY_DIFF_METRICS: list[str] = [
     "latency_p95_ms",
     "avg_input_tokens",
     "avg_output_tokens",
+    "avg_ingest_latency_ms",
     "avg_llm_calls",
 ]
 
@@ -513,7 +524,15 @@ def _baseline_rows(overall: dict[str, Any]) -> list[list[str]]:
             continue
         value = float(raw)
         rating = rate_metric(key, value)
-        rows.append([label, target, f"{value:.3f}", rating if rating else "—", "✅" if ok(value) else "❌"])
+        rows.append(
+            [
+                label,
+                target,
+                format_metric_value(key, value),
+                rating if rating else "—",
+                "✅" if ok(value) else "❌",
+            ]
+        )
     return rows
 
 
@@ -583,12 +602,14 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
         ["正确性", metric_label("token_f1"), format_metric("token_f1", overall.get("token_f1", "n/a"))],
         ["正确性", metric_label("bleu1"), format_metric("bleu1", overall.get("bleu1", "n/a"))],
         ["检索质量", metric_label("evidence_recall"), format_metric("evidence_recall", overall.get("evidence_recall", "n/a"))],
+        ["检索质量", metric_label("recall_at_5"), format_metric("recall_at_5", overall.get("recall_at_5", "n/a"))],
         ["效率成本", metric_label("latency_p50_ms"), _fmt(overall.get("latency_p50_ms", "n/a"))],
         ["效率成本", metric_label("latency_p95_ms"), _fmt(overall.get("latency_p95_ms", "n/a"))],
         ["效率成本", metric_label("avg_input_tokens"), _fmt(overall.get("avg_input_tokens", "n/a"))],
         ["效率成本", metric_label("avg_llm_calls"), _fmt(overall.get("avg_llm_calls", "n/a"))],
         ["记忆动态", metric_label("stale_rate"), format_metric("stale_rate", overall.get("stale_rate", "n/a"))],
         ["拒答", metric_label("abstention_accuracy"), format_metric("abstention_accuracy", overall.get("abstention_accuracy", "n/a"))],
+        ["拒答", metric_label("over_refusal_rate"), format_metric("over_refusal_rate", overall.get("over_refusal_rate", "n/a"))],
     ]
     lines.append(_md_table(["维度", "指标", "值"], summary_rows))
     lines.append("")
@@ -624,11 +645,17 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
         [
             category_display(cat),
             format_metric("accuracy", by_category[cat].get("accuracy", "n/a")),
+            format_metric("token_f1", by_category[cat].get("token_f1", "n/a")),
             str(by_category[cat].get("n", 0)),
         ]
         for cat in sorted(by_category.keys())
     ]
-    lines.append(_md_table(["category", "accuracy", "n"], cat_rows or [["(无)", "", ""]]))
+    lines.append(
+        _md_table(
+            ["题型", metric_label("accuracy"), metric_label("token_f1"), "题数"],
+            cat_rows or [["(无)", "", "", ""]],
+        )
+    )
     lines.append("")
     lines.append("![分题型准确率](fig_category_accuracy.png)")
     lines.append("")
@@ -744,7 +771,14 @@ def write_compare_report_md(
     rows = []
     for key in sorted(diffs.keys()):
         d = diffs[key]
-        rows.append([metric_label(key), _fmt(d.get("a", "n/a")), _fmt(d.get("b", "n/a")), _fmt(d.get("diff", "n/a"))])
+        rows.append(
+            [
+                metric_label(key),
+                format_metric_value(key, d["a"]) if "a" in d else "n/a",
+                format_metric_value(key, d["b"]) if "b" in d else "n/a",
+                format_metric_delta(key, d["diff"]) if "diff" in d else "n/a",
+            ]
+        )
     lines.append(_md_table(["指标", "A (基线)", "B (候选)", "diff"], rows or [["(无)", "", "", ""]]))
     lines.append("")
     lines.append("![关键指标对比](fig_metric_diff.png)")

@@ -4,7 +4,7 @@
 - 各指标阈值边界（如 accuracy 0.90->优秀、0.899->良好；stale_rate 0.03->优秀、0.031->良好）
 - 不可评级指标返回 None
 - overall_rating 混合指标点数均值与 None 场景
-- format_metric 的 "评价（评分）" 输出格式
+- format_metric 的 "评价（百分比）" 输出格式
 - write_run_report_md 报告集成（综合评级行与评价呈现）
 """
 
@@ -16,6 +16,8 @@ import pytest
 
 from membench.ratings import (
     format_metric,
+    format_metric_delta,
+    format_metric_value,
     overall_rating,
     rate_metric,
     rating_points,
@@ -292,10 +294,23 @@ def test_overall_rating_sensitive_to_within_bucket_improvement() -> None:
 
 
 def test_format_metric_rated() -> None:
-    """可评级指标输出 "评价（评分）"，评分保留 3 位小数。"""
-    assert format_metric("accuracy", 0.9234) == "优秀（0.923）"
-    assert format_metric("accuracy", 0.8) == "良好（0.800）"
-    assert format_metric("stale_rate", 0.05) == "良好（0.050）"
+    """可评级比率指标输出 "评价（百分比）"（保留 1 位小数）。"""
+    assert format_metric("accuracy", 0.9234) == "优秀（92.3%）"
+    assert format_metric("accuracy", 0.8) == "良好（80.0%）"
+    assert format_metric("stale_rate", 0.05) == "良好（5.0%）"
+    # 诊断指标无评价标签，只给百分比
+    assert format_metric("recall_at_5", 0.429) == "42.9%"
+    assert format_metric("over_refusal_rate", 0.1) == "10.0%"
+
+
+def test_format_metric_value_and_delta() -> None:
+    """纯数值/差值呈现：比率型百分比与百分点，其余保留 3 位小数。"""
+    assert format_metric_value("accuracy", 0.9234) == "92.3%"
+    assert format_metric_value("latency_p50_ms", 123.4567) == "123.457"
+    assert format_metric_value("accuracy", None) == "未定义"
+    assert format_metric_delta("accuracy", 0.023) == "+2.3pt"
+    assert format_metric_delta("latency_p50_ms", -12.0) == "-12.000"
+    assert format_metric_delta("accuracy", None) == "n/a"
 
 
 def test_format_metric_unrated() -> None:
@@ -334,7 +349,7 @@ def _minimal_metrics() -> dict:
             "avg_llm_calls": 2.0,
             "n_questions": 1,
         },
-        "by_category": {"single_hop": {"accuracy": 0.92, "n": 1}},
+        "by_category": {"single_hop": {"accuracy": 0.92, "token_f1": 0.5, "n": 1}},
     }
 
 
@@ -351,9 +366,9 @@ def test_write_run_report_md_contains_ratings(tmp_path) -> None:
     assert "/4.0）**" in content
     assert "评级规则" in content
 
-    # 摘要表 "值" 列以 "评价（0.xxx）" 形式呈现
-    assert "优秀（0.920）" in content  # accuracy = 0.92
-    assert "（0." in content
+    # 摘要表 "值" 列以 "评价（百分比）" 形式呈现
+    assert "优秀（92.0%）" in content  # accuracy = 0.92
+    assert "（5.0%）" in content  # stale_rate = 0.05
 
     # 效率成本指标保持原数值呈现，不带评价；指标列展示「中文（key）」双标
     assert "123" not in content
@@ -362,8 +377,8 @@ def test_write_run_report_md_contains_ratings(tmp_path) -> None:
     assert "陈旧率（stale_rate）" in content
     assert "拒答准确率（abstention_accuracy）" in content
 
-    # 分题型准确率表同样带评价
-    assert "| 单跳（single_hop） | 优秀（0.920） | 1 |" in content
+    # 分题型表：正确率 + Token F1 双列，同样带评价
+    assert "| 单跳（single_hop） | 优秀（92.0%） | 较差（50.0%） | 1 |" in content
 
     # 验收基线对照表含 "评价" 列
     assert "| 指标 | 目标 | 实际 | 评价 | 结果 |" in content

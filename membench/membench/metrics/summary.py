@@ -75,8 +75,13 @@ def aggregate(
     指标口径：
         - accuracy: ``judge.correct`` 均值。
         - evidence_recall: ``evidence_hit`` 均值（仅非拒答题）。
+        - recall_at_5: 非拒答题上 ``recall@5`` 均值（严格检索覆盖：证据条目
+          进前 5 条检索结果的比例；仅 has_evidence 数据集参与——诊断指标，
+          不参与综合评级）。
         - abstention_accuracy: 拒答题（category 为 abstention 或 gold 为拒答
           哨兵值，见 ``schema.is_abstention``）上 ``judge.abstained_pred`` 均值。
+        - over_refusal_rate: 非拒答题上 ``judge.abstained_pred`` 均值
+          （"不该拒答却拒答"的比例；诊断指标，不参与综合评级）。
         - stale_rate: knowledge_update 题上 ``judge.stale`` 均值。
         - latency_p50_ms / latency_p95_ms: ``latency_ms`` 分位数（线性插值）。
         - avg_input_tokens / avg_output_tokens: 每题输入 / 输出 token 均值。
@@ -121,10 +126,23 @@ def aggregate(
             if caps.get("has_evidence", False)
             else None
         ),
+        # 严格检索覆盖（诊断指标，不参与评级）：非拒答题上前 5 条检索的
+        # 证据条目覆盖率（results.jsonl 的 recall@5）；无 evidence 标注的
+        # 数据集为 None。
+        "recall_at_5": (
+            _mean(float(r.get("recall@5", 0.0)) for r in non_abstention)
+            if caps.get("has_evidence", False)
+            else None
+        ),
         "abstention_accuracy": (
             _mean(bool(_judge(r).get("abstained_pred")) for r in abstention)
             if caps.get("has_abstention", False)
             else None
+        ),
+        # 过度拒答率（诊断指标，不参与评级）：非拒答题上出现拒答信号的
+        # 比例——与 abstention_accuracy（漏拒）互为两个方向。
+        "over_refusal_rate": _mean(
+            bool(_judge(r).get("abstained_pred")) for r in non_abstention
         ),
         "stale_rate": (
             _mean(bool(_judge(r).get("stale")) for r in knowledge_update)

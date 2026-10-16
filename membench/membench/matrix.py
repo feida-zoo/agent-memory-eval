@@ -24,6 +24,7 @@ from typing import Any
 from membench import layout
 from membench.compare import _eval_gates, _load_metrics
 from membench.report import PALETTE, _md_table, _setup_fonts, metric_label
+from membench.ratings import format_metric_value
 
 try:
     import matplotlib
@@ -287,7 +288,13 @@ def _write_matrix_report_md(
             lines.append(f"### {metric_label(metric)}")
             lines.append("")
             rows = [
-                [p] + [f"{table[p][c]:.3f}" if c in table[p] else "n/a" for c in commits]
+                [
+                    p,
+                    *[
+                        format_metric_value(metric, table[p][c]) if c in table[p] else "n/a"
+                        for c in commits
+                    ],
+                ]
                 for p in platforms
             ]
             lines.append(_md_table(["platform \\ commit", *commits], rows))
@@ -300,7 +307,15 @@ def _write_matrix_report_md(
     lines.append("## 逐指标汇总")
     lines.append("")
     rows = [
-        [metric_label(metric)] + [f"{summary[lbl].get(metric, 0.0):.3f}" for lbl in labels]
+        [
+            metric_label(metric),
+            *[
+                format_metric_value(metric, summary[lbl][metric])
+                if metric in summary[lbl]
+                else "n/a"
+                for lbl in labels
+            ],
+        ]
         for metric in MATRIX_METRICS
     ]
     lines.append(_md_table(["指标", *labels], rows))

@@ -96,6 +96,14 @@ class TestClientLLMJudge:
         assert r.correct is True and r.abstained_pred is True
         assert "规则判定" in r.reason
 
+    def test_over_refusal_flag_on_normal_question(self) -> None:
+        """普通题也逐题判定拒答信号（过度拒答率诊断依赖它，不再恒 False）。"""
+        judge = ClientLLMJudge(_EchoClient())
+        r = judge.grade(_Q(category="single_hop"), "旺财", "我不知道，相关信息不在我的记忆中。")
+        assert r.abstained_pred is True
+        r2 = judge.grade(_Q(category="single_hop"), "旺财", "我的狗叫旺财")
+        assert r2.abstained_pred is False
+
     def test_malformed_llm_output_falls_back(self) -> None:
         class _GarbageClient:
             def chat(self, prompt: str) -> str:
