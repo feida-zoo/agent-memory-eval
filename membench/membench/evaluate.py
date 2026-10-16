@@ -31,9 +31,9 @@ from typing import Any, Union
 
 from membench import layout, paths
 from membench.data.info import resolve_available_path
-from membench.data.schema import is_abstention, load_dataset
+from membench.data.schema import load_dataset, question_capabilities
 from membench.ratings import format_metric, overall_rating
-from membench.report import _md_table, fig_dataset_overview, metric_label
+from membench.report import _md_table, _fmt_opt, fig_dataset_overview, metric_label
 from membench.runner import Runner
 from membench.userdata import resolve_dataset
 
@@ -193,28 +193,11 @@ def scan_capabilities(path: Union[str, Path]) -> dict[str, bool]:
     评分的题判断（例如全部拒答题都被忽略时 has_abstention=False）。
 
     Returns:
-        ``{"has_evidence": any(q.evidence), "has_stale": any(q.gold_stale),
-        "has_abstention": any(is_abstention(...))}``（均不含忽略题）。
+        ``{"has_evidence": ..., "has_stale": ..., "has_abstention": ...}``
+        （口径见 :func:`membench.data.schema.question_capabilities`，均不含忽略题）。
     """
     dialogues = load_dataset(path)
-    has_evidence = False
-    has_stale = False
-    has_abstention = False
-    for dialogue in dialogues:
-        for q in dialogue.questions:
-            if q.ignore:
-                continue
-            if q.evidence:
-                has_evidence = True
-            if q.gold_stale:
-                has_stale = True
-            if is_abstention(q.category, q.gold_answer):
-                has_abstention = True
-    return {
-        "has_evidence": has_evidence,
-        "has_stale": has_stale,
-        "has_abstention": has_abstention,
-    }
+    return question_capabilities(q for dialogue in dialogues for q in dialogue.questions)
 
 
 #: 指标 -> 参与条件（capabilities key）；None 表示所有数据集总是参与。
@@ -254,9 +237,11 @@ def fuse_metrics(results: list[DatasetResult]) -> dict[str, dict[str, Any]]:
             if not participates(res.capabilities, metric):
                 continue
             overall = res.metrics.get("overall", {})
-            if metric not in overall:
+            v = overall.get(metric)
+            # None = 该数据集"未计算"该指标：跳过，不按 0 纳入融合。
+            if v is None:
                 continue
-            values.append(float(overall[metric]))
+            values.append(float(v))
             names.append(res.spec.name)
         fused[metric] = {
             "value": (sum(values) / len(values)) if values else None,
@@ -285,7 +270,13 @@ def evaluate_gate(
             "status": "SKIP",
             "detail": f"办公域槽位数据集（{office.spec.name}）无 gold_stale 标注，stale 门禁跳过。",
         }
-    stale_rate = float(office.metrics.get("overall", {}).get("stale_rate", 0.0))
+    stale_raw = office.metrics.get("overall", {}).get("stale_rate")
+    if stale_raw is None:
+        return {
+            "status": "SKIP",
+            "detail": f"办公域槽位数据集（{office.spec.name}）stale_rate 未计算（None），stale 门禁跳过。",
+        }
+    stale_rate = float(stale_raw)
     if stale_rate > threshold:
         return {
             "status": "FAIL",
@@ -386,24 +377,41 @@ def write_evaluate_report(
     lines.append(f"**总评结论： {verdict}**（门禁一票否决，独立于综合评级）")
     lines.append("")
 
-    # 评测配置
-    lines.append("## 评测配置")
-    lines.append("")
+    # 评测配置：补齐 driver_llm / judge_model / adapter_version /
+    # dataset_fingerprint 四项可比性核心元数据（取自首个数据集的
+    # metrics.json；多数据集时指纹逐项见下方「数据集」表）。
+    first_metrics = results[0].metrics if results else {}
+    fingerprint = first_metrics.get("dataset_fingerprint") or {}
+    fp_sha = fingerprint.get("sha256") if isinstance(fingerprint, dict) else None
     config_rows = [
         ["adapter", f"`{adapter_name}`"],
         ["judge", f"`{judge_name}`"],
         ["platform", str(platform or "default")],
         ["commit", str(commit or "n/a")],
+        ["驱动 LLM", _fmt_opt(first_metrics.get("driver_llm"))],
+        ["判分模型", _fmt_opt(first_metrics.get("judge_model"))],
+        ["adapter 版本", _fmt_opt(first_metrics.get("adapter_version"))],
+        # 单数据集时直接给 sha256；多数据集时逐数据集指纹见下表。
+        ["数据集指纹", _fmt_opt(fp_sha) if len(results) <= 1 else "见下表（逐数据集）"],
         ["时间戳", timestamp.isoformat(timespec="seconds")],
         # 数据集范围：本次实际评测的 key 与来源，便于"先确认数据集范围"。
         ["数据集范围", "、".join(f"{r.spec.key}（{r.spec.source}）" for r in results) or "（无）"],
     ]
     lines.append(_md_table(["项目", "值"], config_rows))
     lines.append("")
-    ds_rows = [
-        [r.spec.name, r.spec.key, r.spec.source, f"`{r.spec.path}`"] for r in results
-    ]
-    lines.append(_md_table(["数据集", "槽位", "来源", "路径"], ds_rows))
+    ds_rows = []
+    for r in results:
+        fp = r.metrics.get("dataset_fingerprint")
+        ds_rows.append(
+            [
+                r.spec.name,
+                r.spec.key,
+                r.spec.source,
+                f"`{r.spec.path}`",
+                _fmt_opt(fp.get("sha256") if isinstance(fp, dict) else None),
+            ]
+        )
+    lines.append(_md_table(["数据集", "槽位", "来源", "路径", "指纹"], ds_rows))
     lines.append("")
 
     # 综合评级

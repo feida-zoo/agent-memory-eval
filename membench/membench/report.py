@@ -127,6 +127,69 @@ def metric_labels(keys: Iterable[str], with_key: bool = True) -> list[str]:
     return [metric_label(k, with_key=with_key) for k in keys if k]
 
 
+#: 门禁 / 可比性维度 key -> 中文显示名（数据层 key 不变，仅渲染层本地化）。
+DIM_LABEL_ZH: dict[str, str] = {
+    # compare 门禁名
+    "comparability": "可比性",
+    "accuracy_regression": "准确率回归",
+    "stale_rate_regression": "陈旧率回归",
+    "latency_p95_regression": "延迟 P95 回归",
+    # 可比性维度
+    "adapter": "适配器",
+    "adapter_version": "适配器版本",
+    "dataset_sha256": "数据集指纹",
+    "judge": "判分器",
+    "judge_model": "判分模型",
+    "driver_llm": "驱动 LLM",
+    "platform": "平台",
+    "commit": "commit",
+    "limit": "题目上限",
+    "shards": "分片数",
+    "shard_index": "分片序号",
+    "n_questions": "题目数",
+    "adapter_meta": "adapter 元数据",
+    "dataset_path": "数据集路径",
+    "dataset": "数据集",
+}
+
+
+def dim_label(key: str) -> str:
+    """门禁 / 可比性维度 key 的中文显示名。未知 key 原样返回。"""
+    return DIM_LABEL_ZH.get(key, str(key))
+
+
+#: metadata 字段标签（run / evaluate / compare 报告顶部「评测配置」段）。
+METADATA_FIELD_ZH: dict[str, str] = {
+    "adapter": "adapter",
+    "dataset": "数据集",
+    "dataset_path": "测试集路径",
+    "dataset_source": "测试集来源",
+    "platform": "平台",
+    "commit": "commit",
+    "judge": "判分器",
+    "driver_llm": "驱动 LLM",
+    "judge_model": "判分模型",
+    "adapter_version": "adapter 版本",
+    "adapter_meta": "adapter 元数据",
+    "n_questions": "题目数",
+    "n_ignored": "忽略题数",
+    "timestamp": "时间戳",
+    "limit": "题目上限",
+    "shards": "分片数",
+    "shard_index": "分片序号",
+    "shard_by": "分片维度",
+    "dataset_fingerprint": "数据集指纹",
+    "fused": "融合产物",
+    "fused_from": "来源分片",
+    "schema_version": "schema 版本",
+}
+
+
+def metadata_label(key: str) -> str:
+    """metadata 字段的中文标签。未知 key 原样返回。"""
+    return METADATA_FIELD_ZH.get(key, str(key))
+
+
 # 验收基线（report.md 对照表）：(指标 key, 展示名「中文（英文 key）」, 目标描述, 判定函数)
 BASELINES: list[tuple[str, str, str, Any]] = [
     ("accuracy", metric_label("accuracy"), ">= 0.85", lambda v: v >= 0.85),
@@ -257,13 +320,20 @@ def fig_metric_diff(
     其余保持默认色。效率子图单位各异，仅看相对高低并直接标注数值。
     """
     _setup_fonts()
-    keys = [k for k in DIFF_METRICS if k in overall_a and k in overall_b]
-    vals_a = [float(overall_a.get(k, 0.0)) for k in keys]
-    vals_b = [float(overall_b.get(k, 0.0)) for k in keys]
+    # 双侧都有非 None 值的指标才画（任一侧"未计算"时不出柱，避免把 None 画成 0）。
+    keys = [
+        k for k in DIFF_METRICS
+        if overall_a.get(k) is not None and overall_b.get(k) is not None
+    ]
+    vals_a = [float(overall_a[k]) for k in keys]
+    vals_b = [float(overall_b[k]) for k in keys]
 
-    eff_keys = [k for k in EFFICIENCY_DIFF_METRICS if k in overall_a and k in overall_b]
-    eff_a = [float(overall_a.get(k, 0.0)) for k in eff_keys]
-    eff_b = [float(overall_b.get(k, 0.0)) for k in eff_keys]
+    eff_keys = [
+        k for k in EFFICIENCY_DIFF_METRICS
+        if overall_a.get(k) is not None and overall_b.get(k) is not None
+    ]
+    eff_a = [float(overall_a[k]) for k in eff_keys]
+    eff_b = [float(overall_b[k]) for k in eff_keys]
 
     fig, (ax, ax2) = plt.subplots(1, 2, figsize=(max(12, 1.4 * len(keys)), 4.8))
     width = 0.38
@@ -399,7 +469,9 @@ def fig_dataset_overview(
 # ---------------------------------------------------------------------------
 
 def _fmt(value: Any) -> str:
-    """数值格式化：float 保留 3 位，其余原样。"""
+    """数值格式化：float 保留 3 位；``None``（未计算）显示 ``n/a``；其余原样。"""
+    if value is None:
+        return "n/a"
     if isinstance(value, float):
         return f"{value:.3f}"
     return str(value)
@@ -434,7 +506,12 @@ def _baseline_rows(overall: dict[str, Any]) -> list[list[str]]:
         if key not in overall:
             rows.append([label, target, "n/a", "—", "❓"])
             continue
-        value = float(overall[key])
+        raw = overall[key]
+        # 指标为 None 表示"未计算"（数据集无该题型），不参与基线判定。
+        if raw is None:
+            rows.append([label, target, "未定义", "—", "—"])
+            continue
+        value = float(raw)
         rating = rate_metric(key, value)
         rows.append([label, target, f"{value:.3f}", rating if rating else "—", "✅" if ok(value) else "❌"])
     return rows
@@ -455,27 +532,27 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
     fingerprint = metrics.get("dataset_fingerprint") or {}
     fp_sha = fingerprint.get("sha256") if isinstance(fingerprint, dict) else None
     config_rows = [
-        ["测试集路径", f"`{metrics.get('dataset_path', metrics.get('dataset', 'n/a'))}`"],
-        ["测试集来源", str(metrics.get("dataset_source", "n/a"))],
-        ["平台", str(metrics.get("platform", "default"))],
-        ["commit", str(metrics.get("commit") or "n/a")],
-        ["判分器", str(metrics.get("judge", "n/a"))],
-        ["驱动 LLM", _fmt_opt(metrics.get("driver_llm"))],
-        ["判分模型", _fmt_opt(metrics.get("judge_model"))],
-        ["adapter 版本", _fmt_opt(metrics.get("adapter_version"))],
-        ["数据集指纹", _fmt_opt(fp_sha)],
+        [metadata_label("dataset_path"), f"`{metrics.get('dataset_path', metrics.get('dataset', 'n/a'))}`"],
+        [metadata_label("dataset_source"), str(metrics.get("dataset_source", "n/a"))],
+        [metadata_label("platform"), str(metrics.get("platform", "default"))],
+        [metadata_label("commit"), str(metrics.get("commit") or "n/a")],
+        [metadata_label("judge"), str(metrics.get("judge", "n/a"))],
+        [metadata_label("driver_llm"), _fmt_opt(metrics.get("driver_llm"))],
+        [metadata_label("judge_model"), _fmt_opt(metrics.get("judge_model"))],
+        [metadata_label("adapter_version"), _fmt_opt(metrics.get("adapter_version"))],
+        [metadata_label("dataset_fingerprint"), _fmt_opt(fp_sha)],
     ]
     lines.append(_md_table(["项目", "值"], config_rows))
     lines.append("")
 
-    lines.append(f"- adapter: `{metrics.get('adapter', 'n/a')}`")
-    lines.append(f"- dataset: `{metrics.get('dataset', 'n/a')}`")
-    lines.append(f"- judge: `{metrics.get('judge', 'n/a')}`")
-    lines.append(f"- timestamp: {metrics.get('timestamp', 'n/a')}")
-    lines.append(f"- n_questions: {overall.get('n_questions', len(records))}")
+    lines.append(f"- {metadata_label('adapter')}: `{metrics.get('adapter', 'n/a')}`")
+    lines.append(f"- {metadata_label('dataset')}: `{metrics.get('dataset', 'n/a')}`")
+    lines.append(f"- {metadata_label('judge')}: `{metrics.get('judge', 'n/a')}`")
+    lines.append(f"- {metadata_label('timestamp')}: {metrics.get('timestamp', 'n/a')}")
+    lines.append(f"- {metadata_label('n_questions')}: {overall.get('n_questions', len(records))}")
     n_ignored = int(metrics.get("n_ignored", 0) or 0)
     if n_ignored:
-        lines.append(f"- 忽略题数: {n_ignored}（ignore=true，未参与评分）")
+        lines.append(f"- {metadata_label('n_ignored')}: {n_ignored}（ignore=true，未参与评分）")
     judge_fallback = metrics.get("judge_fallback")
     if judge_fallback:
         fb_count = int(judge_fallback.get("count", 0) or 0)
@@ -483,6 +560,19 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
         lines.append(
             f"- LLM judge 回退: {fb_count} 题（{fb_ratio:.1%}，judge=llm-fallback）"
         )
+    # capabilities 落账在 metrics.json 顶层（has_evidence / has_stale /
+    # has_abstention），直接读三个顶层字段。
+    cap_items = [
+        ("has_evidence", "evidence 标注"),
+        ("has_stale", "gold_stale 标注"),
+        ("has_abstention", "abstention 题"),
+    ]
+    if any(key in metrics for key, _ in cap_items):
+        cap_strs = [
+            f"{label}={'✓' if metrics.get(key) else '✗'}"
+            for key, label in cap_items
+        ]
+        lines.append(f"- 能力标注: {'、'.join(cap_strs)}")
     lines.append("")
 
     # 1. 摘要表（六维核心指标）
@@ -666,8 +756,8 @@ def write_compare_report_md(
     lines.append("")
     gate_rows = []
     for g in gates:
-        icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌"}.get(str(g.get("status", "")), "")
-        gate_rows.append([str(g.get("name", "")), str(g.get("status", "")), icon, str(g.get("detail", ""))])
+        icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌", "SKIP": "⏭️"}.get(str(g.get("status", "")), "")
+        gate_rows.append([dim_label(str(g.get("name", ""))), str(g.get("status", "")), icon, str(g.get("detail", ""))])
     lines.append(_md_table(["门禁", "状态", "", "说明"], gate_rows or [["(无)", "", "", ""]]))
     lines.append("")
 
@@ -681,7 +771,7 @@ def write_compare_report_md(
             same_txt = "是" if same else ("否" if same is False else "—")
             comp_rows.append(
                 [
-                    str(c.get("dimension", "")),
+                    dim_label(str(c.get("dimension", ""))),
                     _fmt_opt(c.get("a")),
                     _fmt_opt(c.get("b")),
                     same_txt,

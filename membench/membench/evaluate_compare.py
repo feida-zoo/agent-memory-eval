@@ -30,6 +30,7 @@ dataset_fingerprint 自动覆盖（同一数据集两侧指纹必一致），故
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -37,18 +38,21 @@ from typing import Any, Union
 
 from membench import layout, paths
 from membench.compare import _diff_overall, _eval_gates
+from membench.data.schema import is_abstention
 from membench.evaluate import (
     DatasetResult,
     DatasetSpec,
     fuse_metrics,
     plan_datasets,
     run_datasets,
+    scan_capabilities,
 )
 from membench.report import (
     PALETTE,
     _md_table,
     _setup_fonts,
     category_display,
+    dim_label,
     metric_label,
     metric_labels,
 )
@@ -75,7 +79,89 @@ class ArmDatasetResult:
     capabilities: dict[str, bool] = field(default_factory=dict)
 
 
-def _arm_fuse(results: list[ArmDatasetResult], side: str) -> dict[str, dict[str, Any]]:
+def _rescan_capabilities(run_dir: str, spec_path: str) -> tuple[dict[str, bool], str]:
+    """重算 capabilities：数据集扫描（准确）→ results.jsonl 反推（近似）→ 缺失。
+
+    Returns:
+        ``(capabilities, source)``，source ∈ ``dataset | results_jsonl | missing``。
+    """
+    try:
+        return scan_capabilities(spec_path), "dataset"
+    except (OSError, ValueError):
+        pass
+
+    jsonl_path = os.path.join(run_dir, "results.jsonl")
+    if os.path.isfile(jsonl_path):
+        try:
+            has_evidence = False
+            has_stale = False
+            has_abstention = False
+            with open(jsonl_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    # results.jsonl 不保留题目原始 evidence / gold_stale 标注，
+                    # 只能近似：evidence_hit 命中过任何一条 → 有 evidence 题；
+                    # knowledge_update 题存在 → 视为有 stale 标注；gold 哨兵或
+                    # category=abstention → 有拒答题。
+                    if rec.get("evidence_hit"):
+                        has_evidence = True
+                    if str(rec.get("category", "")) == "knowledge_update":
+                        has_stale = True
+                    if is_abstention(
+                        str(rec.get("category", "")), str(rec.get("gold_answer", ""))
+                    ):
+                        has_abstention = True
+            return (
+                {
+                    "has_evidence": has_evidence,
+                    "has_stale": has_stale,
+                    "has_abstention": has_abstention,
+                },
+                "results_jsonl",
+            )
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    return (
+        {"has_evidence": False, "has_stale": False, "has_abstention": False},
+        "missing",
+    )
+
+
+def _resolve_capabilities(
+    metrics: dict[str, Any],
+    run_dir: str,
+    spec_path: str,
+) -> tuple[dict[str, bool], str]:
+    """解析某侧数据集的能力标注，优先读 metrics.json 顶层落账字段。
+
+    旧版 run 的 metrics.json 顶层没有 has_evidence / has_stale / has_abstention
+    （或全 False 占位），直接读会把 evidence_recall 等三项判成"未定义 / 参与集
+    （无）"，与真实融合值不一致；此函数按"落账优先、缺失/全 False 时重算核对"
+    的顺序回退。重算结果与落账一致时仍按 ``"metrics"`` 标注，避免报告噪音。
+
+    Returns:
+        ``(capabilities, source)``，source ∈
+        ``metrics | dataset | results_jsonl | missing``（用于报告标注来源）。
+    """
+    keys = ("has_evidence", "has_stale", "has_abstention")
+    stored = {key: metrics.get(key) for key in keys}
+    complete = all(isinstance(v, bool) for v in stored.values())
+    if complete and any(stored.values()):
+        return dict(stored), "metrics"  # type: ignore[arg-type]
+
+    caps, source = _rescan_capabilities(run_dir, spec_path)
+    if complete and caps == stored:
+        return dict(stored), "metrics"  # type: ignore[arg-type]
+    return caps, source
+
+
+def _arm_fuse(
+    results: list[ArmDatasetResult], side: str
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """对一侧（baseline / candidate）的各数据集结果做宏平均融合。
 
     Args:
@@ -83,22 +169,28 @@ def _arm_fuse(results: list[ArmDatasetResult], side: str) -> dict[str, dict[str,
         side: ``"baseline"`` 或 ``"candidate"``。
 
     Returns:
-        ``{metric: {"value": 融合值, "participants": [...]}}``，结构与
-        :func:`membench.evaluate.fuse_metrics` 一致。
+        ``(fused, sources)``：fused 为 ``{metric: {"value", "participants"}}``
+        （结构与 :func:`membench.evaluate.fuse_metrics` 一致）；sources 为
+        ``{数据集 key: capabilities 来源}``（metrics / dataset / results_jsonl /
+        missing），供报告标注"未落账已自动推断"。
     """
     # 直接复用 fuse_metrics：构造一组 DatasetResult-like 即可。
     fake_results: list[DatasetResult] = []
+    sources: dict[str, str] = {}
     for r in results:
         metrics = r.baseline if side == "baseline" else r.candidate
+        run_dir = r.baseline_run_dir if side == "baseline" else r.candidate_run_dir
+        caps, src = _resolve_capabilities(metrics, run_dir, r.spec.path)
+        sources[r.spec.key] = src
         fake_results.append(
             DatasetResult(
                 spec=r.spec,
-                run_dir=r.baseline_run_dir if side == "baseline" else r.candidate_run_dir,
+                run_dir=run_dir,
                 metrics=metrics,
-                capabilities=r.capabilities,
+                capabilities=caps,
             )
         )
-    return fuse_metrics(fake_results)
+    return fuse_metrics(fake_results), sources
 
 
 def _per_dataset_diff(results: list[ArmDatasetResult]) -> list[dict[str, Any]]:
@@ -108,7 +200,7 @@ def _per_dataset_diff(results: list[ArmDatasetResult]) -> list[dict[str, Any]]:
         a = r.baseline.get("overall", {})
         b = r.candidate.get("overall", {})
         diffs = _diff_overall(a, b)
-        rows.append({"spec": r.spec, "diffs": diffs, "a": a, "b": b})
+        rows.append({"spec": r.spec, "diffs": diffs})
     return rows
 
 
@@ -139,6 +231,33 @@ def _fused_gates(
     if not a_overall or not b_overall:
         return []
     return _eval_gates(a_overall, b_overall, acc_threshold, stale_threshold, latency_warn)
+
+
+def _per_dataset_gates(
+    arms: list[ArmDatasetResult],
+    acc_threshold: float,
+    stale_threshold: float,
+    latency_warn: float,
+) -> list[dict[str, Any]]:
+    """逐数据集门禁：单数据集 spike 不被融合平均抹平。
+
+    返回 ``[{dataset, verdict, gates}, ...]``，verdict 由该数据集内 gates
+    决定（任一 FAIL → FAIL；任一 WARN → WARN；否则 PASS）。
+    """
+    rows: list[dict[str, Any]] = []
+    for arm in arms:
+        a_overall = arm.baseline.get("overall", {})
+        b_overall = arm.candidate.get("overall", {})
+        gates = _eval_gates(a_overall, b_overall, acc_threshold, stale_threshold, latency_warn)
+        verdict = "PASS"
+        if any(g["status"] == "FAIL" for g in gates):
+            verdict = "FAIL"
+        elif any(g["status"] == "WARN" for g in gates):
+            verdict = "WARN"
+        elif not any(g["status"] == "PASS" for g in gates):
+            verdict = "SKIP"
+        rows.append({"spec": arm.spec, "verdict": verdict, "gates": gates})
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -325,12 +444,17 @@ def evaluate_compare(
     # 逐数据集 diff
     per_dataset = _per_dataset_diff(arms)
 
-    # 双臂融合
-    fused_baseline = _arm_fuse(arms, "baseline")
-    fused_candidate = _arm_fuse(arms, "candidate")
+    # 双臂融合（sources 记录 capabilities 来源，供报告标注）
+    fused_baseline, cap_sources_a = _arm_fuse(arms, "baseline")
+    fused_candidate, cap_sources_b = _arm_fuse(arms, "candidate")
     fused_diffs = _fused_diff(fused_baseline, fused_candidate)
     gates = _fused_gates(
         fused_baseline, fused_candidate, acc_threshold, stale_threshold, latency_warn
+    )
+
+    # per-dataset 门禁：单数据集 spike 不被融合平均抹平
+    per_dataset_gates = _per_dataset_gates(
+        arms, acc_threshold, stale_threshold, latency_warn
     )
 
     if any(g["status"] == "FAIL" for g in gates):
@@ -339,6 +463,17 @@ def evaluate_compare(
         verdict = "WARN"
     else:
         verdict = "PASS"
+
+    # per-dataset worst verdict 用于报告并列呈现（不改变 fused verdict）。
+    per_dataset_verdict = "PASS"
+    if any(row["verdict"] == "FAIL" for row in per_dataset_gates):
+        per_dataset_verdict = "FAIL"
+    elif any(row["verdict"] == "WARN" for row in per_dataset_gates):
+        per_dataset_verdict = "WARN"
+    elif per_dataset_gates and all(
+        row["verdict"] == "SKIP" for row in per_dataset_gates
+    ):
+        per_dataset_verdict = "SKIP"
 
     # 产物落 <root>/ab_<tag>_<ts>/
     now = datetime.now()
@@ -374,6 +509,9 @@ def evaluate_compare(
         fused_diffs,
         gates,
         verdict,
+        per_dataset_gates=per_dataset_gates,
+        per_dataset_verdict=per_dataset_verdict,
+        cap_sources={"baseline": cap_sources_a, "candidate": cap_sources_b},
     )
 
     _check_plt()
@@ -411,6 +549,9 @@ def _write_evaluate_compare_report(
     fused_diffs: dict[str, dict[str, float]],
     gates: list[dict[str, Any]],
     verdict: str,
+    per_dataset_gates: list[dict[str, Any]] | None = None,
+    per_dataset_verdict: str | None = None,
+    cap_sources: dict[str, dict[str, str]] | None = None,
 ) -> str:
     """生成 evaluate-compare 的 compare_report.md（中文）。"""
     lines: list[str] = []
@@ -418,6 +559,12 @@ def _write_evaluate_compare_report(
     lines.append("")
     verdict_icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌"}.get(verdict, "")
     lines.append(f"**门禁结论： {verdict} {verdict_icon}**")
+    if per_dataset_verdict and per_dataset_verdict != verdict:
+        pd_icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌", "SKIP": "⏭️"}.get(per_dataset_verdict, "")
+        lines.append(
+            f"**per-dataset 门禁最坏结论： {per_dataset_verdict} {pd_icon}**"
+            "（单数据集 spike 不被融合平均抹平）"
+        )
     lines.append("")
     lines.append(f"- 基线 A: `{baseline_name}`")
     lines.append(f"- 候选 B: `{candidate_name}`")
@@ -427,6 +574,25 @@ def _write_evaluate_compare_report(
     lines.append(f"- 数据集数: {len(arms)}（{', '.join(r.spec.name for r in arms)}）")
     lines.append(f"- 时间戳: {timestamp.isoformat(timespec='seconds')}")
     lines.append("")
+
+    # capabilities 来源标注：任一侧有推断值时提示，避免"未定义/未落账"混淆。
+    if cap_sources:
+        parts: list[str] = []
+        for side_key, side_label in (("baseline", "A"), ("candidate", "B")):
+            inferred = [
+                f"{k}:{v}"
+                for k, v in (cap_sources.get(side_key) or {}).items()
+                if v != "metrics"
+            ]
+            if inferred:
+                parts.append(f"{side_label} 侧 " + "、".join(inferred))
+        if parts:
+            lines.append(
+                "<sub>capabilities 未落账，已自动推断（"
+                + "；".join(parts)
+                + "；dataset=重扫数据集，results_jsonl=按逐题记录反推，missing=不可得按全 False）。</sub>"
+            )
+            lines.append("")
 
     # 1. 逐数据集 diff（关键指标）
     lines.append("## 逐数据集关键指标 diff（B - A）")
@@ -523,8 +689,8 @@ def _write_evaluate_compare_report(
     if gates:
         gate_rows: list[list[str]] = []
         for g in gates:
-            icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌"}.get(str(g.get("status", "")), "")
-            gate_rows.append([str(g.get("name", "")), str(g.get("status", "")), icon, str(g.get("detail", ""))])
+            icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌", "SKIP": "⏭️"}.get(str(g.get("status", "")), "")
+            gate_rows.append([dim_label(str(g.get("name", ""))), str(g.get("status", "")), icon, str(g.get("detail", ""))])
         lines.append(_md_table(["门禁", "状态", "", "说明"], gate_rows))
     else:
         lines.append("（无可评估的门禁项——任一侧融合值缺失）")
@@ -555,6 +721,27 @@ def _write_evaluate_compare_report(
         )
     )
     lines.append("")
+
+    # 4.5 per-dataset 门禁明细：单数据集 spike 不被融合抹平
+    if per_dataset_gates:
+        lines.append("## per-dataset 门禁明细")
+        lines.append("")
+        lines.append(
+            "<sub>每个数据集各自的 accuracy_regression / stale_rate_regression /"
+            " latency_p95_regression 判定。融合 verdict 通过时，单数据集仍可能"
+            " 出现 WARN/FAIL（融合平均会抹平 spike）。</sub>"
+        )
+        lines.append("")
+        rows_pd: list[list[str]] = []
+        for row in per_dataset_gates:
+            spec = row["spec"]
+            verdict_pd = row["verdict"]
+            icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌", "SKIP": "⏭️"}.get(verdict_pd, "")
+            fails = [g for g in row["gates"] if g["status"] != "PASS"]
+            detail = "; ".join(f"{g['name']}: {g['detail']}" for g in fails) or "全部通过"
+            rows_pd.append([spec.name, verdict_pd, icon, detail])
+        lines.append(_md_table(["数据集", "verdict", "", "触发明细"], rows_pd))
+        lines.append("")
 
     # 5. 各数据集完整指标（含参与能力标注）
     lines.append("## 各数据集完整指标（参考）")

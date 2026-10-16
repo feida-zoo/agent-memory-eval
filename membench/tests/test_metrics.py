@@ -156,7 +156,17 @@ class TestAggregate:
         ]
         metrics = aggregate(records)
 
-        assert set(metrics) == {"overall", "by_category"}
+        # metrics.json 顶层落账能力标注（caller 直接读，不必再扫 results.jsonl）
+        assert set(metrics) == {
+            "overall",
+            "by_category",
+            "has_evidence",
+            "has_stale",
+            "has_abstention",
+        }
+        assert metrics["has_evidence"] is True
+        assert metrics["has_stale"] is True
+        assert metrics["has_abstention"] is True
         overall = metrics["overall"]
         expected_keys = {
             "accuracy",
@@ -220,9 +230,11 @@ class TestAggregate:
         assert overall["evidence_recall"] == pytest.approx(1.0)
 
     def test_empty_records(self) -> None:
+        # 空 records 时 _mean 返 None（区分"未计算"与"真实 0"），
+        # 而不是把"无题"误算成"准确率为 0"。
         metrics = aggregate([])
         assert metrics["overall"]["n_questions"] == 0
-        assert metrics["overall"]["accuracy"] == 0.0
+        assert metrics["overall"]["accuracy"] is None
         assert metrics["by_category"] == {}
 
     def test_avg_llm_calls_includes_ingest(self) -> None:
@@ -231,3 +243,37 @@ class TestAggregate:
         rec["ingest_llm_calls"] = 2
         metrics = aggregate([rec])
         assert metrics["overall"]["avg_llm_calls"] == pytest.approx(3.0)
+
+    def test_capabilities_passed_in(self) -> None:
+        """runner 把 capabilities 传给 aggregate，落账到 metrics.json 顶层；
+        capabilities 为 False 的指标显式 None（"未计算"）。"""
+        recs = [
+            {
+                "qid": "q1",
+                "category": "single_hop",
+                "judge": {"correct": True},
+                "token_f1": 0.5,
+                "bleu1": 0.4,
+                "evidence_hit": True,
+            }
+        ]
+        caps = {"has_evidence": True, "has_stale": False, "has_abstention": False}
+        metrics = aggregate(recs, capabilities=caps)
+        assert metrics["has_evidence"] is True
+        assert metrics["has_stale"] is False
+        assert metrics["has_abstention"] is False
+        assert metrics["overall"]["evidence_recall"] == pytest.approx(1.0)
+        # 该数据集没有 knowledge_update 题 → stale_rate 显式 None（不污染总分）
+        assert metrics["overall"]["stale_rate"] is None
+        # 该数据集没有 abstention 题 → abstention_accuracy 显式 None
+        assert metrics["overall"]["abstention_accuracy"] is None
+
+    def test_capabilities_default_fallback(self) -> None:
+        """aggregate 不传 capabilities 时从 records 推断（fallback）。"""
+        recs = [
+            {"qid": "q1", "category": "abstention", "judge": {"correct": True, "abstained_pred": True}},
+        ]
+        metrics = aggregate(recs)
+        assert metrics["has_abstention"] is True
+        assert metrics["has_evidence"] is False
+        assert metrics["has_stale"] is False

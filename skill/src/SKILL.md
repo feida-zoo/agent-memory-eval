@@ -148,7 +148,7 @@ python -m membench.cli evaluate --adapter <adapter> --beam-10m   # 1M 换成 10M
 python -m membench.cli evaluate --adapter <adapter> --include-lme-s  # 追加 LongMemEval-S（检索/精确率压力测试）
 ```
 
-用户问"两版系统 A/B 对比一下、跨数据集一次出结论"时用 `evaluate-compare`：两套 adapter × 同一组数据集，分别跑完后产出**逐数据集 diff + 跨数据集融合 diff + 门禁 + 对比图**，落 `<报告父目录>/ab_<tag>_<ts>/` 自包含结构：
+用户问"两版系统 A/B 对比一下、跨数据集一次出结论"时用 `evaluate-compare`：两套 adapter × 同一组数据集，分别跑完后产出**逐数据集 diff + 逐数据集题型 diff + 跨数据集融合 diff + 融合/per-dataset 两层门禁 + 对比图**，落 `<报告父目录>/ab_<tag>_<ts>/` 自包含结构（旧版 run 的 capabilities 未落账时自动推断并在报告头标注来源）：
 
 ```bash
 python -m membench.cli evaluate-compare \

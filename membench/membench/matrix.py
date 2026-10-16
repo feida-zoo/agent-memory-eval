@@ -79,7 +79,10 @@ def _build_pivots(
             table[p] = {}
             for c in commits:
                 label = combo_to_label[(p, c)]
-                table[p][c] = float(overalls[label].get(metric, 0.0))
+                v = overalls[label].get(metric)
+                # None = 该数据集未计算该指标：跳过（matplotlib 会把 None 画成缺口）
+                if v is not None:
+                    table[p][c] = float(v)
         pivots[metric] = table
     return pivots
 
@@ -191,9 +194,10 @@ def compare_matrix(labeled_runs: list[tuple[str, str]], out_dir: str) -> dict[st
     # 1. 逐指标汇总表（行=指标，列=label）
     summary: dict[str, dict[str, float]] = {
         label: {
-            m: float(overalls[label].get(m, 0.0))
+            m: float(overalls[label][m])
             for m in MATRIX_METRICS
-            if m in overalls[label]
+            # None = 未计算：跳过，不按 0 计入汇总/图表。
+            if overalls[label].get(m) is not None
         }
         for label in labels
     }
@@ -283,7 +287,7 @@ def _write_matrix_report_md(
             lines.append(f"### {metric_label(metric)}")
             lines.append("")
             rows = [
-                [p] + [f"{table[p][c]:.3f}" for c in commits]
+                [p] + [f"{table[p][c]:.3f}" if c in table[p] else "n/a" for c in commits]
                 for p in platforms
             ]
             lines.append(_md_table(["platform \\ commit", *commits], rows))

@@ -31,7 +31,11 @@ from datetime import datetime
 from typing import Any, Union
 
 from membench import layout
-from membench.data.schema import dataset_fingerprint, load_dataset
+from membench.data.schema import (
+    dataset_fingerprint,
+    load_dataset,
+    question_capabilities,
+)
 from membench.judges import get_judge
 from membench.metrics import aggregate
 from membench.metrics.text import bleu1, recall_at_k, token_f1
@@ -335,7 +339,14 @@ class Runner:
             except Exception:  # noqa: BLE001 - 自描述信息失败不应中断评测
                 adapter_describe = None
 
-        metrics = dict(aggregate(records))
+        # 能力标注（has_evidence / has_stale / has_abstention）从题目集扫描
+        # 得到（排除 ignore 题），经 aggregate 落账到 metrics.json 顶层，
+        # caller 不必再扫 results.jsonl 二次推断。
+        capabilities = question_capabilities(
+            q for d in dialogues for q in d.questions
+        )
+
+        metrics = dict(aggregate(records, capabilities=capabilities))
         metrics.update(
             {
                 "run_id": run_id,
@@ -386,10 +397,15 @@ class Runner:
             print(f"[membench] 实验目录: {exp_dir}")
 
         overall = metrics.get("overall", {})
+
+        def _fmt(v: Any) -> str:
+            """指标值格式化：None 显式 'n/a'，避免 .3f 报 TypeError。"""
+            return f"{float(v):.3f}" if v is not None else "n/a"
+
         print(
-            f"[membench] done. accuracy={overall.get('accuracy', 0.0):.3f} "
-            f"stale_rate={overall.get('stale_rate', 0.0):.3f} "
-            f"evidence_recall={overall.get('evidence_recall', 0.0):.3f}"
+            f"[membench] done. accuracy={_fmt(overall.get('accuracy'))} "
+            f"stale_rate={_fmt(overall.get('stale_rate'))} "
+            f"evidence_recall={_fmt(overall.get('evidence_recall'))}"
         )
         print(f"[membench] run dir: {run_dir}")
         return run_dir

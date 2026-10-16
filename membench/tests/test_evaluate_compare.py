@@ -220,13 +220,15 @@ def _build_arms(mini: dict[str, Path], scripts: dict[str, dict[str, tuple[str, l
 def test_arm_fuse_matches_per_arm_fuse_metrics(mini_datasets, scripts) -> None:
     """_arm_fuse 与 evaluate.fuse_metrics 在两侧应分别得到一致的融合值。"""
     arms = _build_arms(mini_datasets, scripts)
-    fused_base = _arm_fuse(arms, "baseline")
-    fused_cand = _arm_fuse(arms, "candidate")
+    fused_base, sources_base = _arm_fuse(arms, "baseline")
+    fused_cand, _ = _arm_fuse(arms, "candidate")
 
     # 手工比对：baseline 侧 accuracy
     assert fused_base["accuracy"]["value"] is not None
     assert fused_cand["accuracy"]["value"] is not None
     assert fused_cand["accuracy"]["value"] >= fused_base["accuracy"]["value"]
+    # 新 run 的 metrics.json 顶层已落账 capabilities，来源应全部为 "metrics"
+    assert sources_base == {"a": "metrics", "b": "metrics", "c": "metrics"}
 
 
 def test_fused_diff_computes_per_metric_diff() -> None:
@@ -389,3 +391,94 @@ def test_cli_evaluate_compare_pass_returns_zero(tmp_path, monkeypatch) -> None:
         ]
     )
     assert rc == 0
+
+
+def test_per_dataset_gates_flags_single_dataset_spike() -> None:
+    """单数据集 spike：融合平均抹平后，per-dataset 门禁仍能捕获。
+
+    A 数据集 stale_rate 0.01 → 0.10 远超阈值：逐数据集 verdict 应为 FAIL，
+    且门禁明细包含 stale_rate_regression。
+    """
+    from membench.evaluate import DatasetSpec
+    from membench.evaluate_compare import ArmDatasetResult, _per_dataset_gates
+
+    arms = [
+        ArmDatasetResult(
+            spec=DatasetSpec(key="a", name="A", path="x", source="builtin"),
+            baseline={"overall": {"accuracy": 0.9, "stale_rate": 0.01, "latency_p95_ms": 100.0}},
+            candidate={"overall": {"accuracy": 0.9, "stale_rate": 0.10, "latency_p95_ms": 100.0}},
+            baseline_run_dir="x",
+            candidate_run_dir="y",
+        )
+    ]
+    rows = _per_dataset_gates(arms, acc_threshold=0.02, stale_threshold=0.02, latency_warn=0.30)
+    assert len(rows) == 1
+    assert rows[0]["verdict"] == "FAIL"
+    assert any(g["name"] == "stale_rate_regression" for g in rows[0]["gates"])
+
+
+def test_resolve_capabilities_reads_top_level_and_falls_back(tmp_path) -> None:
+    """capabilities 解析：顶层落账优先直读；旧版全 False 时回退重算并核对。"""
+    from membench.evaluate_compare import _resolve_capabilities
+
+    # 顶层已落账（任一 True）→ 直读，来源 metrics
+    caps, src = _resolve_capabilities(
+        {"has_evidence": True, "has_stale": False, "has_abstention": True},
+        run_dir=str(tmp_path),
+        spec_path=str(tmp_path / "missing.jsonl"),
+    )
+    assert src == "metrics"
+    assert caps == {"has_evidence": True, "has_stale": False, "has_abstention": True}
+
+    # 旧版：顶层全 False 占位，但数据集实际有拒答题 → 回退扫数据集，来源 dataset
+    ds = _write_dataset(
+        tmp_path / "d.jsonl",
+        [
+            {
+                "dialogue_id": "d1",
+                "sessions": [_session()],
+                "questions": [
+                    {
+                        "qid": "q1",
+                        "question": "私人电话？",
+                        "gold_answer": "<ABSTAIN>",
+                        "category": "abstention",
+                        "evidence": [],
+                    }
+                ],
+            }
+        ],
+    )
+    caps, src = _resolve_capabilities(
+        {"has_evidence": False, "has_stale": False, "has_abstention": False},
+        run_dir=str(tmp_path),
+        spec_path=str(ds),
+    )
+    assert src == "dataset"
+    assert caps["has_abstention"] is True
+
+    # 顶层缺失、数据集与 results.jsonl 均不可得 → missing 全 False
+    caps, src = _resolve_capabilities({}, run_dir=str(tmp_path), spec_path=str(tmp_path / "nope.jsonl"))
+    assert src == "missing"
+    assert caps == {"has_evidence": False, "has_stale": False, "has_abstention": False}
+
+    # 数据集不可得时回退按 results.jsonl 反推（evidence_hit / KU / 拒答哨兵）
+    run_dir = tmp_path / "run1"
+    run_dir.mkdir()
+    (run_dir / "results.jsonl").write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                {"category": "knowledge_update", "evidence_hit": False, "gold_answer": "x"},
+                {"category": "privacy_refuse", "evidence_hit": True, "gold_answer": "<ABSTAIN>"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    caps, src = _resolve_capabilities(
+        {},
+        run_dir=str(run_dir),
+        spec_path=str(tmp_path / "nope2.jsonl"),
+    )
+    assert src == "results_jsonl"
+    assert caps == {"has_evidence": True, "has_stale": True, "has_abstention": True}

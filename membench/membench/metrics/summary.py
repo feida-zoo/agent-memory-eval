@@ -39,13 +39,20 @@ def percentile(values: Iterable[float], p: float) -> float:
     return xs[lo] + (xs[hi] - xs[lo]) * frac
 
 
-def _mean(values: Iterable[float]) -> float:
-    """算术均值；空序列返回 0.0。"""
+def _mean(values: Iterable[float]) -> float | None:
+    """算术均值；空序列返回 ``None``（显式区分"未计算"与"真实 0"）。
+
+    返回 ``None`` 让 ``format_metric`` / ``fig_*`` / ``fuse_metrics`` 一律走
+    "未定义"路径，避免旧版把"数据集无 evidence"误算成"召回率为 0"。
+    """
     xs = [float(v) for v in values]
-    return sum(xs) / len(xs) if xs else 0.0
+    return sum(xs) / len(xs) if xs else None
 
 
-def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
+def aggregate(
+    records: list[dict[str, Any]],
+    capabilities: dict[str, bool] | None = None,
+) -> dict[str, Any]:
     """汇总单条评测记录为六维指标字典（SPEC 3.5）。
 
     Args:
@@ -53,11 +60,17 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             ``category / gold_answer / evidence_hit / token_f1 / bleu1 /
             latency_ms / input_tokens / llm_calls / ingest_llm_calls`` 以及
             ``judge``（含 correct / abstained_pred / stale）字段。
+        capabilities: 可选，由 runner 从题目集扫描得到的能力标注
+            （``has_evidence / has_stale / has_abstention``）；传 None 时
+            ``aggregate`` 从 records 自身推断（仅以"是否有非 abstention
+            题 / abstention 题 / knowledge_update 题"为依据——这是
+            fallback，主要路径是 runner 直接传 capabilities）。
 
     Returns:
-        ``{"overall": {...}, "by_category": {category: {"accuracy", "n"}}}``；
-        使用了 LLM judge 时附加 ``"judge_fallback": {"count", "ratio"}``
-        （``judge=="llm-fallback"`` 的记录占比）。
+        ``{"overall": {...}, "by_category": {category: {"accuracy", "n"}},
+        "has_evidence": bool, "has_stale": bool, "has_abstention": bool}``；
+        无对应题型的指标返回 ``None``（区别于"真实 0"）；使用了 LLM judge 时
+        附加 ``"judge_fallback": {"count", "ratio"}``。
 
     指标口径：
         - accuracy: ``judge.correct`` 均值。
@@ -86,17 +99,38 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     abstention = [r for r in records if _is_abstention_rec(r)]
     knowledge_update = [r for r in records if r.get("category") == "knowledge_update"]
 
+    # capabilities：优先用 runner 传入的（基于题目集扫描，含被忽略题统计），
+    # fallback 到从 records 推断（仅看 records 中出现过的 category / evidence_hit）。
+    if capabilities is not None:
+        caps = dict(capabilities)
+    else:
+        caps = {
+            "has_evidence": any(bool(r.get("evidence_hit")) for r in non_abstention),
+            "has_stale": bool(knowledge_update),
+            "has_abstention": bool(abstention),
+        }
+
     overall = {
         "accuracy": _mean(bool(_judge(r).get("correct")) for r in records),
         "token_f1": _mean(r.get("token_f1", 0.0) for r in records),
         "bleu1": _mean(r.get("bleu1", 0.0) for r in records),
-        "evidence_recall": _mean(
-            bool(r.get("evidence_hit")) for r in non_abstention
+        # capabilities 为 False 时显式 None（"未计算"），而非把"无该题型"
+        # 误算成 0（污染总分/评级）。
+        "evidence_recall": (
+            _mean(bool(r.get("evidence_hit")) for r in non_abstention)
+            if caps.get("has_evidence", False)
+            else None
         ),
-        "abstention_accuracy": _mean(
-            bool(_judge(r).get("abstained_pred")) for r in abstention
+        "abstention_accuracy": (
+            _mean(bool(_judge(r).get("abstained_pred")) for r in abstention)
+            if caps.get("has_abstention", False)
+            else None
         ),
-        "stale_rate": _mean(bool(_judge(r).get("stale")) for r in knowledge_update),
+        "stale_rate": (
+            _mean(bool(_judge(r).get("stale")) for r in knowledge_update)
+            if caps.get("has_stale", False)
+            else None
+        ),
         "latency_p50_ms": percentile((r.get("latency_ms", 0.0) for r in records), 50),
         "latency_p95_ms": percentile((r.get("latency_ms", 0.0) for r in records), 95),
         "avg_input_tokens": _mean(r.get("input_tokens", 0) for r in records),
@@ -122,7 +156,13 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         del bucket["_correct"]
         del bucket["_f1"]
 
-    result: dict[str, Any] = {"overall": overall, "by_category": by_category}
+    result: dict[str, Any] = {
+        "overall": overall,
+        "by_category": by_category,
+        # capabilities 落账到 metrics.json 顶层（has_evidence / has_stale /
+        # has_abstention）：caller 直接读，不必再扫 results.jsonl 二次推断。
+        **caps,
+    }
 
     # LLM judge 回退统计：任一记录由 llm / llm-fallback 判分时，
     # 统计 judge=="llm-fallback" 的数量与占比（无 LLM judge 时省略该键）。

@@ -89,7 +89,7 @@ python -m membench.cli evaluate-compare \
     --quick
 ```
 
-门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **双臂融合 diff 表** + **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）。
+门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **逐数据集题型 diff** + **双臂融合 diff 表** + **per-dataset 门禁明细**（单数据集 spike 不被融合平均抹平）+ **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）；指标"未计算"统一记 `null`，与真实 0 区分。旧版 run 的 capabilities 未落账时报告会按数据集/逐题记录自动推断并在头部标注来源。
 
 融合口径（重要，读总分前必读）：
 

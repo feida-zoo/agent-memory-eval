@@ -25,6 +25,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable
 
 #: 题目类别"软约定"全集（SPEC 3.2，7 种）。
 #: 不同数据集设计意图不同，category 集合本来就该不重合——locomo 5 /
@@ -54,6 +55,32 @@ def is_abstention(category: str, gold_answer: str) -> bool:
     category 仅作兼容兜底。
     """
     return category == "abstention" or gold_answer == ABSTAIN_SENTINEL
+
+
+def question_capabilities(questions: Iterable[Question]) -> dict[str, bool]:
+    """扫描题目集合，得出能力标注 has_evidence / has_stale / has_abstention。
+
+    ignore=true 的题不参与评分，能力标注同样排除它们；runner 与
+    :func:`membench.evaluate.scan_capabilities` 共享同一口径，避免两处
+    扫描语义漂移。
+    """
+    has_evidence = False
+    has_stale = False
+    has_abstention = False
+    for q in questions:
+        if q.ignore:
+            continue
+        if q.evidence:
+            has_evidence = True
+        if q.gold_stale:
+            has_stale = True
+        if is_abstention(q.category, q.gold_answer):
+            has_abstention = True
+    return {
+        "has_evidence": has_evidence,
+        "has_stale": has_stale,
+        "has_abstention": has_abstention,
+    }
 
 
 #: 消息允许的 role 取值。

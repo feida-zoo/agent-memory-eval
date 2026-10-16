@@ -10,7 +10,7 @@
 :func:`membench.layout.materialize_ab_experiment` 落地；``<root>`` 取 ``out_dir``
 或 :func:`membench.paths.output_root`。
 
-可比性前置校验（接入侧反馈 1）：比较前先核对驱动/判分模型、适配器实现与数据集
+可比性前置校验：比较前先核对驱动/判分模型、适配器实现与数据集
 指纹等维度；关键维度缺失或不一致时给出 ``comparability`` 门禁，避免结果不可归因
 却照给 PASS。
 """
@@ -39,7 +39,7 @@ _DIFF_KEYS: list[str] = [
     "avg_llm_calls",
 ]
 
-#: 可比性维度（接入侧反馈 1）：任一 critical 维度不一致即视为不可比；
+#: 可比性维度：任一 critical 维度不一致即视为不可比；
 #: 缺值时不记 mismatch，而记入 ``unverifiable``（strict 下同样判不可比）。
 CRITICAL_COMPARABILITY_DIMS: tuple[str, ...] = (
     "adapter",
@@ -87,13 +87,20 @@ def _load_metrics(run_dir: str) -> dict[str, Any]:
 
 
 def _diff_overall(overall_a: dict[str, Any], overall_b: dict[str, Any]) -> dict[str, dict[str, float]]:
-    """逐指标 diff（b - a）。"""
+    """逐指标 diff（b - a）。
+
+    任一侧指标为 None（"未计算"）时跳过，不产出 diff——与
+    ``summary._mean`` 空集返 None 的语义一致。
+    """
     diffs: dict[str, dict[str, float]] = {}
     for key in _DIFF_KEYS:
         if key in overall_a and key in overall_b:
-            va = float(overall_a[key])
-            vb = float(overall_b[key])
-            diffs[key] = {"a": va, "b": vb, "diff": vb - va}
+            va = overall_a[key]
+            vb = overall_b[key]
+            if va is None or vb is None:
+                continue
+            va_f, vb_f = float(va), float(vb)
+            diffs[key] = {"a": va_f, "b": vb_f, "diff": vb_f - va_f}
     return diffs
 
 
@@ -107,30 +114,55 @@ def _eval_gates(
     """按 SPEC 3.6 逐条评估门禁。"""
     gates: list[dict[str, Any]] = []
 
-    acc_a = float(overall_a.get("accuracy", 0.0))
-    acc_b = float(overall_b.get("accuracy", 0.0))
-    acc_diff = acc_b - acc_a
-    gates.append(
-        {
-            "name": "accuracy_regression",
-            "status": "FAIL" if acc_diff < -acc_threshold else "PASS",
-            "detail": f"accuracy diff={acc_diff:+.3f}，阈值 -{acc_threshold}",
-        }
-    )
+    acc_a_raw = overall_a.get("accuracy")
+    acc_b_raw = overall_b.get("accuracy")
+    # 任一侧"未计算"（None）→ 出 SKIP 行显式说明，不强行转 0 污染判定。
+    if acc_a_raw is None or acc_b_raw is None:
+        gates.append(
+            {
+                "name": "accuracy_regression",
+                "status": "SKIP",
+                "detail": "指标未计算（None），跳过判定",
+            }
+        )
+    else:
+        acc_a = float(acc_a_raw)
+        acc_b = float(acc_b_raw)
+        acc_diff = acc_b - acc_a
+        gates.append(
+            {
+                "name": "accuracy_regression",
+                "status": "FAIL" if acc_diff < -acc_threshold else "PASS",
+                "detail": f"accuracy diff={acc_diff:+.3f}，阈值 -{acc_threshold}",
+            }
+        )
 
-    stale_a = float(overall_a.get("stale_rate", 0.0))
-    stale_b = float(overall_b.get("stale_rate", 0.0))
-    stale_diff = stale_b - stale_a
-    gates.append(
-        {
-            "name": "stale_rate_regression",
-            "status": "FAIL" if stale_diff > stale_threshold else "PASS",
-            "detail": f"stale_rate diff={stale_diff:+.3f}，阈值 +{stale_threshold}",
-        }
-    )
+    stale_a_raw = overall_a.get("stale_rate")
+    stale_b_raw = overall_b.get("stale_rate")
+    if stale_a_raw is None or stale_b_raw is None:
+        gates.append(
+            {
+                "name": "stale_rate_regression",
+                "status": "SKIP",
+                "detail": "指标未计算（None），跳过判定",
+            }
+        )
+    else:
+        stale_a = float(stale_a_raw)
+        stale_b = float(stale_b_raw)
+        stale_diff = stale_b - stale_a
+        gates.append(
+            {
+                "name": "stale_rate_regression",
+                "status": "FAIL" if stale_diff > stale_threshold else "PASS",
+                "detail": f"stale_rate diff={stale_diff:+.3f}，阈值 +{stale_threshold}",
+            }
+        )
 
-    p95_a = float(overall_a.get("latency_p95_ms", 0.0))
-    p95_b = float(overall_b.get("latency_p95_ms", 0.0))
+    p95_a_raw = overall_a.get("latency_p95_ms")
+    p95_b_raw = overall_b.get("latency_p95_ms")
+    p95_a = float(p95_a_raw) if p95_a_raw is not None else 0.0
+    p95_b = float(p95_b_raw) if p95_b_raw is not None else 0.0
     if p95_a > 0:
         p95_rel = (p95_b - p95_a) / p95_a
         gates.append(
@@ -145,7 +177,7 @@ def _eval_gates(
             {
                 "name": "latency_p95_regression",
                 "status": "PASS",
-                "detail": "基线 latency_p95 为 0，跳过相对变化判定",
+                "detail": "基线 latency_p95 为 0 或未计算，跳过相对变化判定",
             }
         )
     return gates
@@ -187,7 +219,7 @@ def _check_reason(check: dict[str, Any]) -> str:
 
 
 def check_comparability(metrics_a: dict[str, Any], metrics_b: dict[str, Any]) -> dict[str, Any]:
-    """核对两个 run 的元数据是否可比（接入侧反馈 1）。
+    """核对两个 run 的元数据是否可比。
 
     取值规则：``dataset_sha256`` 取 ``metrics["dataset_fingerprint"]["sha256"]``，
     其余维度取 metrics 顶层字段。
