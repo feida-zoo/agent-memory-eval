@@ -38,7 +38,8 @@ from membench.data.schema import (
 )
 from membench.judges import get_judge
 from membench.metrics import aggregate
-from membench.metrics.text import bleu1, recall_at_k, token_f1
+from membench.metrics.evidence import SubstringMatcher
+from membench.metrics.text import bleu1, token_f1
 from membench.paths import runs_dir
 from membench.report import render_run_report
 
@@ -165,6 +166,7 @@ class Runner:
         adapter_meta: Union[str, None] = None,
         driver_llm: Union[str, None] = None,
         judge_model: Union[str, None] = None,
+        evidence_matcher: Any = None,
         adapter_version: Union[str, None] = None,
         report_out: Union[str, None] = None,
     ) -> None:
@@ -203,6 +205,10 @@ class Runner:
             self.judge_name = getattr(judge, "name", judge.__class__.__name__)
         # judge_model 缺省时从 judge 对象的 .model 自动补全（非空才算）
         self.judge_model = judge_model or getattr(self.judge, "model", None) or None
+        # 检索命中口径：默认 substring（与历史分数一致），可注入 overlap / llm
+        self._evidence_matcher = (
+            evidence_matcher if evidence_matcher is not None else SubstringMatcher()
+        )
 
     # ------------------------------------------------------------------
     def _eval_question(
@@ -220,8 +226,11 @@ class Runner:
         evidence = [str(x) for x in (getattr(question, "evidence", None) or [])]
         gold_answer = str(getattr(question, "gold_answer", "") or "")
 
-        # evidence_hit: 任一 evidence 子串出现在任一 retrieved 条目中
-        evidence_hit = bool(evidence) and any(ev in item for item in retrieved for ev in evidence)
+        # 检索命中口径由匹配器决定（substring / overlap / llm）；
+        # abstention 题无 evidence，匹配器返回 (False, 0.0)
+        evidence_hit, recall_at_5 = self._evidence_matcher.evidence_hits(
+            evidence, retrieved, k=5
+        )
 
         judge_result = self.judge.grade(question, gold_answer, answer)
 
@@ -236,8 +245,7 @@ class Runner:
             "evidence_hit": evidence_hit,
             "token_f1": float(token_f1(gold_answer, answer)),
             "bleu1": float(bleu1(gold_answer, answer)),
-            # abstention 题无 evidence，recall@5 无意义，记 0.0（且不调用以免除零）
-            "recall@5": float(recall_at_k(evidence, retrieved, 5)) if evidence else 0.0,
+            "recall@5": float(recall_at_5),
             "judge": _judge_result_to_dict(judge_result),
             "latency_ms": float(getattr(result, "latency_ms", 0.0) or 0.0),
             "input_tokens": int(getattr(result, "input_tokens", 0) or 0),
@@ -372,6 +380,15 @@ class Runner:
                 "dataset_fingerprint": dataset_fingerprint(self.dataset_path),
             }
         )
+        # 检索命中口径落账（substring / overlap / llm；阈值与回退数按需）
+        retrieval_meta: dict[str, Any] = {"retrieval_match": self._evidence_matcher.name}
+        match_threshold = getattr(self._evidence_matcher, "threshold", None)
+        if match_threshold is not None:
+            retrieval_meta["retrieval_match_threshold"] = float(match_threshold)
+        match_fallbacks = int(getattr(self._evidence_matcher, "fallbacks", 0) or 0)
+        if match_fallbacks:
+            retrieval_meta["retrieval_match_fallbacks"] = match_fallbacks
+        metrics.update(retrieval_meta)
 
         results_path = os.path.join(run_dir, "results.jsonl")
         with open(results_path, "w", encoding="utf-8") as f:

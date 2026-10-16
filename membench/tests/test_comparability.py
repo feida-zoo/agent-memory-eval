@@ -162,6 +162,30 @@ def test_warn_dimension_mismatch_only_warns(tmp_path: Path) -> None:
     assert result["gates"][0]["status"] == "WARN"
 
 
+def test_retrieval_match_mismatch_only_warns(tmp_path: Path) -> None:
+    """检索命中口径不同（substring vs overlap）-> WARN 门禁但不判不可比；
+    两侧同缺（旧版 run）视为一致，不影响结论。"""
+    a = _write_run(tmp_path, "a", _metrics("run_a", retrieval_match="substring"))
+    b = _write_run(tmp_path, "b", _metrics("run_b", retrieval_match="overlap"))
+    result = compare_runs(a, b, out_dir=str(tmp_path))
+
+    assert result["verdict"] == "WARN"
+    assert result["comparability"]["comparable"] is True
+    check = next(
+        c for c in result["comparability"]["checks"] if c["dimension"] == "retrieval_match"
+    )
+    assert check["same"] is False
+
+    a2 = _write_run(tmp_path, "a2", _metrics("run_a2"))
+    b2 = _write_run(tmp_path, "b2", _metrics("run_b2"))
+    result2 = compare_runs(a2, b2, out_dir=str(tmp_path))
+    check2 = next(
+        c for c in result2["comparability"]["checks"] if c["dimension"] == "retrieval_match"
+    )
+    assert check2["same"] is True
+    assert result2["verdict"] == "PASS"
+
+
 def test_rule_based_judge_model_not_applicable(tmp_path: Path) -> None:
     """规则判分器（heuristic）无模型标识：judge_model 记「不适用」，
     strict 模式下也不因它 FAIL（否则 heuristic 的 A/B 会无条件不可比）。"""

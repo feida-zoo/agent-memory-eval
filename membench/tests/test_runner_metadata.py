@@ -180,3 +180,73 @@ def test_default_out_dir_uses_paths_runs_dir(
     run_dir = Path(runner.run())
     assert run_dir.parent == tmp_path / "output" / "runs"
     assert (run_dir / "report.md").is_file()
+
+
+def test_retrieval_match_metadata_and_overlap(tmp_path: Path) -> None:
+    """检索命中口径落账 + overlap 对近原文改写的命中（runner 集成）。"""
+    from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
+    from membench.metrics.evidence import OverlapMatcher
+
+    class _WrappedAdapter(BaseMemoryAdapter):
+        name = "wrapped"
+
+        def reset(self) -> None:
+            pass
+
+        def ingest(self, messages: list[dict]) -> IngestStats:
+            return IngestStats()
+
+        def query(self, question: str) -> QueryResult:
+            # 检索条目插入了空白：子串 miss、token 包含度命中
+            return QueryResult(answer="周五", retrieved=["项目截止日 是 周五"])
+
+    dataset = tmp_path / "wrapped.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "dialogue_id": "d1",
+                "sessions": [[{"role": "user", "content": "随便聊聊。", "timestamp": None}]],
+                "questions": [
+                    {
+                        "qid": "q1",
+                        "question": "项目截止日是哪天？",
+                        "gold_answer": "周五",
+                        "category": "single_hop",
+                        "evidence": ["项目截止日是周五"],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # 默认 substring：命中失败，口径落账
+    runner = Runner(
+        _WrappedAdapter(), str(dataset), judge="heuristic", out_dir=str(tmp_path / "runs1")
+    )
+    run_dir = Path(runner.run())
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["retrieval_match"] == "substring"
+    rec = json.loads(
+        (run_dir / "results.jsonl").read_text(encoding="utf-8").strip().splitlines()[0]
+    )
+    assert rec["evidence_hit"] is False and rec["recall@5"] == 0.0
+
+    # overlap：命中，阈值随口径落账
+    runner = Runner(
+        _WrappedAdapter(),
+        str(dataset),
+        judge="heuristic",
+        out_dir=str(tmp_path / "runs2"),
+        evidence_matcher=OverlapMatcher(threshold=0.6),
+    )
+    run_dir = Path(runner.run())
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["retrieval_match"] == "overlap"
+    assert metrics["retrieval_match_threshold"] == pytest.approx(0.6)
+    rec = json.loads(
+        (run_dir / "results.jsonl").read_text(encoding="utf-8").strip().splitlines()[0]
+    )
+    assert rec["evidence_hit"] is True and rec["recall@5"] == 1.0

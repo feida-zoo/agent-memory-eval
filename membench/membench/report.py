@@ -151,6 +151,7 @@ DIM_LABEL_ZH: dict[str, str] = {
     "driver_llm": "驱动 LLM",
     "platform": "平台",
     "commit": "commit",
+    "retrieval_match": "检索匹配口径",
     "limit": "题目上限",
     "shards": "分片数",
     "shard_index": "分片序号",
@@ -190,6 +191,9 @@ METADATA_FIELD_ZH: dict[str, str] = {
     "fused": "融合产物",
     "fused_from": "来源分片",
     "schema_version": "schema 版本",
+    "retrieval_match": "检索匹配口径",
+    "retrieval_match_threshold": "检索匹配阈值",
+    "retrieval_match_fallbacks": "检索匹配回退数",
 }
 
 
@@ -560,9 +564,35 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
         [metadata_label("judge_model"), _fmt_opt(metrics.get("judge_model"))],
         [metadata_label("adapter_version"), _fmt_opt(metrics.get("adapter_version"))],
         [metadata_label("dataset_fingerprint"), _fmt_opt(fp_sha)],
+        [metadata_label("retrieval_match"), str(metrics.get("retrieval_match") or "substring")],
     ]
     lines.append(_md_table(["项目", "值"], config_rows))
     lines.append("")
+    # 非默认检索命中口径提示：与 substring 的历史跑分不可直接比较
+    match_mode = str(metrics.get("retrieval_match") or "substring")
+    if match_mode != "substring":
+        match_thr = metrics.get("retrieval_match_threshold")
+        lines.append(
+            "> ⚠️ 检索命中口径：**"
+            + match_mode
+            + "**"
+            + (f"（阈值 {match_thr}）" if match_thr else "")
+            + "；与默认 substring 口径的跑分不可直接比较。"
+        )
+        lines.append("")
+    # 检索指标全 0 警示：疑似 evidence 与被检索文本格式不一致（摘要式存储）
+    if (
+        metrics.get("has_evidence")
+        and overall.get("evidence_recall") == 0.0
+        and overall.get("recall_at_5") == 0.0
+    ):
+        lines.append(
+            "> ⚠️ 本数据集标注了 evidence，但「证据召回率」与「检索召回率@5」全为 0："
+            "疑似 evidence 与被检索文本格式不一致（如记忆以摘要/改写形式存储），"
+            "并非真实零召回。可尝试 `--evidence-match overlap|llm` 调整命中口径，"
+            "或让适配器返回可核对的原文片段后重跑。"
+        )
+        lines.append("")
 
     lines.append(f"- {metadata_label('adapter')}: `{metrics.get('adapter', 'n/a')}`")
     lines.append(f"- {metadata_label('dataset')}: `{metrics.get('dataset', 'n/a')}`")
@@ -634,7 +664,7 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
             "<sub>评级规则：取六项质量指标（accuracy / token_f1 / bleu1 / "
             "evidence_recall / abstention_accuracy / stale_rate）的连续点数"
             "（1.0~4.0，档内随数值线性变化）均值，阈值 3.5 / 2.5 / 1.5；"
-            "效率成本指标不参与评级。</sub>"
+            "效率成本指标与两项诊断指标（检索召回率@5 / 过度拒答率）不参与评级。</sub>"
         )
         lines.append("")
 
@@ -764,6 +794,11 @@ def write_compare_report_md(
     rated_b = overall_rating(metrics_b.get("overall", {}))
     if rated_b is not None:
         lines.append(f"- B 综合评级：{rated_b[0]}（{rated_b[1]:.2f}/4.0）")
+    lines.append("")
+    lines.append(
+        "<sub>评级取六项质量指标连续点数均值；效率成本与两项诊断指标"
+        "（检索召回率@5 / 过度拒答率）不参与评级。</sub>"
+    )
     lines.append("")
 
     lines.append("## 逐指标 diff（B - A）")

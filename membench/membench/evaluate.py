@@ -312,12 +312,14 @@ def run_datasets(
     jobs: int = 1,
     driver_llm: Union[str, None] = None,
     adapter_version: Union[str, None] = None,
+    evidence_matcher: Any = None,
 ) -> list[DatasetResult]:
     """对每个数据集用 Runner 各跑一次，收集 metrics.json。
 
     adapter 实例跨数据集复用同一个（reset 由 Runner 内部负责）；
     每个数据集新建 Runner。jobs 透传给 Runner 的题目级并发参数。
     driver_llm / adapter_version 透传给 Runner，记入每个 run 的元数据。
+    evidence_matcher 为检索命中口径匹配器（默认 substring）。
     """
     results: list[DatasetResult] = []
     for spec in specs:
@@ -332,6 +334,7 @@ def run_datasets(
             dataset_source=spec.source,
             driver_llm=driver_llm,
             adapter_version=adapter_version,
+            evidence_matcher=evidence_matcher,
         )
         run_dir = runner.run()
         with open(os.path.join(run_dir, "metrics.json"), encoding="utf-8") as f:
@@ -401,6 +404,7 @@ def write_evaluate_report(
         ["adapter 版本", _fmt_opt(first_metrics.get("adapter_version"))],
         # 单数据集时直接给 sha256；多数据集时逐数据集指纹见下表。
         ["数据集指纹", _fmt_opt(fp_sha) if len(results) <= 1 else "见下表（逐数据集）"],
+        ["检索匹配口径", str(first_metrics.get("retrieval_match") or "substring")],
         ["时间戳", timestamp.isoformat(timespec="seconds")],
         # 数据集范围：本次实际评测的 key 与来源，便于"先确认数据集范围"。
         ["数据集范围", "、".join(f"{r.spec.key}（{r.spec.source}）" for r in results) or "（无）"],
@@ -432,7 +436,8 @@ def write_evaluate_report(
             "evidence_recall / abstention_accuracy / stale_rate）做跨数据集宏平均融合"
             "（指标仅在具备对应能力标注的数据集上参与），再取融合值的连续点数"
             "（1.0~4.0，档内随数值线性变化）均值，阈值 3.5 / 2.5 / 1.5；"
-            "效率成本指标不参与评级。门禁为一票否决，独立于本评级。</sub>"
+            "效率成本指标与两项诊断指标（检索召回率@5 / 过度拒答率）不参与评级。"
+            "门禁为一票否决，独立于本评级。</sub>"
         )
         lines.append("")
 
@@ -519,6 +524,24 @@ def write_evaluate_report(
         "「过度拒答率」为非拒答题上出现拒答信号的比例。</sub>"
     )
     lines.append("")
+    # 检索指标全 0 警示：疑似 evidence 与被检索文本格式不一致（摘要式存储）
+    zero_sets = [
+        r.spec.name
+        for r in results
+        if r.capabilities.get("has_evidence")
+        and (r.metrics.get("overall") or {}).get("evidence_recall") == 0.0
+        and (r.metrics.get("overall") or {}).get("recall_at_5") == 0.0
+    ]
+    if zero_sets:
+        lines.append(
+            "> ⚠️ 「"
+            + "、".join(zero_sets)
+            + "」标注了 evidence，但「证据召回率」与「检索召回率@5」全为 0："
+            "疑似 evidence 与被检索文本格式不一致（如记忆以摘要/改写形式存储），"
+            "并非真实零召回。可尝试 `--evidence-match overlap|llm` 调整命中口径，"
+            "或让适配器返回可核对的原文片段后重跑。"
+        )
+        lines.append("")
 
     # 效率成本（分数据集）
     lines.append("## 效率成本（分数据集）")
@@ -583,6 +606,7 @@ def evaluate(
     jobs: int = 1,
     driver_llm: Union[str, None] = None,
     adapter_version: Union[str, None] = None,
+    evidence_matcher: Any = None,
 ) -> int:
     """执行全量评估：多数据集依次评测 + 宏平均融合 + 门禁 + 报告。
 
@@ -600,6 +624,8 @@ def evaluate(
         specs: 显式数据集清单（默认 None 时按 quick/beam_10m/include_lme_s 调 plan_datasets）。
         driver_llm: 驱动被测系统的 LLM 标识，透传给每个 run 的元数据（默认 None）。
         adapter_version: 适配器实现版本标识，透传给每个 run 的元数据（默认 None）。
+        evidence_matcher: 检索命中口径匹配器（默认 substring；CLI 以
+            ``--evidence-match`` 构造后注入）。
 
     Returns:
         进程退出码：门禁 FAIL 为 1，否则 0（与 compare 一致）。
@@ -641,6 +667,7 @@ def evaluate(
         jobs=jobs,
         driver_llm=driver_llm,
         adapter_version=adapter_version,
+        evidence_matcher=evidence_matcher,
     )
     fused = fuse_metrics(results)
     gate = evaluate_gate(results)

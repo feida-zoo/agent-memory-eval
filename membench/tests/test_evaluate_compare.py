@@ -375,6 +375,50 @@ def test_cli_evaluate_compare_pass_through(tmp_path, monkeypatch) -> None:
     assert captured["beam_10m"] is False
 
 
+def test_cli_evidence_match_pass_through(tmp_path, monkeypatch) -> None:
+    """--evidence-match overlap 构造匹配器并透传到 evaluate_compare。"""
+    captured: dict[str, object] = {}
+
+    def _stub(baseline_adapter, candidate_adapter, judge, **kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return {"verdict": "PASS", "gates": [], "fused_diffs": {}, "fused_baseline": {}, "fused_candidate": {}, "per_dataset": [], "compare_dir": str(tmp_path / "ab")}
+
+    import membench.evaluate_compare as ec_mod
+
+    monkeypatch.setattr(ec_mod, "evaluate_compare", _stub)
+    rc = cli.main(
+        [
+            "evaluate-compare",
+            "--baseline-adapter", "mock-strong",
+            "--candidate-adapter", "mock-weak",
+            "--quick",
+            "--evidence-match", "overlap",
+            "--evidence-match-threshold", "0.7",
+        ]
+    )
+    assert rc == 0
+    matcher = captured["evidence_matcher"]
+    assert matcher.name == "overlap"
+    assert matcher.threshold == 0.7
+
+
+def test_cli_evidence_match_llm_requires_config(monkeypatch) -> None:
+    """--evidence-match llm 缺少 --llm-base-url 时报错退出（可操作的提示）。"""
+    monkeypatch.delenv("MEMBENCH_JUDGE_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "evaluate-compare",
+                "--baseline-adapter", "mock-strong",
+                "--candidate-adapter", "mock-weak",
+                "--quick",
+                "--evidence-match", "llm",
+            ]
+        )
+    assert "--llm-base-url" in str(exc_info.value)
+
+
 def test_cli_evaluate_compare_pass_returns_zero(tmp_path, monkeypatch) -> None:
     """verdict=PASS 时退出码 0。"""
     def _stub(baseline_adapter, candidate_adapter, judge, **kwargs):  # type: ignore[no-untyped-def]

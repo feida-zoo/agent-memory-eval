@@ -65,6 +65,9 @@ WARN_COMPARABILITY_DIMS: tuple[str, ...] = (
     "shard_index",
     "n_questions",
     "adapter_meta",
+    # 检索命中口径（substring / overlap / llm）不同则分数不可直接对比，
+    # 降级 WARN 提示；旧版 run 未落账该字段时两侧同缺，不判不一致。
+    "retrieval_match",
 )
 
 #: 提示维度：仅记录（``same=False``），不影响结论与门禁。

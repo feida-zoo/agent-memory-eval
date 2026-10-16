@@ -5,17 +5,20 @@ matrix / doctor / adapter / user-data / dataset / list-datasets。
     python -m membench.cli run --adapter mock-strong \
         [--dataset membench/data/sample_dataset.jsonl] --judge heuristic [--out runs/] \
         [--platform wx --commit a1b2c3] [--driver-llm gpt-4o] \
-        [--adapter-version a1b2c3] [--report-out DIR]
+        [--adapter-version a1b2c3] [--report-out DIR] \
+        [--evidence-match substring|overlap|llm]
     python -m membench.cli evaluate --adapter mock-strong \
         [--judge heuristic] [--platform wx --commit a1b2c3] [--out runs/] \
         [--driver-llm gpt-4o] [--adapter-version a1b2c3] \
-        [--report-out DIR] [--quick | --beam-10m] [--include-lme-s]
+        [--report-out DIR] [--quick | --beam-10m] [--include-lme-s] \
+        [--evidence-match substring|overlap|llm]
     python -m membench.cli evaluate-compare --baseline-adapter A --candidate-adapter B \
         [--judge heuristic] [--platform wx --commit a1b2c3] [--out runs/] \
         [--driver-llm-a gpt-4o] [--adapter-version-a a1b2c3] \
         [--driver-llm-b gpt-4o-mini] [--adapter-version-b d4e5f6] \
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
-        [--report-out DIR] [--tag <label>] [--quick | --beam-10m] [--include-lme-s]
+        [--report-out DIR] [--tag <label>] [--quick | --beam-10m] [--include-lme-s] \
+        [--evidence-match substring|overlap|llm]
     python -m membench.cli fuse --runs runs/<shard0>,runs/<shard1> --out runs/<fused>
     python -m membench.cli compare --baseline runs/<run_a> --candidate runs/<run_b> \
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
@@ -81,6 +84,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--llm-api-key", default=None, help="judge=llm 时的 API key")
     p_run.add_argument("--llm-model", default=None, help="judge=llm 时的模型名")
     p_run.add_argument("--llm-timeout", type=float, default=None, help="judge=llm 时的请求超时秒数（默认用 judge 内建值 90s）")
+    p_run.add_argument(
+        "--evidence-match",
+        choices=("substring", "overlap", "llm"),
+        default="substring",
+        help="检索证据命中口径：substring=逐字子串（默认，历史口径）；overlap=token 包含度容错近原文改写；llm=语义判定（复用 --llm-* 配置，失败回退 substring）",
+    )
+    p_run.add_argument("--evidence-match-threshold", type=float, default=0.6, help="evidence-match=overlap 时的包含度阈值（默认 0.6）")
     p_run.add_argument("--jobs", type=int, default=1, help="题目级并发数（默认 1；ingest 始终串行，要求 adapter.query 与 judge 线程安全）")
     p_run.add_argument("--client-llm", default=None, help="judge=client 时的 agent 内置 LLM 类路径，如 'my_agent.llm:LLMClient'")
     p_run.add_argument("--limit", type=int, default=None, help="冒烟模式：只评测（分片后的）前 N 道题，run_id 与 metadata 记录 limit")
@@ -149,6 +159,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--llm-api-key", default=None, help="judge=llm 时的 API key")
     p_ev.add_argument("--llm-model", default=None, help="judge=llm 时的模型名")
     p_ev.add_argument("--llm-timeout", type=float, default=None, help="judge=llm 时的请求超时秒数（默认用 judge 内建值 90s）")
+    p_ev.add_argument(
+        "--evidence-match",
+        choices=("substring", "overlap", "llm"),
+        default="substring",
+        help="检索证据命中口径：substring=逐字子串（默认，历史口径）；overlap=token 包含度容错近原文改写；llm=语义判定（复用 --llm-* 配置，失败回退 substring）",
+    )
+    p_ev.add_argument("--evidence-match-threshold", type=float, default=0.6, help="evidence-match=overlap 时的包含度阈值（默认 0.6）")
     p_ev.add_argument("--jobs", type=int, default=1, help="题目级并发数（默认 1；ingest 始终串行，要求 adapter.query 与 judge 线程安全）")
     p_ev.add_argument("--client-llm", default=None, help="judge=client 时的 agent 内置 LLM 类路径，如 'my_agent.llm:LLMClient'")
     p_ev.set_defaults(func=_cmd_evaluate)
@@ -181,6 +198,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ev_cmp.add_argument("--llm-api-key", default=None, help="judge=llm 时的 API key")
     p_ev_cmp.add_argument("--llm-model", default=None, help="judge=llm 时的模型名")
     p_ev_cmp.add_argument("--llm-timeout", type=float, default=None, help="judge=llm 时的请求超时秒数（默认 90s）")
+    p_ev_cmp.add_argument(
+        "--evidence-match",
+        choices=("substring", "overlap", "llm"),
+        default="substring",
+        help="检索证据命中口径（两侧一致）：substring=逐字子串（默认，历史口径）；overlap=token 包含度容错近原文改写；llm=语义判定（复用 --llm-* 配置，失败回退 substring）",
+    )
+    p_ev_cmp.add_argument("--evidence-match-threshold", type=float, default=0.6, help="evidence-match=overlap 时的包含度阈值（默认 0.6）")
     p_ev_cmp.add_argument("--jobs", type=int, default=1, help="题目级并发数（默认 1）")
     p_ev_cmp.add_argument("--client-llm", default=None, help="judge=client 时的 agent 内置 LLM 类路径")
     p_ev_cmp.set_defaults(func=_cmd_evaluate_compare)
@@ -258,6 +282,23 @@ def _make_judge(args: argparse.Namespace):
     return args.judge  # "heuristic"，由 Runner 经 get_judge 解析
 
 
+def _make_evidence_matcher(args: argparse.Namespace):
+    """构造检索命中口径匹配器（--evidence-match；llm 复用 --llm-* 配置）。"""
+    from membench.metrics.evidence import build_evidence_matcher
+
+    try:
+        return build_evidence_matcher(
+            args.evidence_match,
+            threshold=args.evidence_match_threshold,
+            llm_base_url=getattr(args, "llm_base_url", None),
+            llm_api_key=getattr(args, "llm_api_key", None),
+            llm_model=getattr(args, "llm_model", None),
+            llm_timeout=getattr(args, "llm_timeout", None) or 90.0,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"[membench] 参数错误: {exc}")
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     if args.limit is not None and args.limit < 1:
         raise SystemExit(f"--limit 必须 >= 1，当前为 {args.limit}")
@@ -269,6 +310,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
     adapter = _make_adapter(args.adapter)
     judge = _make_judge(args)
+    evidence_matcher = _make_evidence_matcher(args)
     dataset_path, dataset_source = resolve_dataset(args.dataset)
     print(f"[membench] 测试集: {dataset_path} (来源: {dataset_source})")
     runner = Runner(
@@ -287,6 +329,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         driver_llm=args.driver_llm,
         adapter_version=args.adapter_version,
         report_out=args.report_out,
+        evidence_matcher=evidence_matcher,
     )
     run_dir = runner.run()
     # report_out 时 Runner 已自建 <DIR>/eval_<adapter>_<platform>_<ts>/ 并复制 run 副本
@@ -475,6 +518,7 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
         jobs=args.jobs,
         driver_llm=args.driver_llm,
         adapter_version=args.adapter_version,
+        evidence_matcher=_make_evidence_matcher(args),
     )
 
 
@@ -507,6 +551,7 @@ def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
         acc_threshold=args.acc_threshold,
         stale_threshold=args.stale_threshold,
         latency_warn=args.latency_warn,
+        evidence_matcher=_make_evidence_matcher(args),
     )
     return 1 if result["verdict"] == "FAIL" else 0
 

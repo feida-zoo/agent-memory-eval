@@ -49,6 +49,7 @@ from membench.evaluate import (
 )
 from membench.report import (
     PALETTE,
+    EFFICIENCY_DIFF_METRICS,
     _md_table,
     _setup_fonts,
     category_display,
@@ -356,6 +357,7 @@ def evaluate_compare(
     acc_threshold: float = 0.02,
     stale_threshold: float = 0.02,
     latency_warn: float = 0.30,
+    evidence_matcher: Any = None,
 ) -> dict[str, Any]:
     """双臂（baseline vs candidate）× 多数据集融合 A/B 对比。
 
@@ -408,6 +410,7 @@ def evaluate_compare(
         jobs=jobs,
         driver_llm=driver_llm_baseline,
         adapter_version=adapter_version_baseline,
+        evidence_matcher=evidence_matcher,
     )
     print(f"[membench] ===== 候选 adapter: {candidate_name} =====")
     candidate_results = run_datasets(
@@ -420,6 +423,7 @@ def evaluate_compare(
         jobs=jobs,
         driver_llm=driver_llm_candidate,
         adapter_version=adapter_version_candidate,
+        evidence_matcher=evidence_matcher,
     )
 
     # 对齐 baseline / candidate 各数据集（按 spec.key 匹配）
@@ -572,6 +576,19 @@ def _write_evaluate_compare_report(
     lines.append(f"- platform: `{platform or 'default'}`")
     lines.append(f"- commit: `{commit or 'n/a'}`")
     lines.append(f"- 数据集数: {len(arms)}（{', '.join(r.spec.name for r in arms)}）")
+    match_modes = sorted(
+        {
+            str(metrics_dict.get("retrieval_match") or "substring")
+            for arm in arms
+            for metrics_dict in (arm.baseline, arm.candidate)
+        }
+    )
+    lines.append(f"- 检索匹配口径: `{', '.join(match_modes)}`")
+    if len(match_modes) > 1:
+        lines.append(
+            "  ⚠️ 两侧检索匹配口径不一致，检索类指标（证据召回率 / 检索召回率@5）"
+            "不可直接比较。"
+        )
     lines.append(f"- 时间戳: {timestamp.isoformat(timespec='seconds')}")
     lines.append("")
 
@@ -619,18 +636,48 @@ def _write_evaluate_compare_report(
         rows.append(cells)
     lines.append(_md_table(header, rows or [["(无)", *[""] * len(diff_keys)]]))
     lines.append("")
+    # 检索指标全 0 警示：疑似 evidence 与被检索文本格式不一致（摘要式存储）
+    zero_sets: list[str] = []
+    for arm in arms:
+        for metrics_dict, run_dir in (
+            (arm.baseline, arm.baseline_run_dir),
+            (arm.candidate, arm.candidate_run_dir),
+        ):
+            ov = metrics_dict.get("overall", {}) or {}
+            if ov.get("evidence_recall") != 0.0 or ov.get("recall_at_5") != 0.0:
+                continue
+            has_evidence = metrics_dict.get("has_evidence")
+            if not isinstance(has_evidence, bool):
+                has_evidence = _resolve_capabilities(
+                    metrics_dict, run_dir, arm.spec.path
+                )[0].get("has_evidence", False)
+            if has_evidence and arm.spec.name not in zero_sets:
+                zero_sets.append(arm.spec.name)
+    if zero_sets:
+        lines.append(
+            "<sub>⚠️ "
+            + "、".join(zero_sets)
+            + " 标注了 evidence，但两项检索指标全为 0：疑似 evidence 与被检索文本"
+            "格式不一致（如摘要式存储），并非真实零召回；可尝试 "
+            "`--evidence-match overlap|llm` 调整口径，或让适配器返回原文片段后重跑。</sub>"
+        )
+        lines.append("")
     lines.append("![逐数据集准确率差值](fig_per_dataset_diff.png)")
     lines.append("")
 
-    # 1.5 逐数据集 by_category diff：每个数据集按其 raw category 集合分别画
-    # A vs B 准确率与 Δ；不同数据集的 category 互不合并
-    # （BEAM 10 类、gatemem 4 类、locomo 5 类、longmemeval 6 类各自保留）。
+    # 1.5 逐数据集 by_category diff：每个数据集按其实际出现的 raw category
+    # 集合分别画 A vs B 准确率与 Δ；不跨数据集合并。
     lines.append("## 逐数据集题型 diff（B - A）")
     lines.append("")
+    counts = "、".join(
+        f"{arm.spec.name} {len(set(arm.baseline.get('by_category', {})) | set(arm.candidate.get('by_category', {})))} 类"
+        for arm in arms
+        if arm.baseline.get("by_category") or arm.candidate.get("by_category")
+    )
     lines.append(
-        "<sub>每个数据集按各自的 raw category 列出 A/B 准确率与差值；"
-        "category 集合按数据集设计意图保留（BEAM 10 类 / gatemem 4 类 / "
-        "locomo 5 类 / longmemeval 6 类），不跨数据集强行合并。</sub>"
+        "<sub>每个数据集按各自的 raw category 列出 A/B 准确率与差值"
+        + (f"（本报告实际出现：{counts}）" if counts else "")
+        + "；题型集合按数据集设计意图保留，不跨数据集强行合并。</sub>"
     )
     lines.append("")
     for arm in arms:
@@ -669,6 +716,39 @@ def _write_evaluate_compare_report(
         lines.append(f"### {arm.spec.name}")
         lines.append("")
         lines.append(_md_table(header, rows_bc))
+        lines.append("")
+
+    # 1.6 效率成本 diff：逐数据集 A/B/Δ（Δ 为相对变化，与门禁阈值口径一致）
+    lines.append("## 效率成本 diff（A → B）")
+    lines.append("")
+    lines.append(
+        "<sub>逐数据集对照；Δ 为相对变化（B−A）/A，与 latency_p95 门禁的阈值口径"
+        "一致（基线为 0 或缺失时不给 Δ；延迟单位 ms、Token 为每题均值）。</sub>"
+    )
+    lines.append("")
+    for arm in arms:
+        a_ov = arm.baseline.get("overall", {})
+        b_ov = arm.candidate.get("overall", {})
+        rows_eff: list[list[str]] = []
+        for metric in EFFICIENCY_DIFF_METRICS:
+            a_val = a_ov.get(metric)
+            b_val = b_ov.get(metric)
+            a_str = f"{float(a_val):.3f}" if isinstance(a_val, (int, float)) else "—"
+            b_str = f"{float(b_val):.3f}" if isinstance(b_val, (int, float)) else "—"
+            if (
+                isinstance(a_val, (int, float))
+                and isinstance(b_val, (int, float))
+                and a_val
+            ):
+                delta = f"{(b_val - a_val) / a_val:+.1%}"
+            else:
+                delta = "—"
+            rows_eff.append([metric_label(metric), a_str, b_str, delta])
+        if not rows_eff:
+            continue
+        lines.append(f"### {arm.spec.name}")
+        lines.append("")
+        lines.append(_md_table(["指标", "A", "B", "Δ"], rows_eff))
         lines.append("")
 
     # 2. 融合 diff
@@ -812,6 +892,13 @@ def _write_evaluate_compare_report(
         lines.append(f"- B 综合评级（融合）：{rated_b[0]}（{rated_b[1]:.2f}/4.0）")
     if rated_a is None and rated_b is None:
         lines.append("（双臂融合 overall 中无可评级指标）")
+    lines.append("")
+    lines.append(
+        "<sub>评级规则：取六项质量指标（accuracy / token_f1 / bleu1 / "
+        "evidence_recall / abstention_accuracy / stale_rate）的融合值连续点数"
+        "均值（1.0~4.0，阈值 3.5 / 2.5 / 1.5）；效率成本与两项诊断指标"
+        "（检索召回率@5 / 过度拒答率）不参与评级。</sub>"
+    )
     lines.append("")
 
     out_path = os.path.join(ab_dir, "compare_report.md")

@@ -403,7 +403,8 @@ python -m membench.cli adapter remove my-office-adapter
 |---|---|---|---|
 | 正确性 | accuracy | judge 判对比例（heuristic 或 LLM） | ≥ 0.85 |
 | 正确性 | token_f1 / bleu1 | 预测与 gold 的 token 级重合度 | 参考项，不门禁 |
-| 检索质量 | evidence_recall | 非 abstention 题中，证据子串命中任一检索条目的比例 | ≥ 0.90 |
+| 检索质量 | evidence_recall | 非 abstention 题中，证据命中（任一检索条目支持该证据）的比例 | ≥ 0.90 |
+| 检索质量 | recall_at_5（诊断） | 非拒答题中，前 5 条检索的证据条目覆盖率（严格口径；仅 evidence 标注数据集参与） | 诊断项，不评级 |
 | 效率成本 | latency_p50 / p95 | query 延迟分位数（毫秒） | 按系统预算自定 |
 | 效率成本 | avg_input_tokens / avg_llm_calls | 每题平均注入 token 与 LLM 调用数 | 越低越好 |
 | 记忆动态 | stale_rate | knowledge_update 题中命中过期事实且未包含更新值的比例 | ≤ 0.03 |
@@ -411,6 +412,8 @@ python -m membench.cli adapter remove my-office-adapter
 > 注：stale 的"包含更新值"接受两种口径——gold 片段逐字覆盖，或 gold 内容 token 召回 ≥ 0.8（容忍同义改写，如"下周一下午"→"周一下午"）。旧值仅作为变更上下文被引用、且新值已正确给出时不计为 stale。
 | 拒答 | abstention_accuracy | abstention 题中正确拒答的比例 | ≥ 0.80 |
 | 可扩展性 | （随数据规模观察上述指标的退化曲线） | 用更大数据集多跑几轮对比 | — |
+
+**检索命中口径**（`--evidence-match`，默认 `substring`）：`substring` 为逐字子串（要求适配器返回接近原文的检索片段）；`overlap` 用内容 token 包含度（`--evidence-match-threshold`，默认 0.6）容错标点/包裹/轻微改写；`llm` 复用 `--llm-*` 配置逐题做语义判定，覆盖摘要/改写式记忆存储（失败自动回退 substring 并记入 `retrieval_match_fallbacks`）。口径落账到 `metrics.json` 的 `retrieval_match` 字段；**不同口径的跑分不可直接对比**（`compare` 可比性校验会给出 WARN），换口径后 A/B 两侧都要重跑。报告中若出现"两项检索指标全为 0"的警示，通常是 evidence 原文不在检索结果里（如摘要式存储），请换口径或让适配器回填原文片段后再比对。
 
 ## 优化迭代工作流
 

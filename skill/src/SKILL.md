@@ -155,12 +155,15 @@ python -m membench.cli evaluate-compare \
     --baseline-adapter <adapter_A> --candidate-adapter <adapter_B> \
     --judge llm --report-out ../output/ --tag "优化前vs优化后"
 # 两侧可分别指定 driver_llm / adapter-version 供 compare 可比性前置校验
+# 检索口径默认 substring（逐字子串）；摘要/改写式记忆可换 --evidence-match overlap|llm
+# （口径不同不可与历史 substring 跑分直接比较，两侧需同口径重跑）
 ```
 
 > **全量评估前必须先 fetch 用到的按需下载数据集**（locomo / longmemeval_oracle / gatemem_office / beam_1m 等），否则会报错提示先 `dataset fetch <key>`。命令：`python -m membench.cli dataset fetch <key>`（落 `~/.membench/datasets/`）。
 
 解读要点（向用户说明）：
 - **宏平均**：每个指标先在各数据集内算分再跨集等权平均；指标只在具备对应标注能力的集上参与（无 gold_stale 的集不参与 stale_rate，无 evidence 标注的集不参与 evidence_recall），不会用"记 0"稀释总分。
+- **检索指标全 0 时先查口径**：若报告提示"两项检索指标全为 0"，多半是 evidence 原文不在检索结果里（摘要式存储）；用 `--evidence-match overlap|llm` 两侧同口径重跑，或让适配器回填检索原始片段。
 - **门禁独立于总分**：办公域槽位 stale_rate>0.03 一票否决，总评"不达标"、退出码 1，无论综合评级多高。
 - BEAM 未 fetch 时会报错提示先 `dataset fetch beam_1m`；heuristic 判分跑 BEAM 会警告失真，正式全量评估用 `--judge llm`。
 
