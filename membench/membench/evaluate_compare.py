@@ -1,7 +1,7 @@
-"""evaluate_compare：双臂（baseline vs candidate）× 多数据集融合 A/B 对比。
+"""evaluate_compare：两组（baseline vs candidate）× 多数据集融合 A/B 对比。
 
 `compare_runs` 只对比**单数据集**两个 run；`evaluate` 只跑
-**单臂**多数据集融合；`matrix` 只对同数据集跨 label。两臂 × 多数据集的融合
+**单组**多数据集融合；`matrix` 只对同数据集跨 label。两组 × 多数据集的融合
 A/B 没有现成入口——本模块补齐，产出与 ``ab_<tag>_<ts>/`` 自包含结构一致的
 逐数据集 diff + 跨数据集融合 diff + 门禁 + 对比图。
 
@@ -9,7 +9,7 @@ A/B 没有现成入口——本模块补齐，产出与 ``ab_<tag>_<ts>/`` 自�
     plan_datasets（复用 evaluate.plan_datasets，与 evaluate 一致的数据集清单）
     -> 对每个数据集分别用 baseline / candidate 两个 adapter 各跑一次 Runner
     -> 逐数据集 diff（精度复用 :mod:`membench.compare` 的 _diff_overall / 门禁）
-    -> 双臂各自 fuse_metrics 得跨数据集宏平均融合值
+    -> 两组各自 fuse_metrics 得跨数据集宏平均融合值
     -> 融合 diff（b - a）+ 门禁（accuracy / stale_rate / latency_p95）
     -> 产物落 ``<root>/ab_<tag>_<ts>/``，按
        :func:`membench.layout.materialize_ab_experiment` 落 A/B 两侧 run 副本
@@ -23,7 +23,7 @@ A/B 没有现成入口——本模块补齐，产出与 ``ab_<tag>_<ts>/`` 自�
     latency_p95 相对上升 > latency_warn -> WARN
     其余指标变动仅报告。
 
-双臂均跑同一 judge；adapter 元数据（adapter_version / commit / driver_llm）
+两组均跑同一 judge；adapter 元数据（adapter_version / commit / driver_llm）
 独立传入，落到两侧 run 的 metrics.json。可比性前置校验由两侧各数据集的
 dataset_fingerprint 自动覆盖（同一数据集两侧指纹必一致），故不重复。
 """
@@ -62,7 +62,7 @@ from membench.ratings import format_metric, format_metric_delta, format_metric_v
 
 @dataclass
 class ArmDatasetResult:
-    """双臂 A/B 下某数据集的指标：包含 baseline 与 candidate 两侧 metrics。
+    """A/B 两组下某数据集的指标：包含 baseline 与 candidate 两侧 metrics。
 
     Attributes:
         spec: 数据集槽位。
@@ -208,7 +208,7 @@ def _per_dataset_diff(results: list[ArmDatasetResult]) -> list[dict[str, Any]]:
 def _fused_diff(
     fused_a: dict[str, dict[str, Any]], fused_b: dict[str, dict[str, Any]]
 ) -> dict[str, dict[str, float]]:
-    """双臂融合值的逐指标 diff（b - a）；任一侧为 None（未计算）时跳过该指标。"""
+    """两组融合值的逐指标 diff（b - a）；任一侧为 None（未计算）时跳过该指标。"""
     out: dict[str, dict[str, float]] = {}
     for metric in fused_a:
         va = fused_a[metric].get("value")
@@ -226,7 +226,7 @@ def _fused_gates(
     stale_threshold: float,
     latency_warn: float,
 ) -> list[dict[str, Any]]:
-    """双臂融合值的门禁评估（与 compare 口径一致）。"""
+    """两组融合值的门禁评估（与 compare 口径一致）。"""
     a_overall = {k: v["value"] for k, v in fused_a.items() if v.get("value") is not None}
     b_overall = {k: v["value"] for k, v in fused_b.items() if v.get("value") is not None}
     if not a_overall or not b_overall:
@@ -359,7 +359,7 @@ def evaluate_compare(
     latency_warn: float = 0.30,
     evidence_matcher: Any = None,
 ) -> dict[str, Any]:
-    """双臂（baseline vs candidate）× 多数据集融合 A/B 对比。
+    """两组（baseline vs candidate）× 多数据集融合 A/B 对比。
 
     Args:
         baseline_adapter: 基线适配器实例。
@@ -448,7 +448,7 @@ def evaluate_compare(
     # 逐数据集 diff
     per_dataset = _per_dataset_diff(arms)
 
-    # 双臂融合（sources 记录 capabilities 来源，供报告标注）
+    # 两组融合（sources 记录 capabilities 来源，供报告标注）
     fused_baseline, cap_sources_a = _arm_fuse(arms, "baseline")
     fused_candidate, cap_sources_b = _arm_fuse(arms, "candidate")
     fused_diffs = _fused_diff(fused_baseline, fused_candidate)
@@ -559,7 +559,7 @@ def _write_evaluate_compare_report(
 ) -> str:
     """生成 evaluate-compare 的 compare_report.md（中文）。"""
     lines: list[str] = []
-    lines.append(f"# membench 双臂多数据集对比报告 — {baseline_name} vs {candidate_name}")
+    lines.append(f"# membench 两组多数据集对比报告 — {baseline_name} vs {candidate_name}")
     lines.append("")
     verdict_icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌"}.get(verdict, "")
     lines.append(f"**门禁结论： {verdict} {verdict_icon}**")
@@ -767,7 +767,7 @@ def _write_evaluate_compare_report(
     if fused_rows:
         lines.append(_md_table(["指标", "A 融合值", "B 融合值", "diff"], fused_rows))
     else:
-        lines.append("（双臂均无可参与融合的质量指标，跳过）")
+        lines.append("（两组均无可参与融合的质量指标，跳过）")
     lines.append("")
     lines.append("![融合指标差值](fig_fused_diff.png)")
     lines.append("")
@@ -785,8 +785,8 @@ def _write_evaluate_compare_report(
         lines.append("（无可评估的门禁项——任一侧融合值缺失）")
     lines.append("")
 
-    # 4. 双臂融合指标完整表（含参与集与差值）
-    lines.append("## 双臂融合指标对照")
+    # 4. 两组融合指标完整表（含参与集与差值）
+    lines.append("## 两组融合指标对照")
     lines.append("")
     fused_full_rows: list[list[str]] = []
     for metric in [
@@ -866,7 +866,7 @@ def _write_evaluate_compare_report(
         "recall_at_5",
         "over_refusal_rate",
     ]
-    header_q = ["数据集", "臂", *metric_labels(q_cols)]
+    header_q = ["数据集", "组", *metric_labels(q_cols)]
     detail_rows: list[list[str]] = []
     for arm in arms:
         for side_label, metrics_dict in (("A", arm.baseline), ("B", arm.candidate)):
@@ -879,9 +879,9 @@ def _write_evaluate_compare_report(
     lines.append("")
 
     # 6. 评级
-    lines.append("## 双臂综合评级")
+    lines.append("## 两组综合评级")
     lines.append("")
-    # 评级基于双臂各自的融合 overall（与 evaluate 报告口径一致）
+    # 评级基于两组各自的融合 overall（与 evaluate 报告口径一致）
     fused_a_overall = {k: v["value"] for k, v in fused_baseline.items() if v.get("value") is not None}
     fused_b_overall = {k: v["value"] for k, v in fused_candidate.items() if v.get("value") is not None}
     rated_a = overall_rating(fused_a_overall) if fused_a_overall else None
@@ -891,7 +891,7 @@ def _write_evaluate_compare_report(
     if rated_b:
         lines.append(f"- B 综合评级（融合）：{rated_b[0]}（{rated_b[1]:.2f}/4.0）")
     if rated_a is None and rated_b is None:
-        lines.append("（双臂融合 overall 中无可评级指标）")
+        lines.append("（两组融合 overall 中无可评级指标）")
     lines.append("")
     lines.append(
         "<sub>评级规则：取六项质量指标（accuracy / token_f1 / bleu1 / "

@@ -72,7 +72,7 @@ python -m membench.cli evaluate --adapter <a> --beam-10m   # 用 BEAM-10M 替换
 python -m membench.cli evaluate --adapter <a> --include-lme-s  # 追加 LongMemEval-S（大体积，与 oracle 分差反映检索/精确率损失）
 ```
 
-## 双臂多数据集融合 A/B 对比
+## A/B 两组多数据集融合对比
 
 `evaluate-compare` 一次跑两套 adapter × 多数据集，直接产出**逐数据集 diff + 跨数据集融合 diff + 门禁 + 对比图**，落 `<报告父目录>/ab_<tag>_<ts>/` 自包含结构（A/B 两侧各自带各数据集 run 副本 + compare_report.md + 两张对比图）：
 
@@ -89,7 +89,7 @@ python -m membench.cli evaluate-compare \
     --quick
 ```
 
-门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **逐数据集题型 diff** + **双臂融合 diff 表** + **per-dataset 门禁明细**（单数据集 spike 不被融合平均抹平）+ **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）；比率型指标以百分比呈现（如 `81.5%`），差值为百分点（如 `+2.3pt`）。指标"未计算"统一记 `null`，与真实 0 区分；诊断指标（检索召回率@5 / 过度拒答率）在 diff 与对照表中可见但不参与评级。旧版 run 的 capabilities 未落账时报告会按数据集/逐题记录自动推断并在头部标注来源。
+门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **逐数据集题型 diff** + **两组融合 diff 表** + **per-dataset 门禁明细**（单数据集 spike 不被融合平均抹平）+ **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）；比率型指标以百分比呈现（如 `81.5%`），差值为百分点（如 `+2.3pt`）。指标"未计算"统一记 `null`，与真实 0 区分；诊断指标（检索召回率@5 / 过度拒答率）在 diff 与对照表中可见但不参与评级。旧版 run 的 capabilities 未落账时报告会按数据集/逐题记录自动推断并在头部标注来源。
 
 融合口径（重要，读总分前必读）：
 
@@ -170,7 +170,7 @@ python -m membench.cli run --adapter my-system --dataset membench/data/office_da
 
 ## A/B 可比性前置校验
 
-`compare` 只**测量差异**，不**判定**两臂是否只差一个变量。为了让"驱动/判分模型、适配器、数据集变了却照给 PASS"不再发生，`compare` 在算 diff 之前先做**可比性前置校验**：逐维度比对两个 run 的 metrics.json 元数据，结论作为门禁列表的**首位**（`comparability`）。
+`compare` 只**测量差异**，不**判定**两组是否只差一个变量。为了让"驱动/判分模型、适配器、数据集变了却照给 PASS"不再发生，`compare` 在算 diff 之前先做**可比性前置校验**：逐维度比对两个 run 的 metrics.json 元数据，结论作为门禁列表的**首位**（`comparability`）。
 
 维度分三级：
 
@@ -254,7 +254,7 @@ python -m membench.cli matrix \
 
 - `--out` 直接指定完整实验目录（优先）；`--report-out DIR` 是实验目录的**父目录**（给出时落 `DIR/matrix_<ts>/`）；都不给时落 `output_root()/matrix_<ts>/`。
 
-label 推荐 `platform@commit` 格式（也接受任意字符串）。实验目录自包含（各臂 run 副本落 `runs/<label>/`），产出 `matrix_report.md` +
+label 推荐 `platform@commit` 格式（也接受任意字符串）。实验目录自包含（各组 run 副本落 `runs/<label>/`），产出 `matrix_report.md` +
 `matrix_result.json` + `fig_matrix_accuracy.png`：
 
 1. 若标签恰好覆盖 2 平台 × 2 commit，对 accuracy / stale_rate / evidence_recall /
@@ -284,7 +284,7 @@ DIR/ab_<tag>_<ts>/
 # 矩阵对比（matrix：--report-out DIR 为父目录，--out 直接指定完整实验目录）
 DIR/matrix_<ts>/
 ├── matrix_report.md / matrix_result.json / fig_matrix_accuracy.png
-└── runs/<label>/                       # 各臂 run 副本
+└── runs/<label>/                       # 各组 run 副本
 ```
 
 - 不传 `--report-out` 时：`run` 只写 `runs/<run_id>/`；`compare` 落 `output_root()/ab_<tag>_<ts>/`；`evaluate` 保持历史位置 `<out_dir>/evaluate_<ts>/`；`matrix` 落 `output_root()/matrix_<ts>/`。
@@ -432,7 +432,7 @@ run 基线（记全 --driver-llm / --adapter-version / 数据集指纹）
 - latency_p95 上升 > 30% → **WARN**
 - 其余指标变动仅报告
 
-> `compare` 只测量差异，不判定两臂是否只差一个变量——必须自己固定模型 / harness / 数据集，只切优化开关，并用 `--require-comparable` 让 compare 帮你拦下"变量不一致"的对比。
+> `compare` 只测量差异，不判定两组是否只差一个变量——必须自己固定模型 / harness / 数据集，只切优化开关，并用 `--require-comparable` 让 compare 帮你拦下"变量不一致"的对比。
 
 完整教程（含如何扩充黄金集、何时切换 LLM 判分、六阶段优化闭环）见 `examples/optimize_loop.md`。
 

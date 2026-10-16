@@ -28,7 +28,7 @@
 
 1. **一次只改一个变量**（检索策略、写入策略、拒答阈值……），否则无法归因。
 2. **数据集、判分器、驱动模型、harness 在两次 run 之间保持不变**，只变被测系统（优化开关）。
-3. **`compare` 只测量差异，不判定**两臂是否只差一个变量——消融纪律必须你自己保证，并用 `--require-comparable` 让 compare 做前置校验。
+3. **`compare` 只测量差异，不判定**两组是否只差一个变量——消融纪律必须你自己保证，并用 `--require-comparable` 让 compare 做前置校验。
 4. 门禁结论说了算，不要只看 accuracy 单一指标。
 
 ---
@@ -104,7 +104,7 @@ self.store[subject_of(fact)] = fact
 
 ## 5. A/B 对比（消融纪律 + 可比性前置校验）
 
-对"改动前 = 基线 A、改动后 = 候选 B"各跑一次 run，两臂**同数据集、同判分器、同驱动模型、同 harness**，只切优化开关：
+对"改动前 = 基线 A、改动后 = 候选 B"各跑一次 run，两组**同数据集、同判分器、同驱动模型、同 harness**，只切优化开关：
 
 ```bash
 # 基线（改动前）
@@ -122,7 +122,7 @@ python -m membench.cli compare \
 # 自定义门禁阈值：--acc-threshold 0.02 --stale-threshold 0.02 --latency-warn 0.30
 ```
 
-- **消融纪律**：`compare` 只测差异，**不判定**两臂是否只差一个变量。你必须自己固定模型 / harness / 数据集，只切优化开关；否则 diff 无法归因。
+- **消融纪律**：`compare` 只测差异，**不判定**两组是否只差一个变量。你必须自己固定模型 / harness / 数据集，只切优化开关；否则 diff 无法归因。
 - **可比性前置校验**：`--require-comparable` 下，关键维度（adapter / adapter_version / 数据集指纹 / judge / judge_model / driver_llm / platform）不一致或无法核验 → 门禁 FAIL。不可比原因在 CLI 输出与 `ab_<tag>_<ts>/compare_report.md` 的「可比性前置校验」小节可见。
 - 产物落自包含的 `output/ab_<tag>_<ts>/`：`A/`、`B/` 各带 run 副本与报告，`compare_report.md` 是结论；阶段 6 的 `optimization_report.md` 也写在这里。
 
@@ -140,7 +140,7 @@ python -m membench.cli compare \
 把方案与**可归因**效果写成 `output/ab_<tag>_<ts>/optimization_report.md`：
 
 - 本次改了什么（单变量）、为什么；
-- A/B 可比性结论（两臂只在优化开关上不同）；
+- A/B 可比性结论（两组只在优化开关上不同）；
 - 逐指标 diff 与门禁结论（PASS/FAIL/WARN）+ 是否固化 / 回滚。
 
 ## 7. 何时改判分器

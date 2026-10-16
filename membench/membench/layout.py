@@ -20,7 +20,7 @@ A/B 对比（compare）::
 
     <root>/matrix_<ts>/
     ├── matrix_report.md / matrix_result.json / fig_matrix_accuracy.png
-    └── runs/<label>/                             # 各臂 run 副本
+    └── runs/<label>/                             # 各组 run 副本
 
 ``<root>`` 由 :func:`membench.paths.output_root` 解析（或 CLI ``--report-out DIR``）。
 命名 helper（:func:`subdir_for` / :func:`ab_subdir` / :func:`matrix_subdir`）是
@@ -200,7 +200,7 @@ def materialize_matrix_experiment(
     exp_dir: str,
     labeled_runs: Iterable[tuple[str, str]],
 ) -> str:
-    """矩阵对比：各臂 run 副本落 ``<exp_dir>/runs/<label>/``。"""
+    """矩阵对比：各组 run 副本落 ``<exp_dir>/runs/<label>/``。"""
     os.makedirs(exp_dir, exist_ok=True)
     labels: list[str] = []
     run_dirs: list[str] = []

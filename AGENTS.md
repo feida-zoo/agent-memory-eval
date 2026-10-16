@@ -61,7 +61,7 @@ docs/                     # 深度研究报告 + 配图
    - CLI `--report-out DIR` 一律指**实验目录的父目录**。
    - 命名与落位**只走** `membench/layout.py`，不要在业务代码里手写目录名或手抄复制逻辑。
 2. **默认目录只由 `membench/paths.py` 判定**（`output_root()` / `runs_dir()`；`MEMBENCH_OUTPUT_DIR` > skill 的 `output/` > 工程根）。历史上的多处 SKILL.md 探测已收敛到这里，不要再复制一份。
-3. **可比性前置校验**：`compare` 按 `membench/compare.py` 的维度表核对 A/B 元数据（关键维度不一致 → 不可比）。新增关键维度要同步三处：维度表、`Runner` 的元数据写入、文档。**`commit` 不同是 A/B 的被测变量，不得判为不可比。** 纪律：compare 只测量差异，不判定两臂是否只差一个变量。
+3. **可比性前置校验**：`compare` 按 `membench/compare.py` 的维度表核对 A/B 元数据（关键维度不一致 → 不可比）。新增关键维度要同步三处：维度表、`Runner` 的元数据写入、文档。**`commit` 不同是 A/B 的被测变量，不得判为不可比。** 纪律：compare 只测量差异，不判定两组是否只差一个变量。
 4. **数据集政策**：仓库**不内置**开源大数据集。`office_dataset.jsonl` / `sample_dataset.jsonl` 是自造演示集；`locomo` / `longmemeval_*` / `gatemem_office` / `beam_*` 一律 `dataset fetch` 到 `~/.membench/datasets/`。
    - `membench/.gitignore` 已忽略这些文件：**绝不**加入 git，也绝不让它们进入 skill 包（`skill/build_skill.py` 自带自检，混入即报错）。
 5. **改 CLI 要三处同步**：`cli.py` 的参数定义、`cli.py` 顶部 docstring 用法、`membench/README.md`；`skill/src/SKILL.md` 里有命令示例时同样同步。

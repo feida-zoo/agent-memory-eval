@@ -1,7 +1,7 @@
-"""evaluate-compare 双臂多数据集 A/B 融合对比测试。
+"""evaluate-compare A/B 两组多数据集融合对比测试。
 
 覆盖：
-- 双臂融合 diff 计算；
+- 两组融合 diff 计算；
 - 逐数据集 diff 表 + 融合 diff 表 + 门禁结论写入 compare_report.md；
 - 产物布局：A/B 两侧各数据集 run 副本 + compare_report.md + 两张图；
 - CLI：_cmd_evaluate_compare 参数透传 + 系统退出码映射；

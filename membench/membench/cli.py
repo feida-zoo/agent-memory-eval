@@ -173,7 +173,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- evaluate-compare ---
     p_ev_cmp = sub.add_parser(
         "evaluate-compare",
-        help="双臂（baseline vs candidate）× 多数据集融合 A/B 对比；产出 ab_<tag>_<ts>/",
+        help="两组（baseline vs candidate）× 多数据集融合 A/B 对比；产出 ab_<tag>_<ts>/",
     )
     p_ev_cmp.add_argument("--baseline-adapter", required=True, help="基线适配器名")
     p_ev_cmp.add_argument("--candidate-adapter", required=True, help="候选适配器名")
@@ -523,7 +523,7 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
 
 
 def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
-    """双臂（baseline vs candidate）× 多数据集融合 A/B 对比。"""
+    """两组（baseline vs candidate）× 多数据集融合 A/B 对比。"""
     from membench.evaluate_compare import evaluate_compare
 
     if args.jobs < 1:

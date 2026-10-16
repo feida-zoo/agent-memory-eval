@@ -120,7 +120,7 @@ python -m membench.cli compare --baseline runs/<run_a> --candidate runs/<run_b> 
 
 - `--require-comparable`：关键维度（`driver_llm` / `judge_model` / `adapter_version` / `dataset_fingerprint` 等）不一致或无法核验 → 可比性门禁 **FAIL**（整体 verdict=FAIL、退出码 1），即拒绝当 A/B 用；不加该参数时不一致只降级为 WARN。详见 `references/compare_workflows.md`。
 - `--tag <标签>`：决定产物目录 `ab_<tag>_<ts>/`。
-- **`compare` 只测差异，不判定两臂是否只差一个变量**——消融靠你自己保证。
+- **`compare` 只测差异，不判定两组是否只差一个变量**——消融靠你自己保证。
 
 **产物**：`ab_<tag>_<ts>/`（A/B 各自报告与 run、`compare_report.md`、`fig_metric_diff.png`）。
 
