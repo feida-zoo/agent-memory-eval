@@ -452,3 +452,76 @@ def test_plan_datasets_missing_lme_s_systemexit(
     with pytest.raises(SystemExit) as exc_info:
         plan_datasets(quick=True, include_lme_s=True)
     assert "dataset fetch longmemeval_s" in str(exc_info.value)
+
+
+def test_run_datasets_forwards_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """--jobs 必须透传到 Runner。
+
+    历史 bug：run_datasets 接受并文档承诺 jobs 透传，但从未传给 Runner，
+    导致 evaluate / evaluate-compare 的 --jobs 静默失效（含 evidence-match
+    的 LLM 逐题调用也因此完全串行）。
+    """
+    import membench.evaluate as ev_mod
+
+    dataset = _write_dataset(
+        tmp_path / "d.jsonl",
+        [
+            {
+                "dialogue_id": "d1",
+                "sessions": [_session()],
+                "questions": [
+                    {
+                        "qid": "q1",
+                        "question": "q?",
+                        "gold_answer": "a",
+                        "category": "single_hop",
+                        "evidence": [],
+                    }
+                ],
+            }
+        ],
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeRunner:
+        def __init__(self, adapter, path, **kwargs):  # noqa: ANN001
+            captured.update(kwargs)
+
+        def run(self) -> str:
+            run_dir = tmp_path / "fake_run"
+            run_dir.mkdir(exist_ok=True)
+            (run_dir / "metrics.json").write_text("{}", encoding="utf-8")
+            return str(run_dir)
+
+    monkeypatch.setattr(ev_mod, "Runner", _FakeRunner)
+    specs = [DatasetSpec(key="k", name="K", path=str(dataset), source="user-specified")]
+    results = ev_mod.run_datasets(object(), "heuristic", specs, str(tmp_path / "runs"), jobs=7)
+    assert captured["jobs"] == 7
+    assert results and results[0].metrics == {}
+
+
+def test_cli_run_forwards_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLI `run --jobs N` 必须传给 Runner（历史 bug：从未传）。"""
+    from membench.data import SAMPLE_DATASET_PATH
+
+    captured: dict[str, object] = {}
+
+    class _FakeRunner:
+        def __init__(self, adapter, path, **kwargs):  # noqa: ANN001
+            captured.update(kwargs)
+
+        def run(self) -> str:
+            return str(tmp_path)
+
+    monkeypatch.setattr(cli, "Runner", _FakeRunner)
+    rc = cli.main(
+        [
+            "run",
+            "--adapter", "mock-weak",
+            "--dataset", str(SAMPLE_DATASET_PATH),
+            "--jobs", "5",
+            "--out", str(tmp_path / "runs"),
+        ]
+    )
+    assert rc == 0
+    assert captured["jobs"] == 5

@@ -6,10 +6,11 @@
     -> membench.metrics.aggregate(records) -> 补元数据
     -> 写 results.jsonl / metrics.json -> report.py 生成 report.md 与图表
 
-并发：query+judge 阶段在 ``jobs>1`` 时用 ThreadPoolExecutor 题目级并发
+并发：query+judge+证据匹配 阶段在 ``jobs>1`` 时用 ThreadPoolExecutor 题目级并发
 （对话时序和记忆状态敏感的 ingest 阶段必须保持串行）；收集结果后按原始题目
 顺序排序落盘，results.jsonl 的记录顺序与 jobs=1 完全一致。
-**jobs>1 要求 adapter.query 与 judge 线程安全**；内置 mock adapter 和
+**jobs>1 要求 adapter.query 与 judge 线程安全**（evidence-match 匹配器自身
+线程安全，LLM 口径的逐题调用也随之并发）；内置 mock adapter 和
 LLMJudge（urllib 无状态调用）均视为线程安全。
 
 题目级忽略标记（ignore=true）的题整条跳过：不调用 adapter.query、不写入
@@ -297,6 +298,11 @@ class Runner:
 
         records: list[dict[str, Any]] = []
         done = 0
+        # 检索回退数按本次 run 增量统计（matcher 实例可在多数据集间共享）
+        match_fallbacks_start = int(
+            getattr(self._evidence_matcher, "fallbacks", 0) or 0
+        )
+
         for di, dialogue in enumerate(dialogues, 1):
             self.adapter.reset()
             ingest_latency_ms = 0.0
@@ -385,7 +391,10 @@ class Runner:
         match_threshold = getattr(self._evidence_matcher, "threshold", None)
         if match_threshold is not None:
             retrieval_meta["retrieval_match_threshold"] = float(match_threshold)
-        match_fallbacks = int(getattr(self._evidence_matcher, "fallbacks", 0) or 0)
+        match_fallbacks = (
+            int(getattr(self._evidence_matcher, "fallbacks", 0) or 0)
+            - match_fallbacks_start
+        )
         if match_fallbacks:
             retrieval_meta["retrieval_match_fallbacks"] = match_fallbacks
         metrics.update(retrieval_meta)

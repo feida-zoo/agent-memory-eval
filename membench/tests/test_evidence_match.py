@@ -113,3 +113,27 @@ class TestBuildEvidenceMatcher:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         with pytest.raises(ValueError, match="--llm-base-url"):
             build_evidence_matcher("llm")
+
+
+class TestLLMFallbacksConcurrency:
+    def test_fallbacks_thread_safe(self) -> None:
+        """--jobs 并发下回退计数不丢：32 并发同时失败应精确计 32。"""
+        import threading
+
+        matcher = LLMEvidenceMatcher(base_url="http://x")
+        barrier = threading.Barrier(32)
+
+        def _boom(evidence: list[str], retrieved: list[str]) -> list[list[int]]:
+            barrier.wait(timeout=5)
+            raise ConnectionError("model service down")
+
+        matcher._chat = _boom  # type: ignore[method-assign]
+        threads = [
+            threading.Thread(target=matcher.evidence_hits, args=(["e"], ["d"]))
+            for _ in range(32)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert matcher.fallbacks == 32

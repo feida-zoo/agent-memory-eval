@@ -332,6 +332,7 @@ def run_datasets(
             platform=platform,
             commit=commit,
             dataset_source=spec.source,
+            jobs=jobs,
             driver_llm=driver_llm,
             adapter_version=adapter_version,
             evidence_matcher=evidence_matcher,

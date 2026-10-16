@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import urllib.request
 from typing import Any, Sequence
 
@@ -142,6 +143,8 @@ class LLMEvidenceMatcher:
         self.model = model or os.environ.get("MEMBENCH_JUDGE_MODEL") or "gpt-4o-mini"
         self.timeout = float(timeout)
         self._fallback = fallback or SubstringMatcher()
+        # 回退计数需线程安全：--jobs>1 时多题并发调用本匹配器
+        self._fallbacks_lock = threading.Lock()
         self.fallbacks = 0
 
     def _chat(self, evidence: list[str], retrieved: list[str]) -> list[list[int]]:
@@ -197,7 +200,8 @@ class LLMEvidenceMatcher:
         try:
             support = self._chat(evidence, retrieved)
         except Exception:  # noqa: BLE001 - 任何失败都必须回退，不中断评测
-            self.fallbacks += 1
+            with self._fallbacks_lock:
+                self.fallbacks += 1
             return self._fallback.evidence_hits(evidence, retrieved, k)
         top = len(retrieved[:k])
         hit = any(entries for entries in support)

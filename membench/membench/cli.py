@@ -91,7 +91,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="检索证据命中口径：substring=逐字子串（默认，历史口径）；overlap=token 包含度容错近原文改写；llm=语义判定（复用 --llm-* 配置，失败回退 substring）",
     )
     p_run.add_argument("--evidence-match-threshold", type=float, default=0.6, help="evidence-match=overlap 时的包含度阈值（默认 0.6）")
-    p_run.add_argument("--jobs", type=int, default=1, help="题目级并发数（默认 1；ingest 始终串行，要求 adapter.query 与 judge 线程安全）")
+    p_run.add_argument("--jobs", type=int, default=1, help="题目级并发数（默认 1；ingest 始终串行；query / judge / 证据匹配在此并发下执行，要求 adapter.query 与 judge 线程安全）")
     p_run.add_argument("--client-llm", default=None, help="judge=client 时的 agent 内置 LLM 类路径，如 'my_agent.llm:LLMClient'")
     p_run.add_argument("--limit", type=int, default=None, help="冒烟模式：只评测（分片后的）前 N 道题，run_id 与 metadata 记录 limit")
     p_run.add_argument("--adapter-meta", default=None, help='适配器配置自由文本（"key=value;..."），原样记入 metadata["adapter_meta"]')
@@ -166,7 +166,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="检索证据命中口径：substring=逐字子串（默认，历史口径）；overlap=token 包含度容错近原文改写；llm=语义判定（复用 --llm-* 配置，失败回退 substring）",
     )
     p_ev.add_argument("--evidence-match-threshold", type=float, default=0.6, help="evidence-match=overlap 时的包含度阈值（默认 0.6）")
-    p_ev.add_argument("--jobs", type=int, default=1, help="题目级并发数（默认 1；ingest 始终串行，要求 adapter.query 与 judge 线程安全）")
+    p_ev.add_argument("--jobs", type=int, default=1, help="题目级并发数（默认 1；ingest 始终串行；query / judge / 证据匹配在此并发下执行，要求 adapter.query 与 judge 线程安全）")
     p_ev.add_argument("--client-llm", default=None, help="judge=client 时的 agent 内置 LLM 类路径，如 'my_agent.llm:LLMClient'")
     p_ev.set_defaults(func=_cmd_evaluate)
 
@@ -205,7 +205,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="检索证据命中口径（两侧一致）：substring=逐字子串（默认，历史口径）；overlap=token 包含度容错近原文改写；llm=语义判定（复用 --llm-* 配置，失败回退 substring）",
     )
     p_ev_cmp.add_argument("--evidence-match-threshold", type=float, default=0.6, help="evidence-match=overlap 时的包含度阈值（默认 0.6）")
-    p_ev_cmp.add_argument("--jobs", type=int, default=1, help="题目级并发数（默认 1）")
+    p_ev_cmp.add_argument("--jobs", type=int, default=1, help="题目级并发数（默认 1；ingest 始终串行；query / judge / 证据匹配在此并发下执行，要求 adapter.query 与 judge 线程安全）")
     p_ev_cmp.add_argument("--client-llm", default=None, help="judge=client 时的 agent 内置 LLM 类路径")
     p_ev_cmp.set_defaults(func=_cmd_evaluate_compare)
 
@@ -321,6 +321,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         platform=args.platform,
         commit=args.commit,
         dataset_source=dataset_source,
+        jobs=args.jobs,
         limit=args.limit,
         shards=args.shards,
         shard_index=args.shard_index,

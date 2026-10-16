@@ -250,3 +250,37 @@ def test_retrieval_match_metadata_and_overlap(tmp_path: Path) -> None:
         (run_dir / "results.jsonl").read_text(encoding="utf-8").strip().splitlines()[0]
     )
     assert rec["evidence_hit"] is True and rec["recall@5"] == 1.0
+
+
+def test_retrieval_match_fallbacks_per_run_delta(tmp_path: Path) -> None:
+    """matcher 实例跨 run 共享时，metrics.json 记本次 run 的回退增量。"""
+    from membench.data.schema import load_dataset
+    from membench.metrics.evidence import LLMEvidenceMatcher
+
+    matcher = LLMEvidenceMatcher(base_url="http://x")
+
+    def _boom(evidence: list[str], retrieved: list[str]) -> list[list[int]]:
+        raise ConnectionError("model service down")
+
+    matcher._chat = _boom  # type: ignore[method-assign]
+    n_evidence = sum(
+        1
+        for d in load_dataset(SAMPLE_DATASET_PATH)
+        for q in d.questions
+        if q.evidence and not q.ignore
+    )
+    assert n_evidence > 0
+
+    for name in ("r1", "r2"):
+        runner = Runner(
+            MockStrongAdapter(),
+            str(SAMPLE_DATASET_PATH),
+            judge="heuristic",
+            out_dir=str(tmp_path / name),
+            evidence_matcher=matcher,
+        )
+        run_dir = Path(runner.run())
+        metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+        # 每次 run 只记自己的增量（而非累计值）
+        assert metrics["retrieval_match_fallbacks"] == n_evidence
+    assert matcher.fallbacks == 2 * n_evidence

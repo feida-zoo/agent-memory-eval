@@ -157,6 +157,7 @@ python -m membench.cli evaluate-compare \
 # 两侧可分别指定 driver_llm / adapter-version 供 compare 可比性前置校验
 # 检索口径默认 substring（逐字子串）；摘要/改写式记忆可换 --evidence-match overlap|llm
 # （口径不同不可与历史 substring 跑分直接比较，两侧需同口径重跑）
+# llm 口径为逐题 chat 调用（单题可达 10s+），大规模评测配 --jobs 8~16 并发跑
 ```
 
 > **全量评估前必须先 fetch 用到的按需下载数据集**（locomo / longmemeval_oracle / gatemem_office / beam_1m 等），否则会报错提示先 `dataset fetch <key>`。命令：`python -m membench.cli dataset fetch <key>`（落 `~/.membench/datasets/`）。

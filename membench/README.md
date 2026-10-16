@@ -112,10 +112,12 @@ python -m membench.cli run --adapter mock-strong \
     --llm-timeout 120   # 可选：判分请求超时秒数（默认 90s，适配推理模型）
 ```
 
-题目级并发（可选）：`run` / `evaluate` 均支持 `--jobs N`（默认 1）。ingest 阶段
-始终串行（对话时序与记忆状态敏感），仅 query+judge 阶段并发；`results.jsonl`
-的记录顺序与 `--jobs 1` 完全一致。`--jobs > 1` 要求你的 `adapter.query` 与
-judge 线程安全（内置 mock adapter 与 LLMJudge 均线程安全）。
+题目级并发（可选）：`run` / `evaluate` / `evaluate-compare` 均支持 `--jobs N`
+（默认 1）。ingest 阶段始终串行（对话时序与记忆状态敏感），query / judge /
+证据匹配（含 `--evidence-match llm` 的逐题 chat 调用）在该并发下执行；
+`results.jsonl` 的记录顺序与 `--jobs 1` 完全一致。`--jobs > 1` 要求你的
+`adapter.query` 与 judge 线程安全（内置 mock adapter 与 LLMJudge 均线程安全）。
+使用 `--evidence-match llm` 评测大规模数据集时建议配 `--jobs 8~16`。
 
 ## 大数据集：冒烟与分片
 
@@ -519,7 +521,7 @@ A: 填 0 即可，报告中对应项视为 n/a，不影响 accuracy 等核心指
 A: `compare` 子命令在 verdict=FAIL 时以退出码 1 退出，直接放进流水线即可。
 
 **Q: 支持并发评测吗？**
-A: 当前 Runner 为顺序执行（记忆系统有状态，顺序最安全）。题目级并发可用 `--jobs N`（仅 query+judge 阶段并发，ingest 仍串行）。数据量大时建议按 dialogue 拆分数据集并行跑多个进程，再合并 results.jsonl。
+A: 当前 Runner 按题目级并发执行（记忆系统有状态，ingest 顺序最安全）。并发用 `--jobs N`（query / judge / 证据匹配并发，ingest 仍串行）。数据量大时建议按 dialogue 拆分数据集并行跑多个进程，再合并 results.jsonl。
 
 ## 办公 Agent 专用黄金集（office_dataset.jsonl）
 
