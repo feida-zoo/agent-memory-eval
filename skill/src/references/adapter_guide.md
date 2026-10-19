@@ -21,8 +21,8 @@ membench 与被测系统之间**只有一个协议**：`BaseMemoryAdapter`
 |---|---|---|
 | Python 库/进程，记忆写入与检索能在 Python 侧调用 | **① 实现 `BaseMemoryAdapter`**（推荐） | 本文第 2 节 |
 | 独立服务（Node/Electron/其他进程），不便嵌 Python | **② HTTP 三端点 + 内置 `HttpAdapter`** | 第 6 节 + `references/http_bridge_guide.md` |
-| 记忆能力本身就是"LLM + 工具调用"循环（ingest/query 同构） | **③ `AgentLoopAdapter` 复用循环** | 第 2.4 节 |
-| 不改系统、先量现状，或复现线上 badcase | **④ `TranscriptAdapter` 回放真实日志** | 第 2.5 节 |
+| 记忆能力本身就是"LLM + 工具调用"循环（ingest/query 同构） | **③ `AgentLoopAdapter` 复用循环** | 第 2.5 节 |
+| 不改系统、先量现状，或复现线上 badcase | **④ `TranscriptAdapter` 回放真实日志** | 第 2.6 节 |
 
 ## 2. 三个挂点怎么找、怎么写
 
@@ -60,7 +60,24 @@ membench 与被测系统之间**只有一个协议**：`BaseMemoryAdapter`
 - 返回 `QueryResult(answer, retrieved, latency_ms, input_tokens, output_tokens, llm_calls)`：
   查询过程触发的全部 LLM 调用与 token 都要计入；填不了填 0。
 
-### 2.4 `AgentLoopAdapter`（路径③速览）
+### 2.4 时间锚：temporal 题的正确性从哪来
+
+- 消息时间戳（`messages[].timestamp`）是**唯一时间锚**：逐条原样传给 ingest；被测系统
+  解释"昨天 / 上周 / 上季度 / 上次会议"时必须相对**消息时间线**，而不是机器时钟、
+  也不是记忆的写入时刻；
+- membench **不会**把数据集时间平移到"现在"，分数与墙钟无关（stale / abstention
+  红线也是规则判定）——数据集是 2026-09 的对话、评测跑在哪一天，都不影响正确性；
+  参考：office 集的 gold 会把锚点写明（如 `9月11日（9月12日说的"昨天"）`）；
+- **验证方法（5 分钟）**：同一对话构造两份时间戳版本（整体平移 3 年），各跑一遍，
+  答案应完全一致；若随评测日期或写入时刻变化 → 系统缺陷（用墙钟解释相对时间），
+  不要用"数据集时间对不上"去解释或掩盖；
+- 系统"写入时刻 = 事件时间"是个常见坑：若系统改不动，只能在**数据集构造阶段**
+  整体平移时间戳（同 delta、保持相对结构），且因 `dataset_fingerprint` 变化
+  **必须重跑基线**；membench 无内置平移工具，绝不要评测期偷偷平移；
+- 消息缺 `timestamp` 的数据集：temporal 题无法锚定，属数据集缺陷，构造时补齐
+  （见 `references/user_dataset_guide.md`）。
+
+### 2.5 `AgentLoopAdapter`（路径③速览）
 
 若 ingest/query 是同一套 tool-call 骨架，用
 `membench.agent_loop.AgentLoopAdapter` 只给 `{llm_client, tools, system_prompt}`：
@@ -75,7 +92,7 @@ membench 与被测系统之间**只有一个协议**：`BaseMemoryAdapter`
   被检索到的记忆原文**，否则请自传 `retrieved_from`；
 - 循环内每一轮 LLM 调用都是被测系统的真实成本，membench 会自动统计。
 
-### 2.5 `TranscriptAdapter`（路径④速览）
+### 2.6 `TranscriptAdapter`（路径④速览）
 
 把线上真实「写入/检索」日志导出为离线 transcript（对话 + 每题实际检索到的记忆条目），
 回放注入。适合先量现状、复现 badcase；**它固定了写入侧**，属降级口径：按第 3 节
@@ -198,5 +215,6 @@ python -m membench.cli run --adapter <你的adapter> --dataset membench/data/off
 - [ ] `reset` 只清了会话没清记忆库 → 跨 dialogue 串扰（single_hop 异常高、abstention 异常低）；
 - [ ] `ingest` 里同步调了生成模型做总结但没计入 `llm_calls` → 成本指标失真；
 - [ ] timestamp 没传给记忆系统 → temporal 题系统性失败；
+- [ ] 系统用机器时钟/写入时刻解释"昨天/上周"（而不是消息时间戳）→ temporal 题随评测日期漂移；用"整体平移 3 年"的对照验证（见第 2.4 节）；
 - [ ] 检索工具名不含 `retrieve/search/recall` 关键词且未自传 `retrieved_from`
   （AgentLoopAdapter）→ 证据回填空，检索指标全 0。
