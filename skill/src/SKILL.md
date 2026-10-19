@@ -126,6 +126,19 @@ python -m membench.cli run --adapter <adapter> --dataset ~/.membench/datasets/lo
 # 完整清单与介绍：python -m membench.cli dataset info
 ```
 
+> **评测前置确认（强制）**：启动任何评测（`run` / `evaluate` / `evaluate-compare`，含单纯评测与对比）之前，必须先向用户确认**召回率口径**（`--evidence-match`），并说明选项与适用性：
+>
+> | 口径 | 判定方式 | 适用与代价 |
+> |---|---|---|
+> | `substring`（默认） | 证据逐字出现在检索结果中 | 记忆存原文/近原文时用；最快、与历史跑分可比 |
+> | `overlap` | 内容 token 包含度 ≥ 阈值（容错标点/包裹/轻微改写） | 仍偏字面；免费 |
+> | `llm` | 逐题语义判定（每题一次 LLM 调用） | **摘要/改写式存储必选**——选错时整晚评测的召回率会系统性偏低；慢，配 `--jobs 8~16` |
+>
+> - 对比类（`evaluate-compare`、A/B 两次 run）**两侧必须同口径**；
+> - 换口径后与历史 substring 跑分不可直接对比（可比性校验会给 WARN）；
+> - 用户不确定时不要干问：给判断依据（记忆系统存原文→`substring`/`overlap`；存摘要/改写→`llm`），仍不确定就先 `--limit 20` 小样本冒烟看命中情况，再定完整评测口径；
+> - 口径选错只能重跑（无自动补救）——这一步是整晚评测成本的关键闸门，必须落实。
+
 **产物目录约定（本波已落地的布局，报告与 run 就近归属）：**
 
 | 命令 | 产物目录 | 内含 |
@@ -139,7 +152,7 @@ python -m membench.cli run --adapter <adapter> --dataset ~/.membench/datasets/lo
 
 ### 工作流 2.5：全量评估（多数据集融合总分）
 
-用户问"整体打个分 / 全部数据集跑一遍"时用 `evaluate`：对办公域槽位（用户集>内置office）+ locomo + longmemeval_oracle + gatemem_office + LongMemEval-S + BEAM-1M 依次评测，跨数据集**宏平均**融合出综合评级，输出一份全量报告：
+用户问"整体打个分 / 全部数据集跑一遍"时用 `evaluate`：对办公域槽位（用户集>内置office）+ locomo + longmemeval_oracle + gatemem_office + LongMemEval-S + BEAM-1M 依次评测，跨数据集**宏平均**融合出综合评级，输出一份全量报告（**启动前先做「评测前置确认」选定召回口径**，见工作流 2）：
 
 ```bash
 python -m membench.cli evaluate --adapter <adapter> --judge llm --report-out ../output/
@@ -152,7 +165,7 @@ python -m membench.cli evaluate --adapter <adapter> \
 # 默认清单含 LongMemEval-S 与 BEAM-1M（用 --no-lme-s / --no-beam 剔除）
 ```
 
-用户问"两版系统 A/B 对比一下、跨数据集一次出结论"时用 `evaluate-compare`：两套 adapter × 同一组数据集，分别跑完后产出**逐数据集 diff + 逐数据集题型 diff + 跨数据集融合 diff + 融合/per-dataset 两层门禁 + 对比图**，落 `<报告父目录>/ab_<tag>_<ts>/` 自包含结构（旧版 run 的 capabilities 未落账时自动推断并在报告头标注来源）：
+用户问"两版系统 A/B 对比一下、跨数据集一次出结论"时用 `evaluate-compare`：两套 adapter × 同一组数据集，分别跑完后产出**逐数据集 diff + 逐数据集题型 diff + 跨数据集融合 diff + 融合/per-dataset 两层门禁 + 对比图**，落 `<报告父目录>/ab_<tag>_<ts>/` 自包含结构（旧版 run 的 capabilities 未落账时自动推断并在报告头标注来源；**启动前先做「评测前置确认」，两侧同口径**，见工作流 2）：
 
 ```bash
 python -m membench.cli evaluate-compare \
@@ -190,6 +203,7 @@ python -m membench.cli compare --baseline runs/<旧commit的run> --candidate run
 ```
 
 - **`--require-comparable`**：对比前做**前置校验**——驱动/判分模型、适配器实现版本、数据集指纹等关键维度不一致即判"不可比"，禁止当 A/B 用（避免"变量变了还照给 PASS"）。
+- **召回口径一致性**：两次 run 必须同一 `--evidence-match` 口径（默认 substring；口径不同对比无意义，可比性校验会给 WARN）——启动评测前按「评测前置确认」（见工作流 2）先与用户敲定。
 - **`--tag`**：给本次对比命名，决定 `ab_<tag>_<ts>/` 目录名。
 - 其余 commit 对比模板见 `scripts/eval_two_commits.sh`。
 

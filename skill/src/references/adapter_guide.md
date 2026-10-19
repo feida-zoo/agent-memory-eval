@@ -206,7 +206,7 @@ python -m membench.cli run --adapter <你的adapter> --dataset membench/data/off
 - [ ] HTTP 路径已过 `doctor`；
 - [ ] sample 冒烟通过，office 验收跑通且缺陷暴露合理；
 - [ ] 需要 `--jobs>1` 时，`query` 已确认线程安全；
-- [ ] 摘要式存储已选好检索口径（`--evidence-match overlap|llm`）或回填原文片段。
+- [ ] **评测启动前已与用户确认召回口径**（`--evidence-match`：`substring` / `overlap` / `llm`；对比两侧同口径）——摘要/改写式存储切勿用默认 `substring` 跑长任务，确需字面口径则先回填原文片段。
 
 ## 10. 常见接错（自查清单）
 
