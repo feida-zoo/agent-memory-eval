@@ -526,3 +526,59 @@ def test_resolve_capabilities_reads_top_level_and_falls_back(tmp_path) -> None:
     )
     assert src == "results_jsonl"
     assert caps == {"has_evidence": True, "has_stale": True, "has_abstention": True}
+
+
+def test_cli_evaluate_compare_dataset_flag(tmp_path, monkeypatch) -> None:
+    """CLI evaluate-compare --dataset：两侧透传同一显式清单。"""
+    import membench.evaluate_compare as ec_mod
+
+    ds = tmp_path / "custom.jsonl"
+    ds.write_text(
+        json.dumps(
+            {
+                "dialogue_id": "d1",
+                "sessions": [[{"role": "user", "content": "聊聊", "timestamp": None}]],
+                "questions": [],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def _stub(baseline_adapter, candidate_adapter, judge, **kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return {
+            "verdict": "PASS",
+            "gates": [],
+            "fused_diffs": {},
+            "fused_baseline": {},
+            "fused_candidate": {},
+            "per_dataset": [],
+            "compare_dir": str(tmp_path / "ab"),
+        }
+
+    monkeypatch.setattr(ec_mod, "evaluate_compare", _stub)
+    rc = cli.main(
+        [
+            "evaluate-compare",
+            "--baseline-adapter", "mock-strong",
+            "--candidate-adapter", "mock-weak",
+            "--dataset", str(ds),
+        ]
+    )
+    assert rc == 0
+    specs = captured["specs"]
+    assert specs is not None and specs[0].path == str(ds.resolve())
+
+    with pytest.raises(SystemExit, match="互斥"):
+        cli.main(
+            [
+                "evaluate-compare",
+                "--baseline-adapter", "mock-strong",
+                "--candidate-adapter", "mock-weak",
+                "--dataset", str(ds),
+                "--quick",
+            ]
+        )

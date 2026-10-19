@@ -429,6 +429,8 @@ def test_cli_quick_skips_beam_check(
     assert rc == 0
     assert captured["quick"] is True
     assert captured["beam_10m"] is False
+    assert captured["no_beam"] is False
+    assert captured["no_lme_s"] is False
 
 
 def test_plan_datasets_missing_fetch_systemexit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -441,17 +443,28 @@ def test_plan_datasets_missing_fetch_systemexit(monkeypatch: pytest.MonkeyPatch)
     assert "locomo" in msg
 
 
-def test_plan_datasets_missing_lme_s_systemexit(
+def test_plan_datasets_lme_s_default_and_exclusions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """--include-lme-s 且 LongMemEval-S 未下载 -> SystemExit 提示 fetch longmemeval_s。"""
+    """LongMemEval-S 默认包含：缺失时报错；--no-lme-s / --quick 剔除后不再要求。"""
     monkeypatch.setattr(
         "membench.evaluate.resolve_available_path",
         lambda key: None if key == "longmemeval_s" else tmp_path / f"{key}.jsonl",
     )
+    home = tmp_path / "home"
+    beam_dir = home / ".membench" / "datasets"
+    beam_dir.mkdir(parents=True)
+    (beam_dir / "beam_1m.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("MEMBENCH_USER_DATA_DIR", str(tmp_path / "no_user_data"))
+
     with pytest.raises(SystemExit) as exc_info:
-        plan_datasets(quick=True, include_lme_s=True)
+        plan_datasets()
     assert "dataset fetch longmemeval_s" in str(exc_info.value)
+
+    # 剔除此变体后不再要求该文件
+    assert "longmemeval_s" not in [s.key for s in plan_datasets(no_lme_s=True)]
+    assert "longmemeval_s" not in [s.key for s in plan_datasets(quick=True)]
 
 
 def test_run_datasets_forwards_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -525,3 +538,122 @@ def test_cli_run_forwards_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     )
     assert rc == 0
     assert captured["jobs"] == 5
+
+
+def test_dataset_specs_parsing_rules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """--dataset 解析：路径收录、key 解析、办公域槽位规则、错误提示。"""
+    import membench.evaluate as ev_mod
+
+    # 路径 → user-specified，key 取 stem，第一个承担办公域槽位
+    ds = _write_dataset(
+        tmp_path / "custom.jsonl",
+        [{"dialogue_id": "d1", "sessions": [_session()], "questions": []}],
+    )
+    specs = ev_mod.dataset_specs([str(ds)])
+    assert len(specs) == 1
+    assert specs[0].key == "custom" and specs[0].source == "user-specified"
+    assert specs[0].is_office_slot is True
+
+    # key 解析（内置文件优先、其次 fetch 目录由 resolve_available_path 负责）
+    monkeypatch.setattr(
+        ev_mod, "resolve_available_path", lambda key: tmp_path / f"{key}.jsonl"
+    )
+    specs = ev_mod.dataset_specs(["locomo", "longmemeval_s"])
+    assert [s.key for s in specs] == ["locomo", "longmemeval_s"]
+    assert all(s.source == "fetch" for s in specs)
+    assert specs[0].is_office_slot is True and specs[1].is_office_slot is False
+
+    # 显式 office 参与时以它为准
+    monkeypatch.setattr(
+        ev_mod, "resolve_dataset", lambda specified: (str(tmp_path / "user.jsonl"), "user")
+    )
+    specs = ev_mod.dataset_specs(["locomo", "office"])
+    assert specs[1].key == "office" and specs[1].is_office_slot is True
+    assert specs[0].is_office_slot is False
+
+    # key 不可解析 → SystemExit 提示 fetch
+    monkeypatch.setattr(ev_mod, "resolve_available_path", lambda key: None)
+    with pytest.raises(SystemExit, match="dataset fetch"):
+        ev_mod.dataset_specs(["nope"])
+
+
+def test_cli_evaluate_dataset_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLI evaluate --dataset：透传 specs；与预设开关互斥报错。"""
+    import membench.evaluate as ev_mod
+
+    ds = _write_dataset(
+        tmp_path / "custom.jsonl",
+        [{"dialogue_id": "d1", "sessions": [_session()], "questions": []}],
+    )
+    captured: dict[str, object] = {}
+
+    def _stub(adapter, judge, **kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(ev_mod, "evaluate", _stub)
+    rc = cli.main(["evaluate", "--adapter", "mock-weak", "--dataset", str(ds)])
+    assert rc == 0
+    specs = captured["specs"]
+    assert specs is not None and specs[0].path == str(ds.resolve())
+
+    with pytest.raises(SystemExit, match="互斥"):
+        cli.main(
+            ["evaluate", "--adapter", "mock-weak", "--dataset", str(ds), "--quick"]
+        )
+
+
+def test_plan_datasets_default_and_switches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """默认清单含 LongMemEval-S 与 BEAM-1M；no_lme_s / no_beam / beam_10m / quick 切换。"""
+    home = tmp_path / "home"
+    beam_dir = home / ".membench" / "datasets"
+    beam_dir.mkdir(parents=True)
+    (beam_dir / "beam_1m.jsonl").write_text("", encoding="utf-8")
+    (beam_dir / "beam_10m.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("MEMBENCH_USER_DATA_DIR", str(tmp_path / "no_user_data"))
+    _stub_fetched(monkeypatch, tmp_path)
+
+    assert [s.key for s in plan_datasets()] == [
+        "office",
+        "locomo",
+        "longmemeval_oracle",
+        "gatemem_office",
+        "longmemeval_s",
+        "beam_1m",
+    ]
+    assert [s.key for s in plan_datasets(no_lme_s=True)][-1] == "beam_1m"
+    assert "longmemeval_s" not in [s.key for s in plan_datasets(no_lme_s=True)]
+    assert [s.key for s in plan_datasets(no_beam=True)][-1] == "longmemeval_s"
+    assert [s.key for s in plan_datasets(quick=True)][-1] == "gatemem_office"
+    assert [s.key for s in plan_datasets(no_lme_s=True, beam_10m=True)][-1] == "beam_10m"
+    with pytest.raises(SystemExit, match="互斥"):
+        plan_datasets(beam_10m=True, no_beam=True)
+
+
+def test_cli_no_lme_s_no_beam_pass_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLI --no-lme-s / --no-beam 透传；--beam-10m 与 --no-beam 互斥报错。"""
+    captured: dict[str, object] = {}
+
+    def _stub_evaluate(adapter, judge, **kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return 0
+
+    import membench.evaluate as evaluate_mod
+
+    monkeypatch.setattr(evaluate_mod, "evaluate", _stub_evaluate)
+    rc = cli.main(
+        ["evaluate", "--adapter", "mock-strong", "--no-lme-s", "--no-beam"]
+    )
+    assert rc == 0
+    assert captured["no_lme_s"] is True
+    assert captured["no_beam"] is True
+
+    with pytest.raises(SystemExit, match="互斥"):
+        cli.main(
+            ["evaluate", "--adapter", "mock-strong", "--beam-10m", "--no-beam"]
+        )

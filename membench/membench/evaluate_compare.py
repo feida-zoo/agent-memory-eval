@@ -345,7 +345,8 @@ def evaluate_compare(
     commit: Union[str, None] = None,
     quick: bool = False,
     beam_10m: bool = False,
-    include_lme_s: bool = False,
+    no_beam: bool = False,
+    no_lme_s: bool = False,
     report_out: Union[str, None] = None,
     tag: Union[str, None] = None,
     specs: Union[list[DatasetSpec], None] = None,
@@ -367,10 +368,10 @@ def evaluate_compare(
         judge: judge 名字符串或 Judge 实例（与 Runner 约定一致）。
         out_dir: run 输出父目录；None 时用 :func:`membench.paths.runs_dir`。
         platform / commit: 平台与 commit 标签（写到两侧 run 元数据）。
-        quick / beam_10m / include_lme_s: 同 :func:`membench.evaluate.evaluate`。
+        quick / beam_10m / no_beam / no_lme_s: 同 :func:`membench.evaluate.evaluate`。
         report_out: 实验目录父目录；缺省 :func:`membench.paths.output_root`。
         tag: A/B 实验目录标签；缺省由两个 adapter 名拼成 ``<baseline>_vs_<candidate>``。
-        specs: 显式数据集清单（默认 None 时按 quick/beam_10m/include_lme_s 调 plan_datasets）。
+        specs: 显式数据集清单（默认 None 时按 quick/beam_10m/no_beam/no_lme_s 调 plan_datasets）。
         jobs: 透传给 Runner 的题目级并发参数。
         driver_llm_baseline / driver_llm_candidate: 两侧各自的 driver LLM 标识。
         adapter_version_baseline / adapter_version_candidate: 两侧各自的 adapter 版本。
@@ -385,7 +386,7 @@ def evaluate_compare(
     if out_dir is None:
         out_dir = paths.runs_dir()
     if specs is None:
-        specs = plan_datasets(quick=quick, beam_10m=beam_10m, include_lme_s=include_lme_s)
+        specs = plan_datasets(quick=quick, beam_10m=beam_10m, no_beam=no_beam, no_lme_s=no_lme_s)
 
     judge_name = judge if isinstance(judge, str) else str(getattr(judge, "name", judge.__class__.__name__))
     baseline_name = str(getattr(baseline_adapter, "name", baseline_adapter.__class__.__name__))

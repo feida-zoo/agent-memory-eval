@@ -139,13 +139,17 @@ python -m membench.cli run --adapter <adapter> --dataset ~/.membench/datasets/lo
 
 ### 工作流 2.5：全量评估（多数据集融合总分）
 
-用户问"整体打个分 / 全部数据集跑一遍"时用 `evaluate`：对办公域槽位（用户集>内置office）+ locomo + longmemeval_oracle + gatemem_office + BEAM-1M 依次评测，跨数据集**宏平均**融合出综合评级，输出一份全量报告：
+用户问"整体打个分 / 全部数据集跑一遍"时用 `evaluate`：对办公域槽位（用户集>内置office）+ locomo + longmemeval_oracle + gatemem_office + LongMemEval-S + BEAM-1M 依次评测，跨数据集**宏平均**融合出综合评级，输出一份全量报告：
 
 ```bash
 python -m membench.cli evaluate --adapter <adapter> --judge llm --report-out ../output/
-python -m membench.cli evaluate --adapter <adapter> --quick      # 跳过 BEAM，分钟级日常回归
-python -m membench.cli evaluate --adapter <adapter> --beam-10m   # 1M 换成 10M 全集终验
-python -m membench.cli evaluate --adapter <adapter> --include-lme-s  # 追加 LongMemEval-S（检索/精确率压力测试）
+python -m membench.cli evaluate --adapter <adapter> --no-lme-s   # 剔除 LongMemEval-S（~268MB、ingest 成本高）
+python -m membench.cli evaluate --adapter <adapter> --no-beam    # 不跑 BEAM
+python -m membench.cli evaluate --adapter <adapter> --beam-10m   # 1M 换成 10M 全集终验（与 --no-beam 互斥）
+python -m membench.cli evaluate --adapter <adapter> --quick      # 跳过 BEAM 与 LongMemEval-S，分钟级日常回归
+python -m membench.cli evaluate --adapter <adapter> \
+    --dataset office --dataset locomo --dataset ~/data/my_set.jsonl  # 显式清单（与预设开关互斥）
+# 默认清单含 LongMemEval-S 与 BEAM-1M（用 --no-lme-s / --no-beam 剔除）
 ```
 
 用户问"两版系统 A/B 对比一下、跨数据集一次出结论"时用 `evaluate-compare`：两套 adapter × 同一组数据集，分别跑完后产出**逐数据集 diff + 逐数据集题型 diff + 跨数据集融合 diff + 融合/per-dataset 两层门禁 + 对比图**，落 `<报告父目录>/ab_<tag>_<ts>/` 自包含结构（旧版 run 的 capabilities 未落账时自动推断并在报告头标注来源）：
@@ -160,7 +164,7 @@ python -m membench.cli evaluate-compare \
 # llm 口径为逐题 chat 调用（单题可达 10s+），大规模评测配 --jobs 8~16 并发跑
 ```
 
-> **全量评估前必须先 fetch 用到的按需下载数据集**（locomo / longmemeval_oracle / gatemem_office / beam_1m 等），否则会报错提示先 `dataset fetch <key>`。命令：`python -m membench.cli dataset fetch <key>`（落 `~/.membench/datasets/`）。
+> **全量评估前必须先 fetch 用到的按需下载数据集**（locomo / longmemeval_oracle / gatemem_office / longmemeval_s / beam_1m 等），否则会报错提示先 `dataset fetch <key>`。命令：`python -m membench.cli dataset fetch <key>`（落 `~/.membench/datasets/`）。
 
 解读要点（向用户说明）：
 - **宏平均**：每个指标先在各数据集内算分再跨集等权平均；指标只在具备对应标注能力的集上参与（无 gold_stale 的集不参与 stale_rate，无 evidence 标注的集不参与 evidence_recall），不会用"记 0"稀释总分。

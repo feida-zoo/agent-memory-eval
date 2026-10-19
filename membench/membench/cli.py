@@ -10,15 +10,17 @@ matrix / doctor / adapter / user-data / dataset / list-datasets。
     python -m membench.cli evaluate --adapter mock-strong \
         [--judge heuristic] [--platform wx --commit a1b2c3] [--out runs/] \
         [--driver-llm gpt-4o] [--adapter-version a1b2c3] \
-        [--report-out DIR] [--quick | --beam-10m] [--include-lme-s] \
-        [--evidence-match substring|overlap|llm]
+        [--report-out DIR] [--quick | --beam-10m | --no-beam] [--no-lme-s] \
+        [--evidence-match substring|overlap|llm] \
+        [--dataset KEY|PATH]...   # 显式数据集清单（与预设开关互斥）
     python -m membench.cli evaluate-compare --baseline-adapter A --candidate-adapter B \
         [--judge heuristic] [--platform wx --commit a1b2c3] [--out runs/] \
         [--driver-llm-a gpt-4o] [--adapter-version-a a1b2c3] \
         [--driver-llm-b gpt-4o-mini] [--adapter-version-b d4e5f6] \
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
-        [--report-out DIR] [--tag <label>] [--quick | --beam-10m] [--include-lme-s] \
-        [--evidence-match substring|overlap|llm]
+        [--report-out DIR] [--tag <label>] [--quick | --beam-10m | --no-beam] \
+        [--no-lme-s] [--evidence-match substring|overlap|llm] \
+        [--dataset KEY|PATH]...   # 两侧使用同一清单（与预设开关互斥）
     python -m membench.cli fuse --runs runs/<shard0>,runs/<shard1> --out runs/<fused>
     python -m membench.cli compare --baseline runs/<run_a> --candidate runs/<run_b> \
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
@@ -152,9 +154,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--adapter-version", default=None, help="适配器实现版本/commit，记入每个 run 的元数据")
     p_ev.add_argument("--report-out", default=None, help="实验目录父目录：产出 <DIR>/eval_<adapter>_<platform>_<ts>/")
     ev_group = p_ev.add_mutually_exclusive_group()
-    ev_group.add_argument("--quick", action="store_true", help="快速模式：跳过 BEAM 槽位（不检查 BEAM 文件是否存在）")
+    ev_group.add_argument("--quick", action="store_true", help="快速模式：跳过 BEAM 与 LongMemEval-S（等价 --no-beam --no-lme-s，分钟级回归）")
     ev_group.add_argument("--beam-10m", action="store_true", help="BEAM 槽位使用 beam_10m.jsonl（默认 beam_1m.jsonl）")
-    p_ev.add_argument("--include-lme-s", action="store_true", help="追加 LongMemEval-S 变体（~268MB、高成本，与 oracle 分差反映检索/精确率损失）")
+    p_ev.add_argument("--no-beam", action="store_true", help="不评测 BEAM 槽位（与 --beam-10m 互斥）")
+    p_ev.add_argument("--no-lme-s", action="store_true", help="剔除 LongMemEval-S 变体（默认包含；~268MB、高成本）")
+    p_ev.add_argument(
+        "--dataset",
+        action="append",
+        default=None,
+        metavar="KEY|PATH",
+        help="显式指定评测数据集（数据集 key 或 JSONL 路径，可重复，列表中第一个承担办公域槽位）；与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）互斥",
+    )
     p_ev.add_argument("--llm-base-url", default=None, help="judge=llm 时的 OpenAI 兼容 base_url")
     p_ev.add_argument("--llm-api-key", default=None, help="judge=llm 时的 API key")
     p_ev.add_argument("--llm-model", default=None, help="judge=llm 时的模型名")
@@ -191,9 +201,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ev_cmp.add_argument("--tag", default=None, help="A/B 实验目录标签（缺省由两个 adapter 名拼成）")
     p_ev_cmp.add_argument("--report-out", default=None, help="实验目录父目录：产出 <DIR>/ab_<tag>_<ts>/")
     ev_cmp_group = p_ev_cmp.add_mutually_exclusive_group()
-    ev_cmp_group.add_argument("--quick", action="store_true", help="跳过 BEAM 槽位（不检查 BEAM 文件是否存在）")
+    ev_cmp_group.add_argument("--quick", action="store_true", help="快速模式：跳过 BEAM 与 LongMemEval-S（等价 --no-beam --no-lme-s）")
     ev_cmp_group.add_argument("--beam-10m", action="store_true", help="BEAM 槽位使用 beam_10m.jsonl")
-    p_ev_cmp.add_argument("--include-lme-s", action="store_true", help="追加 LongMemEval-S 变体")
+    p_ev_cmp.add_argument("--no-beam", action="store_true", help="不评测 BEAM 槽位（与 --beam-10m 互斥）")
+    p_ev_cmp.add_argument("--no-lme-s", action="store_true", help="剔除 LongMemEval-S 变体（默认包含）")
+    p_ev_cmp.add_argument(
+        "--dataset",
+        action="append",
+        default=None,
+        metavar="KEY|PATH",
+        help="显式指定评测数据集（数据集 key 或 JSONL 路径，可重复，两侧使用同一清单，第一个承担办公域槽位）；与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）互斥",
+    )
     p_ev_cmp.add_argument("--llm-base-url", default=None, help="judge=llm 时的 OpenAI 兼容 base_url")
     p_ev_cmp.add_argument("--llm-api-key", default=None, help="judge=llm 时的 API key")
     p_ev_cmp.add_argument("--llm-model", default=None, help="judge=llm 时的模型名")
@@ -500,10 +518,20 @@ def _cmd_adapter_remove(args: argparse.Namespace) -> int:
 
 
 def _cmd_evaluate(args: argparse.Namespace) -> int:
-    from membench.evaluate import evaluate
+    from membench.evaluate import dataset_specs, evaluate
 
     if args.jobs < 1:
         raise SystemExit(f"--jobs 必须 >= 1，当前为 {args.jobs}")
+    if args.beam_10m and args.no_beam:
+        raise SystemExit("--beam-10m 与 --no-beam 互斥（BEAM 槽位状态冲突）")
+    if args.dataset and (
+        args.quick or args.beam_10m or args.no_beam or args.no_lme_s
+    ):
+        raise SystemExit(
+            "--dataset 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）"
+            "互斥：显式清单时请直接枚举全部数据集"
+        )
+    specs = dataset_specs(args.dataset) if args.dataset else None
     adapter = _make_adapter(args.adapter)
     judge = _make_judge(args)
     return evaluate(
@@ -514,21 +542,34 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
         commit=args.commit,
         quick=args.quick,
         beam_10m=args.beam_10m,
-        include_lme_s=args.include_lme_s,
+        no_beam=args.no_beam,
+        no_lme_s=args.no_lme_s,
         report_out=args.report_out,
         jobs=args.jobs,
         driver_llm=args.driver_llm,
         adapter_version=args.adapter_version,
         evidence_matcher=_make_evidence_matcher(args),
+        specs=specs,
     )
 
 
 def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
     """两组（baseline vs candidate）× 多数据集融合 A/B 对比。"""
+    from membench.evaluate import dataset_specs
     from membench.evaluate_compare import evaluate_compare
 
     if args.jobs < 1:
         raise SystemExit(f"--jobs 必须 >= 1，当前为 {args.jobs}")
+    if args.beam_10m and args.no_beam:
+        raise SystemExit("--beam-10m 与 --no-beam 互斥（BEAM 槽位状态冲突）")
+    if args.dataset and (
+        args.quick or args.beam_10m or args.no_beam or args.no_lme_s
+    ):
+        raise SystemExit(
+            "--dataset 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）"
+            "互斥：显式清单时请直接枚举全部数据集"
+        )
+    specs = dataset_specs(args.dataset) if args.dataset else None
     baseline_adapter = _make_adapter(args.baseline_adapter)
     candidate_adapter = _make_adapter(args.candidate_adapter)
     judge = _make_judge(args)
@@ -541,7 +582,8 @@ def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
         commit=args.commit,
         quick=args.quick,
         beam_10m=args.beam_10m,
-        include_lme_s=args.include_lme_s,
+        no_beam=args.no_beam,
+        no_lme_s=args.no_lme_s,
         report_out=args.report_out,
         tag=args.tag,
         jobs=args.jobs,
@@ -553,6 +595,7 @@ def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
         stale_threshold=args.stale_threshold,
         latency_warn=args.latency_warn,
         evidence_matcher=_make_evidence_matcher(args),
+        specs=specs,
     )
     return 1 if result["verdict"] == "FAIL" else 0
 

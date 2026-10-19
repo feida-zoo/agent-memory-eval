@@ -64,13 +64,24 @@ python -m membench.cli list-datasets
 `evaluate` 对所有数据集全量测试，跨数据集**宏平均**融合出综合评级：
 
 ```bash
-# 默认全量 = 办公域槽位（用户集>内置office）+ locomo + longmemeval_oracle + gatemem_office + BEAM-1M
+# 默认全量 = 办公域槽位（用户集>内置office）+ locomo + longmemeval_oracle
+#            + gatemem_office + LongMemEval-S + BEAM-1M
 python -m membench.cli evaluate --adapter <你的adapter> --judge llm --report-out <报告父目录>
 
-python -m membench.cli evaluate --adapter <a> --quick      # 跳过 BEAM，分钟级日常回归
-python -m membench.cli evaluate --adapter <a> --beam-10m   # 用 BEAM-10M 替换 1M，全集终验
-python -m membench.cli evaluate --adapter <a> --include-lme-s  # 追加 LongMemEval-S（大体积，与 oracle 分差反映检索/精确率损失）
+python -m membench.cli evaluate --adapter <a> --no-lme-s    # 剔除 LongMemEval-S（~268MB、ingest 成本高）
+python -m membench.cli evaluate --adapter <a> --no-beam     # 不跑 BEAM
+python -m membench.cli evaluate --adapter <a> --beam-10m    # BEAM 换 10M 全集终验（与 --no-beam 互斥）
+python -m membench.cli evaluate --adapter <a> --quick       # 跳过 BEAM 与 LongMemEval-S（分钟级回归）
+# 显式数据集清单（可重复 --dataset，key 与 JSONL 路径可混用；与预设开关互斥）
+python -m membench.cli evaluate --adapter <a> \
+    --dataset office --dataset locomo --dataset ~/data/my_set.jsonl
 ```
+
+说明：默认全量**包含** LongMemEval-S（每题约 50 个干扰会话 / ~115k token 的检索压力
+变体，与 oracle 的分差反映检索/精确率损失）；未下载时默认全量会报错提示先
+`dataset fetch longmemeval_s`，不需要则用 `--no-lme-s` 剔除。显式 `--dataset`
+清单中**第一个数据集承担办公域槽位**（stale 门禁作用域；无 gold_stale 标注时门禁自动
+SKIP）；未显式给出时默认清单的办公域槽位规则不变。
 
 ## A/B 两组多数据集融合对比
 
@@ -81,7 +92,8 @@ python -m membench.cli evaluate-compare \
     --baseline-adapter <adapter_A> --candidate-adapter <adapter_B> \
     --judge llm --report-out <报告父目录> --tag "优化前vs优化后"
 
-# 同样支持 --quick / --beam-10m / --include-lme-s；两侧可分别指定 driver_llm / adapter_version
+# 同样支持 --no-lme-s / --no-beam / --beam-10m / --quick 与 --dataset 显式清单；
+# 两侧可分别指定 driver_llm / adapter_version
 python -m membench.cli evaluate-compare \
     --baseline-adapter A --candidate-adapter B \
     --driver-llm-a gpt-4o --driver-llm-b gpt-4o-mini \
@@ -95,7 +107,7 @@ python -m membench.cli evaluate-compare \
 
 - **宏平均**：六项质量指标（accuracy/token_f1/bleu1/evidence_recall/abstention_accuracy/stale_rate）先在各数据集内算分，再跨集等权平均；**指标只在具备对应标注能力的数据集上参与**——无 gold_stale 的集（locomo/longmemeval）不参与 stale_rate，无 evidence 标注的集（longmemeval/beam）不参与 evidence_recall，无 abstention 题的集不参与 abstention_accuracy。绝不用"记 0"稀释。此外**诊断指标**（检索召回率@5 需 has_evidence；过度拒答率全数据集参与）同样跨集融合展示，但不参与综合评级与门禁。
 - **门禁一票否决独立于总分**：办公域槽位 stale_rate > 0.03 → 总评"不达标"，退出码 1（可接 CI），无论综合评级多高。
-- **按需下载的公开集必须先 fetch**：`locomo` / `longmemeval_oracle` / `gatemem_office` / `beam_1m`（或 `beam_10m`）都没有内置文件，`evaluate` 从 `~/.membench/datasets/` 解析可用路径，缺失时报错提示先 `python -m membench.cli dataset fetch <key>`（`--quick` 不检查 BEAM 槽位）。judge=heuristic 跑 BEAM 会警告（rubric 型题目规则判分失真，建议 llm/client）。
+- **按需下载的公开集必须先 fetch**：`locomo` / `longmemeval_oracle` / `gatemem_office` / `longmemeval_s` / `beam_1m`（或 `beam_10m`）都没有内置文件，`evaluate` 从 `~/.membench/datasets/` 解析可用路径，缺失时报错提示先 `python -m membench.cli dataset fetch <key>`（`--no-lme-s` 不检查 LongMemEval-S；`--no-beam` / `--quick` 不检查 BEAM 槽位）。judge=heuristic 跑 BEAM 会警告（rubric 型题目规则判分失真，建议 llm/client）。
 - **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**）时落 `DIR/eval_<adapter>_<platform>_<ts>/`，内含 `evaluate_report.md`、`evaluate_summary.json`、`fig_dataset_overview.png` 与 `runs/<各数据集 run_id>/`（自包含）；不传时保持历史位置 `<out_dir>/evaluate_<ts>/`。
 
 run 产物（`runs/<run_id>/`）：`results.jsonl`（逐题原始记录）、`metrics.json`、`report.md`、`fig_category_accuracy.png`、`fig_latency_hist.png`。

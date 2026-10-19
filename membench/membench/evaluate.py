@@ -64,8 +64,8 @@ _FETCH_DATASETS: tuple[str, ...] = (
     "gatemem_office",
 )
 
-#: 可选公开集：--include-lme-s 时追加。体积大（~268MB）、ingest 成本高，默认不入全量；
-#: 与 oracle 同题，分差反映检索/精确率损失。
+#: LongMemEval-S：默认包含（--no-lme-s / --quick 剔除）。体积大（~268MB）、
+#: ingest 成本高；与 oracle 同题，分差反映检索/精确率损失。
 _LME_S_KEY = "longmemeval_s"
 
 
@@ -122,32 +122,113 @@ def _beam_path(beam_10m: bool) -> Path:
     return Path.home() / ".membench" / "datasets" / name
 
 
-def plan_datasets(
-    quick: bool = False, beam_10m: bool = False, include_lme_s: bool = False
-) -> list[DatasetSpec]:
-    """规划全量评估的数据集清单。
+def dataset_specs(values: list[str]) -> list[DatasetSpec]:
+    """把 CLI ``--dataset`` 值（数据集 key 或 JSONL 路径）解析为评测清单。
 
-    槽位顺序：办公域槽位（resolve_dataset 优先级：用户集 > 内置 office）
-    -> 按需下载公开集（locomo / longmemeval_oracle / gatemem_office）
-    -> 可选：longmemeval_s（--include-lme-s 时追加）
-    -> BEAM 槽位（--quick 时跳过；--beam-10m 时换成 10m 集）。
+    解析规则（列表顺序即评测顺序）：
 
-    四个公开集都没有内置文件，统一经 ``data.info.resolve_available_path``
-    解析可用路径（内置文件优先，其次 dataset fetch 下载目录）；解析不到即
-    报错提示先下载，避免拿"路径不存在"的空集当基准、污染可比性。
+    - 存在的文件路径 -> ``user-specified`` 收录，key 取文件名 stem；
+    - ``office`` -> 办公域槽位（优先级：用户测试集 > 内置 office）；
+    - 其余按数据集 key 经 ``resolve_available_path`` 解析（内置文件优先，
+      其次 ``dataset fetch`` 下载目录）；解析不到报错提示先 fetch；
+    - 列表中第一个数据集承担办公域槽位（stale 门禁作用域；显式给出
+      ``office`` 时以它为准）。若该集无 gold_stale 标注，门禁自动 SKIP。
 
     Args:
-        quick: True 时跳过 BEAM 槽位（不检查文件是否存在）。
-        beam_10m: True 时 BEAM 槽位使用 beam_10m.jsonl。
-        include_lme_s: True 时追加 LongMemEval-S 变体（大体积、高成本）。
+        values: ``--dataset`` 原始字符串列表（key 或路径）。
 
     Returns:
         DatasetSpec 列表。
 
     Raises:
-        SystemExit: 任一按需下载公开集解析不到路径，或非 quick 模式且 BEAM
-            文件不存在时，提示先运行 dataset fetch。
+        SystemExit: 列表为空、含空值，或某个 key 无法解析。
     """
+    if not values:
+        raise SystemExit("--dataset 需要至少一个数据集（key 或 JSONL 路径）")
+    specs: list[DatasetSpec] = []
+    for raw in values:
+        value = raw.strip()
+        if not value:
+            raise SystemExit("--dataset 收到空值（key 或 JSONL 路径）")
+        if os.path.exists(value):
+            path = Path(value)
+            specs.append(
+                DatasetSpec(
+                    key=path.stem,
+                    name=path.stem,
+                    path=str(path.resolve()),
+                    source="user-specified",
+                )
+            )
+        elif value == "office":
+            office_path, office_source = resolve_dataset(None)
+            office_name = (
+                "office（用户测试集）"
+                if office_source == "user"
+                else "office（内置办公黄金集）"
+            )
+            specs.append(
+                DatasetSpec(
+                    key="office",
+                    name=office_name,
+                    path=office_path,
+                    source=office_source,
+                    is_office_slot=True,
+                )
+            )
+        else:
+            resolved = resolve_available_path(value)
+            if resolved is None:
+                raise SystemExit(
+                    f"数据集 {value!r} 无法解析：既不是存在的文件路径，也不是可用"
+                    f"的数据集 key（可用 key 见 list-datasets）；若需按需下载，"
+                    f"先运行 python -m membench.cli dataset fetch {value}"
+                )
+            specs.append(
+                DatasetSpec(key=value, name=value, path=str(resolved), source="fetch")
+            )
+    # 标出办公域槽位：显式 office 优先，否则列表第一个数据集承担
+    if not any(spec.is_office_slot for spec in specs):
+        specs[0].is_office_slot = True
+    return specs
+
+
+def plan_datasets(
+    quick: bool = False,
+    beam_10m: bool = False,
+    no_beam: bool = False,
+    no_lme_s: bool = False,
+) -> list[DatasetSpec]:
+    """规划全量评估的数据集清单。
+
+    默认槽位顺序：办公域槽位（resolve_dataset 优先级：用户集 > 内置 office）
+    -> 按需下载公开集（locomo / longmemeval_oracle / gatemem_office）
+    -> longmemeval_s（检索压力变体，默认包含）-> BEAM-1M。
+
+    ``quick=True`` 等价 ``no_beam=True + no_lme_s=True``：跳过 BEAM 与
+    LongMemEval-S 两个重型数据集，适合分钟级日常回归。
+
+    所有按需下载公开集都没有内置文件，统一经 ``data.info.resolve_available_path``
+    解析可用路径（内置文件优先，其次 dataset fetch 下载目录）；解析不到即
+    报错提示先下载，避免拿"路径不存在"的空集当基准、污染可比性。
+
+    Args:
+        quick: True 时跳过 BEAM 与 LongMemEval-S 槽位（不检查对应文件）。
+        beam_10m: True 时 BEAM 槽位使用 beam_10m.jsonl（与 no_beam/quick 互斥）。
+        no_beam: True 时不评测 BEAM 槽位。
+        no_lme_s: True 时剔除 LongMemEval-S 变体。
+
+    Returns:
+        DatasetSpec 列表。
+
+    Raises:
+        SystemExit: beam_10m 与 no_beam/quick 同传；任一按需下载公开集解析
+            不到路径；未跳过 BEAM 时 BEAM 文件不存在（提示先 dataset fetch）。
+    """
+    if beam_10m and (no_beam or quick):
+        raise SystemExit(
+            "--beam-10m 与 --no-beam / --quick 互斥（BEAM 槽位状态冲突）"
+        )
     specs: list[DatasetSpec] = []
 
     # 办公域槽位：复用 resolve_dataset 的优先级（用户集 > 内置 office）。
@@ -167,19 +248,19 @@ def plan_datasets(
     for key in _FETCH_DATASETS:
         specs.append(_fetch_spec(key))
 
-    # 可选：LongMemEval-S（大体积、高成本，默认不入全量）。
-    if include_lme_s:
+    # LongMemEval-S：默认包含（检索/精确率压力变体）；quick / no_lme_s 剔除。
+    if not (quick or no_lme_s):
         specs.append(_fetch_spec(_LME_S_KEY))
 
-    # BEAM 槽位。
-    if not quick:
+    # BEAM 槽位：默认 beam_1m；beam_10m 切换；no_beam / quick 跳过。
+    if not (quick or no_beam):
         beam_key = "beam_10m" if beam_10m else "beam_1m"
         beam_path = _beam_path(beam_10m)
         if not beam_path.is_file():
             raise SystemExit(
                 f"BEAM 数据集不存在: {beam_path}。"
                 f"请先运行 python -m membench.cli dataset fetch {beam_key}，"
-                "或使用 --quick 跳过 BEAM 槽位。"
+                "或使用 --no-beam / --quick 跳过 BEAM 槽位。"
             )
         specs.append(
             DatasetSpec(
@@ -601,7 +682,8 @@ def evaluate(
     commit: Union[str, None] = None,
     quick: bool = False,
     beam_10m: bool = False,
-    include_lme_s: bool = False,
+    no_beam: bool = False,
+    no_lme_s: bool = False,
     report_out: Union[str, None] = None,
     specs: Union[list[DatasetSpec], None] = None,
     jobs: int = 1,
@@ -616,13 +698,14 @@ def evaluate(
         judge: judge 名字符串或 Judge 实例（与 Runner 约定一致）。
         out_dir: run 数据与缺省报告目录的父目录；None 时默认 paths.runs_dir()。
         platform: 平台标签。commit: commit 标签。
-        quick: 跳过 BEAM 槽位。beam_10m: BEAM 槽位用 10m 集。
-        include_lme_s: 追加 LongMemEval-S 变体（大体积、高成本）。
+        quick: 跳过 BEAM 与 LongMemEval-S 槽位（等价 no_beam + no_lme_s）。
+        beam_10m: BEAM 槽位用 10m 集。no_beam: 不评测 BEAM 槽位。
+        no_lme_s: 剔除 LongMemEval-S 变体（默认包含）。
         report_out: 报告根目录。给定后报告落
             ``<report_out>/eval_<adapter>_<platform>_<ts>/``；None 时落
             ``<out_dir>/evaluate_<ts>/``。两种情况都把各数据集 run 目录复制进
             报告目录的 ``runs/`` 下（自包含，便于就近归属与搬移）。
-        specs: 显式数据集清单（默认 None 时按 quick/beam_10m/include_lme_s 调 plan_datasets）。
+        specs: 显式数据集清单（默认 None 时按 quick/beam_10m/no_beam/no_lme_s 调 plan_datasets）。
         driver_llm: 驱动被测系统的 LLM 标识，透传给每个 run 的元数据（默认 None）。
         adapter_version: 适配器实现版本标识，透传给每个 run 的元数据（默认 None）。
         evidence_matcher: 检索命中口径匹配器（默认 substring；CLI 以
@@ -635,7 +718,7 @@ def evaluate(
         out_dir = paths.runs_dir()
 
     if specs is None:
-        specs = plan_datasets(quick=quick, beam_10m=beam_10m, include_lme_s=include_lme_s)
+        specs = plan_datasets(quick=quick, beam_10m=beam_10m, no_beam=no_beam, no_lme_s=no_lme_s)
 
     judge_name = judge if isinstance(judge, str) else str(getattr(judge, "name", judge.__class__.__name__))
     adapter_name = str(getattr(adapter, "name", adapter.__class__.__name__))
