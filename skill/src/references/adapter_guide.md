@@ -1,61 +1,207 @@
-# Adapter 接入指南
+# Adapter 接入指南（把被测 Agent 的记忆系统接上 membench）
 
-membench 与被测 Agent 之间只有一个协议：`BaseMemoryAdapter`（见 `membench/adapters/base.py`）。
+本文是「agent 接入 membench」的完整指导：选路径 → 实现三个挂点 → 真实性与口径红线
+→ 持久化与自检 → 冒烟与验收。速查卡见 `SKILL.md` 工作流 0；最小可运行示例见
+`membench/examples/quickstart.py`；非 Python 系统另见 `references/http_bridge_guide.md`。
 
-## 三个挂点在被测 Agent 源码中的典型位置
+membench 与被测系统之间**只有一个协议**：`BaseMemoryAdapter`
+（`membench/adapters/base.py`）——实现 `reset / ingest / query` 三个方法即可，
+其余（数据集、判分、指标、报告、门禁）全部由 harness 负责。
 
-| membench 方法 | 在 Agent 源码中找什么 | 注意事项 |
-|---|---|---|
-| `reset()` | 记忆存储的清空入口 | 必须真清空（向量库 collection、事实表、情景缓冲、图谱）。测试环境用独立实例/库，绝不碰生产数据 |
-| `ingest(messages)` | 记忆的**写入路径**：对话结束时的抽取/总结/入库逻辑 | 传入 `messages: [{"role","content","timestamp"}]`；返回写入耗时与 LLM 调用数 |
-| `query(question)` | 记忆的**读取路径** + 回答生成 | `retrieved` 字段必须填**实际注入 prompt 的记忆条目原文**（用于 evidence_recall）；填不了检索细节时至少返回注入的记忆文本 |
+一次 run 的数据流：
 
-## Python 直接接入（推荐）
-
-```python
-from membench import BaseMemoryAdapter, IngestStats, QueryResult
-
-class MyAgentAdapter(BaseMemoryAdapter):
-    name = "my-agent-v1"          # 版本写进 name，便于 compare 区分
-
-    def __init__(self, platform: str = "default"):
-        # platform 用于多平台对比：在此切换接入配置（如不同 IM 平台的记忆命名空间）
-        ...
-
-    def reset(self) -> None: ...
-    def ingest(self, messages) -> IngestStats: ...
-    def query(self, question) -> QueryResult: ...
+```
+数据集(dialogue/questions) → 每个 dialogue 前 reset() → 逐 session ingest(messages)
+→ 逐题 query(question) → judge 判分 → 六维指标 + 诊断指标 → metrics.json / report.md
 ```
 
-注册方式二选一：
-1. 在 `membench/adapters/__init__.py` 的 `ADAPTERS` 注册表中加一行（改 membench 源码）；
-2. 不动 membench：写 `my_adapter.py` 后用 Runner API 直接传实例（见 `examples/quickstart.py`）。
+## 1. 选接入路径
 
-## HTTP 接入（Agent 是独立服务时）
+| 你的被测系统形态 | 路径 | 入口 |
+|---|---|---|
+| Python 库/进程，记忆写入与检索能在 Python 侧调用 | **① 实现 `BaseMemoryAdapter`**（推荐） | 本文第 2 节 |
+| 独立服务（Node/Electron/其他进程），不便嵌 Python | **② HTTP 三端点 + 内置 `HttpAdapter`** | 第 6 节 + `references/http_bridge_guide.md` |
+| 记忆能力本身就是"LLM + 工具调用"循环（ingest/query 同构） | **③ `AgentLoopAdapter` 复用循环** | 第 2.4 节 |
+| 不改系统、先量现状，或复现线上 badcase | **④ `TranscriptAdapter` 回放真实日志** | 第 2.5 节 |
 
-在 Agent 侧实现三个端点，然后用内置适配器：
+## 2. 三个挂点怎么找、怎么写
+
+`references/adapter_guide.md` 的定位方法一句话版：**在被测 Agent 源码里找"记忆清空"、
+"记忆写入路径"、"记忆读取路径 + 回答生成"三处入口**，包成三个方法。
+
+### 2.1 `reset()`——每个 dialogue 开始前调用
+
+- 必须**真清空全部记忆状态**：向量库 collection、事实表、情景缓冲、图谱，一个都不能漏；
+- 只清会话历史不清记忆库 → 跨 dialogue 串扰（典型症状：single_hop 异常高、
+  abstention 异常低）；
+- **用独立测试实例/库/命名空间，绝不碰生产数据**。
+
+### 2.2 `ingest(messages)`——写入一段会话（逐 session 调用）
+
+- 入参 `messages: [{"role": "user"|"assistant", "content": str, "timestamp": str|None}]`
+  ——**忠实回放**，不要增删消息；
+- 走**真实写入路径**（抽取/总结/入库/索引），不得用测试专用旁路（见第 3 节）；
+- **timestamp 必须传给记忆系统**：办公集与公开集里有大量"昨天/下周"类时间锚题，
+  时间戳丢失会让 temporal 类题系统性失败；
+- 返回 `IngestStats(input_tokens, llm_calls, latency_ms)`：写入过程触发的 LLM 调用
+  （如抽取、总结）必须计入 `llm_calls`，否则效率成本指标失真；填不了的字段填 0
+  （报告中显示为 n/a）。
+
+### 2.3 `query(question)`——逐题独立调用，返回答案与检索明细
+
+- 粒度：**逐题独立、不带当轮对话上下文**；不要自行补数据集之外的上下文（跨系统不可比）；
+- 走**真实读取路径 + 回答生成**：检索、重排、注入、生成，与线上同一套；
+- `retrieved` 必须填**实际注入 prompt 的记忆条目原文**（用于 `evidence_recall` /
+  `recall@5`）；填不出检索细节时至少返回注入的记忆文本；
+  - 摘要/改写式存储：回填原文片段，或用 `--evidence-match overlap|llm` 换命中口径
+    （口径会记入 `metrics.json`，不同口径的跑分不可直接对比）；
+  - 若报告出现"两项检索指标全为 0"的警示，先排查证据原文是否根本不在检索结果里，
+    再怀疑检索能力；
+- 返回 `QueryResult(answer, retrieved, latency_ms, input_tokens, output_tokens, llm_calls)`：
+  查询过程触发的全部 LLM 调用与 token 都要计入；填不了填 0。
+
+### 2.4 `AgentLoopAdapter`（路径③速览）
+
+若 ingest/query 是同一套 tool-call 骨架，用
+`membench.agent_loop.AgentLoopAdapter` 只给 `{llm_client, tools, system_prompt}`：
+
+- `llm_client` 三选一：带 `chat_with_tools(messages, tools)` 的对象（原生 tool-call，
+  优先）> 带 `chat`/`complete` 的对象或可调用对象（文本 JSON 约定）> `"module:ClassName"`
+  类路径字符串（与 `--judge client` 同约定）；
+- `tools` 元素 `{"name", "schema", "handler"}`；handler 收解析后的 arguments，
+  返回 str/dict；handler 抛异常会折叠成观察文本回填、不中断循环；
+- `retrieved` 回填由 `retrieved_from(question, loop_result)` 决定，缺省识别工具名含
+  `retrieve` / `search` / `recall` 的调用——**检索工具名要对得上关键词、结果要是
+  被检索到的记忆原文**，否则请自传 `retrieved_from`；
+- 循环内每一轮 LLM 调用都是被测系统的真实成本，membench 会自动统计。
+
+### 2.5 `TranscriptAdapter`（路径④速览）
+
+把线上真实「写入/检索」日志导出为离线 transcript（对话 + 每题实际检索到的记忆条目），
+回放注入。适合先量现状、复现 badcase；**它固定了写入侧**，结论要限定为
+"读取/回答层评测"（见第 3 节声明要求）。
+
+## 3. 真实性红线（评测有效性的前提，必读）
+
+**原则：adapter 内调用的应当是线上同一套代码/服务，只有环境不同（独立测试库/命名空间）。**
+由此推出三条红线：
+
+1. **不得用测试专用旁路代替真实写入路径**——例如跳过抽取/索引逻辑直接 insert 原文；
+2. **不得用格式仿真的手写文件冒充真实写入**（如绕过记忆 MCP server，按记忆格式手写文件）。
+   写入侧的抽取/索引/冲突处理/成本一行没跑，分数不可归因到该记忆系统；
+   还有一种隐蔽风险：格式"像"≠路径"真"，系统可能以降级路径（读时重建索引等）
+   消费你的文件，读出来的行为也不是常态；
+3. **不得绕过真实检索直接问底座模型**——分数虚高，`evidence_recall` 会暴露
+   （证据一个都没检索到）。
+
+### 旁路判定实验（无法走真实写入时必须先做）
+
+同一批数据、同一批问题，做两组对照：
+
+- A 组：真实写入（MCP/库）→ 真实检索；
+- B 组：旁路写入（手写文件等）→ **同样的**真实检索。
+
+对比两组的检索结果（条数/内容/顺序）与 `recall@5`：
+
+- **一致** → 说明该系统的写入是薄存储，旁路近似可接受，但必须在报告中声明；
+- **不一致** → 失真，不得用其分数下结论。
+
+### 声明与口径纪律
+
+- 走任何非真实路径（注入式写入、Transcript 回放等）时，把范围写进适配器元数据
+  （`--adapter-meta` 或 `describe()`，会落入 `metrics.json` 与报告），并在结论里
+  限定为"检索/回答层评测、写入路径未覆盖、ingest 成本未计"；
+- A/B 对比时**两侧必须同口径**：一侧真实写入、一侧旁路，就不是 A/B。
+
+## 4. 元数据、统计与并发
+
+- `name` 带版本（如 `my-agent-v1`），便于 compare 区分；
+- 评测时传 `--driver-llm`（驱动被测系统的 LLM 标识）与 `--adapter-version`
+  ——可比性前置校验的关键维度，缺失会记"无法核验"；
+- **统计诚实**：token / `llm_calls` 填不了可以填 0（报告标 n/a），但填得出来的
+  （尤其写入侧抽取、查询侧生成的调用）**必须计**，否则效率成本与"token 正收益"
+  类结论失真；
+- 并发：`--jobs>1` 时 query / judge / 证据匹配按题目并发执行，**要求 `query` 线程安全**
+  （ingest 始终串行，不受影响）；适配器内部有共享可变状态（缓存、连接池）时先排查。
+
+## 5. 持久化与加载
 
 ```bash
-python -m membench.cli run --adapter http --judge heuristic   # 端点地址见 adapters/http.py 的配置方式
+cd <skill目录>/membench
+python -m membench.cli adapter install /path/to/your_adapter.py --name <适配器名>
+# 落盘 ~/.membench/adapters/（可用 MEMBENCH_ADAPTERS_DIR 覆盖）
+python -m membench.cli adapter list      # 查看
+python -m membench.cli adapter remove <名>  # 删除
 ```
 
-- `POST /reset` → 200
-- `POST /ingest`  body: `{"messages": [...]}` → `{"input_tokens":int,"llm_calls":int,"latency_ms":float}`
-- `POST /query`   body: `{"question": str}` → `{"answer":str,"retrieved":[str],...}`
+- 临时/CI 场景用环境变量 `MEMBENCH_ADAPTER_MODULES=module.path`（同名时优先于持久化）；
+- 也可以在 Python 侧直接传实例（`Runner(MyAdapter(), ...)`），不经注册表。
 
-## 判分器接入（三选一）
+## 6. HTTP 路径：契约与自检
 
-| 方式 | 命令 | 适用场景 |
+在 Agent 侧实现三个端点（细节与模板见 `references/http_bridge_guide.md`、
+`membench/examples/http_bridge_node/`）：
+
+- `POST /reset` → 2xx；
+- `POST /ingest` body `{"messages": [{"role","content","timestamp"}]}` → 2xx +
+  可选 `{"input_tokens": int, "llm_calls": int, "latency_ms": float}`；
+- `POST /query` body `{"question": str}` → 2xx + JSON + 字符串 `answer`；
+  `retrieved` 若出现须为字符串列表。
+
+正式评测前先自检（连通性 + 契约校验，避免把"接错"误判成"记忆能力差"）：
+
+```bash
+python -m membench.cli doctor --target http://127.0.0.1:8787 [--timeout 10.0] [--api-key K]
+```
+
+## 7. 冒烟与验收
+
+```bash
+cd <skill目录>/membench
+# 1) 冒烟：迷你集跑通链路
+python -m membench.cli run --adapter <你的adapter> --dataset membench/data/sample_dataset.jsonl --judge heuristic
+# 2) 业务验收：办公黄金集
+python -m membench.cli run --adapter <你的adapter> --dataset membench/data/office_dataset.jsonl --judge heuristic
+```
+
+**验收判据**：
+
+- pipeline 跑通，报告各指标可解释；
+- `stale_rate` 与 `abstention_accuracy` 的**缺陷暴露合理**（这两项是红线类指标，
+  规则判定、不依赖 LLM 判分）；
+- **若全部满分，先回头查接错**（query 没走记忆、reset 没清库、判分口径等），
+  而不是庆祝。
+
+## 8. 判分器三选一
+
+| 方式 | 命令 | 适用 |
 |---|---|---|
-| `--judge heuristic` | 零配置 | 首次接入跑通；stale/abstention 红线指标始终规则判定 |
-| `--judge llm` | 配 `--llm-base-url/--llm-api-key/--llm-model` | **正式评估首选**：第三方模型，避免自评偏差 |
-| `--judge client` | 配 `--client-llm "my_agent.llm:LLMClient"` | 复用 agent 自己的 LLM 快速验证；报告需注明同源偏差 |
+| `--judge heuristic` | 零配置 | 接入冒烟；stale / abstention 红线始终规则判定 |
+| `--judge llm` | `--llm-base-url / --llm-api-key / --llm-model` | **正式评估首选**：第三方模型，避免自评偏差 |
+| `--judge client` | `--client-llm "my_agent.llm:LLMClient"` | 复用 agent 自己的 LLM 快速验证；报告需注明同源偏差 |
 
-`--client-llm` 接受 `module:ClassName` 类路径（无参实例化），或返回字符串的函数。类需带 `.chat(prompt)->str` 或 `.complete(prompt)->str` 方法；若类名/方法名不同，继承 `membench.judges.client.ClientLLMJudge` 并重写 `_call()` 即可。
+`--client-llm` 接受 `module:ClassName`（无参实例化）或返回字符串的函数；类需带
+`.chat(prompt)->str` 或 `.complete(prompt)->str`；名称不同就继承
+`membench.judges.client.ClientLLMJudge` 重写 `_call()`。
 
-## 常见接错（自查清单）
+## 9. 接入完成定义（Checklist）
 
-- [ ] `query` 里把问题直接丢给底座模型而没走记忆检索 → 分数虚高，证据召回字段暴露
-- [ ] `reset` 只清了会话没清记忆库 → 跨 dialogue 串扰，single_hop 异常高、abstention 异常低
-- [ ] `ingest` 里同步调了生成模型做总结但没计入 `llm_calls` → 成本指标失真
-- [ ] timestamp 没传给记忆系统 → temporal 题系统性失败（办公集里大量"昨天/下周"依赖时间锚）
+- [ ] 三个方法走的是**线上同款**写入/读取路径；旁路场景已做对照实验并在元数据中声明；
+- [ ] `reset` 真清空（独立测试实例，不碰生产）；
+- [ ] timestamp 已落库；`retrieved` 填的是注入 prompt 的记忆原文；
+- [ ] 写入/查询触发的 LLM 调用与 token 已计入统计；
+- [ ] 适配套件已持久化（`adapter install`）或配置 `MEMBENCH_ADAPTER_MODULES`；
+- [ ] HTTP 路径已过 `doctor`；
+- [ ] sample 冒烟通过，office 验收跑通且缺陷暴露合理；
+- [ ] 需要 `--jobs>1` 时，`query` 已确认线程安全；
+- [ ] 摘要式存储已选好检索口径（`--evidence-match overlap|llm`）或回填原文片段。
+
+## 10. 常见接错（自查清单）
+
+- [ ] `query` 里把问题直接丢给底座模型而没走记忆检索 → 分数虚高，证据召回字段暴露；
+- [ ] 手写文件仿记忆格式、绕过真实写入管线 → 见第 3 节：先做旁路判定实验，否则分数不可归因；
+- [ ] `reset` 只清了会话没清记忆库 → 跨 dialogue 串扰（single_hop 异常高、abstention 异常低）；
+- [ ] `ingest` 里同步调了生成模型做总结但没计入 `llm_calls` → 成本指标失真；
+- [ ] timestamp 没传给记忆系统 → temporal 题系统性失败；
+- [ ] 检索工具名不含 `retrieve/search/recall` 关键词且未自传 `retrieved_from`
+  （AgentLoopAdapter）→ 证据回填空，检索指标全 0。

@@ -307,6 +307,8 @@ DIR/matrix_<ts>/
 
 ## 如何接入自己的记忆系统
 
+> 详细接入指导（三个挂点写法、**真实性红线与旁路判定实验**、验收判据、接入 checklist）见 skill 包内 `references/adapter_guide.md`。
+
 四条路径，按推荐程度排序：
 
 ### 路径一：继承 BaseMemoryAdapter（推荐，最灵活）

@@ -41,7 +41,7 @@ description: >
 | `user_dataset/` | 用户专属测试集存放目录（与内置集物理隔离） |
 | `output/` | 所有评估/对比报告的输出目录（实验子目录：`eval_*` / `ab_*` / `matrix_*`） |
 | `docs/` | 《Agent 记忆系统深度研究报告》及配图，供随时查阅背景知识 |
-| `references/adapter_guide.md` | 接入指南（三挂点、Python/HTTP 接入、判分器） |
+| `references/adapter_guide.md` | 接入指南详解（三挂点、真实性红线与旁路判定、验收 checklist、判分器） |
 | `references/compare_workflows.md` | commit / 平台 / 矩阵对比详解 + 可比性前置校验 |
 | `references/optimize_workflow.md` | 记忆系统优化闭环操作手册（六阶段） |
 | `references/http_bridge_guide.md` | 非 Python 系统 HTTP bridge 接入 checklist |
@@ -53,7 +53,7 @@ description: >
 
 ## 工作流 0：接入被测 Agent（首次使用必做）
 
-1. 阅读 `references/adapter_guide.md`，在被测 Agent 源码中定位三个挂点：记忆清空、记忆写入、记忆读取+回答。
+1. 阅读 `references/adapter_guide.md`（含第 3 节真实性红线：手写文件冒充写入等旁路必须先做判定实验并声明口径），在被测 Agent 源码中定位三个挂点：记忆清空、记忆写入、记忆读取+回答。
 2. 实现 `BaseMemoryAdapter` 三方法（`reset` / `ingest` / `query`），或在 Agent 侧暴露 `POST /reset|/ingest|/query` 三个端点后用内置 HttpAdapter。
    - **若被测 Agent 的记忆能力本身就是"LLM + 工具调用"**（ingest 与 query 是同构的 tool-call 循环），不要各写一遍骨架——直接用 `membench.agent_loop.AgentLoopAdapter` 复用循环（见「本波新能力」）。
 3. **生成的适配器必须显式持久化**（否则跨 session 丢失）：
