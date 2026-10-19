@@ -307,7 +307,7 @@ DIR/matrix_<ts>/
 
 ## 如何接入自己的记忆系统
 
-> 详细接入指导（三个挂点写法、**真实性红线与旁路判定实验**、验收判据、接入 checklist）见 skill 包内 `references/adapter_guide.md`。
+> 详细接入指导（三个挂点写法、**真实性红线与降级口径流程**、验收判据、接入 checklist）见 skill 包内 `references/adapter_guide.md`。
 
 四条路径，按推荐程度排序：
 
