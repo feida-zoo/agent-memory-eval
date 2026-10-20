@@ -185,3 +185,61 @@ def test_fuse_rejects_mixed_shard_by(tmp_path: Path) -> None:
     d1 = _shard_run(tmp_path, "d1", MockStrongAdapter(), 2, 1, shard_by="dialogue")
     with pytest.raises(ValueError, match="shard_by 不一致"):
         fuse_runs([q0, d1], str(tmp_path / "fused"))
+
+
+def test_fuse_passes_through_comparability_metadata(tmp_path: Path) -> None:
+    """融合产物透传可比性元数据：fused run 之间必须能过 strict 可比性（回归铁证）。"""
+    from membench.compare import compare_runs
+
+    def _shard(name: str, index: int) -> str:
+        runner = Runner(
+            MockStrongAdapter(),
+            str(SAMPLE_DATASET_PATH),
+            judge="heuristic",
+            out_dir=str(tmp_path / name),
+            shards=2,
+            shard_index=index,
+            driver_llm="gpt-4o",
+            adapter_version="v1",
+            adapter_meta="k=v",
+        )
+        return runner.run()
+
+    s0 = _shard("m0", 0)
+    s1 = _shard("m1", 1)
+    fused = fuse_runs([s0, s1], str(tmp_path / "fused_meta"))["out_dir"]
+
+    src = json.loads((Path(s0) / "metrics.json").read_text(encoding="utf-8"))
+    dst = json.loads((Path(fused) / "metrics.json").read_text(encoding="utf-8"))
+    for key in (
+        "adapter_version",
+        "judge_model",
+        "driver_llm",
+        "adapter_meta",
+        "dataset_fingerprint",
+        "retrieval_match",
+        "schema_version",
+    ):
+        assert dst.get(key) == src.get(key), key
+    assert dst["fused"] is True and dst["fused_from"]
+
+    # 回归：此前关键维度全缺失，require_comparable 必然 FAIL
+    result = compare_runs(
+        fused, fused, require_comparable=True, out_dir=str(tmp_path / "cmp")
+    )
+    assert result["comparability"]["unverifiable"] == []
+    assert result["comparability"]["comparable"] is True
+    assert result["verdict"] != "FAIL"
+
+
+def test_fuse_rejects_mixed_metadata(tmp_path: Path) -> None:
+    """判分/驱动等元数据不一致的分片拒绝融合（防止混片）。"""
+    s0 = _shard_run(tmp_path, "x0", MockStrongAdapter(), 2, 0)
+    s1 = _shard_run(tmp_path, "x1", MockStrongAdapter(), 2, 1)
+    metrics_path = Path(s1) / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["driver_llm"] = "different-model"
+    metrics_path.write_text(json.dumps(metrics, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="driver_llm 不一致"):
+        fuse_runs([s0, s1], str(tmp_path / "bad"))

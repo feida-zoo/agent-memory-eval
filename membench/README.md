@@ -174,6 +174,8 @@ python -m membench.cli fuse --runs runs/..._dshard0of4,runs/..._dshard1of4,... -
 
 **分片数上限与 `--shards max`**：`--shard-by dialogue` 上限为数据集对话数、`--shard-by question` 上限为题目数。传入超过上限的整数**按上限执行**（不报错，输出中会说明实际分片数）；`--shards max` 直接按上限取最大分片；分片索引越过有效分片数的进程**安全跳过**（不产生空 run——空分片纯浪费进程/内存与桥实例）。
 
+**分片 A/B 官方通路**：两侧分别 `run --shards N --shard-by dialogue` 并行跑 → 每侧每数据集 `fuse` 合并成完整 run → `evaluate-compare --baseline-run <key>=<A完整run> --candidate-run <key>=<B完整run>` 汇总出完整对比报告。融合产物与普通 run 同等可校验：可比性元数据（adapter_version / judge_model / driver_llm / 数据集指纹 / 检索口径）全部透传，可直接用 `compare --require-comparable` 复验。
+
 **分片维度怎么选（`--shard-by`，重要）**：
 
 - `--shard-by question`（默认）按全局题号 `i % N == shard_index` 分片；不含入选题的对话整段跳过（ingest 也省掉）。适合"少量超长对话承载大量题"、能整块跳过对话的场景。

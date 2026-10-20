@@ -9,6 +9,7 @@ import pytest
 
 from membench import cli
 from membench.adapters import MockStrongAdapter, MockWeakAdapter
+from membench.data import SAMPLE_DATASET_PATH
 from membench.evaluate import DatasetSpec, evaluate, parse_run_kv
 from membench.evaluate_compare import evaluate_compare
 
@@ -235,3 +236,41 @@ def test_cli_from_runs_and_conflicts(tmp_path: Path) -> None:
 
     with pytest.raises(SystemExit, match="KEY=RUN_DIR"):
         cli.main(["evaluate", "--from-runs", "badformat"])
+
+
+def test_sharded_ab_official_path(tmp_path: Path) -> None:
+    """分片 A/B 官方通路：两侧各自 分片 run → fuse → evaluate-compare 汇总出对比报告。"""
+    from membench.fuse import fuse_runs
+    from membench.runner import Runner
+
+    def _fused_side(side: str, adapter) -> str:
+        shard_dirs = []
+        for i in (0, 1):
+            shard_dirs.append(
+                Runner(
+                    adapter,
+                    str(SAMPLE_DATASET_PATH),
+                    judge="heuristic",
+                    out_dir=str(tmp_path / f"{side}{i}"),
+                    shards=2,
+                    shard_index=i,
+                ).run()
+            )
+        return fuse_runs(shard_dirs, str(tmp_path / f"{side}_fused"))["out_dir"]
+
+    baseline = _fused_side("a", MockWeakAdapter())
+    candidate = _fused_side("b", MockStrongAdapter())
+
+    result = evaluate_compare(
+        None,
+        None,
+        None,
+        report_out=str(tmp_path / "ab_sharded"),
+        tag="sharded",
+        baseline_runs={"sample": baseline},
+        candidate_runs={"sample": candidate},
+    )
+    md = (Path(result["compare_dir"]) / "compare_report.md").read_text(encoding="utf-8")
+    assert "两组多数据集对比报告" in md
+    assert "mock-weak vs mock-strong" in md
+    assert result["verdict"] in ("PASS", "WARN", "FAIL")

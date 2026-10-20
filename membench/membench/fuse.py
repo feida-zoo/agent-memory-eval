@@ -4,13 +4,19 @@
 ``membench fuse --runs dir1,dir2,... --out DIR`` 融合：
 
 - 校验各 run 的 adapter / dataset / shards / shard_by 一致，且 shard_index 恰好覆盖 0..N-1；
+  判分与可比性元数据（judge / judge_model / driver_llm / adapter_version / adapter_meta /
+  dataset_fingerprint / retrieval_match / schema_version）也必须一致，防止混片；
 - 合并 results.jsonl（按 qid 去重校验，简单拼接保持传入顺序）；
-- 复用 ``metrics.summary.aggregate`` 重新计算指标，复用 report 渲染完整报告；
+- 复用 ``metrics.summary.aggregate`` 重新计算指标（能力标注优先按数据集扫描，
+  与 run 口径一致），复用 report 渲染完整报告；
 - 门禁判定（stale 一票否决）对融合结果同样生效：存在 knowledge_update 题
   且 stale_rate 超过阈值（与 evaluate 的办公域门禁同阈值）即 FAIL。
 
 输出目录结构与普通 run 一致（results.jsonl + metrics.json + report.md + 图表），
-metadata 标记 ``"fused": true`` 及来源分片列表 ``"fused_from"``。
+metadata 标记 ``"fused": true`` 及来源分片列表 ``"fused_from"``，并透传可比性
+元数据（adapter_version / judge_model / driver_llm / dataset_fingerprint /
+retrieval_match / adapter_meta / adapter_describe / schema_version）——融合产物
+可直接参与 ``compare --require-comparable``。
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ import os
 from datetime import datetime
 from typing import Any, Union
 
-from membench.evaluate import STALE_GATE_THRESHOLD
+from membench.evaluate import STALE_GATE_THRESHOLD, scan_capabilities
 from membench.metrics import aggregate
 from membench.report import render_run_report
 
@@ -109,6 +115,19 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
         for key in ("adapter", "dataset"):
             if m.get(key) != first.get(key):
                 raise _err(f"{key} 不一致: {first.get(key)!r} vs {m.get(key)!r}（{d}）")
+        for key in (
+            "judge",
+            "judge_model",
+            "driver_llm",
+            "adapter_version",
+            "adapter_meta",
+            "dataset_fingerprint",
+            "retrieval_match",
+            "retrieval_match_threshold",
+            "schema_version",
+        ):
+            if m.get(key) != first.get(key):
+                raise _err(f"{key} 不一致: {first.get(key)!r} vs {m.get(key)!r}（{d}）")
         if int(m.get("shards") or 1) != int(first.get("shards") or 1):
             raise _err(f"shards 不一致: {first.get('shards')!r} vs {m.get('shards')!r}（{d}）")
         if (m.get("shard_by") or "question") != (first.get("shard_by") or "question"):
@@ -132,7 +151,15 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
             raise _err(f"qid 重复出现在多个分片中: {qid}")
         seen.add(qid)
 
-    metrics = dict(aggregate(records))
+    # 能力标注优先按数据集扫描（与 run 口径一致）；数据集不可读时按 records 推断
+    caps = None
+    ds_path = str(first.get("dataset_path") or "")
+    if ds_path and os.path.isfile(ds_path):
+        try:
+            caps = scan_capabilities(ds_path)
+        except (OSError, ValueError):
+            caps = None
+    metrics = dict(aggregate(records, capabilities=caps))
     now = datetime.now()
     run_id = (
         f"{first.get('adapter', 'unknown')}_{first.get('platform', 'default')}_"
@@ -154,10 +181,24 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
             "shards": shards,
             "shard_index": None,
             "shard_by": first.get("shard_by") or "question",
+            # 可比性元数据透传：融合产物与普通 run 同等可校验/可对比
+            "adapter_meta": first.get("adapter_meta"),
+            "adapter_describe": first.get("adapter_describe"),
+            "schema_version": first.get("schema_version"),
+            "driver_llm": first.get("driver_llm"),
+            "judge_model": first.get("judge_model"),
+            "adapter_version": first.get("adapter_version"),
+            "dataset_fingerprint": first.get("dataset_fingerprint"),
+            "retrieval_match": first.get("retrieval_match"),
             "fused": True,
             "fused_from": [str(m.get("run_id", d)) for m, d in zip(metas, run_dirs)],
         }
     )
+    if first.get("retrieval_match_threshold") is not None:
+        metrics["retrieval_match_threshold"] = first["retrieval_match_threshold"]
+    match_fallbacks = sum(int(m.get("retrieval_match_fallbacks", 0) or 0) for m in metas)
+    if match_fallbacks:
+        metrics["retrieval_match_fallbacks"] = match_fallbacks
     gate = fuse_gate(records, metrics)
     metrics["stale_gate"] = gate
 
