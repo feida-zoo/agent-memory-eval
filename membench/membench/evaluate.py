@@ -193,6 +193,96 @@ def dataset_specs(values: list[str]) -> list[DatasetSpec]:
     return specs
 
 
+def parse_run_kv(values: Union[list[str], None], option: str) -> dict[str, str]:
+    """解析 ``KEY=RUN_DIR`` 形式的已有 run 参数（--from-runs / --baseline-run / --candidate-run）。
+
+    Returns:
+        ``{数据集 key: run 目录}``（保持输入顺序）。
+
+    Raises:
+        SystemExit: 不是 ``KEY=RUN_DIR`` 形式、key 重复或目录不存在。
+    """
+    out: dict[str, str] = {}
+    for raw in values or []:
+        text = str(raw)
+        key, sep, run_dir = text.partition("=")
+        key, run_dir = key.strip(), run_dir.strip()
+        if not sep or not key or not run_dir:
+            raise SystemExit(f"{option} 需为 KEY=RUN_DIR 形式，当前为 {text!r}")
+        if key in out:
+            raise SystemExit(f"{option} 的 key 重复: {key}")
+        if not os.path.isdir(run_dir):
+            raise SystemExit(f"{option} 的 run 目录不存在: {run_dir}（{key}）")
+        out[key] = run_dir
+    return out
+
+
+def _capabilities_from_metrics(metrics: dict[str, Any], dataset_path: str) -> dict[str, bool]:
+    """能力标注：优先 run 顶层落账（新 run）；缺失时扫描数据集；再缺按全 False。"""
+    keys = ("has_evidence", "has_stale", "has_abstention")
+    stored = {k: metrics.get(k) for k in keys}
+    if all(isinstance(v, bool) for v in stored.values()):
+        return dict(stored)  # type: ignore[arg-type]
+    if dataset_path and os.path.isfile(dataset_path):
+        try:
+            return scan_capabilities(dataset_path)
+        except (OSError, ValueError):
+            pass
+    return {k: False for k in keys}
+
+
+def load_provided_result(key: str, run_dir: str) -> DatasetResult:
+    """从现成 run 目录加载 DatasetResult（汇总模式复用已有评测结果）。"""
+    metrics_path = os.path.join(run_dir, "metrics.json")
+    if not os.path.isfile(metrics_path):
+        raise SystemExit(f"run 目录缺少 metrics.json: {run_dir}（{key}）")
+    with open(metrics_path, encoding="utf-8") as f:
+        metrics = json.load(f)
+    dataset_path = str(metrics.get("dataset_path") or "")
+    source = str(metrics.get("dataset_source") or "user-specified")
+    if key == "office":
+        name = "office（用户测试集）" if source == "user" else "office（内置办公黄金集）"
+    else:
+        name = key
+    spec = DatasetSpec(key=key, name=name, path=dataset_path, source=source)
+    return DatasetResult(
+        spec=spec,
+        run_dir=run_dir,
+        metrics=metrics,
+        capabilities=_capabilities_from_metrics(metrics, dataset_path),
+    )
+
+
+#: 汇总模式的元数据一致性检查维度（不含 commit：它是 A/B 的被测变量）。
+_META_CHECK_KEYS = (
+    "adapter",
+    "judge",
+    "driver_llm",
+    "judge_model",
+    "adapter_version",
+    "platform",
+)
+
+
+def metadata_inconsistencies(results: list[DatasetResult]) -> list[str]:
+    """跨数据集元数据不一致清单（汇总模式提示"混 run"风险）。
+
+    Returns:
+        每个不一致维度一条说明（``维度: 值A ← 数据集x、y；值B ← 数据集z``）。
+    """
+    findings: list[str] = []
+    for key in _META_CHECK_KEYS:
+        grouped: dict[str, list[str]] = {}
+        for r in results:
+            grouped.setdefault(repr(r.metrics.get(key)), []).append(r.spec.key)
+        if len(grouped) > 1:
+            detail = "；".join(
+                f"{value} ← {','.join(keys)}" for value, keys in grouped.items()
+            )
+            findings.append(f"{key}: {detail}")
+    return findings
+
+
 def plan_datasets(
     quick: bool = False,
     beam_10m: bool = False,
@@ -419,6 +509,8 @@ def run_datasets(
             evidence_matcher=evidence_matcher,
         )
         run_dir = runner.run()
+        if run_dir is None:
+            raise SystemExit(f"数据集 {spec.name} 无可评测内容（空数据集），终止评估")
         with open(os.path.join(run_dir, "metrics.json"), encoding="utf-8") as f:
             metrics = json.load(f)
         results.append(
@@ -442,8 +534,12 @@ def write_evaluate_report(
     results: list[DatasetResult],
     fused: dict[str, dict[str, Any]],
     gate: dict[str, Any],
+    extra_notes: Union[list[str], None] = None,
 ) -> str:
     """生成 evaluate_report.md（中文），写入报告目录并返回报告路径。
+
+    Args:
+        extra_notes: 报告顶部追加的提示行（Markdown，如汇总模式的元数据不一致告警）。
 
     Args:
         eval_dir: 报告目录。各数据集 run 副本已复制到其 ``runs/<run_id>/`` 下，
@@ -469,6 +565,9 @@ def write_evaluate_report(
     lines.append("")
     lines.append(f"**总评结论： {verdict}**（门禁一票否决，独立于综合评级）")
     lines.append("")
+    for note in extra_notes or []:
+        lines.append(note)
+        lines.append("")
 
     # 评测配置：补齐 driver_llm / judge_model / adapter_version /
     # dataset_fingerprint 四项可比性核心元数据（取自首个数据集的
@@ -675,8 +774,8 @@ def write_evaluate_report(
 
 
 def evaluate(
-    adapter: Any,
-    judge: Any,
+    adapter: Any = None,
+    judge: Any = None,
     out_dir: Union[str, None] = None,
     platform: Union[str, None] = None,
     commit: Union[str, None] = None,
@@ -686,6 +785,7 @@ def evaluate(
     no_lme_s: bool = False,
     report_out: Union[str, None] = None,
     specs: Union[list[DatasetSpec], None] = None,
+    from_runs: Union[dict[str, str], None] = None,
     jobs: int = 1,
     driver_llm: Union[str, None] = None,
     adapter_version: Union[str, None] = None,
@@ -694,8 +794,13 @@ def evaluate(
     """执行全量评估：多数据集依次评测 + 宏平均融合 + 门禁 + 报告。
 
     Args:
-        adapter: 适配器实例（跨数据集复用，Runner 内部负责 reset）。
-        judge: judge 名字符串或 Judge 实例（与 Runner 约定一致）。
+        adapter: 适配器实例（跨数据集复用，Runner 内部负责 reset）；汇总模式下
+            仅当存在需要补跑的数据集时必需，纯复用可为 None。
+        judge: judge 名字符串或 Judge 实例（与 Runner 约定一致）；纯复用可为
+            None，此时报告头以已有 run 的元数据为准。
+        from_runs: 汇总模式：``{数据集 key: 已有 run 目录}``。目标清单（``specs``）
+            中有对应 run 的复用其结果、缺失的**补跑**（要求 adapter/judge 可用）；
+            未给 ``specs`` 时目标清单即这些 key（纯汇总）。
         out_dir: run 数据与缺省报告目录的父目录；None 时默认 paths.runs_dir()。
         platform: 平台标签。commit: commit 标签。
         quick: 跳过 BEAM 与 LongMemEval-S 槽位（等价 no_beam + no_lme_s）。
@@ -717,11 +822,54 @@ def evaluate(
     if out_dir is None:
         out_dir = paths.runs_dir()
 
-    if specs is None:
-        specs = plan_datasets(quick=quick, beam_10m=beam_10m, no_beam=no_beam, no_lme_s=no_lme_s)
+    if from_runs and specs is None and (quick or beam_10m or no_beam or no_lme_s):
+        raise SystemExit("--from-runs 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）互斥")
 
-    judge_name = judge if isinstance(judge, str) else str(getattr(judge, "name", judge.__class__.__name__))
-    adapter_name = str(getattr(adapter, "name", adapter.__class__.__name__))
+    provided: dict[str, DatasetResult] = {}
+    for key, run_dir in (from_runs or {}).items():
+        provided[key] = load_provided_result(key, run_dir)
+
+    if specs is None:
+        if provided:
+            # 纯汇总：目标清单即提供的 key（保持输入顺序）
+            specs = [r.spec for r in provided.values()]
+        else:
+            specs = plan_datasets(quick=quick, beam_10m=beam_10m, no_beam=no_beam, no_lme_s=no_lme_s)
+    else:
+        target_keys = {s.key for s in specs}
+        unknown = [k for k in provided if k not in target_keys]
+        if unknown:
+            raise SystemExit(
+                f"以下复用 run 不在目标数据集清单中: {', '.join(unknown)}"
+                "（请加入 --dataset 或删除对应 --from-runs）"
+            )
+
+    # 缺口前置检查：目标清单里有需要补跑的数据集时，adapter/judge 必须可用
+    missing_keys = [s.key for s in specs if s.key not in provided]
+    if missing_keys and (adapter is None or judge is None):
+        raise SystemExit(
+            "以下数据集没有可复用的 run，补跑需要 --adapter 与 --judge: "
+            + "、".join(missing_keys)
+        )
+
+    # 头信息：汇总模式优先以已有 run 的元数据为准（纯复用时没有新评测元数据）
+    first_provided_metrics = next(iter(provided.values())).metrics if provided else None
+    if judge is None:
+        if first_provided_metrics is None:
+            raise SystemExit("未提供 judge：无已有 run 可复用时必须指定 --judge")
+        judge_name = str(first_provided_metrics.get("judge") or "heuristic")
+    else:
+        judge_name = judge if isinstance(judge, str) else str(getattr(judge, "name", judge.__class__.__name__))
+    if adapter is not None:
+        adapter_name = str(getattr(adapter, "name", adapter.__class__.__name__))
+    elif first_provided_metrics is not None:
+        adapter_name = str(first_provided_metrics.get("adapter") or "unknown")
+    else:
+        raise SystemExit("未提供 adapter：无已有 run 可复用时必须指定 --adapter")
+    if platform is None and first_provided_metrics is not None:
+        platform = first_provided_metrics.get("platform")
+    if commit is None and first_provided_metrics is not None:
+        commit = first_provided_metrics.get("commit")
 
     if judge_name == "heuristic" and any(s.key.startswith("beam") for s in specs):
         print(
@@ -741,18 +889,45 @@ def evaluate(
         report_dir = os.path.join(out_dir, f"evaluate_{now.strftime('%Y%m%d_%H%M%S')}")
         os.makedirs(report_dir, exist_ok=True)
 
-    results = run_datasets(
-        adapter,
-        judge,
-        specs,
-        out_dir,
-        platform=platform,
-        commit=commit,
-        jobs=jobs,
-        driver_llm=driver_llm,
-        adapter_version=adapter_version,
-        evidence_matcher=evidence_matcher,
-    )
+    provided_by_key = dict(provided)
+    missing_specs: list[DatasetSpec] = []
+    for spec in specs:
+        if spec.key in provided_by_key:
+            print(f"[membench] 复用已有 run: {spec.key} <- {provided_by_key[spec.key].run_dir}")
+        else:
+            missing_specs.append(spec)
+    if missing_specs:
+        for r in run_datasets(
+            adapter,
+            judge,
+            missing_specs,
+            out_dir,
+            platform=platform,
+            commit=commit,
+            jobs=jobs,
+            driver_llm=driver_llm,
+            adapter_version=adapter_version,
+            evidence_matcher=evidence_matcher,
+        ):
+            provided_by_key[r.spec.key] = r
+
+    # 按目标清单顺序组装；复用项套用目标 spec（保留统一的展示口径）
+    results: list[DatasetResult] = []
+    for spec in specs:
+        res = provided_by_key[spec.key]
+        if spec.key in provided:
+            res = DatasetResult(
+                spec=spec,
+                run_dir=res.run_dir,
+                metrics=res.metrics,
+                capabilities=res.capabilities,
+            )
+        results.append(res)
+
+    notes = metadata_inconsistencies(results)
+    for note in notes:
+        print(f"[membench] ⚠️ 汇总模式：跨数据集元数据不一致 —— {note}")
+
     fused = fuse_metrics(results)
     gate = evaluate_gate(results)
 
@@ -763,7 +938,16 @@ def evaluate(
     )
 
     report_path = write_evaluate_report(
-        report_dir, adapter_name, judge_name, platform, commit, now, results, fused, gate
+        report_dir,
+        adapter_name,
+        judge_name,
+        platform,
+        commit,
+        now,
+        results,
+        fused,
+        gate,
+        extra_notes=[f"> ⚠️ **汇总模式**：跨数据集元数据不一致 —— {note}" for note in notes],
     )
 
     # 汇总 JSON，便于程序化消费。

@@ -43,6 +43,8 @@ from membench.evaluate import (
     DatasetResult,
     DatasetSpec,
     fuse_metrics,
+    load_provided_result,
+    metadata_inconsistencies,
     plan_datasets,
     run_datasets,
     scan_capabilities,
@@ -337,9 +339,9 @@ def _check_plt() -> None:
 
 
 def evaluate_compare(
-    baseline_adapter: Any,
-    candidate_adapter: Any,
-    judge: Any,
+    baseline_adapter: Any = None,
+    candidate_adapter: Any = None,
+    judge: Any = None,
     out_dir: Union[str, None] = None,
     platform: Union[str, None] = None,
     commit: Union[str, None] = None,
@@ -350,6 +352,8 @@ def evaluate_compare(
     report_out: Union[str, None] = None,
     tag: Union[str, None] = None,
     specs: Union[list[DatasetSpec], None] = None,
+    baseline_runs: Union[dict[str, str], None] = None,
+    candidate_runs: Union[dict[str, str], None] = None,
     jobs: int = 1,
     driver_llm_baseline: Union[str, None] = None,
     driver_llm_candidate: Union[str, None] = None,
@@ -363,9 +367,14 @@ def evaluate_compare(
     """两组（baseline vs candidate）× 多数据集融合 A/B 对比。
 
     Args:
-        baseline_adapter: 基线适配器实例。
-        candidate_adapter: 候选适配器实例。
-        judge: judge 名字符串或 Judge 实例（与 Runner 约定一致）。
+        baseline_adapter / candidate_adapter: 两侧适配器实例；对应侧存在需要
+            补跑的数据集时必需，纯复用可为 None（此时该侧名称取已有 run 的
+            元数据）。
+        judge: judge 名字符串或 Judge 实例（与 Runner 约定一致）；纯复用可为
+            None。
+        baseline_runs / candidate_runs: 汇总模式：``{数据集 key: 已有 run 目录}``。
+            目标清单中有对应 run 的复用、缺失的**补跑**（需要该侧 adapter 与
+            judge 可用）；未给 ``specs`` 时目标清单即两侧 key 的并集。
         out_dir: run 输出父目录；None 时用 :func:`membench.paths.runs_dir`。
         platform / commit: 平台与 commit 标签（写到两侧 run 元数据）。
         quick / beam_10m / no_beam / no_lme_s: 同 :func:`membench.evaluate.evaluate`。
@@ -385,12 +394,67 @@ def evaluate_compare(
     """
     if out_dir is None:
         out_dir = paths.runs_dir()
-    if specs is None:
-        specs = plan_datasets(quick=quick, beam_10m=beam_10m, no_beam=no_beam, no_lme_s=no_lme_s)
 
-    judge_name = judge if isinstance(judge, str) else str(getattr(judge, "name", judge.__class__.__name__))
-    baseline_name = str(getattr(baseline_adapter, "name", baseline_adapter.__class__.__name__))
-    candidate_name = str(getattr(candidate_adapter, "name", candidate_adapter.__class__.__name__))
+    if (
+        (baseline_runs or candidate_runs)
+        and specs is None
+        and (quick or beam_10m or no_beam or no_lme_s)
+    ):
+        raise SystemExit("--baseline-run/--candidate-run 与预设开关互斥")
+
+    baseline_provided: dict[str, DatasetResult] = {}
+    for key, run_dir in (baseline_runs or {}).items():
+        baseline_provided[key] = load_provided_result(key, run_dir)
+    candidate_provided: dict[str, DatasetResult] = {}
+    for key, run_dir in (candidate_runs or {}).items():
+        candidate_provided[key] = load_provided_result(key, run_dir)
+
+    if specs is None:
+        if baseline_provided or candidate_provided:
+            # 纯汇总：目标清单即两侧 key 的并集（基线顺序在前）
+            keys = list(baseline_provided) + [
+                k for k in candidate_provided if k not in baseline_provided
+            ]
+            specs = [
+                (baseline_provided.get(k) or candidate_provided[k]).spec for k in keys
+            ]
+        else:
+            specs = plan_datasets(quick=quick, beam_10m=beam_10m, no_beam=no_beam, no_lme_s=no_lme_s)
+    else:
+        target_keys = {s.key for s in specs}
+        unknown = [k for k in {**baseline_provided, **candidate_provided} if k not in target_keys]
+        if unknown:
+            raise SystemExit(
+                f"以下复用 run 不在目标数据集清单中: {', '.join(unknown)}"
+                "（请加入 --dataset 或删除对应的 --baseline-run / --candidate-run）"
+            )
+
+    # 头信息：汇总模式优先以已有 run 的元数据为准
+    first_b = next(iter(baseline_provided.values())).metrics if baseline_provided else None
+    first_c = next(iter(candidate_provided.values())).metrics if candidate_provided else None
+    if judge is None:
+        src = first_b or first_c
+        if src is None:
+            raise SystemExit("未提供 judge：无已有 run 可复用时必须指定 --judge")
+        judge_name = str(src.get("judge") or "heuristic")
+    else:
+        judge_name = judge if isinstance(judge, str) else str(getattr(judge, "name", judge.__class__.__name__))
+    if baseline_adapter is not None:
+        baseline_name = str(getattr(baseline_adapter, "name", baseline_adapter.__class__.__name__))
+    elif first_b is not None:
+        baseline_name = str(first_b.get("adapter") or "baseline")
+    else:
+        raise SystemExit("未提供基线适配器：该侧没有可复用的 run 时必须指定 --baseline-adapter")
+    if candidate_adapter is not None:
+        candidate_name = str(getattr(candidate_adapter, "name", candidate_adapter.__class__.__name__))
+    elif first_c is not None:
+        candidate_name = str(first_c.get("adapter") or "candidate")
+    else:
+        raise SystemExit("未提供候选适配器：该侧没有可复用的 run 时必须指定 --candidate-adapter")
+    if platform is None:
+        platform = (first_b or first_c or {}).get("platform")
+    if commit is None:
+        commit = (first_b or first_c or {}).get("commit")
 
     if judge_name == "heuristic" and any(s.key.startswith("beam") for s in specs):
         print(
@@ -398,33 +462,58 @@ def evaluate_compare(
             "heuristic 判分可能失真，建议使用 --judge llm 或 --judge client。"
         )
 
-    # 两侧各跑一次 Runner：用 evaluate.run_datasets 跑 baseline，临时复制 adapter
-    # 接口（baseline 与 candidate 类型不同但 run_datasets 不感知）。
+    # 两侧组装：已有 run 直接复用，缺失数据集用该侧 adapter 补跑
+    def _assemble_side(
+        label: str,
+        adapter: Any,
+        provided: dict[str, DatasetResult],
+        driver_llm_value: Union[str, None],
+        adapter_version_value: Union[str, None],
+    ) -> list[DatasetResult]:
+        by_key = dict(provided)
+        for spec in specs:
+            if spec.key in provided:
+                print(f"[membench] 复用已有 run（{label}）: {spec.key} <- {provided[spec.key].run_dir}")
+        missing = [s for s in specs if s.key not in by_key]
+        if missing:
+            if adapter is None or judge is None:
+                raise SystemExit(
+                    f"{label} 以下数据集没有可复用的 run，补跑需要适配器与 judge: "
+                    + "、".join(s.key for s in missing)
+                )
+            for r in run_datasets(
+                adapter,
+                judge,
+                missing,
+                out_dir,
+                platform=platform,
+                commit=commit,
+                jobs=jobs,
+                driver_llm=driver_llm_value,
+                adapter_version=adapter_version_value,
+                evidence_matcher=evidence_matcher,
+            ):
+                by_key[r.spec.key] = r
+        out: list[DatasetResult] = []
+        for spec in specs:
+            res = by_key[spec.key]
+            if spec.key in provided:
+                res = DatasetResult(
+                    spec=spec,
+                    run_dir=res.run_dir,
+                    metrics=res.metrics,
+                    capabilities=res.capabilities,
+                )
+            out.append(res)
+        return out
+
     print(f"[membench] ===== 基线 adapter: {baseline_name} =====")
-    baseline_results = run_datasets(
-        baseline_adapter,
-        judge,
-        specs,
-        out_dir,
-        platform=platform,
-        commit=commit,
-        jobs=jobs,
-        driver_llm=driver_llm_baseline,
-        adapter_version=adapter_version_baseline,
-        evidence_matcher=evidence_matcher,
+    baseline_results = _assemble_side(
+        "基线侧", baseline_adapter, baseline_provided, driver_llm_baseline, adapter_version_baseline
     )
     print(f"[membench] ===== 候选 adapter: {candidate_name} =====")
-    candidate_results = run_datasets(
-        candidate_adapter,
-        judge,
-        specs,
-        out_dir,
-        platform=platform,
-        commit=commit,
-        jobs=jobs,
-        driver_llm=driver_llm_candidate,
-        adapter_version=adapter_version_candidate,
-        evidence_matcher=evidence_matcher,
+    candidate_results = _assemble_side(
+        "候选侧", candidate_adapter, candidate_provided, driver_llm_candidate, adapter_version_candidate
     )
 
     # 对齐 baseline / candidate 各数据集（按 spec.key 匹配）
@@ -445,6 +534,14 @@ def evaluate_compare(
                 capabilities=b.capabilities,
             )
         )
+
+    # 汇总模式的元数据一致性提示（混 run 风险）
+    notes: list[str] = []
+    for label, side in (("基线侧", baseline_results), ("候选侧", candidate_results)):
+        for note in metadata_inconsistencies(side):
+            notes.append(f"{label}内部：{note}")
+    for note in notes:
+        print(f"[membench] ⚠️ 汇总模式：{note}")
 
     # 逐数据集 diff
     per_dataset = _per_dataset_diff(arms)
@@ -517,6 +614,7 @@ def evaluate_compare(
         per_dataset_gates=per_dataset_gates,
         per_dataset_verdict=per_dataset_verdict,
         cap_sources={"baseline": cap_sources_a, "candidate": cap_sources_b},
+        extra_notes=[f"> ⚠️ **汇总模式**：{note}" for note in notes],
     )
 
     _check_plt()
@@ -557,6 +655,7 @@ def _write_evaluate_compare_report(
     per_dataset_gates: list[dict[str, Any]] | None = None,
     per_dataset_verdict: str | None = None,
     cap_sources: dict[str, dict[str, str]] | None = None,
+    extra_notes: list[str] | None = None,
 ) -> str:
     """生成 evaluate-compare 的 compare_report.md（中文）。"""
     lines: list[str] = []
@@ -611,6 +710,10 @@ def _write_evaluate_compare_report(
                 + "；dataset=重扫数据集，results_jsonl=按逐题记录反推，missing=不可得按全 False）。</sub>"
             )
             lines.append("")
+
+    for note in extra_notes or []:
+        lines.append(note)
+        lines.append("")
 
     # 1. 逐数据集 diff（关键指标）
     lines.append("## 逐数据集关键指标 diff（B - A）")

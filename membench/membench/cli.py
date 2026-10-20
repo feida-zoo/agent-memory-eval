@@ -13,7 +13,8 @@ matrix / doctor / adapter / user-data / dataset / list-datasets。
         [--driver-llm gpt-4o] [--adapter-version a1b2c3] \
         [--report-out DIR] [--quick | --beam-10m | --no-beam] [--no-lme-s] \
         [--evidence-match substring|overlap|llm] \
-        [--dataset KEY|PATH]...   # 显式数据集清单（与预设开关互斥）
+        [--dataset KEY|PATH]...   # 显式数据集清单（与预设开关互斥） \
+        [--from-runs KEY=RUN_DIR]...   # 复用已有 run；缺失数据集用 --adapter 补跑
     python -m membench.cli evaluate-compare --baseline-adapter A --candidate-adapter B \
         [--judge heuristic] [--platform wx --commit a1b2c3] [--out runs/] \
         [--driver-llm-a gpt-4o] [--adapter-version-a a1b2c3] \
@@ -21,7 +22,8 @@ matrix / doctor / adapter / user-data / dataset / list-datasets。
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
         [--report-out DIR] [--tag <label>] [--quick | --beam-10m | --no-beam] \
         [--no-lme-s] [--evidence-match substring|overlap|llm] \
-        [--dataset KEY|PATH]...   # 两侧使用同一清单（与预设开关互斥）
+        [--dataset KEY|PATH]...   # 两侧使用同一清单（与预设开关互斥） \
+        [--baseline-run KEY=RUN_DIR]... [--candidate-run KEY=RUN_DIR]...  # 两侧复用+补跑
     python -m membench.cli fuse --runs runs/<shard0>,runs/<shard1> --out runs/<fused>
     python -m membench.cli compare --baseline runs/<run_a> --candidate runs/<run_b> \
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
@@ -151,8 +153,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # --- evaluate ---
     p_ev = sub.add_parser("evaluate", help="全量评估：多数据集依次评测 + 宏平均融合综合评分 + 办公域 stale 门禁")
-    p_ev.add_argument("--adapter", required=True, help="适配器名（见 list-datasets 提示 / ADAPTERS 注册表）")
-    p_ev.add_argument("--judge", default="heuristic", choices=["heuristic", "llm", "client"], help="判分器（默认 heuristic；llm=OpenAI兼容接口；client=agent内置LLM）")
+    p_ev.add_argument("--adapter", default=None, help="适配器名（见 list-datasets 提示 / ADAPTERS 注册表）；--from-runs 全复用时可省略")
+    p_ev.add_argument("--judge", default=None, choices=["heuristic", "llm", "client"], help="判分器（默认 heuristic；--from-runs 全复用/纯汇总时以已有 run 判分器为准）")
     p_ev.add_argument("--platform", default=None, help="平台标签（如 wx / fs），记入 run_id 与元数据")
     p_ev.add_argument("--commit", default=None, help="commit 标签（如 a1b2c3），记入元数据")
     p_ev.add_argument("--out", default=None, help="run 与 evaluate 报告输出父目录（默认 skill/output/runs/）")
@@ -170,6 +172,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="KEY|PATH",
         help="显式指定评测数据集（数据集 key 或 JSONL 路径，可重复，列表中第一个承担办公域槽位）；与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）互斥",
+    )
+    p_ev.add_argument(
+        "--from-runs",
+        action="append",
+        default=None,
+        metavar="KEY=RUN_DIR",
+        help="复用已有 run 汇总（可重复，KEY 为数据集 key、RUN_DIR 为 run 目录）；目标清单中缺失的数据集用 --adapter 补跑；与预设开关互斥",
     )
     p_ev.add_argument("--llm-base-url", default=None, help="judge=llm 时的 OpenAI 兼容 base_url")
     p_ev.add_argument("--llm-api-key", default=None, help="judge=llm 时的 API key")
@@ -191,9 +200,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "evaluate-compare",
         help="两组（baseline vs candidate）× 多数据集融合 A/B 对比；产出 ab_<tag>_<ts>/",
     )
-    p_ev_cmp.add_argument("--baseline-adapter", required=True, help="基线适配器名")
-    p_ev_cmp.add_argument("--candidate-adapter", required=True, help="候选适配器名")
-    p_ev_cmp.add_argument("--judge", default="heuristic", choices=["heuristic", "llm", "client"], help="判分器（默认 heuristic）")
+    p_ev_cmp.add_argument("--baseline-adapter", default=None, help="基线适配器名；该侧全复用时可省略")
+    p_ev_cmp.add_argument("--candidate-adapter", default=None, help="候选适配器名；该侧全复用时可省略")
+    p_ev_cmp.add_argument(
+        "--baseline-run",
+        action="append",
+        default=None,
+        metavar="KEY=RUN_DIR",
+        help="复用已有的基线 run（可重复，KEY 为数据集 key）；缺失数据集用 --baseline-adapter 补跑",
+    )
+    p_ev_cmp.add_argument(
+        "--candidate-run",
+        action="append",
+        default=None,
+        metavar="KEY=RUN_DIR",
+        help="复用已有的候选 run（可重复，KEY 为数据集 key）；缺失数据集用 --candidate-adapter 补跑",
+    )
+    p_ev_cmp.add_argument("--judge", default=None, choices=["heuristic", "llm", "client"], help="判分器（默认 heuristic；两侧全复用时以已有 run 判分器为准）")
     p_ev_cmp.add_argument("--platform", default=None, help="平台标签（如 wx / fs），记入两侧 run 元数据")
     p_ev_cmp.add_argument("--commit", default=None, help="commit 标签，记入两侧 run 元数据")
     p_ev_cmp.add_argument("--out", default=None, help="run 输出父目录（默认 paths.runs_dir()）")
@@ -545,22 +568,31 @@ def _cmd_adapter_remove(args: argparse.Namespace) -> int:
 
 
 def _cmd_evaluate(args: argparse.Namespace) -> int:
-    from membench.evaluate import dataset_specs, evaluate
+    from membench.evaluate import dataset_specs, evaluate, parse_run_kv
 
     if args.jobs < 1:
         raise SystemExit(f"--jobs 必须 >= 1，当前为 {args.jobs}")
     if args.beam_10m and args.no_beam:
         raise SystemExit("--beam-10m 与 --no-beam 互斥（BEAM 槽位状态冲突）")
-    if args.dataset and (
-        args.quick or args.beam_10m or args.no_beam or args.no_lme_s
-    ):
+    preset_used = args.quick or args.beam_10m or args.no_beam or args.no_lme_s
+    if args.dataset and preset_used:
         raise SystemExit(
             "--dataset 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）"
             "互斥：显式清单时请直接枚举全部数据集"
         )
+    if args.from_runs and preset_used:
+        raise SystemExit(
+            "--from-runs 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）互斥"
+        )
     specs = dataset_specs(args.dataset) if args.dataset else None
-    adapter = _make_adapter(args.adapter)
-    judge = _make_judge(args)
+    from_runs = parse_run_kv(args.from_runs, "--from-runs")
+    if args.judge is not None:
+        judge = _make_judge(args)
+    elif from_runs and (not specs or {s.key for s in specs} <= set(from_runs)):
+        judge = None  # 全复用：报告头以已有 run 的元数据为准
+    else:
+        judge = "heuristic"
+    adapter = _make_adapter(args.adapter) if args.adapter else None
     return evaluate(
         adapter,
         judge,
@@ -577,29 +609,44 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
         adapter_version=args.adapter_version,
         evidence_matcher=_make_evidence_matcher(args),
         specs=specs,
+        from_runs=from_runs or None,
     )
 
 
 def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
     """两组（baseline vs candidate）× 多数据集融合 A/B 对比。"""
-    from membench.evaluate import dataset_specs
+    from membench.evaluate import dataset_specs, parse_run_kv
     from membench.evaluate_compare import evaluate_compare
 
     if args.jobs < 1:
         raise SystemExit(f"--jobs 必须 >= 1，当前为 {args.jobs}")
     if args.beam_10m and args.no_beam:
         raise SystemExit("--beam-10m 与 --no-beam 互斥（BEAM 槽位状态冲突）")
-    if args.dataset and (
-        args.quick or args.beam_10m or args.no_beam or args.no_lme_s
-    ):
+    preset_used = args.quick or args.beam_10m or args.no_beam or args.no_lme_s
+    if args.dataset and preset_used:
         raise SystemExit(
             "--dataset 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）"
             "互斥：显式清单时请直接枚举全部数据集"
         )
+    if (args.baseline_run or args.candidate_run) and preset_used:
+        raise SystemExit(
+            "--baseline-run / --candidate-run 与预设开关"
+            "（--quick / --beam-10m / --no-beam / --no-lme-s）互斥"
+        )
     specs = dataset_specs(args.dataset) if args.dataset else None
-    baseline_adapter = _make_adapter(args.baseline_adapter)
-    candidate_adapter = _make_adapter(args.candidate_adapter)
-    judge = _make_judge(args)
+    baseline_runs = parse_run_kv(args.baseline_run, "--baseline-run")
+    candidate_runs = parse_run_kv(args.candidate_run, "--candidate-run")
+    if args.judge is not None:
+        judge = _make_judge(args)
+    else:
+        provided_union = set(baseline_runs) | set(candidate_runs)
+        target_keys = {s.key for s in specs} if specs else provided_union
+        both_covered = bool(target_keys) and (
+            target_keys <= set(baseline_runs) and target_keys <= set(candidate_runs)
+        )
+        judge = None if (provided_union and both_covered) else "heuristic"
+    baseline_adapter = _make_adapter(args.baseline_adapter) if args.baseline_adapter else None
+    candidate_adapter = _make_adapter(args.candidate_adapter) if args.candidate_adapter else None
     result = evaluate_compare(
         baseline_adapter,
         candidate_adapter,
@@ -623,6 +670,8 @@ def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
         latency_warn=args.latency_warn,
         evidence_matcher=_make_evidence_matcher(args),
         specs=specs,
+        baseline_runs=baseline_runs or None,
+        candidate_runs=candidate_runs or None,
     )
     return 1 if result["verdict"] == "FAIL" else 0
 

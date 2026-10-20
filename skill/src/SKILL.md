@@ -162,6 +162,9 @@ python -m membench.cli evaluate --adapter <adapter> --beam-10m   # 1M 换成 10M
 python -m membench.cli evaluate --adapter <adapter> --quick      # 跳过 BEAM 与 LongMemEval-S，分钟级日常回归
 python -m membench.cli evaluate --adapter <adapter> \
     --dataset office --dataset locomo --dataset ~/data/my_set.jsonl  # 显式清单（与预设开关互斥）
+python -m membench.cli evaluate --from-runs office=<run目录> --from-runs locomo=<run目录>
+# ↑ 汇总模式：已有 run 复用、缺口自动补跑；全部已跑完时 --adapter/--judge 可省略
+#   （元数据不一致会在控制台与报告顶部标注；与预设开关互斥）
 # 默认清单含 LongMemEval-S 与 BEAM-1M（用 --no-lme-s / --no-beam 剔除）
 ```
 
@@ -175,6 +178,12 @@ python -m membench.cli evaluate-compare \
 # 检索口径默认 substring（逐字子串）；摘要/改写式记忆可换 --evidence-match overlap|llm
 # （口径不同不可与历史 substring 跑分直接比较，两侧需同口径重跑）
 # llm 口径为逐题 chat 调用（单题可达 10s+），大规模评测配 --jobs 8~16 并发跑
+
+# 汇总模式：两侧各自复用+补跑（KEY=RUN_DIR 可重复；某侧全部已跑完时可省略该侧 adapter）
+python -m membench.cli evaluate-compare \
+    --baseline-run office=<A_run> --candidate-run office=<B_run> \
+    --baseline-run locomo=<A_run> --candidate-run locomo=<B_run> \
+    --report-out ../output/ --tag "优化前vs优化后"
 ```
 
 > **全量评估前必须先 fetch 用到的按需下载数据集**（locomo / longmemeval_oracle / gatemem_office / longmemeval_s / beam_1m 等），否则会报错提示先 `dataset fetch <key>`。命令：`python -m membench.cli dataset fetch <key>`（落 `~/.membench/datasets/`）。

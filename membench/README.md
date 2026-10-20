@@ -75,7 +75,16 @@ python -m membench.cli evaluate --adapter <a> --quick       # 跳过 BEAM 与 Lo
 # 显式数据集清单（可重复 --dataset，key 与 JSONL 路径可混用；与预设开关互斥）
 python -m membench.cli evaluate --adapter <a> \
     --dataset office --dataset locomo --dataset ~/data/my_set.jsonl
+
+# 汇总模式：复用已跑完的 run（按数据集挨个跑完之后统一出报告）；
+# 目标清单里的缺口自动用 --adapter 补跑（纯复用、无缺口时 --adapter/--judge 可省略）
+python -m membench.cli evaluate --adapter <a> \
+    --dataset office --dataset locomo \
+    --from-runs office=output/runs/<run_office> \
+    --from-runs locomo=output/runs/<run_locomo>
 ```
+
+**汇总模式（`--from-runs KEY=RUN_DIR`，可重复）**：目标数据集里已有 run 的直接复用、缺失的补跑，最后统一出融合/评级/门禁报告；复用的 run 目录会复制进报告的 `runs/` 保持自包含。跨 run 的 adapter / judge / driver_llm 等元数据不一致会在控制台与报告顶部**显著标注**（混 run 风险自担）。
 
 说明：默认全量**包含** LongMemEval-S（每题约 50 个干扰会话 / ~115k token 的检索压力
 变体，与 oracle 的分差反映检索/精确率损失）；未下载时默认全量会报错提示先
@@ -99,6 +108,13 @@ python -m membench.cli evaluate-compare \
     --driver-llm-a gpt-4o --driver-llm-b gpt-4o-mini \
     --adapter-version-a v1 --adapter-version-b v2 \
     --quick
+
+# 汇总模式：两侧逐数据集复用已跑完的 run、缺口自动补跑（KEY=RUN_DIR 可重复；
+# 某侧全部已跑完时可省略该侧 adapter）
+python -m membench.cli evaluate-compare \
+    --baseline-run office=<A_office_run> --candidate-run office=<B_office_run> \
+    --baseline-run locomo=<A_locomo_run> --candidate-run locomo=<B_locomo_run> \
+    --report-out <报告父目录> --tag "优化前vs优化后"
 ```
 
 门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **逐数据集题型 diff** + **两组融合 diff 表** + **per-dataset 门禁明细**（单数据集 spike 不被融合平均抹平）+ **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）；比率型指标以百分比呈现（如 `81.5%`），差值为百分点（如 `+2.3pt`）。指标"未计算"统一记 `null`，与真实 0 区分；诊断指标（检索召回率@5 / 过度拒答率）在 diff 与对照表中可见但不参与评级。旧版 run 的 capabilities 未落账时报告会按数据集/逐题记录自动推断并在头部标注来源。
