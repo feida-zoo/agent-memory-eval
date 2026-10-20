@@ -156,6 +156,8 @@ python -m membench.cli fuse --runs runs/..._dshard0of4,runs/..._dshard1of4,... -
 
 **并行分片的实例隔离**：分片是进程级并行——每个分片必须独占一个记忆实例（HTTP 桥 → 每分片独立桥进程 / `BRIDGE_PORT` / `BRIDGE_DATA_DIR`；Python 适配器 → 每分片独立进程）。runner 对每个 dialogue 调 `reset()`，共享同一实例并行会互相清库（跨片串扰）；只有一个实例时请串行跑分片，`fuse` 结果不受影响。
 
+**分片数上限**：`--shard-by dialogue` 不得超过数据集对话数、`--shard-by question` 不得超过题目数——超出会**直接报错**（越界分片必为空，纯浪费进程/内存；对话级还要多起一个空跑的桥实例）。按数据集规模先定 N，再设 `--shards`。
+
 **分片维度怎么选（`--shard-by`，重要）**：
 
 - `--shard-by question`（默认）按全局题号 `i % N == shard_index` 分片；不含入选题的对话整段跳过（ingest 也省掉）。适合"少量超长对话承载大量题"、能整块跳过对话的场景。

@@ -74,7 +74,23 @@ def _select_questions(
     ``d % shards == shard_index`` 的**整段对话**入选，保留其全部题目，再取前
     ``limit`` 道。分片之间 ingest 互不重复——适合"几乎每个对话都有题"的
     ingest 密集型数据集（如 BEAM-1M），避免题目级分片造成的 ingest 成本 ×N。
+
+    Raises:
+        ValueError: 分片数超过该维度上限（dialogue=对话数、question=题目数）——
+            越界分片必为空，纯浪费进程/内存（对话级还会多起一个桥实例）。
     """
+    if shards > 1:
+        if shard_by == "dialogue":
+            n_units, unit = len(dialogues), "对话数"
+        else:
+            n_units = sum(len(dialogue.questions) for dialogue in dialogues)
+            unit = "题目数"
+        if shards > n_units:
+            raise ValueError(
+                f"--shards {shards} 超限：--shard-by {shard_by} 的分片上限为数据集"
+                f"{unit} {n_units}——索引 >= {n_units} 的分片必为空、纯浪费资源；"
+                f"请把 --shards 降到 <= {n_units}"
+            )
     if shard_by == "dialogue":
         out: list[Any] = []
         n_taken = 0

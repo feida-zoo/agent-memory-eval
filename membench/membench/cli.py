@@ -97,7 +97,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--client-llm", default=None, help="judge=client 时的 agent 内置 LLM 类路径，如 'my_agent.llm:LLMClient'")
     p_run.add_argument("--limit", type=int, default=None, help="冒烟模式：只评测（分片后的）前 N 道题，run_id 与 metadata 记录 limit")
     p_run.add_argument("--adapter-meta", default=None, help='适配器配置自由文本（"key=value;..."），原样记入 metadata["adapter_meta"]')
-    p_run.add_argument("--shards", type=int, default=1, help="数据集分片总数（默认 1 不分片）；按 i %% N == I 确定性分片")
+    p_run.add_argument("--shards", type=int, default=1, help="数据集分片总数（默认 1 不分片）；上限=对话数（--shard-by dialogue）或题目数（默认 question 维度），超出直接报错")
     p_run.add_argument("--shard-index", type=int, default=0, help="本分片序号（从 0 开始，需 < --shards；与 --limit 组合时先分片再截断）")
     p_run.add_argument("--shard-by", choices=["question", "dialogue"], default="question", help="分片维度：question 按题目（默认）；dialogue 整段选取对话、分片间不重复 ingest，适合几乎每个对话都有题的数据集（如 BEAM）")
     p_run.set_defaults(func=_cmd_run)
@@ -350,7 +350,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         report_out=args.report_out,
         evidence_matcher=evidence_matcher,
     )
-    run_dir = runner.run()
+    try:
+        run_dir = runner.run()
+    except ValueError as exc:
+        # 数据集相关参数错误（分片数超限、schema 校验失败等）→ 友好退出
+        raise SystemExit(f"[membench] 参数错误: {exc}")
     # report_out 时 Runner 已自建 <DIR>/eval_<adapter>_<platform>_<ts>/ 并复制 run 副本
     print(f"[membench] 完成: {run_dir}")
     return 0

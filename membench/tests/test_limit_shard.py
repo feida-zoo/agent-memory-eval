@@ -251,3 +251,65 @@ def test_cli_shard_by_dialogue(tmp_path: Path) -> None:
     metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["shard_by"] == "dialogue"
     assert metrics["overall"]["n_questions"] > 0
+
+
+def test_shards_over_dialogue_count_rejected(tmp_path: Path) -> None:
+    """--shard-by dialogue 分片数超过对话数 -> 直接报错（空分片纯浪费）。"""
+    ds = _dense_dataset(tmp_path, n_dialogues=2, per=2)
+    with pytest.raises(ValueError, match="对话数 2"):
+        Runner(
+            MockStrongAdapter(),
+            str(ds),
+            judge="heuristic",
+            out_dir=str(tmp_path / "x"),
+            shards=3,
+            shard_index=0,
+            shard_by="dialogue",
+        ).run()
+
+
+def test_shards_over_question_count_rejected(tmp_path: Path) -> None:
+    """question 维度分片数超过题目数 -> 直接报错。"""
+    ds = _dense_dataset(tmp_path, n_dialogues=1, per=2)
+    with pytest.raises(ValueError, match="题目数 2"):
+        Runner(
+            MockStrongAdapter(),
+            str(ds),
+            judge="heuristic",
+            out_dir=str(tmp_path / "x"),
+            shards=3,
+            shard_index=0,
+        ).run()
+
+
+def test_shards_at_limit_ok(tmp_path: Path) -> None:
+    """分片数等于上限可用（每个分片恰有归属）。"""
+    ds = _dense_dataset(tmp_path, n_dialogues=2, per=1)
+    run_dir = Runner(
+        MockStrongAdapter(),
+        str(ds),
+        judge="heuristic",
+        out_dir=str(tmp_path / "ok"),
+        shards=2,
+        shard_index=1,
+        shard_by="dialogue",
+    ).run()
+    assert (Path(run_dir) / "metrics.json").is_file()
+
+
+def test_cli_shards_over_limit_systemexit(tmp_path: Path) -> None:
+    """CLI 上分片数超限 -> SystemExit 友好报错。"""
+    from membench import cli
+
+    ds = _dense_dataset(tmp_path, n_dialogues=1, per=2)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "run",
+                "--adapter", "mock-weak",
+                "--dataset", str(ds),
+                "--shards", "5",
+                "--shard-by", "dialogue",
+            ]
+        )
+    assert "超限" in str(exc_info.value)
