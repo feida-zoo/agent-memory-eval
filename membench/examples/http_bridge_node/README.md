@@ -68,6 +68,9 @@ python -m membench.cli run --adapter http --judge heuristic \
   这是故意的——接上真实入口前 `node bridge.mjs` 起不来，`node --check bridge.mjs` 仍能过语法。
 - **ingest 的 messages 要带 timestamp**：`temporal` 类题（"昨天/下周"）依赖时间锚，
   丢时间戳会系统性失败。
+- **并行分片要起多个实例**：一个桥进程只服务一个分片——评测对每个 dialogue 调
+  `reset()`，两片共享一个实例会互相清库（跨片串扰）。N 分片并行 = N 个进程，
+  各自 `BRIDGE_PORT` + `BRIDGE_DATA_DIR`；单实例时只能串行跑分片。
 - **query 要真的走检索**：别把问题直接丢给底座模型。`retrieved` 填**实际注入 prompt 的
   记忆原文**，否则 `evidence_recall` 会暴露"没走记忆路径"。
 - **别用 express 等额外框架**：三端点用 `node:http` 足够，少一个依赖少一类 native/构建坑。

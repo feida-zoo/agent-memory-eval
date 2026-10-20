@@ -300,6 +300,7 @@ python -m membench.cli doctor --target <url>     # 连通性 + 三端点契约�
 - `--shard-by question`（默认）按**全局题号**分片（`i % N == I`），不含入选题的对话整段跳过——适合"少量超长对话承载大量题"的集，ingest 真省。
 - `--shard-by dialogue` 按**对话整段**分片（`d % N == I`），分片之间 ingest 互不重复——"几乎每个对话都有题"的 ingest 密集型数据集（如 office、BEAM-1M）**必须用这个**；用题目级分片会让每个分片仍对全部对话 ingest，成本 ×N 反而更慢。
 - 两种维度都能用 `fuse` 融合，但**不许混维融合**（fuse 会明确报错）。
+- **并行分片要实例隔离**：分片是"进程级"并行——每个分片必须独占一个记忆实例（HTTP 桥 = 每分片独立桥进程，`BRIDGE_PORT` / `BRIDGE_DATA_DIR` 各自隔离；Python 适配器 = 每分片独立进程）。runner 对每个 dialogue 调 `reset()`，共享同一实例并行会互相清库（跨片串扰）；只有一个实例时请串行跑分片。
 
 ## 结果解读准则
 

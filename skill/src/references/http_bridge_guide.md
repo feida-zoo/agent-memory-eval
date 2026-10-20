@@ -102,3 +102,4 @@ result = check_target("http://127.0.0.1:8787", timeout=10.0, api_key=None)
 - 若系统只在 UI 事件里触发记忆写入，注意 bridge 调用的是**纯函数/服务层**，绕开 UI 依赖
   （stub 掉 `ipcMain`/`BrowserWindow` 即可），否则会因缺窗口上下文而失败。
 - 评测用独立数据目录（`BRIDGE_DATA_DIR`）与独立实例：`reset` 必须真清空，且**绝不能碰生产数据**。
+- **并行分片 = 每分片一个桥实例**：评测对每个 dialogue 调 `reset()`，两个分片共享一个实例会互相清库（跨片串扰）。N 分片并行就起 N 个桥（各自 `BRIDGE_PORT` + `BRIDGE_DATA_DIR`）；只有一个实例时请串行跑分片。被测系统若自带多命名空间隔离，可自行在桥上按命名空间路由——那是系统能力增强，不是本模板的默认行为。
