@@ -57,6 +57,13 @@ def _judge_result_to_dict(jr: Any) -> dict[str, Any]:
         return {"correct": bool(getattr(jr, "correct", False))}
 
 
+def _shard_units(dialogues: list[Any], shard_by: str) -> int:
+    """分片上限：dialogue 维度为对话数，question 维度为题目数。"""
+    if shard_by == "dialogue":
+        return len(dialogues)
+    return sum(len(dialogue.questions) for dialogue in dialogues)
+
+
 def _select_questions(
     dialogues: list[Any],
     shards: int,
@@ -75,22 +82,9 @@ def _select_questions(
     ``limit`` 道。分片之间 ingest 互不重复——适合"几乎每个对话都有题"的
     ingest 密集型数据集（如 BEAM-1M），避免题目级分片造成的 ingest 成本 ×N。
 
-    Raises:
-        ValueError: 分片数超过该维度上限（dialogue=对话数、question=题目数）——
-            越界分片必为空，纯浪费进程/内存（对话级还会多起一个桥实例）。
+    调用方（:meth:`Runner.run`）保证 ``shards`` 已按数据集上限解析过
+    （``max`` / 超限整数在此前收敛），本函数不做上限校验。
     """
-    if shards > 1:
-        if shard_by == "dialogue":
-            n_units, unit = len(dialogues), "对话数"
-        else:
-            n_units = sum(len(dialogue.questions) for dialogue in dialogues)
-            unit = "题目数"
-        if shards > n_units:
-            raise ValueError(
-                f"--shards {shards} 超限：--shard-by {shard_by} 的分片上限为数据集"
-                f"{unit} {n_units}——索引 >= {n_units} 的分片必为空、纯浪费资源；"
-                f"请把 --shards 降到 <= {n_units}"
-            )
     if shard_by == "dialogue":
         out: list[Any] = []
         n_taken = 0
@@ -147,7 +141,9 @@ class Runner:
             query+judge 阶段并发，输出顺序与 jobs=1 一致。
             **jobs>1 要求 adapter.query 与 judge 线程安全。**
         limit: 冒烟模式：只评测（分片后的）前 N 道题；None 表示全量。
-        shards: 分片总数（默认 1 不分片）；与 limit 组合时先分片再截断。
+        shards: 分片总数（默认 1 不分片）；可传 ``"max"`` 按数据集上限自动取最大
+            （dialogue=对话数、question=题目数）；超过上限的整数按上限执行，
+            越界分片索引安全跳过（不生成空 run）。与 limit 组合时先分片再截断。
         shard_index: 本分片序号（从 0 开始，需 < shards）。
         shard_by: 分片维度（默认 ``"question"``）——``"question"`` 按全局题号
             ``i % shards == shard_index`` 分片；``"dialogue"`` 整段选取
@@ -177,7 +173,7 @@ class Runner:
         dataset_source: Union[str, None] = None,
         jobs: int = 1,
         limit: Union[int, None] = None,
-        shards: int = 1,
+        shards: Union[int, str] = 1,
         shard_index: int = 0,
         shard_by: Union[str, None] = None,
         adapter_meta: Union[str, None] = None,
@@ -192,15 +188,19 @@ class Runner:
         self.jobs = int(jobs)
         if limit is not None and limit < 1:
             raise ValueError(f"limit 必须 >= 1，当前为 {limit}")
-        if shards < 1:
-            raise ValueError(f"shards 必须 >= 1，当前为 {shards}")
-        if not 0 <= shard_index < shards:
-            raise ValueError(f"shard_index 必须满足 0 <= shard_index < shards，当前为 {shard_index}/{shards}")
+        if shards != "max" and (not isinstance(shards, int) or shards < 1):
+            raise ValueError(f"shards 必须 >= 1 的整数或 'max'，当前为 {shards!r}")
+        if shard_index < 0:
+            raise ValueError(f"shard_index 必须 >= 0，当前为 {shard_index}")
+        if isinstance(shards, int) and shard_index >= shards:
+            raise ValueError(
+                f"shard_index 必须满足 0 <= shard_index < shards，当前为 {shard_index}/{shards}"
+            )
         self.shard_by = shard_by or "question"
         if self.shard_by not in ("question", "dialogue"):
             raise ValueError(f"shard_by 必须是 'question' 或 'dialogue'，当前为 {self.shard_by!r}")
         self.limit = limit
-        self.shards = int(shards)
+        self.shards = shards  # int 或 "max"（run() 按数据集上限解析）
         self.shard_index = int(shard_index)
         self.adapter_meta = adapter_meta
         self.adapter = adapter
@@ -273,12 +273,35 @@ class Runner:
         }
 
     # ------------------------------------------------------------------
-    def run(self) -> str:
-        """执行评测，返回 run 目录路径。"""
+    def run(self) -> Union[str, None]:
+        """执行评测，返回 run 目录路径；分片无可执行内容（空数据集/索引越界）时返回 None。"""
         dialogues = load_dataset(self.dataset_path)
-        if self.shards > 1 or self.limit is not None:
+
+        # 分片解析：'max' 取数据集上限；超过上限的整数按上限执行（不报错）
+        shard_units = _shard_units(dialogues, self.shard_by)
+        unit_label = "对话数" if self.shard_by == "dialogue" else "题目数"
+        if self.shards == "max":
+            shards = shard_units
+            print(f"[membench] --shards max -> {shards}（按数据集{unit_label}）")
+        else:
+            shards = min(int(self.shards), shard_units)
+            if shards < int(self.shards):
+                print(
+                    f"[membench] --shards {self.shards} 超过数据集上限 {shard_units}"
+                    f"（{unit_label}），按 {shards} 分片执行"
+                )
+        if shards == 0:
+            print("[membench] 数据集为空（无可分片的对话/题目），本进程跳过、不产生 run 产物。")
+            return None
+        if self.shard_index >= shards:
+            print(
+                f"[membench] 分片索引 {self.shard_index} 超出有效分片数 {shards}，"
+                "本进程无事可做，跳过（不产生 run 产物）。"
+            )
+            return None
+        if shards > 1 or self.limit is not None:
             dialogues = _select_questions(
-                dialogues, self.shards, self.shard_index, self.limit, self.shard_by
+                dialogues, shards, self.shard_index, self.limit, self.shard_by
             )
         adapter_name = str(getattr(self.adapter, "name", self.adapter.__class__.__name__))
         dataset_name = os.path.splitext(os.path.basename(self.dataset_path))[0]
@@ -289,9 +312,9 @@ class Runner:
         # limit / shard 进 run_id，避免冒烟或分片结果被误当全量结果对比；
         # dialogue 分片用 _dshard 标记，与题目级分片区分
         limit_tag = f"_limit{self.limit}" if self.limit is not None else ""
-        if self.shards > 1:
+        if shards > 1:
             mode = "dshard" if self.shard_by == "dialogue" else "shard"
-            shard_tag = f"_{mode}{self.shard_index}of{self.shards}"
+            shard_tag = f"_{mode}{self.shard_index}of{shards}"
         else:
             shard_tag = ""
         run_id = (
@@ -390,7 +413,7 @@ class Runner:
                 "n_ignored": n_ignored,
                 "timestamp": now.isoformat(timespec="seconds"),
                 "limit": self.limit,
-                "shards": self.shards,
+                "shards": shards,
                 "shard_index": self.shard_index,
                 "shard_by": self.shard_by,
                 "adapter_meta": self.adapter_meta,

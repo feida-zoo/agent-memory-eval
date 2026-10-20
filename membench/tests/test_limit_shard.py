@@ -253,33 +253,38 @@ def test_cli_shard_by_dialogue(tmp_path: Path) -> None:
     assert metrics["overall"]["n_questions"] > 0
 
 
-def test_shards_over_dialogue_count_rejected(tmp_path: Path) -> None:
-    """--shard-by dialogue 分片数超过对话数 -> 直接报错（空分片纯浪费）。"""
+def test_shards_over_dialogue_count_clamped(tmp_path: Path) -> None:
+    """--shards 超过对话数 -> 按上限执行（不报错），标签与元数据用有效分片数。"""
     ds = _dense_dataset(tmp_path, n_dialogues=2, per=2)
-    with pytest.raises(ValueError, match="对话数 2"):
-        Runner(
-            MockStrongAdapter(),
-            str(ds),
-            judge="heuristic",
-            out_dir=str(tmp_path / "x"),
-            shards=3,
-            shard_index=0,
-            shard_by="dialogue",
-        ).run()
+    run_dir = Runner(
+        MockStrongAdapter(),
+        str(ds),
+        judge="heuristic",
+        out_dir=str(tmp_path / "ok"),
+        shards=5,
+        shard_index=1,
+        shard_by="dialogue",
+    ).run()
+    assert run_dir is not None
+    assert "_dshard1of2_" in Path(run_dir).name
+    metrics = json.loads((Path(run_dir) / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["shards"] == 2
 
 
-def test_shards_over_question_count_rejected(tmp_path: Path) -> None:
-    """question 维度分片数超过题目数 -> 直接报错。"""
-    ds = _dense_dataset(tmp_path, n_dialogues=1, per=2)
-    with pytest.raises(ValueError, match="题目数 2"):
-        Runner(
-            MockStrongAdapter(),
-            str(ds),
-            judge="heuristic",
-            out_dir=str(tmp_path / "x"),
-            shards=3,
-            shard_index=0,
-        ).run()
+def test_shards_over_question_count_clamped(tmp_path: Path) -> None:
+    """question 维度超过题目数 -> 同样按上限执行。"""
+    ds = _dense_dataset(tmp_path, n_dialogues=1, per=3)
+    run_dir = Runner(
+        MockStrongAdapter(),
+        str(ds),
+        judge="heuristic",
+        out_dir=str(tmp_path / "ok"),
+        shards=9,
+        shard_index=2,
+    ).run()
+    assert run_dir is not None
+    metrics = json.loads((Path(run_dir) / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["shards"] == 3
 
 
 def test_shards_at_limit_ok(tmp_path: Path) -> None:
@@ -297,19 +302,66 @@ def test_shards_at_limit_ok(tmp_path: Path) -> None:
     assert (Path(run_dir) / "metrics.json").is_file()
 
 
-def test_cli_shards_over_limit_systemexit(tmp_path: Path) -> None:
-    """CLI 上分片数超限 -> SystemExit 友好报错。"""
+def test_shards_index_beyond_effective_skips(tmp_path: Path) -> None:
+    """索引越过有效分片数 -> 安全跳过：返回 None 且不产生 run 产物。"""
+    ds = _dense_dataset(tmp_path, n_dialogues=2, per=1)
+    out_dir = tmp_path / "skip"
+    result = Runner(
+        MockStrongAdapter(),
+        str(ds),
+        judge="heuristic",
+        out_dir=str(out_dir),
+        shards=9,
+        shard_index=5,
+        shard_by="dialogue",
+    ).run()
+    assert result is None
+    assert not out_dir.exists()
+
+
+def test_shards_max_auto_and_skip(tmp_path: Path) -> None:
+    """--shards max 按上限自动取最大；越界索引同样安全跳过。"""
+    ds = _dense_dataset(tmp_path, n_dialogues=2, per=1)
+    out_dir = tmp_path / "mx"
+    run_dir = Runner(
+        MockStrongAdapter(),
+        str(ds),
+        judge="heuristic",
+        out_dir=str(out_dir),
+        shards="max",
+        shard_index=0,
+        shard_by="dialogue",
+    ).run()
+    assert run_dir is not None and "_dshard0of2_" in Path(run_dir).name
+    metrics = json.loads((Path(run_dir) / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["shards"] == 2
+    skipped = Runner(
+        MockStrongAdapter(),
+        str(ds),
+        judge="heuristic",
+        out_dir=str(out_dir),
+        shards="max",
+        shard_index=2,
+        shard_by="dialogue",
+    ).run()
+    assert skipped is None
+
+
+def test_cli_shards_max_and_clamp(tmp_path: Path) -> None:
+    """CLI：--shards max 可用；超过上限按上限执行（退出码 0）。"""
     from membench import cli
 
-    ds = _dense_dataset(tmp_path, n_dialogues=1, per=2)
-    with pytest.raises(SystemExit) as exc_info:
-        cli.main(
-            [
-                "run",
-                "--adapter", "mock-weak",
-                "--dataset", str(ds),
-                "--shards", "5",
-                "--shard-by", "dialogue",
-            ]
-        )
-    assert "超限" in str(exc_info.value)
+    ds = _dense_dataset(tmp_path, n_dialogues=2, per=1)
+    rc = cli.main(
+        [
+            "run",
+            "--adapter", "mock-weak",
+            "--dataset", str(ds),
+            "--shards", "max",
+            "--shard-index", "0",
+            "--shard-by", "dialogue",
+            "--out", str(tmp_path / "runs"),
+        ]
+    )
+    assert rc == 0
+    assert list((tmp_path / "runs").glob("*_dshard0of2_*"))

@@ -6,6 +6,7 @@ matrix / doctor / adapter / user-data / dataset / list-datasets。
         [--dataset membench/data/sample_dataset.jsonl] --judge heuristic [--out runs/] \
         [--platform wx --commit a1b2c3] [--driver-llm gpt-4o] \
         [--adapter-version a1b2c3] [--report-out DIR] \
+        [--shards N|max --shard-index I --shard-by question|dialogue] \
         [--evidence-match substring|overlap|llm]
     python -m membench.cli evaluate --adapter mock-strong \
         [--judge heuristic] [--platform wx --commit a1b2c3] [--out runs/] \
@@ -97,7 +98,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--client-llm", default=None, help="judge=client 时的 agent 内置 LLM 类路径，如 'my_agent.llm:LLMClient'")
     p_run.add_argument("--limit", type=int, default=None, help="冒烟模式：只评测（分片后的）前 N 道题，run_id 与 metadata 记录 limit")
     p_run.add_argument("--adapter-meta", default=None, help='适配器配置自由文本（"key=value;..."），原样记入 metadata["adapter_meta"]')
-    p_run.add_argument("--shards", type=int, default=1, help="数据集分片总数（默认 1 不分片）；上限=对话数（--shard-by dialogue）或题目数（默认 question 维度），超出直接报错")
+    p_run.add_argument(
+        "--shards",
+        type=_parse_shards,
+        default=1,
+        help="数据集分片总数（默认 1 不分片）；可传整数或 max（自动按数据集上限取最大：dialogue=对话数、question=题目数）；超过上限的整数按上限执行，越界分片索引安全跳过",
+    )
     p_run.add_argument("--shard-index", type=int, default=0, help="本分片序号（从 0 开始，需 < --shards；与 --limit 组合时先分片再截断）")
     p_run.add_argument("--shard-by", choices=["question", "dialogue"], default="question", help="分片维度：question 按题目（默认）；dialogue 整段选取对话、分片间不重复 ingest，适合几乎每个对话都有题的数据集（如 BEAM）")
     p_run.set_defaults(func=_cmd_run)
@@ -265,6 +271,20 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _parse_shards(value: str) -> int | str:
+    """--shards 解析：>= 1 的整数，或 'max'（按数据集上限自动取最大分片）。"""
+    text = str(value).strip().lower()
+    if text == "max":
+        return "max"
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("--shards 需为 >= 1 的整数或 'max'")
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"--shards 必须 >= 1 或 'max'，当前为 {n}")
+    return n
+
+
 def _make_adapter(name: str):
     """按注册表名实例化适配器。"""
     if name not in ADAPTERS:
@@ -320,9 +340,9 @@ def _make_evidence_matcher(args: argparse.Namespace):
 def _cmd_run(args: argparse.Namespace) -> int:
     if args.limit is not None and args.limit < 1:
         raise SystemExit(f"--limit 必须 >= 1，当前为 {args.limit}")
-    if args.shards < 1:
-        raise SystemExit(f"--shards 必须 >= 1，当前为 {args.shards}")
-    if not 0 <= args.shard_index < args.shards:
+    if args.shard_index < 0:
+        raise SystemExit(f"--shard-index 必须 >= 0，当前为 {args.shard_index}")
+    if args.shards != "max" and args.shard_index >= args.shards:
         raise SystemExit(
             f"--shard-index 必须满足 0 <= I < --shards，当前为 {args.shard_index}/{args.shards}"
         )
@@ -353,8 +373,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     try:
         run_dir = runner.run()
     except ValueError as exc:
-        # 数据集相关参数错误（分片数超限、schema 校验失败等）→ 友好退出
+        # 数据集相关参数错误（schema 校验失败等）→ 友好退出
         raise SystemExit(f"[membench] 参数错误: {exc}")
+    if run_dir is None:
+        # 分片无事可做（索引越界 / 空数据集）：runner 已打印说明，干净退出
+        return 0
     # report_out 时 Runner 已自建 <DIR>/eval_<adapter>_<platform>_<ts>/ 并复制 run 副本
     print(f"[membench] 完成: {run_dir}")
     return 0
