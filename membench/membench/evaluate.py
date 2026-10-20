@@ -253,26 +253,29 @@ def load_provided_result(key: str, run_dir: str) -> DatasetResult:
     )
 
 
-#: 汇总模式的元数据一致性检查维度（不含 commit：它是 A/B 的被测变量）。
-_META_CHECK_KEYS = (
+#: 汇总模式的「提示型」不一致维度：被测对象与评测口径维度（:data:`_IDENTITY_KEYS`）
+#: 混用已在跑前直接拒绝，这里只剩 platform 这类允许跨 run 差异、仅需标注的维度；
+#: commit 是 A/B 的被测变量，不在此列。
+_META_CHECK_KEYS = ("platform",)
+
+
+#: 同一侧/同一报告内必须唯一的维度：被测对象身份 + 评测口径（A/B 差异只应发生在侧之间）。
+_IDENTITY_KEYS = (
     "adapter",
-    "judge",
-    "driver_llm",
-    "judge_model",
     "adapter_version",
-    "platform",
+    "driver_llm",
+    "judge",
+    "judge_model",
+    "retrieval_match",
+    "retrieval_match_threshold",
 )
 
 
-#: 被测对象身份字段：同一侧/同一报告内必须唯一（A/B 的差异变量只应发生在侧与侧之间）。
-_IDENTITY_KEYS = ("adapter", "adapter_version", "driver_llm")
-
-
 def assert_single_identity(results: list[DatasetResult], label: str) -> None:
-    """校验一侧（或单臂汇总）内的被测对象身份唯一，防止混入多个系统/版本。
+    """校验一侧（或单臂汇总）内的被测对象与评测口径唯一，防止混入多个系统/版本/仪器。
 
     Raises:
-        SystemExit: ``adapter / adapter_version / driver_llm`` 出现多组取值。
+        SystemExit: :data:`_IDENTITY_KEYS` 中任一维度出现多组取值。
     """
     seen: dict[tuple, list[str]] = {}
     for r in results:
@@ -283,9 +286,61 @@ def assert_single_identity(results: list[DatasetResult], label: str) -> None:
             f"{dict(zip(_IDENTITY_KEYS, k))} ← {','.join(keys)}" for k, keys in seen.items()
         )
         raise SystemExit(
-            f"{label}混合了多个被测对象身份（adapter / adapter_version / driver_llm）："
-            f"{detail}——同一侧必须固定一个被测对象；请统一 run 来源或改用同一版本补跑"
-            "（对比的差异变量只应发生在两侧之间）"
+            f"{label}混合了多个被测对象身份或评测口径"
+            f"（{' / '.join(_IDENTITY_KEYS)}）：{detail}——同一侧必须固定一个被测对象与"
+            "评测口径；请统一 run 来源或改用同一参数补跑（差异变量只应发生在两侧之间）"
+        )
+
+
+def expected_fresh_metadata(
+    adapter: Any,
+    judge: Any,
+    driver_llm: Union[str, None],
+    adapter_version: Union[str, None],
+    matcher: Any = None,
+) -> dict[str, Any]:
+    """补跑将写入的（被测对象 + 评测口径）字段，用于与已有 run 预对齐。"""
+    if judge is None:
+        judge_name: Union[str, None] = None
+    elif isinstance(judge, str):
+        judge_name = judge
+    else:
+        judge_name = str(getattr(judge, "name", judge.__class__.__name__))
+    return {
+        "adapter": (
+            str(getattr(adapter, "name", adapter.__class__.__name__))
+            if adapter is not None
+            else None
+        ),
+        "adapter_version": adapter_version,
+        "driver_llm": driver_llm,
+        "judge": judge_name,
+        "judge_model": getattr(judge, "model", None) if judge is not None else None,
+        "retrieval_match": (
+            str(getattr(matcher, "name", None) or "substring") if matcher is not None else "substring"
+        ),
+        "retrieval_match_threshold": (
+            getattr(matcher, "threshold", None) if matcher is not None else None
+        ),
+    }
+
+
+def assert_gap_matches_provided(
+    provided: dict[str, DatasetResult], expected: dict[str, Any], label: str
+) -> None:
+    """补跑前预检：新 run 将写入的字段必须与已有 run 一致（不一致在跑之前就拒绝）。"""
+    if not provided:
+        return
+    sample = next(iter(provided.values()))
+    diffs = [
+        f"{key}: 现有 run={sample.metrics.get(key)!r} vs 本轮补跑={expected.get(key)!r}"
+        for key in _IDENTITY_KEYS
+        if sample.metrics.get(key) != expected.get(key)
+    ]
+    if diffs:
+        raise SystemExit(
+            f"{label}补跑参数与已有 run 不一致，融合后将不可归因：" + "；".join(diffs)
+            + "——请让补跑参数与已有 run 保持一致（或全部重跑）"
         )
 
 
@@ -825,9 +880,10 @@ def evaluate(
             None，此时报告头以已有 run 的元数据为准。
         from_runs: 汇总模式：``{数据集 key: 已有 run 目录}``。目标清单（``specs``）
             中有对应 run 的复用其结果、缺失的**补跑**（要求 adapter/judge 可用）；
-            未给 ``specs`` 时目标清单即这些 key（纯汇总）。同一汇总内
-            ``adapter / adapter_version / driver_llm`` 必须一致——混入多个被测对象
-            直接拒绝（避免结果不可归因）。
+            未给 ``specs`` 时目标清单即这些 key（纯汇总）。被测对象与评测口径
+            （:data:`_IDENTITY_KEYS`）在**开跑之前**校验：已有 run 之间混用、或
+            补跑参数与已有 run 不一致，直接拒绝（避免结果不可归因）；全新 run 缺
+            ``driver_llm / adapter_version`` 只在启动时提示（严格可比性会判无法核验）。
         out_dir: run 数据与缺省报告目录的父目录；None 时默认 paths.runs_dir()。
         platform: 平台标签。commit: commit 标签。
         quick: 跳过 BEAM 与 LongMemEval-S 槽位（等价 no_beam + no_lme_s）。
@@ -877,6 +933,27 @@ def evaluate(
         raise SystemExit(
             "以下数据集没有可复用的 run，补跑需要 --adapter 与 --judge: "
             + "、".join(missing_keys)
+        )
+
+    # 跑前预检：身份/口径问题必须在开跑之前暴露，避免昂贵评测跑完才发现汇总不可用。
+    if provided:
+        assert_single_identity(list(provided.values()), "本次汇总")
+    if missing_keys:
+        assert_gap_matches_provided(
+            provided,
+            expected_fresh_metadata(adapter, judge, driver_llm, adapter_version, evidence_matcher),
+            "本次评估",
+        )
+    if not provided and (driver_llm is None or adapter_version is None):
+        missing_meta = [
+            option
+            for option, value in (("--driver-llm", driver_llm), ("--adapter-version", adapter_version))
+            if value is None
+        ]
+        print(
+            f"[membench] 提示: 新 run 未标注 {' / '.join(missing_meta)}；"
+            "后续 compare --require-comparable 会判这些关键维度「无法核验」。"
+            "建议补齐参数，省略的标注无法事后补记。"
         )
 
     # 头信息：汇总模式优先以已有 run 的元数据为准（纯复用时没有新评测元数据）
@@ -954,8 +1031,6 @@ def evaluate(
     notes = metadata_inconsistencies(results)
     for note in notes:
         print(f"[membench] ⚠️ 汇总模式：跨数据集元数据不一致 —— {note}")
-
-    assert_single_identity(results, "本次汇总")
 
     fused = fuse_metrics(results)
     gate = evaluate_gate(results)

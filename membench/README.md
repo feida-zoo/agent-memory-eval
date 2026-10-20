@@ -84,7 +84,7 @@ python -m membench.cli evaluate --adapter <a> \
     --from-runs locomo=output/runs/<run_locomo>
 ```
 
-**汇总模式（`--from-runs KEY=RUN_DIR`，可重复）**：目标数据集里已有 run 的直接复用、缺失的补跑，最后统一出融合/评级/门禁报告；复用的 run 目录会复制进报告的 `runs/` 保持自包含。**同一汇总内 `adapter / adapter_version / driver_llm` 必须一致**（混入多个被测对象直接拒绝；对比场景同理，每侧固定一个被测对象，差异变量只应发生在两侧之间）。跨 run 的 `judge / judge_model / platform` 等评测条件不一致会在控制台与报告顶部**显著标注**（混 run 风险自担）。
+**汇总模式（`--from-runs KEY=RUN_DIR`，可重复）**：目标数据集里已有 run 的直接复用、缺失的补跑，最后统一出融合/评级/门禁报告；复用的 run 目录会复制进报告的 `runs/` 保持自包含。**被测对象与评测口径（`adapter / adapter_version / driver_llm / judge / judge_model / 检索口径`）同一侧必须一致**——已有 run 之间混用、或补跑参数与已有 run 不一致，都在**开跑之前**直接拒绝（对比场景同理，每侧固定一个被测对象，差异变量只应发生在两侧之间），避免跑完才发现汇总不可归因。仅跨 run 的 `platform` 差异保留：在控制台与报告顶部**显著标注**。全新评测缺 `--driver-llm / --adapter-version` 时启动即提示——严格可比性（`compare --require-comparable`）会判这些关键维度「无法核验」，且无法事后补记。
 
 说明：默认全量**包含** LongMemEval-S（每题约 50 个干扰会话 / ~115k token 的检索压力
 变体，与 oracle 的分差反映检索/精确率损失）；未下载时默认全量会报错提示先
@@ -110,14 +110,15 @@ python -m membench.cli evaluate-compare \
     --quick
 
 # 汇总模式：两侧逐数据集复用已跑完的 run、缺口自动补跑（KEY=RUN_DIR 可重复；
-# 某侧全部已跑完时可省略该侧 adapter）
+# 某侧全部已跑完时可省略该侧 adapter；被测对象与评测口径同一侧一致——
+# 混用或补跑参数与已有 run 不一致 → 开跑之前直接拒绝）
 python -m membench.cli evaluate-compare \
     --baseline-run office=<A_office_run> --candidate-run office=<B_office_run> \
     --baseline-run locomo=<A_locomo_run> --candidate-run locomo=<B_locomo_run> \
     --report-out <报告父目录> --tag "优化前vs优化后"
 ```
 
-门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **逐数据集题型 diff** + **两组融合 diff 表** + **per-dataset 门禁明细**（单数据集 spike 不被融合平均抹平）+ **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）；比率型指标以百分比呈现（如 `81.5%`），差值为百分点（如 `+2.3pt`）。指标"未计算"统一记 `null`，与真实 0 区分；诊断指标（检索召回率@5 / 过度拒答率）在 diff 与对照表中可见但不参与评级。旧版 run 的 capabilities 未落账时报告会按数据集/逐题记录自动推断并在头部标注来源。
+门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **逐数据集题型 diff** + **两组融合 diff 表** + **per-dataset 门禁明细**（单数据集 spike 不被融合平均抹平）+ **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）+ **「两侧可比性（逐数据集）」小节**（复用单数据集 `compare` 的维度表：两侧 `dataset_sha256 / judge / judge_model / driver_llm / platform` 不一致记「关键」、两侧都未标注记「关键缺失」、检索命中口径等次要维度记「次要」；两侧 `adapter / adapter_version` 与 `commit` 是被测变量，差异属预期不计入）；比率型指标以百分比呈现（如 `81.5%`），差值为百分点（如 `+2.3pt`）。指标"未计算"统一记 `null`，与真实 0 区分；诊断指标（检索召回率@5 / 过度拒答率）在 diff 与对照表中可见但不参与评级。旧版 run 的 capabilities 未落账时报告会按数据集/逐题记录自动推断并在头部标注来源。可比性问题在**两侧都复用的数据集对上会于开跑前**先打印到控制台——不必等跑完才发现两侧口径对不上。
 
 融合口径（重要，读总分前必读）：
 
@@ -226,6 +227,8 @@ python -m membench.cli run --adapter my-system --dataset membench/data/office_da
 - **FAIL**：strict 下存在关键维度不一致或无法核验。
 
 不可比原因在两处可见：CLI 输出逐条 `[membench] 不可比原因: [关键] <维度>: <说明>`；`ab_<tag>_<ts>/compare_report.md` 的「可比性前置校验」小节给出逐维度对照表（A / B / 是否一致）与「不可比原因」列表。
+
+**多数据集对比（`evaluate-compare`）同样逐数据集核对**：报告头部有一行汇总，正文附「两侧可比性（逐数据集）」小节（只列不一致与缺失项，级别同上表——「关键缺失」表示两侧都未标注、核验不了）。两点与单数据集 `compare` 不同：两侧 `adapter / adapter_version` 跨侧不同是本实验的设计变量，不进清单；两侧都已复用的数据集对在**跑前**就把问题清单打到控制台，跑完再用最终 run（含本轮补跑的数据集）复核一遍。
 
 ```bash
 python -m membench.cli compare --baseline runs/<run_a> --candidate runs/<run_b> \

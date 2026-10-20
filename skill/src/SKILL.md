@@ -164,8 +164,9 @@ python -m membench.cli evaluate --adapter <adapter> \
     --dataset office --dataset locomo --dataset ~/data/my_set.jsonl  # 显式清单（与预设开关互斥）
 python -m membench.cli evaluate --from-runs office=<run目录> --from-runs locomo=<run目录>
 # ↑ 汇总模式：已有 run 复用、缺口自动补跑；全部已跑完时 --adapter/--judge 可省略
-#   （同一侧 adapter / adapter_version / driver_llm 必须一致，混入多个被测对象直接拒绝；
-#    judge 等评测条件不一致会在控制台与报告顶部标注；与预设开关互斥）
+#   （同一侧 adapter / adapter_version / driver_llm / judge / judge_model / 检索口径 必须一致，
+#    混入多个被测对象或补跑参数与已有 run 不一致 → 开跑之前直接拒绝；
+#    仅 platform 差异会在控制台与报告顶部标注；与预设开关互斥）
 # 默认清单含 LongMemEval-S 与 BEAM-1M（用 --no-lme-s / --no-beam 剔除）
 ```
 
@@ -181,11 +182,14 @@ python -m membench.cli evaluate-compare \
 # llm 口径为逐题 chat 调用（单题可达 10s+），大规模评测配 --jobs 8~16 并发跑
 
 # 汇总模式：两侧各自复用+补跑（KEY=RUN_DIR 可重复；某侧全部已跑完时可省略该侧 adapter；
-# 每侧 adapter / adapter_version / driver_llm 必须一致——一侧固定一个被测对象）
+# 每侧 adapter / adapter_version / driver_llm / judge / judge_model / 检索口径 必须一致，
+# 混用或补跑参数与已有 run 不一致 → 开跑之前直接拒绝）
 python -m membench.cli evaluate-compare \
     --baseline-run office=<A_run> --candidate-run office=<B_run> \
     --baseline-run locomo=<A_run> --candidate-run locomo=<B_run> \
     --report-out ../output/ --tag "优化前vs优化后"
+# 报告附「两侧可比性（逐数据集）」：dataset_sha256 / judge / judge_model / driver_llm / platform
+# 不一致或两侧都未标注逐项列出（两侧都复用的数据集对在跑前先打印一份——别等跑完才发现）
 ```
 
 > **全量评估前必须先 fetch 用到的按需下载数据集**（locomo / longmemeval_oracle / gatemem_office / longmemeval_s / beam_1m 等），否则会报错提示先 `dataset fetch <key>`。命令：`python -m membench.cli dataset fetch <key>`（落 `~/.membench/datasets/`）。
@@ -314,6 +318,7 @@ python -m membench.cli doctor --target <url>     # 连通性 + 三端点契约�
 - **并行分片要实例隔离**：分片是"进程级"并行——每个分片必须独占一个记忆实例（HTTP 桥 = 每分片独立桥进程，`BRIDGE_PORT` / `BRIDGE_DATA_DIR` 各自隔离；Python 适配器 = 每分片独立进程）。runner 对每个 dialogue 调 `reset()`，共享同一实例并行会互相清库（跨片串扰）；只有一个实例时请串行跑分片。
 - **分片数上限与 `--shards max`**：dialogue 模式上限=数据集对话数、question 模式上限=题目数；传超过上限的整数会**按上限执行**（不报错）；`--shards max` 自动按上限取最大；索引越过有效分片数的进程安全跳过（不产生空 run）。
 - **分片 A/B（大数据集对比）官方通路**：两侧分别 `run --shards N --shard-by dialogue`（每分片独立实例并行）→ 每侧每数据集 `fuse` 合并成完整 run → `evaluate-compare --baseline-run <key>=<A完整run> --candidate-run <key>=<B完整run>` 汇总出完整对比报告；融合产物透传全部可比性元数据，可直接参与 `compare --require-comparable` 复验。
+- **多数据集对比的可比性**：报告附「两侧可比性（逐数据集）」（两侧 `dataset_sha256 / judge / judge_model / driver_llm / platform` 不一致记「关键」、两侧都未标注记「关键缺失」、检索口径等记「次要」；`adapter / adapter_version` 与 `commit` 是被测变量，差异属预期）；两侧都复用的数据集对在**开跑前**先打印问题清单。要做成"能归因的 A/B"，两侧就都带上 `--driver-llm-a/-b` 与 `--adapter-version-a/-b`——缺了只能在报告里记「无法核验」，事后无法补记。
 
 ## 结果解读准则
 

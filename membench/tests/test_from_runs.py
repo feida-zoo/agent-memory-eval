@@ -138,12 +138,12 @@ def test_parse_run_kv_validation(tmp_path: Path) -> None:
     assert parse_run_kv([f"a={tmp_path}"], "--from-runs") == {"a": str(tmp_path)}
 
 
-def test_metadata_inconsistency_note(tmp_path: Path) -> None:
-    """混 run 汇总：跨数据集元数据不一致要在报告与控制台显著标注。"""
+def test_metadata_inconsistency_note(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """混 run 汇总：platform 这类允许差异的维度不拒绝，但要在报告与控制台显著标注。"""
     _, _, runs = _make_runs(tmp_path)
     metrics_path = Path(runs["b"]) / "metrics.json"
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-    metrics["judge"] = "llm"
+    metrics["platform"] = "other-platform"
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False), encoding="utf-8")
 
     rc = evaluate(
@@ -154,9 +154,68 @@ def test_metadata_inconsistency_note(tmp_path: Path) -> None:
         from_runs={"a": runs["a"], "b": runs["b"]},
     )
     assert rc == 0
+    assert "platform" in capsys.readouterr().out
     eval_dir = next((tmp_path / "out6").glob("eval_*"))
     md = (eval_dir / "evaluate_report.md").read_text(encoding="utf-8")
-    assert "汇总模式" in md and "judge" in md
+    assert "汇总模式" in md and "platform" in md
+
+
+def test_evaluate_mixed_judge_rejected_before_run(tmp_path: Path) -> None:
+    """单臂汇总：judge 混用 → 跑前拒绝，且不创建报告目录。"""
+    _, _, runs = _make_runs(tmp_path)
+    metrics_path = Path(runs["b"]) / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["judge"] = "llm"
+    metrics_path.write_text(json.dumps(metrics, ensure_ascii=False), encoding="utf-8")
+
+    out = tmp_path / "out_judge_mix"
+    with pytest.raises(SystemExit, match="混合了多个被测对象"):
+        evaluate(
+            None,
+            None,
+            out_dir=str(tmp_path / "runs_judge_mix"),
+            report_out=str(out),
+            from_runs={"a": runs["a"], "b": runs["b"]},
+        )
+    assert not out.exists()
+
+
+def test_evaluate_gap_fill_metadata_mismatch_rejected_before_run(tmp_path: Path) -> None:
+    """补跑参数与已有 run 不一致 → 跑前拒绝（不白跑一轮才发现融合不可归因）。"""
+    _, _, runs = _make_runs(tmp_path)
+    out = tmp_path / "out_mismatch"
+    with pytest.raises(SystemExit, match="补跑参数与已有 run 不一致"):
+        evaluate(
+            MockStrongAdapter(),
+            "heuristic",
+            out_dir=str(tmp_path / "runs_mismatch"),
+            report_out=str(out),
+            specs=[
+                DatasetSpec(key="a", name="a", path=str(tmp_path / "a.jsonl"), source="user-specified"),
+                DatasetSpec(key="b", name="b", path=str(tmp_path / "b.jsonl"), source="user-specified"),
+                DatasetSpec(key="c", name="c", path=str(tmp_path / "a.jsonl"), source="user-specified"),
+            ],
+            from_runs={"a": runs["a"], "b": runs["b"]},
+            adapter_version="v2",
+        )
+    assert not out.exists()
+
+
+def test_evaluate_fresh_run_missing_verifiable_meta_hint(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """全新建评测缺 driver_llm/adapter_version → 启动即提示严格可比性会判无法核验。"""
+    a = _write_dataset(tmp_path / "a.jsonl", "d_a", "q_a")
+    b = _write_dataset(tmp_path / "b.jsonl", "d_b", "q_b")
+    rc = evaluate(
+        MockStrongAdapter(),
+        "heuristic",
+        out_dir=str(tmp_path / "runs_hint"),
+        report_out=str(tmp_path / "out_hint"),
+        specs=_specs(a, b),
+    )
+    assert rc == 0
+    assert "无法核验" in capsys.readouterr().out
 
 
 def _make_compare(tmp_path: Path) -> tuple[dict[str, str], dict[str, str]]:
@@ -325,3 +384,83 @@ def test_evaluate_mixed_adapter_version_rejected(tmp_path: Path) -> None:
             report_out=str(tmp_path / "out_mix"),
             from_runs={"a": ra, "b": rb},
         )
+
+
+def test_evaluate_compare_gap_fill_metadata_mismatch_rejected_before_run(tmp_path: Path) -> None:
+    """对比侧补跑参数与已有 run 不一致 → 跑前拒绝，实验目录不落地。"""
+    baseline, candidate = _make_compare(tmp_path)
+    out = tmp_path / "ab_mismatch"
+    with pytest.raises(SystemExit, match="补跑参数与已有 run 不一致"):
+        evaluate_compare(
+            MockWeakAdapter(),
+            None,
+            "heuristic",
+            out_dir=str(tmp_path / "runs_ab_mismatch"),
+            report_out=str(out),
+            tag="mismatch",
+            baseline_runs={"a": baseline["a"]},
+            candidate_runs=candidate,
+            adapter_version_baseline="v2",
+        )
+    assert not out.exists()
+
+
+def test_evaluate_compare_cross_side_instrument_diff_flagged(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """跨侧仪器维度（platform / 检索口径）不一致：跑前告警 + 报告「两侧可比性」逐项可查。"""
+    baseline, candidate = _make_compare(tmp_path)
+    capsys.readouterr()  # 丢弃 _make_compare 内部运行的输出，只断言本次调用
+    metrics_path = Path(candidate["a"]) / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["platform"] = "fs"
+    metrics["retrieval_match"] = "llm"
+    metrics_path.write_text(json.dumps(metrics, ensure_ascii=False), encoding="utf-8")
+
+    result = evaluate_compare(
+        None,
+        None,
+        None,
+        report_out=str(tmp_path / "ab_inst"),
+        tag="inst",
+        baseline_runs={"a": baseline["a"]},
+        candidate_runs={"a": candidate["a"]},
+    )
+    out = capsys.readouterr().out
+    assert "两侧可比性问题（两侧均复用 run，跑前检查）" in out
+    assert "platform: A=" in out and "B=fs" in out
+    assert "[次要] retrieval_match: A=substring != B=llm" in out
+    md = (Path(result["compare_dir"]) / "compare_report.md").read_text(encoding="utf-8")
+    assert "## 两侧可比性（逐数据集）" in md
+    assert "| 平台 | 关键 |" in md and "| 检索匹配口径 | 次要 |" in md
+    # 两侧都未标注 driver_llm 记「关键缺失」，与「关键不一致」分开计数
+    assert "| 驱动 LLM | 关键缺失 |" in md or "| driver_llm | 关键缺失 |" in md
+    assert "两侧可比性：关键不一致 1 项、关键缺失 1 项、次要 1 项" in md
+
+
+def test_evaluate_compare_cross_side_ignores_tested_object_dims(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """跨侧被测对象不同（adapter / adapter_version）属设计变量，不作为可比性问题。"""
+    baseline, candidate = _make_compare(tmp_path)
+    capsys.readouterr()  # 丢弃 _make_compare 内部运行的输出，只断言本次调用
+    for run_map in (baseline, candidate):
+        for run_dir in run_map.values():
+            metrics_path = Path(run_dir) / "metrics.json"
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            metrics["driver_llm"] = "gpt-4o"  # 仪器维度对齐后不应再有任何可比性问题
+            metrics_path.write_text(json.dumps(metrics, ensure_ascii=False), encoding="utf-8")
+    result = evaluate_compare(
+        None,
+        None,
+        None,
+        report_out=str(tmp_path / "ab_tested"),
+        tag="tested",
+        baseline_runs={"a": baseline["a"], "b": baseline["b"]},
+        candidate_runs={"a": candidate["a"], "b": candidate["b"]},
+    )
+    out = capsys.readouterr().out
+    assert "两侧可比性问题" not in out
+    md = (Path(result["compare_dir"]) / "compare_report.md").read_text(encoding="utf-8")
+    assert "（无：各数据集两侧关键与次要维度均一致且可核验）" in md
+    assert "两侧可比性：各数据集关键维度一致且可核验" in md

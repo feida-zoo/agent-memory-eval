@@ -24,8 +24,10 @@ A/B 没有现成入口——本模块补齐，产出与 ``ab_<tag>_<ts>/`` 自�
     其余指标变动仅报告。
 
 两组均跑同一 judge；adapter 元数据（adapter_version / commit / driver_llm）
-独立传入，落到两侧 run 的 metrics.json。可比性前置校验由两侧各数据集的
-dataset_fingerprint 自动覆盖（同一数据集两侧指纹必一致），故不重复。
+独立传入，落到两侧 run 的 metrics.json。跨侧可比性按单数据集 compare 的维度表
+逐数据集核对：两侧都已复用的数据集对在**开跑前**打印问题清单，跑完（含本轮补跑
+的数据集）在控制台与报告「两侧可比性（逐数据集）」小节呈现——只测量差异，不改变
+accuracy / stale / latency 门禁结论。
 """
 
 from __future__ import annotations
@@ -37,12 +39,14 @@ from datetime import datetime
 from typing import Any, Union
 
 from membench import layout, paths
-from membench.compare import _diff_overall, _eval_gates
+from membench.compare import _diff_overall, _eval_gates, check_comparability
 from membench.data.schema import is_abstention
 from membench.evaluate import (
     DatasetResult,
     DatasetSpec,
+    assert_gap_matches_provided,
     assert_single_identity,
+    expected_fresh_metadata,
     fuse_metrics,
     load_provided_result,
     metadata_inconsistencies,
@@ -53,6 +57,7 @@ from membench.evaluate import (
 from membench.report import (
     PALETTE,
     EFFICIENCY_DIFF_METRICS,
+    _fmt_opt,
     _md_table,
     _setup_fonts,
     category_display,
@@ -206,6 +211,82 @@ def _per_dataset_diff(results: list[ArmDatasetResult]) -> list[dict[str, Any]]:
         diffs = _diff_overall(a, b)
         rows.append({"spec": r.spec, "diffs": diffs})
     return rows
+
+
+#: 跨侧可比性清单中不呈现的维度：evaluate-compare 的契约就是两侧各固定一个被测对象
+#: （A 基线 / B 候选），``adapter / adapter_version`` 跨侧不同是本实验的设计变量；
+#: ``commit`` 等同属 info 级（不出清单）。仪器类维度（数据集指纹 / judge / 判分模型 /
+#: driver LLM / platform / 检索口径）才决定报告能否归因。
+_CROSS_SIDE_EXPECTED_DIFFS: tuple[str, ...] = ("adapter", "adapter_version")
+
+
+def _cross_side_findings(
+    pairs: list[tuple[DatasetSpec, dict[str, Any], dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """逐数据集核对两侧 run 是否可比（复用单数据集 compare 的维度表与分级）。
+
+    只测量差异、不判定两侧是否只差一个变量；被测变量（adapter / adapter_version）
+    与 info 级维度（commit / 数据集路径等）不进清单——它们跨侧不同是预期内的。
+    ``kind`` 区分「两侧不一致」（``mismatch``）与「关键维度缺失、无法核验」
+    （``missing``，如未标注 driver LLM）；两者含义不同，报告分开计数。
+
+    Args:
+        pairs: ``[(spec, baseline_metrics, candidate_metrics)]``。
+
+    Returns:
+        每项 ``{"key", "name", "dimension", "severity", "kind", "a", "b", "detail"}``。
+    """
+    findings: list[dict[str, Any]] = []
+    for spec, baseline_metrics, candidate_metrics in pairs:
+        comparability = check_comparability(baseline_metrics, candidate_metrics)
+        missing_dims = {c["dimension"] for c in comparability["unverifiable"]}
+        for check in comparability["checks"]:
+            if check["severity"] == "info" or check["same"]:
+                continue
+            if check["dimension"] in _CROSS_SIDE_EXPECTED_DIFFS:
+                continue
+            findings.append(
+                {
+                    "key": spec.key,
+                    "name": spec.name,
+                    "dimension": check["dimension"],
+                    "severity": check["severity"],
+                    "kind": "missing" if check["dimension"] in missing_dims else "mismatch",
+                    "a": check.get("a"),
+                    "b": check.get("b"),
+                    "detail": check.get("detail", ""),
+                }
+            )
+    return findings
+
+
+def _finding_level(finding: dict[str, Any]) -> str:
+    """finding 的级别显示名（``关键缺失`` 区别于 ``关键`` 不一致）。"""
+    if finding.get("kind") == "missing":
+        return "关键缺失"
+    return "关键" if finding["severity"] == "critical" else "次要"
+
+
+def _finding_counts(findings: list[dict[str, Any]]) -> tuple[int, int, int]:
+    """按「关键不一致 / 关键缺失 / 次要」三类计数。"""
+    critical = sum(
+        1 for f in findings if f["kind"] == "mismatch" and f["severity"] == "critical"
+    )
+    missing = sum(1 for f in findings if f["kind"] == "missing")
+    return critical, missing, len(findings) - critical - missing
+
+
+def _print_cross_side_findings(findings: list[dict[str, Any]], title: str) -> None:
+    """把两侧可比性问题打到控制台（跑前与跑后共用）。"""
+    if not findings:
+        return
+    critical, missing, secondary = _finding_counts(findings)
+    print(
+        f"[membench] ⚠️ {title}"
+        f"（关键不一致 {critical} 项 / 关键缺失 {missing} 项 / 次要 {secondary} 项）"
+    )
+    for f in findings:
+        print(f"[membench]   - {f['name']} [{_finding_level(f)}] {f['dimension']}: {f['detail']}")
 
 
 def _fused_diff(
@@ -376,8 +457,10 @@ def evaluate_compare(
         baseline_runs / candidate_runs: 汇总模式：``{数据集 key: 已有 run 目录}``。
             目标清单中有对应 run 的复用、缺失的**补跑**（需要该侧 adapter 与
             judge 可用）；未给 ``specs`` 时目标清单即两侧 key 的并集。**每侧**
-            的 ``adapter / adapter_version / driver_llm`` 必须一致——一侧混入
-            多个被测对象直接拒绝（A/B 的差异变量只应发生在两侧之间）。
+            的被测对象与评测口径（:data:`membench.evaluate._IDENTITY_KEYS`）在
+            **开跑之前**校验：已有 run 之间混用、或补跑参数与已有 run 不一致，
+            直接拒绝（A/B 的差异变量只应发生在两侧之间）；某侧全新评测缺
+            driver_llm / adapter_version 时启动即提示（严格可比性会判无法核验）。
         out_dir: run 输出父目录；None 时用 :func:`membench.paths.runs_dir`。
         platform / commit: 平台与 commit 标签（写到两侧 run 元数据）。
         quick / beam_10m / no_beam / no_lme_s: 同 :func:`membench.evaluate.evaluate`。
@@ -465,6 +548,18 @@ def evaluate_compare(
             "heuristic 判分可能失真，建议使用 --judge llm 或 --judge client。"
         )
 
+    # 跑前预检：两侧都已复用的数据集对先把可比性问题摆出来（避免跑完才发现报告不可用）
+    _print_cross_side_findings(
+        _cross_side_findings(
+            [
+                (s, baseline_provided[s.key].metrics, candidate_provided[s.key].metrics)
+                for s in specs
+                if s.key in baseline_provided and s.key in candidate_provided
+            ]
+        ),
+        "两侧可比性问题（两侧均复用 run，跑前检查）",
+    )
+
     # 两侧组装：已有 run 直接复用，缺失数据集用该侧 adapter 补跑
     def _assemble_side(
         label: str,
@@ -478,12 +573,37 @@ def evaluate_compare(
             if spec.key in provided:
                 print(f"[membench] 复用已有 run（{label}）: {spec.key} <- {provided[spec.key].run_dir}")
         missing = [s for s in specs if s.key not in by_key]
+        # 跑前预检：身份/口径问题必须在开跑之前暴露（避免昂贵评测跑完才发现对比不可用）
+        if provided:
+            assert_single_identity(list(provided.values()), label)
+        else:
+            missing_meta = [
+                option
+                for option, value in (
+                    ("--driver-llm-a/-b", driver_llm_value),
+                    ("--adapter-version-a/-b", adapter_version_value),
+                )
+                if value is None
+            ]
+            if missing_meta:
+                print(
+                    f"[membench] 提示: {label}为全新评测且未标注 {' / '.join(missing_meta)}；"
+                    "严格可比性（compare --require-comparable）会判这些关键维度「无法核验」。"
+                    "建议补齐参数，省略的标注无法事后补记。"
+                )
         if missing:
             if adapter is None or judge is None:
                 raise SystemExit(
                     f"{label} 以下数据集没有可复用的 run，补跑需要适配器与 judge: "
                     + "、".join(s.key for s in missing)
                 )
+            assert_gap_matches_provided(
+                provided,
+                expected_fresh_metadata(
+                    adapter, judge, driver_llm_value, adapter_version_value, evidence_matcher
+                ),
+                label,
+            )
             for r in run_datasets(
                 adapter,
                 judge,
@@ -519,10 +639,6 @@ def evaluate_compare(
         "候选侧", candidate_adapter, candidate_provided, driver_llm_candidate, adapter_version_candidate
     )
 
-    # 每侧必须固定一个被测对象身份（A/B 的差异变量只应发生在两侧之间）
-    assert_single_identity(baseline_results, "基线侧")
-    assert_single_identity(candidate_results, "候选侧")
-
     # 对齐 baseline / candidate 各数据集（按 spec.key 匹配）
     baseline_by_key = {r.spec.key: r for r in baseline_results}
     candidate_by_key = {r.spec.key: r for r in candidate_results}
@@ -542,6 +658,11 @@ def evaluate_compare(
             )
         )
 
+    # 两侧可比性（逐数据集）：与单数据集 compare 同一套维度表；只测量差异、不进门禁结论
+    comparability_findings = _cross_side_findings(
+        [(arm.spec, arm.baseline, arm.candidate) for arm in arms]
+    )
+
     # 汇总模式的元数据一致性提示（混 run 风险）
     notes: list[str] = []
     for label, side in (("基线侧", baseline_results), ("候选侧", candidate_results)):
@@ -549,6 +670,9 @@ def evaluate_compare(
             notes.append(f"{label}内部：{note}")
     for note in notes:
         print(f"[membench] ⚠️ 汇总模式：{note}")
+
+    # 两侧可比性问题（含本轮补跑的数据集）在控制台同步提示；详情见报告同名小节
+    _print_cross_side_findings(comparability_findings, "两侧可比性问题（详见报告「两侧可比性」）")
 
     # 逐数据集 diff
     per_dataset = _per_dataset_diff(arms)
@@ -620,6 +744,7 @@ def evaluate_compare(
         verdict,
         per_dataset_gates=per_dataset_gates,
         per_dataset_verdict=per_dataset_verdict,
+        comparability_findings=comparability_findings,
         cap_sources={"baseline": cap_sources_a, "candidate": cap_sources_b},
         extra_notes=[f"> ⚠️ **汇总模式**：{note}" for note in notes],
     )
@@ -663,8 +788,14 @@ def _write_evaluate_compare_report(
     per_dataset_verdict: str | None = None,
     cap_sources: dict[str, dict[str, str]] | None = None,
     extra_notes: list[str] | None = None,
+    comparability_findings: list[dict[str, Any]] | None = None,
 ) -> str:
-    """生成 evaluate-compare 的 compare_report.md（中文）。"""
+    """生成 evaluate-compare 的 compare_report.md（中文）。
+
+    ``comparability_findings`` 非空时：抬头给一行汇总，并在「门禁明细」后附
+    「两侧可比性（逐数据集）」小节（逐数据集列出关键不一致 / 关键缺失 / 次要差异，
+    口径与单数据集 compare 一致）。
+    """
     lines: list[str] = []
     lines.append(f"# membench 两组多数据集对比报告 — {baseline_name} vs {candidate_name}")
     lines.append("")
@@ -697,6 +828,15 @@ def _write_evaluate_compare_report(
             "不可直接比较。"
         )
     lines.append(f"- 时间戳: {timestamp.isoformat(timespec='seconds')}")
+    findings = comparability_findings or []
+    if findings:
+        critical_n, missing_n, secondary_n = _finding_counts(findings)
+        lines.append(
+            f"- ⚠️ 两侧可比性：关键不一致 {critical_n} 项、关键缺失 {missing_n} 项、"
+            f"次要 {secondary_n} 项——详见「两侧可比性（逐数据集）」小节"
+        )
+    else:
+        lines.append("- 两侧可比性：各数据集关键维度一致且可核验")
     lines.append("")
 
     # capabilities 来源标注：任一侧有推断值时提示，避免"未定义/未落账"混淆。
@@ -894,6 +1034,35 @@ def _write_evaluate_compare_report(
         lines.append(_md_table(["门禁", "状态", "", "说明"], gate_rows))
     else:
         lines.append("（无可评估的门禁项——任一侧融合值缺失）")
+    lines.append("")
+
+    # 3.5 两侧可比性（逐数据集）
+    lines.append("## 两侧可比性（逐数据集）")
+    lines.append("")
+    lines.append(
+        "<sub>与单数据集 `compare` 同一套维度表：关键维度（dataset_sha256 / judge / "
+        "judge_model / driver_llm / platform）不一致（级别「关键」）或两侧都未标注、"
+        "无法核验（级别「关键缺失」）时，该数据集的对比结果不可归因"
+        "（`compare --require-comparable` 两种情况都判不可比）；次要维度（检索命中口径等）"
+        "不一致时检索类指标不可直接比较。两侧 `adapter / adapter_version` 与 `commit` "
+        "是被测变量，差异属预期，不计入本表。</sub>"
+    )
+    lines.append("")
+    if findings:
+        comp_rows = [
+            [
+                f["name"],
+                dim_label(str(f["dimension"])),
+                _finding_level(f),
+                _fmt_opt(f.get("a")),
+                _fmt_opt(f.get("b")),
+                str(f.get("detail", "")),
+            ]
+            for f in findings
+        ]
+        lines.append(_md_table(["数据集", "维度", "级别", "A (基线)", "B (候选)", "说明"], comp_rows))
+    else:
+        lines.append("（无：各数据集两侧关键与次要维度均一致且可核验）")
     lines.append("")
 
     # 4. 两组融合指标完整表（含参与集与差值）
