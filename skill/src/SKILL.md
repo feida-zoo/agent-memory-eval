@@ -164,7 +164,8 @@ python -m membench.cli evaluate --adapter <adapter> \
     --dataset office --dataset locomo --dataset ~/data/my_set.jsonl  # 显式清单（与预设开关互斥）
 python -m membench.cli evaluate --from-runs office=<run目录> --from-runs locomo=<run目录>
 # ↑ 汇总模式：已有 run 复用、缺口自动补跑；全部已跑完时 --adapter/--judge 可省略
-#   （元数据不一致会在控制台与报告顶部标注；与预设开关互斥）
+#   （同一侧 adapter / adapter_version / driver_llm 必须一致，混入多个被测对象直接拒绝；
+#    judge 等评测条件不一致会在控制台与报告顶部标注；与预设开关互斥）
 # 默认清单含 LongMemEval-S 与 BEAM-1M（用 --no-lme-s / --no-beam 剔除）
 ```
 
@@ -179,7 +180,8 @@ python -m membench.cli evaluate-compare \
 # （口径不同不可与历史 substring 跑分直接比较，两侧需同口径重跑）
 # llm 口径为逐题 chat 调用（单题可达 10s+），大规模评测配 --jobs 8~16 并发跑
 
-# 汇总模式：两侧各自复用+补跑（KEY=RUN_DIR 可重复；某侧全部已跑完时可省略该侧 adapter）
+# 汇总模式：两侧各自复用+补跑（KEY=RUN_DIR 可重复；某侧全部已跑完时可省略该侧 adapter；
+# 每侧 adapter / adapter_version / driver_llm 必须一致——一侧固定一个被测对象）
 python -m membench.cli evaluate-compare \
     --baseline-run office=<A_run> --candidate-run office=<B_run> \
     --baseline-run locomo=<A_run> --candidate-run locomo=<B_run> \

@@ -84,7 +84,7 @@ python -m membench.cli evaluate --adapter <a> \
     --from-runs locomo=output/runs/<run_locomo>
 ```
 
-**汇总模式（`--from-runs KEY=RUN_DIR`，可重复）**：目标数据集里已有 run 的直接复用、缺失的补跑，最后统一出融合/评级/门禁报告；复用的 run 目录会复制进报告的 `runs/` 保持自包含。跨 run 的 adapter / judge / driver_llm 等元数据不一致会在控制台与报告顶部**显著标注**（混 run 风险自担）。
+**汇总模式（`--from-runs KEY=RUN_DIR`，可重复）**：目标数据集里已有 run 的直接复用、缺失的补跑，最后统一出融合/评级/门禁报告；复用的 run 目录会复制进报告的 `runs/` 保持自包含。**同一汇总内 `adapter / adapter_version / driver_llm` 必须一致**（混入多个被测对象直接拒绝；对比场景同理，每侧固定一个被测对象，差异变量只应发生在两侧之间）。跨 run 的 `judge / judge_model / platform` 等评测条件不一致会在控制台与报告顶部**显著标注**（混 run 风险自担）。
 
 说明：默认全量**包含** LongMemEval-S（每题约 50 个干扰会话 / ~115k token 的检索压力
 变体，与 oracle 的分差反映检索/精确率损失）；未下载时默认全量会报错提示先

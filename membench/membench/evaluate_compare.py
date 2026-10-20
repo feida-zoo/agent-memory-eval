@@ -42,6 +42,7 @@ from membench.data.schema import is_abstention
 from membench.evaluate import (
     DatasetResult,
     DatasetSpec,
+    assert_single_identity,
     fuse_metrics,
     load_provided_result,
     metadata_inconsistencies,
@@ -374,7 +375,9 @@ def evaluate_compare(
             None。
         baseline_runs / candidate_runs: 汇总模式：``{数据集 key: 已有 run 目录}``。
             目标清单中有对应 run 的复用、缺失的**补跑**（需要该侧 adapter 与
-            judge 可用）；未给 ``specs`` 时目标清单即两侧 key 的并集。
+            judge 可用）；未给 ``specs`` 时目标清单即两侧 key 的并集。**每侧**
+            的 ``adapter / adapter_version / driver_llm`` 必须一致——一侧混入
+            多个被测对象直接拒绝（A/B 的差异变量只应发生在两侧之间）。
         out_dir: run 输出父目录；None 时用 :func:`membench.paths.runs_dir`。
         platform / commit: 平台与 commit 标签（写到两侧 run 元数据）。
         quick / beam_10m / no_beam / no_lme_s: 同 :func:`membench.evaluate.evaluate`。
@@ -515,6 +518,10 @@ def evaluate_compare(
     candidate_results = _assemble_side(
         "候选侧", candidate_adapter, candidate_provided, driver_llm_candidate, adapter_version_candidate
     )
+
+    # 每侧必须固定一个被测对象身份（A/B 的差异变量只应发生在两侧之间）
+    assert_single_identity(baseline_results, "基线侧")
+    assert_single_identity(candidate_results, "候选侧")
 
     # 对齐 baseline / candidate 各数据集（按 spec.key 匹配）
     baseline_by_key = {r.spec.key: r for r in baseline_results}

@@ -274,3 +274,54 @@ def test_sharded_ab_official_path(tmp_path: Path) -> None:
     assert "两组多数据集对比报告" in md
     assert "mock-weak vs mock-strong" in md
     assert result["verdict"] in ("PASS", "WARN", "FAIL")
+
+
+def test_evaluate_compare_side_identity_unique(tmp_path: Path) -> None:
+    """同一侧混入多个被测对象（adapter 不同）→ 直接拒绝（A/B 差异只能发生在两侧之间）。"""
+    from membench.runner import Runner
+
+    baseline, candidate = _make_compare(tmp_path)
+    a = _write_dataset(tmp_path / "a.jsonl", "d_a", "q_a")
+    other = Runner(
+        MockStrongAdapter(), str(a), judge="heuristic", out_dir=str(tmp_path / "other")
+    ).run()
+    with pytest.raises(SystemExit, match="混合了多个被测对象身份"):
+        evaluate_compare(
+            None,
+            None,
+            None,
+            report_out=str(tmp_path / "ab_mix"),
+            tag="mix",
+            baseline_runs={"a": other, "b": baseline["b"]},
+            candidate_runs=candidate,
+        )
+
+
+def test_evaluate_mixed_adapter_version_rejected(tmp_path: Path) -> None:
+    """单臂汇总：adapter_version 不一致 → 直接拒绝。"""
+    from membench.runner import Runner
+
+    a = _write_dataset(tmp_path / "a.jsonl", "d_a", "q_a")
+    b = _write_dataset(tmp_path / "b.jsonl", "d_b", "q_b")
+    ra = Runner(
+        MockStrongAdapter(),
+        str(a),
+        judge="heuristic",
+        out_dir=str(tmp_path / "ra"),
+        adapter_version="v1",
+    ).run()
+    rb = Runner(
+        MockStrongAdapter(),
+        str(b),
+        judge="heuristic",
+        out_dir=str(tmp_path / "rb"),
+        adapter_version="v2",
+    ).run()
+    with pytest.raises(SystemExit, match="混合了多个被测对象身份"):
+        evaluate(
+            None,
+            None,
+            out_dir=str(tmp_path / "runs"),
+            report_out=str(tmp_path / "out_mix"),
+            from_runs={"a": ra, "b": rb},
+        )

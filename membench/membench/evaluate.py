@@ -264,6 +264,31 @@ _META_CHECK_KEYS = (
 )
 
 
+#: 被测对象身份字段：同一侧/同一报告内必须唯一（A/B 的差异变量只应发生在侧与侧之间）。
+_IDENTITY_KEYS = ("adapter", "adapter_version", "driver_llm")
+
+
+def assert_single_identity(results: list[DatasetResult], label: str) -> None:
+    """校验一侧（或单臂汇总）内的被测对象身份唯一，防止混入多个系统/版本。
+
+    Raises:
+        SystemExit: ``adapter / adapter_version / driver_llm`` 出现多组取值。
+    """
+    seen: dict[tuple, list[str]] = {}
+    for r in results:
+        key = tuple(r.metrics.get(k) for k in _IDENTITY_KEYS)
+        seen.setdefault(key, []).append(r.spec.key)
+    if len(seen) > 1:
+        detail = "；".join(
+            f"{dict(zip(_IDENTITY_KEYS, k))} ← {','.join(keys)}" for k, keys in seen.items()
+        )
+        raise SystemExit(
+            f"{label}混合了多个被测对象身份（adapter / adapter_version / driver_llm）："
+            f"{detail}——同一侧必须固定一个被测对象；请统一 run 来源或改用同一版本补跑"
+            "（对比的差异变量只应发生在两侧之间）"
+        )
+
+
 def metadata_inconsistencies(results: list[DatasetResult]) -> list[str]:
     """跨数据集元数据不一致清单（汇总模式提示"混 run"风险）。
 
@@ -800,7 +825,9 @@ def evaluate(
             None，此时报告头以已有 run 的元数据为准。
         from_runs: 汇总模式：``{数据集 key: 已有 run 目录}``。目标清单（``specs``）
             中有对应 run 的复用其结果、缺失的**补跑**（要求 adapter/judge 可用）；
-            未给 ``specs`` 时目标清单即这些 key（纯汇总）。
+            未给 ``specs`` 时目标清单即这些 key（纯汇总）。同一汇总内
+            ``adapter / adapter_version / driver_llm`` 必须一致——混入多个被测对象
+            直接拒绝（避免结果不可归因）。
         out_dir: run 数据与缺省报告目录的父目录；None 时默认 paths.runs_dir()。
         platform: 平台标签。commit: commit 标签。
         quick: 跳过 BEAM 与 LongMemEval-S 槽位（等价 no_beam + no_lme_s）。
@@ -927,6 +954,8 @@ def evaluate(
     notes = metadata_inconsistencies(results)
     for note in notes:
         print(f"[membench] ⚠️ 汇总模式：跨数据集元数据不一致 —— {note}")
+
+    assert_single_identity(results, "本次汇总")
 
     fused = fuse_metrics(results)
     gate = evaluate_gate(results)
