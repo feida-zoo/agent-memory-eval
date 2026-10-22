@@ -55,6 +55,7 @@ description: >
 
 1. 阅读 `references/adapter_guide.md`（含第 3 节真实性红线：真实写入/读取路径是完整评测的唯一前提；旁路不得自行采用，走不通时停下、由用户决定降级口径），在被测 Agent 源码中定位三个挂点：记忆清空、记忆写入、记忆读取+回答。
 2. 实现 `BaseMemoryAdapter` 三方法（`reset` / `ingest` / `query`），或在 Agent 侧暴露 `POST /reset|/ingest|/query` 三个端点后用内置 HttpAdapter。
+   - **`query` 必须回填 `retrieved`**：= 实际拼进回答 prompt 的**记忆条目原文**，按注入优先级排序，多轮检索**先合并去重**再返回，报**注入的那一份全量**（框架不合并、不去重、不截断；返回空列表 = 静默按 0 召回计）。它决定 `evidence_recall` / `recall@5` 是否成立，细则见 `references/adapter_guide.md` §2.3。
    - **若被测 Agent 的记忆能力本身就是"LLM + 工具调用"**（ingest 与 query 是同构的 tool-call 循环），不要各写一遍骨架——直接用 `membench.agent_loop.AgentLoopAdapter` 复用循环（见「本波新能力」）。
 3. **生成的适配器必须显式持久化**（否则跨 session 丢失）：
    ```bash
@@ -286,7 +287,7 @@ adapter = AgentLoopAdapter(
 
 - 确切签名：`AgentLoopAdapter(llm_client, ingest_tools, query_tools=None, system_prompt=None, name="agent-loop", max_rounds=8, retrieved_from=None, ingest_prompt=None, query_prompt=None)`。
 - `llm_client` 可为对象 / 可调用 / `"module:ClassName"` 类路径；`tools` 元素为 `{"name","schema","handler"}`。
-- membench 负责循环、`IngestStats`/`QueryResult` 统计与 `retrieved` 回填（检索类工具名含 `retrieve`/`search`/`recall` 即被识别；不满足时传自定义 `retrieved_from`）。
+- membench 负责循环、`IngestStats`/`QueryResult` 统计与 `retrieved` 回填（缺省把检索类工具名含 `retrieve`/`search`/`recall` 的**多轮结果按调用顺序合并去重**；不满足时传自定义 `retrieved_from`）。
 - 把实例交给 Runner API 即可评测（见 `membench/examples/quickstart.py` 的用法）。
 - **适用边界**：仅当被测系统的写入/读取函数与 LLM 客户端能在 **Python 侧**调用时适用；非 Python 系统（Node/Electron）的 tool-call 循环必须留在被测进程内，membench 无法复用——走 HttpAdapter 三端点（见下一节）。
 

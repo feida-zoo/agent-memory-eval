@@ -51,8 +51,13 @@ membench 与被测系统之间**只有一个协议**：`BaseMemoryAdapter`
 
 - 粒度：**逐题独立、不带当轮对话上下文**；不要自行补数据集之外的上下文（跨系统不可比）；
 - 走**真实读取路径 + 回答生成**：检索、重排、注入、生成，与线上同一套；
-- `retrieved` 必须填**实际注入 prompt 的记忆条目原文**（用于 `evidence_recall` /
-  `recall@5`）；填不出检索细节时至少返回注入的记忆文本；
+- `retrieved` 决定 `evidence_recall` / `recall@5` 是否成立，口径 = **注入即口径**（四条规则）：
+  1. **内容**：只填**实际拼进回答 prompt 的记忆条目原文**——不是摘要、不是条目 ID、不是给你自己的查询语句、更不是答案本身；
+  2. **顺序**：按**注入优先级**排列（最相关的在前）——`recall@5` 只看前 5 条，顺序即优先级；
+  3. **合并与去重**：多次检索（先搜 → 改写 query → 再搜）的结果**先合并、再去重**再返回（重复条目按首次出现保留）；框架不合并、不去重，重复项会白占前 5 窗口，丢后续轮次会让 `evidence_recall` 系统性偏低；
+  4. **条数**：报**注入的那一份全量**——不要只报 top-k（`evidence_recall` 扫全部返回条目，报少了会虚低），也不要报未经注入裁剪的内部原始 top-N（报多了会虚高）。
+- 落地写法：在**构造 prompt 的那一处**把选中的列表直接返回，别事后另算一遍（另算必然与注入内容漂移）；
+- 填不出检索细节时至少返回注入的记忆文本；
   - 摘要/改写式存储：回填原文片段，或用 `--evidence-match overlap|llm` 换命中口径
     （口径会记入 `metrics.json`，不同口径的跑分不可直接对比）；
   - 若报告出现"两项检索指标全为 0"的警示，先排查证据原文是否根本不在检索结果里，
@@ -109,8 +114,8 @@ membench 与被测系统之间**只有一个协议**：`BaseMemoryAdapter`
   类路径字符串（与 `--judge client` 同约定）；
 - `tools` 元素 `{"name", "schema", "handler"}`；handler 收解析后的 arguments，
   返回 str/dict；handler 抛异常会折叠成观察文本回填、不中断循环；
-- `retrieved` 回填由 `retrieved_from(question, loop_result)` 决定，缺省识别工具名含
-  `retrieve` / `search` / `recall` 的调用——**检索工具名要对得上关键词、结果要是
+- `retrieved` 回填由 `retrieved_from(question, loop_result)` 决定，缺省把工具名含
+  `retrieve` / `search` / `recall` 的**多轮调用结果按调用顺序合并、去重**——**检索工具名要对得上关键词、结果要是
   被检索到的记忆原文**，否则请自传 `retrieved_from`；
 - 循环内每一轮 LLM 调用都是被测系统的真实成本，membench 会自动统计。
 

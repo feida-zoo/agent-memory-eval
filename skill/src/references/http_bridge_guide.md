@@ -14,7 +14,7 @@
 |---|---|---|---|
 | `POST /reset` | `{}` 或 `{"run_dir","dialogue_id","dialogue_index"}`（可选提示） | 2xx 即可（体可空） | 真清空记忆库（向量 collection / 事实表 / 情景缓冲 / 图谱），测试库与生产库隔离；上下文只用于"清空前快照"等回溯能力，可忽略 |
 | `POST /ingest` | `{"messages":[{"role","content","timestamp"}]}` | `{"input_tokens":int,"llm_calls":int,"latency_ms":float}` | 走**记忆写入路径**；拿不到 token/调用数填 `0`（报告标「未上报」） |
-| `POST /query` | `{"question":str}` | `{"answer":str,"retrieved":[str],...}` | 走**记忆读取+回答**；`retrieved` 填实际注入 prompt 的**记忆原文**；`input_tokens`/`output_tokens` 填了才会进「Token 消耗」账 |
+| `POST /query` | `{"question":str}` | `{"answer":str,"retrieved":[str],...}` | 走**记忆读取+回答**；`retrieved` 填实际注入 prompt 的**记忆原文**，注入即口径（优先级顺序、多轮检索先合并去重、报全量，见下方常见坑）；`input_tokens`/`output_tokens` 填了才会进「Token 消耗」账 |
 
 - `Content-Type: application/json`；如果服务要求鉴权，客户端用 `api_key` 时发
   `Authorization: Bearer <key>`，bridge 侧做对应校验即可。
@@ -63,6 +63,9 @@
 - `/ingest` 的 `messages` 逐条透传，**保留 `timestamp`**——temporal 题依赖时间锚。
 - `/query` 必须真的走检索；`retrieved` 填实际注入 prompt 的记忆原文（`evidence_recall` 的判据）。
   把问题直接丢给底座模型会让分数虚高、证据召回暴露。
+  **口径 = 注入即口径**：① 按注入优先级顺序排列（`recall@5` 只看前 5 条）；② 多轮检索先合并去重
+  （重复条目白占前 5 窗口）；③ 报注入的那一份全量（只报 top-k 会让 `evidence_recall` 虚低，
+  报未经注入裁剪的内部 top-N 会虚高）；④ 在构造 prompt 的那一处直接记下列表，别事后另算。
 - 拿不到 token / 调用数就填 `0`，不要瞎填——成本指标失真比缺省更糟。
 - `reset` 只清会话不清记忆库 → 跨 dialogue 串扰，`single_hop` 异常高、`abstention` 异常低。
 

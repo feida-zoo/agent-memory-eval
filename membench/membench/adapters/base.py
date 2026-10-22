@@ -31,7 +31,12 @@ class QueryResult:
 
     Attributes:
         answer: 系统给出的回答文本。
-        retrieved: 命中的记忆条目原文（用于 Recall@k / 证据命中判定）。
+        retrieved: 实际拼进回答 prompt 的记忆条目原文（用于 Recall@k / 证据
+            命中判定）。口径 = **注入即口径**：报"注入的那一份全量"，按注入
+            优先级顺序排列（``recall@5`` 只看前 5 条 = 最高优先级的 5 条）；
+            多次检索先合并去重再返回（框架不合并、不去重、不截断），重复条目
+            会白占前 5 窗口；不要报未经注入裁剪的内部原始 top-N，也不要把
+            摘要/ID/答案当条目。
         latency_ms: 查询耗时（毫秒）。
         input_tokens: 注入 prompt 的记忆 token 数（估算即可）。
         output_tokens: 生成回答的 token 数（估算即可）。

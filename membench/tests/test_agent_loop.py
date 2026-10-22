@@ -306,6 +306,36 @@ class TestDefaultRetrievedFrom:
         loop_result = {"tool_calls": [{"name": "remember", "arguments": {}, "result": "x"}]}
         assert default_retrieved_from("q", loop_result) == []
 
+    def test_multi_round_merges_and_dedupes(self) -> None:
+        """多轮检索：按调用顺序合并、重复条目只留首次出现（不丢后续轮次）。"""
+        loop_result = {
+            "tool_calls": [
+                {"name": "remember", "arguments": {}, "result": "已写入"},
+                {"name": "memory_search", "arguments": {}, "result": '["证据A", "证据B"]'},
+                {"name": "memory_search", "arguments": {}, "result": "证据B\n证据C"},
+            ]
+        }
+        assert default_retrieved_from("q", loop_result) == ["证据A", "证据B", "证据C"]
+
+    def test_empty_result_round_does_not_stop_merge(self) -> None:
+        """某轮检索无结果（空列表）不终止合并，后续轮次照收。"""
+        loop_result = {
+            "tool_calls": [
+                {"name": "retrieve", "arguments": {}, "result": "[]"},
+                {"name": "retrieve", "arguments": {}, "result": '["证据A"]'},
+            ]
+        }
+        assert default_retrieved_from("q", loop_result) == ["证据A"]
+
+    def test_non_retrieval_calls_ignored_in_merge(self) -> None:
+        loop_result = {
+            "tool_calls": [
+                {"name": "write_memory", "arguments": {}, "result": '["不该进来"]'},
+                {"name": "retrieve", "arguments": {}, "result": '["证据A"]'},
+            ]
+        }
+        assert default_retrieved_from("q", loop_result) == ["证据A"]
+
 
 # ---------------------------------------------------------------------------
 # AgentLoopAdapter 全链路

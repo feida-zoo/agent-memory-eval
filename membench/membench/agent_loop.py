@@ -409,30 +409,37 @@ def _as_evidence_list(value: Any) -> list[str]:
 
 
 def default_retrieved_from(question: str, loop_result: dict) -> list[str]:
-    """缺省证据回填：从检索类工具调用的结果里取 ``retrieved`` 条目。
+    """缺省证据回填：把检索类工具的结果**按调用顺序合并、去重**后返回。
 
     匹配规则：工具名（小写）**包含** ``retrieve`` / ``search`` / ``recall``
     之一即视为检索类工具（因此 ``retrieve``、``retrieve_memory``、
-    ``memory_search`` 都命中）。取第一个结果非空的匹配调用，其结果先按 JSON
-    列表解析，解析不出再按行切分；都没有则返回 ``[]``。
+    ``memory_search`` 都命中）。多轮检索（先搜 → 改写 query → 再搜）的结果
+    全部计入：按调用顺序拼接，同一条目（字符串完全相同）只保留首次出现——
+    这与"实际注入模型上下文的条目集合，按优先级排序"的口径一致；被丢弃的
+    后续轮次会让 ``evidence_recall`` 系统性偏低。
 
-    这一步决定了 ``evidence_recall`` 等证据指标是否有意义：若不提供自定义
-    ``retrieved_from``，请确保检索工具名含上述关键词、且结果是被检索到的
-    记忆原文（JSON 列表或一行一条）。
+    单条结果的解析：JSON 列表优先，解析不出按行切分；都没有则跳过该次调用。
+
+    这一步决定了 ``evidence_recall`` 等证据指标是否有意义：结果要是被检索到的
+    记忆原文（JSON 列表或一行一条）；工具名对不上关键词、或返回结构不满足时
+    请自传 ``retrieved_from``。
 
     Args:
         question: 当前问题（缺省实现未使用，留给自定义实现）。
         loop_result: :func:`run_tool_loop` 的返回值。
     """
     del question  # 缺省实现不依赖问题文本
+    merged: list[str] = []
+    seen: set[str] = set()
     for call in loop_result.get("tool_calls", []):
         name = str(call.get("name", "")).lower()
         if not any(k in name for k in _RETRIEVAL_TOOL_KEYWORDS):
             continue
-        items = _as_evidence_list(call.get("result"))
-        if items:
-            return items
-    return []
+        for item in _as_evidence_list(call.get("result")):
+            if item not in seen:
+                seen.add(item)
+                merged.append(item)
+    return merged
 
 
 # ---------------------------------------------------------------------------

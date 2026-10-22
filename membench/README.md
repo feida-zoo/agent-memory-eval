@@ -363,6 +363,8 @@ Runner(MyAdapter(), "membench/data/sample_dataset.jsonl").run()
 
 完整可运行示例见 `examples/quickstart.py`。token / llm_calls 填不了就填 0（报告中视为 n/a /「未上报」）。`reset()` 里若要实现"清空前快照"这类回溯能力，可读框架给的可选提示环境变量 `MEMBENCH_RUN_DIR` / `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`（框架不读也不写你的存储）。
 
+`query` 返回的 `retrieved` 决定 `evidence_recall` / `recall@5` 是否成立，口径 = **注入即口径**：填实际拼进回答 prompt 的**记忆条目原文**，按注入优先级排序，多轮检索先合并去重再返回，报注入的那一份全量（框架不合并、不去重、不截断；空列表 = 静默按 0 召回计）。
+
 ### 路径二：实现 REST 契约，用 HttpAdapter
 
 如果你的记忆系统已有 HTTP 服务，实现三个端点即可，无需写 Python：
@@ -413,7 +415,7 @@ Runner(adapter, "membench/data/office_dataset.jsonl", judge="heuristic",
 
 - 确切签名：`run_tool_loop(client, messages, tools, max_rounds=8, system_prompt=None) -> dict`；`AgentLoopAdapter(llm_client, ingest_tools, query_tools=None, system_prompt=None, name="agent-loop", max_rounds=8, retrieved_from=None, ingest_prompt=None, query_prompt=None)`。
 - `llm_client` 三选一：带 `chat_with_tools(messages, tools)` 的对象（优先，走原生 tool-call）> 带 `chat` / `complete` 的对象或可调用对象（走纯文本 JSON 约定）> `"module:ClassName"` 类路径字符串。`tools` 元素为 `{"name", "schema", "handler"}`；handler 收解析后的 `arguments` dict，返回 str 或 dict（handler 抛异常会被折叠成观察文本回填，**不中断**循环）。
-- membench 负责循环、`IngestStats` / `QueryResult` 统计与 `retrieved` 回填。回填由 `retrieved_from(question, loop_result) -> list[str]` 决定，缺省 `default_retrieved_from` 识别工具名含 `retrieve` / `search` / `recall` 的调用并取其结果——这决定 `evidence_recall` 等证据指标是否有意义：**检索工具名要对得上关键词、结果要是被检索到的记忆原文**（JSON 列表或一行一条），否则请自传 `retrieved_from`。
+- membench 负责循环、`IngestStats` / `QueryResult` 统计与 `retrieved` 回填。回填由 `retrieved_from(question, loop_result) -> list[str]` 决定，缺省 `default_retrieved_from` 识别工具名含 `retrieve` / `search` / `recall` 的调用，把**多轮检索的结果按调用顺序合并、去重**后返回（不丢后续轮次）——这决定 `evidence_recall` 等证据指标是否有意义：**检索工具名要对得上关键词、结果要是被检索到的记忆原文**（JSON 列表或一行一条），否则请自传 `retrieved_from`。
 - `AgentLoopAdapter.describe()` 返回驱动 LLM 标识与工具名列表，自动落入 run 元数据 `adapter_describe`。
 
 ### 路径四：导出对话日志，用 TranscriptAdapter
