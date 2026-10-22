@@ -106,7 +106,8 @@ def test_convert_beam_dialogue_structure(tmp_path: Path) -> None:
     assert len(dialogue["sessions"][0]) == 4
     assert len(dialogue["sessions"][1]) == 2
     # timestamp：消息级 time_anchor 优先；缺失时为 None（batch 级也是 null）
-    assert dialogue["sessions"][0][0]["timestamp"] == "March-01-2024"
+    # 归一为 ISO 日期（原始只到日，不补 00:00）
+    assert dialogue["sessions"][0][0]["timestamp"] == "2024-03-01"
     assert dialogue["sessions"][0][1]["timestamp"] is None
     assert all(m["role"] in ("user", "assistant") for s in dialogue["sessions"] for m in s)
 

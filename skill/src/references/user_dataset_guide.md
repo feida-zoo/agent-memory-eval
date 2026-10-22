@@ -17,6 +17,7 @@
    - 敏感信息（密码、证件号、薪酬）→ abstention 题（**原文绝不进 evidence**）
 3. **出题**：参照内置集 `membench/membench/data/office_dataset.jsonl` 的题型配比（single_hop 约 40%，multi_hop 20%，knowledge_update ≥10%，temporal ≥10%，preference ≥10%，abstention ≥5%）。
 4. **字段规则**（schema 强制）：
+   - `timestamp` 写 **ISO 8601、精度按原始数据**（`2026-04-06T09:00` 或只到日 `2026-04-06`；不要为了"统一"补时分秒，也不要写中文/散文时间）——公开数据集已统一成这个口径，自建集跟上，适配器只需一套解析；
    - `evidence` 必须是对话原文的**逐字子串**；
    - knowledge_update 题必须填 `gold_stale`（旧值），且旧值必须出现在对话原文中；
    - abstention 题 `gold_answer` 固定为 `<ABSTAIN>`，`evidence` 为空；

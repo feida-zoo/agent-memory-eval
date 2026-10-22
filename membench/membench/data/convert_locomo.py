@@ -33,6 +33,8 @@ import json
 import sys
 from pathlib import Path
 
+from .timestamps import normalize_timestamp
+
 #: LoCoMo category int -> membench category str
 CATEGORY_MAP = {
     1: "multi_hop",
@@ -87,7 +89,10 @@ def convert_locomo(input_path: str, output_path: str, max_dialogues: int | None 
         )
         sessions: list[list[dict]] = []
         for sid in session_ids:
-            ts = conv.get(f"session_{sid}_date_time")
+            ts = normalize_timestamp(
+                conv.get(f"session_{sid}_date_time"),
+                where=f"{sample.get('sample_id', '?')} session_{sid}",
+            )
             turns = [
                 {
                     "role": "user" if t.get("speaker") == speaker_a else "assistant",

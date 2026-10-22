@@ -15,6 +15,11 @@
 其中 ``ignore`` / ``ignore_reason`` 为可选的题目级忽略标记：``ignore=true``
 的题在评测时被整条跳过（不查询、不计分），但数据保留在文件中可追溯。
 
+``timestamp`` 约定为 **ISO 8601、精度可变**（``YYYY-MM-DD`` / ``YYYY-MM-DDTHH:MM`` /
+``YYYY-MM-DDTHH:MM:SS``，可省缺）：加载器只保证它是字符串，不理解时间语义，
+原样透传给 ``ingest``；公开数据集的转换器统一按此约定输出（见
+``membench/data/timestamps.py``），用户自建集请直接写 ISO。
+
 加载器做字段校验，缺字段 / 非法取值时报错并给出**行号**。
 """
 

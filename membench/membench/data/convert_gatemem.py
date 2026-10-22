@@ -75,6 +75,8 @@ import json
 import sys
 from pathlib import Path
 
+from .timestamps import normalize_timestamp
+
 #: abstention 题的 gold_answer 哨兵值。
 ABSTAIN_SENTINEL = "<ABSTAIN>"
 
@@ -132,7 +134,10 @@ def _convert_episode(episode: dict) -> dict:
             {
                 "role": _normalize_role(turn.get("speaker") or {}, str(turn.get("turn_kind", ""))),
                 "content": str(turn.get("text", "")),
-                "timestamp": turn.get("timestamp"),
+                "timestamp": normalize_timestamp(
+                    turn.get("timestamp"),
+                    where=f"{episode.get('episode_id', '?')} {turn.get('turn_id', '?')}",
+                ),
             }
         )
     return {

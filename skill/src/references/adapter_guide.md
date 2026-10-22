@@ -65,6 +65,28 @@ membench 与被测系统之间**只有一个协议**：`BaseMemoryAdapter`
 - 消息时间戳（`messages[].timestamp`）是**唯一时间锚**：逐条原样传给 ingest；被测系统
   解释"昨天 / 上周 / 上季度 / 上次会议"时必须相对**消息时间线**，而不是机器时钟、
   也不是记忆的写入时刻；
+- **格式已统一为 ISO 8601，精度保持原样**（转换器归一，`membench/data/timestamps.py`）：
+  只到日的仍是 `YYYY-MM-DD`（不补 00:00）、只到分的仍是 `YYYY-MM-DDTHH:MM`（不补秒）、
+  原到秒的保留到秒、原始没有时区就不造时区。转换前的原始形态（供对照）：
+  LoCoMo `1:56 pm on 8 May, 2023`、LongMemEval `2023/04/10 (Mon) 17:50`、
+  BEAM `March-01-2024`、GateMem/内置集本来就是 ISO。**粒度不同依旧存在**：
+  LoCoMo / LongMemEval 是**会话级**（同一 session 内所有消息共用一个时间）、
+  GateMem **逐轮**、BEAM **极稀疏**（每个 batch 首条 user 消息一个只到日的锚点，
+  约 0.6% 消息带时间戳）。所以解析要按"可能缺时间、可能只有日期"来写，
+  Python 3.10 下 `datetime.fromisoformat` 不认缺秒的串，稳妥写法：
+
+  ```python
+  from datetime import datetime
+  def parse_ts(v: str) -> datetime:
+      for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+          try:
+              return datetime.strptime(v, fmt)
+          except ValueError:
+              continue
+      raise ValueError(f"非 ISO 时间戳：{v!r}")
+  ```
+- 不认识的形态在 `dataset fetch` 阶段就会**报错停下**（不静默留混格式）：混进去之后
+  只会在个别题上无声失效，比 fetch 期报错难查得多；用户自建集请直接写 ISO 8601；
 - membench **不会**把数据集时间平移到"现在"，分数与墙钟无关（stale / abstention
   红线也是规则判定）——数据集是 2026-09 的对话、评测跑在哪一天，都不影响正确性；
   参考：office 集的 gold 会把锚点写明（如 `9月11日（9月12日说的"昨天"）`）；

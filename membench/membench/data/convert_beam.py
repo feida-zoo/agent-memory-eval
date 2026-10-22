@@ -44,7 +44,9 @@ abstention 题 gold_answer 固定 "<ABSTAIN>"（忽略原始 answer/ideal_respon
   incorrectly recall the original March 15 ..."），是描述而非纯粹的过期
   答案，stale 判定需做包含式匹配。
 - 消息 timestamp 稀疏：仅每个 batch 首条 user 消息携带 time_anchor，
-  其余消息回退到 batch 级 time_anchor（也可能为 null）。
+  其余消息回退到 batch 级 time_anchor（也可能为 null）。锚点原始形态为
+  ``March-01-2024``（**只有日期**），经 ``normalize_timestamp`` 归一为
+  ``2024-03-01``——不补时刻，避免伪造精度。
 
 用法::
 
@@ -57,6 +59,8 @@ import argparse
 import json
 import sys
 from pathlib import Path
+
+from .timestamps import normalize_timestamp
 
 #: BEAM 题型 -> membench category（1:1 直传，不再合并）
 #: 旧的"event_ordering/temporal_reasoning 合并到 temporal"等聚合会丢诊断信息；
@@ -112,10 +116,10 @@ def _flatten_turns(turns: object) -> list[dict]:
     return messages
 
 
-def _convert_sessions(chat: list[dict]) -> list[list[dict]]:
+def _convert_sessions(chat: list[dict], where_prefix: str = "") -> list[list[dict]]:
     """将 chat.json 的 batch 列表转为 sessions：一个 batch 一个 session。"""
     sessions: list[list[dict]] = []
-    for batch in chat:
+    for bi, batch in enumerate(chat, 1):
         if not isinstance(batch, dict):
             continue
         batch_anchor = batch.get("time_anchor")
@@ -125,7 +129,10 @@ def _convert_sessions(chat: list[dict]) -> list[list[dict]]:
                 {
                     "role": _normalize_role(msg.get("role")),
                     "content": str(msg.get("content", "")),
-                    "timestamp": msg.get("time_anchor") or batch_anchor,
+                    "timestamp": normalize_timestamp(
+                        msg.get("time_anchor") or batch_anchor,
+                        where=f"{where_prefix} batch {bi}".strip(),
+                    ),
                 }
             )
         sessions.append(session)
@@ -207,7 +214,7 @@ def convert_beam(chat_dir: str | Path, scale: str, chat_id: str) -> dict:
     id_prefix = f"beam_{scale}_{chat_id}"
     return {
         "dialogue_id": id_prefix,
-        "sessions": _convert_sessions(chat if isinstance(chat, list) else []),
+        "sessions": _convert_sessions(chat if isinstance(chat, list) else [], id_prefix),
         "questions": _convert_questions(pq if isinstance(pq, dict) else {}, id_prefix),
     }
 

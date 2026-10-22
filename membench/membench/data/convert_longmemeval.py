@@ -48,6 +48,8 @@ import logging
 import sys
 from pathlib import Path
 
+from .timestamps import normalize_timestamp
+
 logger = logging.getLogger(__name__)
 
 #: 单条 evidence 的最大字符数（超出截断，防止超长会话撑爆证据字段）。
@@ -126,7 +128,10 @@ def convert_longmemeval(input_path: str, output_path: str, limit: int | None = N
         dates = inst.get("haystack_dates") or []
         sessions: list[list[dict]] = []
         for idx, session in enumerate(inst.get("haystack_sessions") or []):
-            ts = dates[idx] if idx < len(dates) else None
+            ts = normalize_timestamp(
+                dates[idx] if idx < len(dates) else None,
+                where=f"{inst.get('question_id', '?')} haystack_dates[{idx}]",
+            )
             sessions.append(
                 [
                     {

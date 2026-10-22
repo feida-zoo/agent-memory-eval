@@ -501,6 +501,8 @@ python -m membench.cli list-datasets           # 仅列内置数据集
 
 （另有 `statemembench` 暂不可用：数据未公开，无法下载。）
 
+**时间戳统一（ISO 8601，精度不变）**：转换器把各原始数据集的时间戳归一成 ISO 8601——LoCoMo `1:56 pm on 8 May, 2023` → `2023-05-08T13:56`、LongMemEval `2023/04/10 (Mon) 17:50` → `2023-04-10T17:50`、BEAM `March-01-2024` → `2024-03-01`、GateMem 与内置集本来就是 ISO（空格分隔会规范成 `T`）。**粒度保持原样**：只到日的不补 `00:00`、只到分的不补秒、原始无时区就不造时区。粒度差异依然存在（LoCoMo / LongMemEval 会话级、GateMem 逐轮、BEAM 每 batch 一条只到日的锚点≈0.6% 消息）；不认识的形态在 `fetch` 阶段报错停下，不静默留混格式。归一实现在 `membench/data/timestamps.py`，解析表按实测形态定（含 LoCoMo 12 小时制边界与 LongMemEval 星期一致性校验）。
+
 ```bash
 python -m membench.cli dataset fetch locomo            # 逐个下载；幂等，--force 可重下
 python -m membench.cli dataset fetch longmemeval_oracle

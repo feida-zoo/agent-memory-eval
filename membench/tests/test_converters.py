@@ -21,12 +21,12 @@ _LOCOMO_SAMPLE = [
         "conversation": {
             "speaker_a": "Alice",
             "speaker_b": "Bob",
-            "session_1_date_time": "2023-05-01 10:00",
+            "session_1_date_time": "1:56 pm on 8 May, 2023",  # LoCoMo 原始形态（12 小时制）
             "session_1": [
                 {"speaker": "Alice", "dia_id": "D1:1", "text": "I adopted a dog named Rex."},
                 {"speaker": "Bob", "dia_id": "D1:2", "text": "Nice! How old is he?"},
             ],
-            "session_2_date_time": "2023-06-01 10:00",
+            "session_2_date_time": "10:00 am on 1 June, 2023",
             "session_2": [
                 {"speaker": "Alice", "dia_id": "D2:1", "text": "Rex turned three yesterday."},
             ],
@@ -52,7 +52,7 @@ _LME_SAMPLE = [
             [{"role": "user", "content": "I work remotely now."},
              {"role": "assistant", "content": "Nice."}],
         ],
-        "haystack_dates": ["2024-01-01", "2024-02-01"],
+        "haystack_dates": ["2023/04/10 (Mon) 17:50", "2024/02/01 (Thu) 09:05"],
         "answer_session_ids": ["s1"],
     },
     {
@@ -64,7 +64,7 @@ _LME_SAMPLE = [
             [{"role": "user", "content": "I love jazz."},
              {"role": "assistant", "content": "Noted."}]
         ],
-        "haystack_dates": ["2024-01-03"],
+        "haystack_dates": ["2024/01/03 (Wed) 08:30"],
         "answer_session_ids": ["s1"],
     },
 ]
@@ -93,7 +93,7 @@ def test_locomo_convert_and_load(tmp_path: Path) -> None:
     # 角色映射：speaker_a -> user
     assert d.sessions[0][0]["role"] == "user"
     assert d.sessions[0][1]["role"] == "assistant"
-    assert d.sessions[0][0]["timestamp"] == "2023-05-01 10:00"
+    assert d.sessions[0][0]["timestamp"] == "2023-05-08T13:56"  # 归一为 ISO，精度仍是到分
 
     by_cat = {q.category: q for q in d.questions}
     assert by_cat["single_hop"].gold_answer == "Rex"
@@ -125,7 +125,7 @@ def test_longmemeval_convert_and_load(tmp_path: Path) -> None:
     d0 = dialogues[0]
     assert len(d0.sessions) == 2
     assert d0.sessions[0][1]["role"] == "assistant"
-    assert d0.sessions[1][0]["timestamp"] == "2024-02-01"
+    assert d0.sessions[1][0]["timestamp"] == "2024-02-01T09:05"
     q = d0.questions[0]
     assert q.qid == "lme_q1" and q.gold_answer == "Berlin"
     assert q.category == "knowledge_update"
