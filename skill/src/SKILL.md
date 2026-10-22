@@ -302,12 +302,14 @@ python -m membench.cli doctor --target <url>     # 连通性 + 三端点契约�
 
 - 校验 `/reset` 2xx、`/ingest` 2xx（含 `input_tokens`/`llm_calls` 数值校验）、`/query` 2xx + JSON + 字符串 `answer`（`retrieved` 若出现须为字符串列表）。
 - 底层实现为 `membench.doctor.check_target(base_url, timeout=10.0, api_key=None)`，只依赖标准库。
+- **清空前快照（可选，回溯用）**：框架在每次 `reset()` 前给出上下文（HTTP：`POST /reset` 请求体的 `run_dir` / `dialogue_id` / `dialogue_index`；Python 适配器：同名环境变量 `MEMBENCH_*`），框架**不读不写**记忆存储——要不要快照由桥决定。模板支持 `BRIDGE_RESET_BACKUP=run`（快照进本次 run 的 `run_snapshots/reset_<序号>_<dialogue_id>/`）或指定固定目录；默认关闭（reset 每对话一次，长跑常开会把磁盘翻倍）。逐题 `retrieved` 已在 `results.jsonl` 里，快照只用于查内部存储状态。
 
 ### run 元数据与可比性
 
 - `run` 新增 `--driver-llm` / `--adapter-version`；`metrics.json` 记 `driver_llm` / `judge_model` / `adapter_version` / `dataset_fingerprint` / `schema_version`，用于回溯"这次分数是用什么跑出来的"。
 - `compare` 新增 `--require-comparable` / `--tag`：前者做可比性前置校验（关键维度不一致 → 不可比，禁止当 A/B），后者决定 `ab_<tag>_<ts>/` 目录名。
 - 数据集指纹 `membench.data.schema.dataset_fingerprint(path) -> {"sha256", "bytes", "name"}`；可用 `membench.data.info.resolve_available_path(key)` 解析某数据集当前可用路径（内置优先，其次 `datasets_dir()`）。
+- **token 消耗记账**：`metrics.json` 的 `token_usage` 块记全流程累计（`ingest_input_tokens` / `query_input_tokens` / `query_output_tokens` / `ingest_llm_calls` / `query_llm_calls` + `n_dialogues` / `n_questions`）；run 结束控制台直接打印一行摘要，run 报告有「Token 消耗（全流程）」表，`evaluate` 报告给分数据集消耗 + 合计（`evaluate_summary.json` 的 `token_usage`）。适配器不填 = 0 且标注「未上报」，不是真实零消耗；该块不参与评级 / 门禁 / 可比性校验。
 
 ### `--shards` 的分片维度
 

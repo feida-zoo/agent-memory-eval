@@ -128,8 +128,9 @@ python -m membench.cli evaluate-compare \
 - **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**）时落 `DIR/eval_<adapter>_<platform>_<ts>/`，内含 `evaluate_report.md`、`evaluate_summary.json`、`fig_dataset_overview.png` 与 `runs/<各数据集 run_id>/`（自包含）；不传时保持历史位置 `<out_dir>/evaluate_<ts>/`。
 
 run 产物（`runs/<run_id>/`）：`results.jsonl`（逐题原始记录）、`metrics.json`、`report.md`、`fig_category_accuracy.png`、`fig_latency_hist.png`。
+run 报告含 **「Token 消耗（全流程）」** 小节，取自 `metrics.json` 的 `token_usage` 块（被测系统上报口径的累计值：`ingest_input_tokens` / `query_input_tokens` / `query_output_tokens` / `ingest_llm_calls` / `query_llm_calls` + `n_dialogues` / `n_questions`）；`evaluate` 报告给出**分数据集消耗与合计**（`evaluate_summary.json` 的 `token_usage` 同步落账，含 `datasets_reported` 标明合计覆盖范围）。ingest 按每次 reset 后的真实写入累计——题目级分片下同一对话被多个分片各自 ingest 也如实各记一次；分片融合时逐片相加，任一分片未落账则整体不落账。适配器不填 token 时记 0 并显式提示"未上报"，不读成真实零消耗；这不是指标，不参与评级与门禁。
 report.md 中比率型指标以 **"评价（百分比）"** 呈现（如 `优秀（92.3%）`，四级：优秀/良好/中等/较差），开头附 **综合评级**（六项质量指标连续点数均值，1.0~4.0，档内随数值线性变化，阈值 3.5/2.5/1.5）；效率成本指标不参与评级（依赖部署环境）；**诊断指标**（检索召回率@5、过度拒答率）仅展示与归因，不参与评级——前者是前 5 条检索的证据覆盖率，后者是非拒答题的误拒比例，与 `evidence_recall` / `abstention_accuracy` 配合分诊（检索 vs 生成、漏拒 vs 误拒）。评级规则见 `membench/ratings.py` 的 `METRIC_THRESHOLDS` 表，可按团队标准调整。
-compare 产物（`output_root()/ab_<tag>_<ts>/`，见「产物布局」）：A/B 各自带 run 副本 + `compare_report.md` + `fig_metric_diff.png`（质量指标高亮明显变化 + 效率成本）+ `fig_category_diff.png`（分题型准确率对比）。
+compare 产物（`output_root()/ab_<tag>_<ts>/`，见「产物布局」）：A/B 各自带 run 副本 + `compare_report.md` + `fig_metric_diff.png`（质量指标高亮明显变化 + 效率成本）+ `fig_category_diff.png`（分题型准确率对比）。两张图的图例写明 **A（基线）· 短名 / B（候选）· 短名**（短名取 `adapter@commit`，跑 id 见报告头部），B 条的绿/红只表示"明显优化/劣化"，另有独立图例项说明——别把高亮色当身份色。
 
 使用 LLM 判分（可选）：
 
@@ -360,13 +361,13 @@ class MyAdapter(BaseMemoryAdapter):
 Runner(MyAdapter(), "membench/data/sample_dataset.jsonl").run()
 ```
 
-完整可运行示例见 `examples/quickstart.py`。token / llm_calls 填不了就填 0（报告中视为 n/a）。
+完整可运行示例见 `examples/quickstart.py`。token / llm_calls 填不了就填 0（报告中视为 n/a /「未上报」）。`reset()` 里若要实现"清空前快照"这类回溯能力，可读框架给的可选提示环境变量 `MEMBENCH_RUN_DIR` / `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`（框架不读也不写你的存储）。
 
 ### 路径二：实现 REST 契约，用 HttpAdapter
 
 如果你的记忆系统已有 HTTP 服务，实现三个端点即可，无需写 Python：
 
-- `POST /reset`：清空全部记忆状态
+- `POST /reset`：清空全部记忆状态。请求体带**可选**上下文 `{"run_dir", "dialogue_id", "dialogue_index"}`——供服务端在清空前自行快照/归档；不认识就忽略，不影响契约。
 - `POST /ingest`：body `{"messages": [{"role", "content", "timestamp"}]}`
 - `POST /query`：body `{"question": "..."}`，返回 `{"answer": str, "retrieved": [str], ...}`
 
@@ -554,7 +555,10 @@ A: 同一数据集（指纹一致）、同一判分器与判分模型、同一�
 A: 启发式是 token 包含匹配，表述差异大时会误判。先跑 `--judge llm` 复核；长期方案是优化黄金集答案表述或改用 LLM 判分（注意对基线重跑保持同尺比较）。
 
 **Q: 我的系统拿不到 token / llm_calls 统计？**
-A: 填 0 即可，报告中对应项视为 n/a，不影响 accuracy 等核心指标。
+A: 填 0 即可，报告中对应项视为 n/a /「未上报」，不影响 accuracy 等核心指标。注意这与"真实消耗为 0"是两回事：`token_usage` 块全为 0 时报告会显式标注"适配器未上报该字段"。适配器（或 HTTP 桥的 `/ingest`、`/query` 响应）能填多少填多少——填了才有"这次评测烧了多少 token"的账。
+
+**Q: 每个对话都 `reset()`，怎么回溯"清空前记忆里存了什么"？**
+A: 框架不读不写你的记忆存储（黑盒契约），但会把 reset 上下文（run 目录 / 对话 id 与序号）作为可选提示给出：Python 适配器读环境变量 `MEMBENCH_RUN_DIR` / `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`；HTTP 桥收 `POST /reset` 请求体里的 `run_dir` / `dialogue_id` / `dialogue_index`。要不要在清空前快照、落到哪里，由接入侧决定——参考模板的实现：`BRIDGE_RESET_BACKUP=run` 时快照到本次 run 的 `run_snapshots/reset_<序号>_<dialogue_id>/`（`examples/http_bridge_node/README.md`）。逐题 `retrieved` 已在 `results.jsonl` 里，快照只用于查内部存储状态；reset 每对话一次，长跑请谨慎常开。
 
 **Q: 如何把门禁接入 CI？**
 A: `compare` 子命令在 verdict=FAIL 时以退出码 1 退出，直接放进流水线即可。

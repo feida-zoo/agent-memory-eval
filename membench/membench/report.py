@@ -20,8 +20,10 @@ try:
 
     matplotlib.use("Agg")  # 必须在 pyplot 导入前设置，保证无显示环境可用
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
 except ImportError:  # matplotlib 为可选依赖（pip install membench[report]）
     plt = None  # type: ignore[assignment]
+    Patch = None  # type: ignore[assignment]
 
 _MPL_HINT = "报告图表需要 matplotlib，请运行: pip install matplotlib"
 
@@ -135,6 +137,55 @@ def metric_labels(keys: Iterable[str], with_key: bool = True) -> list[str]:
     return [metric_label(k, with_key=with_key) for k in keys if k]
 
 
+#: ``metrics.json`` 的 ``token_usage`` 块字段 -> 中文显示名（报告与控制台共用）。
+TOKEN_USAGE_FIELD_ZH: dict[str, str] = {
+    "ingest_input_tokens": "ingest 写入 token（估算）",
+    "query_input_tokens": "query 输入 token 合计",
+    "query_output_tokens": "query 输出 token 合计",
+    "ingest_llm_calls": "ingest LLM 调用",
+    "query_llm_calls": "query LLM 调用",
+    "n_dialogues": "对话数",
+    "n_questions": "题目数",
+}
+
+
+def token_usage_totals(usage: "dict[str, Any] | None") -> dict[str, int]:
+    """从 ``token_usage`` 块取可求和字段（缺字段按 0 计）。
+
+    只保留 :data:`TOKEN_USAGE_FIELD_ZH` 里的计数器字段——``n_dialogues`` /
+    ``n_questions`` 是上下文，不参与求和。
+    """
+    if not usage:
+        return {}
+    return {
+        key: int(usage.get(key, 0) or 0)
+        for key in TOKEN_USAGE_FIELD_ZH
+        if key not in ("n_dialogues", "n_questions")
+    }
+
+
+def format_token_usage(usage: "dict[str, Any] | None") -> str:
+    """token 消耗单行摘要（run 控制台 / 报告摘要共用）。
+
+    ``usage`` 为空（旧 run 未落账）时返回 ``n/a``；适配器未上报 token 时各项为 0，
+    摘要显式注明"未上报"，避免读成"真的没消耗"。
+    """
+    if not usage:
+        return "n/a（该 run 未落账 token_usage）"
+    totals = token_usage_totals(usage)
+    ingest = totals.get("ingest_input_tokens", 0)
+    q_in = totals.get("query_input_tokens", 0)
+    q_out = totals.get("query_output_tokens", 0)
+    calls = totals.get("ingest_llm_calls", 0) + totals.get("query_llm_calls", 0)
+    text = (
+        f"ingest {ingest} + query 输入 {q_in} / 输出 {q_out}"
+        f"（合计约 {ingest + q_in + q_out}），LLM 调用 {calls} 次"
+    )
+    if ingest == 0 and q_in == 0 and q_out == 0:
+        text += "；全为 0 = 适配器未上报该字段，非真实零消耗"
+    return text
+
+
 #: 门禁 / 可比性维度 key -> 中文显示名（数据层 key 不变，仅渲染层本地化）。
 DIM_LABEL_ZH: dict[str, str] = {
     # compare 门禁名
@@ -231,6 +282,11 @@ EFFICIENCY_DIFF_METRICS: list[str] = [
     "avg_ingest_latency_ms",
     "avg_llm_calls",
 ]
+
+#: B 条高亮色：明显优化 / 明显劣化。图例里单列为语义项，不参与身份区分——
+#: 否则 B 的身份色会被高亮色顶掉，读者看不出哪根是 B。
+HIGHLIGHT_UP = "#2e8b57"
+HIGHLIGHT_DOWN = "#cc3333"
 
 #: A/B 变化高亮阈值：质量指标 diff 绝对值超过该值即视为"明显"优化/劣化，
 #: 与 compare 门禁默认阈值（--acc-threshold / --stale-threshold 0.02）同口径。
@@ -330,9 +386,12 @@ def fig_metric_diff(
 ) -> str:
     """compare 用：A vs B 分组条形图，左质量指标、右效率成本。
 
-    质量子图对"明显变化"高亮：diff（B-A，stale_rate 反向）绝对值
-    > :data:`HIGHLIGHT_THRESHOLD` 时 B 条染绿（优化）/ 红（劣化），
-    其余保持默认色。效率子图单位各异，仅看相对高低并直接标注数值。
+    图例给「A（基线）· 短名 / B（候选）· 短名」两个身份项（短名由调用方从
+    adapter / commit 拼出，不用 run_id——那会压住柱体且分不出 A/B）；B 条的
+    「明显优化 / 明显劣化」高亮另列语义图例项，不冒充身份色。质量子图对
+    "明显变化"高亮：diff（B-A，stale_rate 反向）绝对值 >
+    :data:`HIGHLIGHT_THRESHOLD` 时 B 条染绿（优化）/ 红（劣化），其余保持
+    身份色。效率子图单位各异，仅看相对高低并直接标注数值。
     """
     _setup_fonts()
     # 双侧都有非 None 值的指标才画（任一侧"未计算"时不出柱，避免把 None 画成 0）。
@@ -350,40 +409,57 @@ def fig_metric_diff(
     eff_a = [float(overall_a[k]) for k in eff_keys]
     eff_b = [float(overall_b[k]) for k in eff_keys]
 
+    id_handles = [
+        Patch(facecolor=PALETTE[0], label=f"A（基线）· {label_a}"),
+        Patch(facecolor=PALETTE[1], label=f"B（候选）· {label_b}"),
+    ]
+
     fig, (ax, ax2) = plt.subplots(1, 2, figsize=(max(12, 1.4 * len(keys)), 4.8))
     width = 0.38
     x = list(range(len(keys)))
-    ax.bar([i - width / 2 for i in x], vals_a, width, label=label_a, color=PALETTE[0])
+    ax.bar([i - width / 2 for i in x], vals_a, width, color=PALETTE[0])
     colors_b = []
     for k, va, vb in zip(keys, vals_a, vals_b):
         diff = vb - va
         if k == "stale_rate":
             diff = -diff  # 越低越好，反向计"改进量"
         if diff > HIGHLIGHT_THRESHOLD:
-            colors_b.append("#2e8b57")  # 明显优化
+            colors_b.append(HIGHLIGHT_UP)  # 明显优化
         elif diff < -HIGHLIGHT_THRESHOLD:
-            colors_b.append("#cc3333")  # 明显劣化
+            colors_b.append(HIGHLIGHT_DOWN)  # 明显劣化
         else:
             colors_b.append(PALETTE[1])
-    ax.bar([i + width / 2 for i in x], vals_b, width, label=label_b, color=colors_b)
+    ax.bar([i + width / 2 for i in x], vals_b, width, color=colors_b)
     ax.set_xticks(x)
     ax.set_xticklabels([metric_label(k, with_key=False) for k in keys], rotation=20, ha="right")
-    ax.set_ylim(0, 1.0)
+    # 顶部留出图例带：柱体最高 1.0、值标签到 ~1.03，图例放 1.1~1.2 不可能压柱
+    ax.set_ylim(0, 1.24)
     ax.set_ylabel("value")
     ax.set_title("质量指标 (A vs B)")
-    ax.legend()
+    q_handles = list(id_handles)
+    if HIGHLIGHT_UP in colors_b:
+        q_handles.append(
+            Patch(facecolor=HIGHLIGHT_UP, label=f"B 明显优化（> +{HIGHLIGHT_THRESHOLD}）")
+        )
+    if HIGHLIGHT_DOWN in colors_b:
+        q_handles.append(
+            Patch(facecolor=HIGHLIGHT_DOWN, label=f"B 明显劣化（< -{HIGHLIGHT_THRESHOLD}）")
+        )
+    ax.legend(handles=q_handles, loc="upper center", fontsize=8, ncol=2, framealpha=0.92)
     for i, (va, vb) in enumerate(zip(vals_a, vals_b)):
         ax.text(i - width / 2, va + 0.01, f"{va:.2f}", ha="center", fontsize=8)
         ax.text(i + width / 2, vb + 0.01, f"{vb:.2f}", ha="center", fontsize=8)
 
     x2 = list(range(len(eff_keys)))
-    ax2.bar([i - width / 2 for i in x2], eff_a, width, label=label_a, color=PALETTE[0])
-    ax2.bar([i + width / 2 for i in x2], eff_b, width, label=label_b, color=PALETTE[1])
+    ax2.bar([i - width / 2 for i in x2], eff_a, width, color=PALETTE[0])
+    ax2.bar([i + width / 2 for i in x2], eff_b, width, color=PALETTE[1])
     ax2.set_xticks(x2)
     ax2.set_xticklabels([metric_label(k, with_key=False) for k in eff_keys], rotation=20, ha="right")
+    # 效率值无上界：按最大值留出图例带（值标签到 ~1.02×max）
+    ax2.set_ylim(0, max(1.0, max(eff_a + eff_b, default=1.0) * 1.45))
     ax2.set_ylabel("cost (units differ)")
     ax2.set_title("效率成本 (A vs B)")
-    ax2.legend()
+    ax2.legend(handles=id_handles, loc="upper center", fontsize=8, ncol=2, framealpha=0.92)
     for i, (va, vb) in enumerate(zip(eff_a, eff_b)):
         ax2.text(i - width / 2, va, f"{va:.0f}", ha="center", va="bottom", fontsize=7)
         ax2.text(i + width / 2, vb, f"{vb:.0f}", ha="center", va="bottom", fontsize=7)
@@ -401,7 +477,11 @@ def fig_category_diff(
     label_b: str,
     out_path: str,
 ) -> str:
-    """compare 用：分题型准确率 A vs B 横向分组条形图。"""
+    """compare 用：分题型准确率 A vs B 横向分组条形图。
+
+    图例同 :func:`fig_metric_diff`：明确 A（基线）/ B（候选）与短名；右侧留出
+    图例带（``xlim`` 扩到 1.5），图例不压柱体。
+    """
     _setup_fonts()
     cats = sorted(set(by_category_a) | set(by_category_b))
     accs_a = [float(by_category_a.get(c, {}).get("accuracy", 0.0)) for c in cats]
@@ -409,16 +489,25 @@ def fig_category_diff(
 
     y = list(range(len(cats)))
     height = 0.38
-    fig, ax = plt.subplots(figsize=(8, max(3.0, 0.6 * len(cats) + 1.5)))
-    ax.barh([i + height / 2 for i in y], accs_a, height, label=label_a, color=PALETTE[0])
-    ax.barh([i - height / 2 for i in y], accs_b, height, label=label_b, color=PALETTE[1])
+    fig, ax = plt.subplots(figsize=(9, max(3.0, 0.6 * len(cats) + 1.5)))
+    ax.barh([i + height / 2 for i in y], accs_a, height, color=PALETTE[0])
+    ax.barh([i - height / 2 for i in y], accs_b, height, color=PALETTE[1])
     ax.set_yticks(y)
     ax.set_yticklabels([category_display(c) for c in cats])
     ax.invert_yaxis()
-    ax.set_xlim(0, 1.0)
+    # 柱体最长到 1.0（值标签到 0.95），1.05~1.5 留给图例
+    ax.set_xlim(0, 1.5)
     ax.set_xlabel("accuracy")
     ax.set_title("分题型准确率对比 (A vs B)")
-    ax.legend()
+    ax.legend(
+        handles=[
+            Patch(facecolor=PALETTE[0], label=f"A（基线）· {label_a}"),
+            Patch(facecolor=PALETTE[1], label=f"B（候选）· {label_b}"),
+        ],
+        loc="lower right",
+        fontsize=8,
+        framealpha=0.92,
+    )
     for i, (va, vb) in enumerate(zip(accs_a, accs_b)):
         ax.text(min(va + 0.01, 0.95), i + height / 2, f"{va:.2f}", va="center", fontsize=8)
         ax.text(min(vb + 0.01, 0.95), i - height / 2, f"{vb:.2f}", va="center", fontsize=8)
@@ -708,6 +797,37 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
     lines.append("![查询延迟分布](fig_latency_hist.png)")
     lines.append("")
 
+    # 3.5 全流程 token 消耗（被测系统上报口径，不参与评级/门禁）
+    lines.append("## Token 消耗（全流程）")
+    lines.append("")
+    usage = metrics.get("token_usage")
+    lines.append(
+        "<sub>被测系统（适配器）上报口径：ingest 按每次对话写入累计、query 逐题累计；"
+        "不含判分器 / 驱动侧消耗。适配器未填报字段显示 0（= 未上报，非真实零消耗）。</sub>"
+    )
+    lines.append("")
+    if usage:
+        totals = token_usage_totals(usage)
+        grand = (
+            totals.get("ingest_input_tokens", 0)
+            + totals.get("query_input_tokens", 0)
+            + totals.get("query_output_tokens", 0)
+        )
+        token_rows = [
+            [TOKEN_USAGE_FIELD_ZH["ingest_input_tokens"], str(totals.get("ingest_input_tokens", 0))],
+            [TOKEN_USAGE_FIELD_ZH["query_input_tokens"], str(totals.get("query_input_tokens", 0))],
+            [TOKEN_USAGE_FIELD_ZH["query_output_tokens"], str(totals.get("query_output_tokens", 0))],
+            ["合计（ingest + query 输入 + 输出）", str(grand)],
+            [TOKEN_USAGE_FIELD_ZH["ingest_llm_calls"], str(totals.get("ingest_llm_calls", 0))],
+            [TOKEN_USAGE_FIELD_ZH["query_llm_calls"], str(totals.get("query_llm_calls", 0))],
+            [TOKEN_USAGE_FIELD_ZH["n_dialogues"], str(usage.get("n_dialogues", "n/a"))],
+            [TOKEN_USAGE_FIELD_ZH["n_questions"], str(usage.get("n_questions", "n/a"))],
+        ]
+        lines.append(_md_table(["项目", "值"], token_rows))
+    else:
+        lines.append("（本次 run 未落账 `token_usage`：适配器未上报或产物来自旧版本）")
+    lines.append("")
+
     # 4. 失败样例 Top10
     lines.append("## 失败样例 Top10")
     lines.append("")
@@ -820,6 +940,13 @@ def write_compare_report_md(
     lines.append("")
     lines.append("![分题型准确率对比](fig_category_diff.png)")
     lines.append("")
+    short_a, short_b = ab_series_labels(metrics_a, metrics_b)
+    lines.append(
+        f"<sub>图中 **A（基线）** = `{short_a}`、**B（候选）** = `{short_b}`；"
+        "B 条染绿/红表示该项明显优化/劣化（|diff| > 0.02，stale_rate 反向）。"
+        "完整 run_id 见上方。</sub>"
+    )
+    lines.append("")
 
     lines.append("## 门禁明细")
     lines.append("")
@@ -866,6 +993,27 @@ def write_compare_report_md(
     return out_path
 
 
+def ab_series_labels(metrics_a: dict[str, Any], metrics_b: dict[str, Any]) -> tuple[str, str]:
+    """A/B 图的系列短名（adapter@commit 优先，退回 run_id）。
+
+    图例不用 run_id：那既长（压住柱体）又分不出哪根是基线——短名 + 「A（基线）/
+    B（候选）」前缀才是可读的身份标识。两侧短名相同时退回 run_id 保证可区分。
+    """
+
+    def _short(metrics: dict[str, Any]) -> str:
+        adapter = str(metrics.get("adapter") or "").strip()
+        commit = metrics.get("commit")
+        if adapter and commit:
+            return f"{adapter}@{str(commit)[:8]}"
+        return adapter or str(metrics.get("run_id") or "?")
+
+    label_a, label_b = _short(metrics_a), _short(metrics_b)
+    if label_a == label_b:
+        label_a = str(metrics_a.get("run_id") or label_a)
+        label_b = str(metrics_b.get("run_id") or label_b)
+    return label_a, label_b
+
+
 def render_compare_report(
     out_dir: str,
     metrics_a: dict[str, Any],
@@ -876,20 +1024,24 @@ def render_compare_report(
     comparability: "dict[str, Any] | None" = None,
 ) -> None:
     """生成 compare 目录下的 compare_report.md 与两张对比图
-    （fig_metric_diff.png 质量+效率、fig_category_diff.png 分题型）。"""
+    （fig_metric_diff.png 质量+效率、fig_category_diff.png 分题型）。
+
+    图例用短名（``adapter@commit``）而非 run_id，完整 run_id 见报告正文头部。
+    """
     os.makedirs(out_dir, exist_ok=True)
+    label_a, label_b = ab_series_labels(metrics_a, metrics_b)
     fig_metric_diff(
         metrics_a.get("overall", {}),
         metrics_b.get("overall", {}),
-        str(metrics_a.get("run_id", "A")),
-        str(metrics_b.get("run_id", "B")),
+        label_a,
+        label_b,
         os.path.join(out_dir, "fig_metric_diff.png"),
     )
     fig_category_diff(
         metrics_a.get("by_category", {}),
         metrics_b.get("by_category", {}),
-        str(metrics_a.get("run_id", "A")),
-        str(metrics_b.get("run_id", "B")),
+        label_a,
+        label_b,
         os.path.join(out_dir, "fig_category_diff.png"),
     )
     write_compare_report_md(out_dir, metrics_a, metrics_b, diffs, gates, verdict, comparability)

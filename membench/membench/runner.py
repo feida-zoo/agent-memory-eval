@@ -42,7 +42,7 @@ from membench.metrics import aggregate
 from membench.metrics.evidence import SubstringMatcher
 from membench.metrics.text import bleu1, token_f1
 from membench.paths import runs_dir
-from membench.report import render_run_report
+from membench.report import format_token_usage, render_run_report
 
 
 def _judge_result_to_dict(jr: Any) -> dict[str, Any]:
@@ -234,6 +234,7 @@ class Runner:
         question: Any,
         ingest_latency_ms: float,
         ingest_llm_calls: int,
+        ingest_input_tokens: int,
     ) -> dict[str, Any]:
         """评测单题，返回 SPEC 3.4 的记录行。"""
         result = self.adapter.query(question.question)
@@ -270,6 +271,7 @@ class Runner:
             "llm_calls": int(getattr(result, "llm_calls", 0) or 0),
             "ingest_latency_ms": float(ingest_latency_ms),
             "ingest_llm_calls": int(ingest_llm_calls),
+            "ingest_input_tokens": int(ingest_input_tokens),
         }
 
     # ------------------------------------------------------------------
@@ -337,19 +339,39 @@ class Runner:
 
         records: list[dict[str, Any]] = []
         done = 0
+        # 全流程 token / LLM 调用记账（ingest 按对话真实调用计一次；query 逐题累加）：
+        # 与 records 的「每题归属」不同，这里是总量的唯一真相来源——question 分片下
+        # 同一对话可能被多个分片各自 ingest，只有各分片自己的计数才是真实成本。
+        token_usage: dict[str, int] = {
+            "ingest_input_tokens": 0,
+            "ingest_llm_calls": 0,
+            "query_input_tokens": 0,
+            "query_output_tokens": 0,
+            "query_llm_calls": 0,
+        }
         # 检索回退数按本次 run 增量统计（matcher 实例可在多数据集间共享）
         match_fallbacks_start = int(
             getattr(self._evidence_matcher, "fallbacks", 0) or 0
         )
 
         for di, dialogue in enumerate(dialogues, 1):
+            # reset 上下文：只作为「适配器可选提示」暴露（环境变量 + HTTP 桥透传），
+            # 框架不读不写适配器的记忆存储——要不要在清空前快照、落到哪里，由接入侧
+            # 决定（见 examples/http_bridge_node 的 BRIDGE_RESET_BACKUP）。
+            os.environ["MEMBENCH_RUN_DIR"] = run_dir
+            os.environ["MEMBENCH_DIALOGUE_ID"] = str(dialogue.dialogue_id)
+            os.environ["MEMBENCH_DIALOGUE_INDEX"] = str(di)
             self.adapter.reset()
             ingest_latency_ms = 0.0
             ingest_llm_calls = 0
+            ingest_input_tokens = 0
             for session in dialogue.sessions:
                 stats = self.adapter.ingest(session)
                 ingest_latency_ms += float(getattr(stats, "latency_ms", 0.0) or 0.0)
                 ingest_llm_calls += int(getattr(stats, "llm_calls", 0) or 0)
+                ingest_input_tokens += int(getattr(stats, "input_tokens", 0) or 0)
+            token_usage["ingest_input_tokens"] += ingest_input_tokens
+            token_usage["ingest_llm_calls"] += ingest_llm_calls
 
             print(
                 f"[membench] dialogue {di}/{len(dialogues)} "
@@ -363,7 +385,11 @@ class Runner:
             def _eval(q: Any) -> dict[str, Any]:
                 # 单题内部计时：latency_ms 是该题 query 调用的墙钟时间，不受并发影响。
                 return self._eval_question(
-                    str(dialogue.dialogue_id), q, ingest_latency_ms, ingest_llm_calls
+                    str(dialogue.dialogue_id),
+                    q,
+                    ingest_latency_ms,
+                    ingest_llm_calls,
+                    ingest_input_tokens,
                 )
 
             if self.jobs > 1 and len(active_questions) > 1:
@@ -375,12 +401,19 @@ class Runner:
 
             for record in dialogue_records:
                 records.append(record)
+                token_usage["query_input_tokens"] += int(record.get("input_tokens", 0) or 0)
+                token_usage["query_output_tokens"] += int(record.get("output_tokens", 0) or 0)
+                token_usage["query_llm_calls"] += int(record.get("llm_calls", 0) or 0)
                 done += 1
                 print(
                     f"[membench] [{done}/{n_active}] {record['qid']} "
                     f"({record['category']}) correct={record['judge'].get('correct')} "
                     f"latency={record['latency_ms']:.0f}ms"
                 )
+
+        # reset 上下文用完即撤（异常中断时残留也无害：下一次 reset 前会被覆写）
+        for _key in ("MEMBENCH_RUN_DIR", "MEMBENCH_DIALOGUE_ID", "MEMBENCH_DIALOGUE_INDEX"):
+            os.environ.pop(_key, None)
 
         # 适配器可选的 describe() -> dict：记录其配置/版本等自描述信息；
         # 调用失败记 None，不中断评测。
@@ -423,6 +456,14 @@ class Runner:
                 "judge_model": self.judge_model,
                 "adapter_version": self.adapter_version,
                 "dataset_fingerprint": dataset_fingerprint(self.dataset_path),
+                # 全流程 token / 调用记账（被测系统上报口径；适配器未上报时为 0，
+                # 报告按「未上报」提示，不当作真实 0 消耗）。这不是指标，不参与
+                # 评级/门禁，只回答"这次评测烧了多少"。
+                "token_usage": {
+                    **token_usage,
+                    "n_dialogues": len(dialogues),
+                    "n_questions": n_active,
+                },
             }
         )
         # 检索命中口径落账（substring / overlap / llm；阈值与回退数按需）
@@ -472,5 +513,6 @@ class Runner:
             f"stale_rate={_fmt(overall.get('stale_rate'))} "
             f"evidence_recall={_fmt(overall.get('evidence_recall'))}"
         )
+        print(f"[membench] token 消耗（被测系统上报）: {format_token_usage(token_usage)}")
         print(f"[membench] run dir: {run_dir}")
         return run_dir

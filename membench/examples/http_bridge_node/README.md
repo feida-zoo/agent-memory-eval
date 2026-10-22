@@ -34,6 +34,10 @@ npm run build         # = node build.mjs，产物 dist/memory-entry.cjs
 # 3) 起服务
 npm start             # = node bridge.mjs，默认 http://127.0.0.1:8787
 #   可用环境变量覆盖：BRIDGE_HOST / BRIDGE_PORT / BRIDGE_DATA_DIR
+#   可选：清空前快照（调试/回溯用）——BRIDGE_RESET_BACKUP=run 时每次
+#   /reset 前把记忆目录快照到本次评测 run 目录的 run_snapshots/
+#   （目录名带 reset 序号与 dialogue_id，与 results.jsonl 对得上）；
+#   设成具体目录则快照到该目录。默认关闭（每个对话调一次 reset，长跑别开）。
 
 # 4) 自检（另开一个终端）
 cd <仓库根>/membench
@@ -73,6 +77,10 @@ python -m membench.cli run --adapter http --judge heuristic \
   各自 `BRIDGE_PORT` + `BRIDGE_DATA_DIR`；单实例时只能串行跑分片。
 - **query 要真的走检索**：别把问题直接丢给底座模型。`retrieved` 填**实际注入 prompt 的
   记忆原文**，否则 `evidence_recall` 会暴露"没走记忆路径"。
+- **回溯记忆内部状态用 `BRIDGE_RESET_BACKUP`**：它把"清空"变成"先快照再清空"。框架本身
+  不读不写你的记忆存储（黑盒契约），只通过 `/reset` 请求体告诉你本次 run 目录、对话 id
+  与序号；要不要快照、落到哪里，由桥决定。逐题 `retrieved` 已在 `results.jsonl` 里，
+  快照只用来查"内部存储为什么这样"，别在所有长跑里常开（每对话一份 = 磁盘翻倍）。
 - **别用 express 等额外框架**：三端点用 `node:http` 足够，少一个依赖少一类 native/构建坑。
 
 对应 checklist（打包 / stub / external / define / 契约字段 / doctor 用法）见

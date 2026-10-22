@@ -4,14 +4,16 @@
  * 用途：被测系统的记忆能力是「库内能力」、没有独立服务（典型是 Electron 主进程
  * 里的 TS 源码）时，用本服务把三个动作暴露成 membench HttpAdapter 认识的 REST 端点：
  *
- *   POST /reset   -> 清空记忆
+ *   POST /reset   -> 清空记忆（可选：清空前把记忆目录快照一份，见 BRIDGE_RESET_BACKUP）
  *   POST /ingest  -> 写入一段对话，返回 {"input_tokens","llm_calls","latency_ms"}
  *   POST /query   -> 查一个问题，返回 {"answer","retrieved",...}
  *
  * 契约对齐：membench/adapters/http.py 与 doctor.check_target。
  * 模板默认监听 127.0.0.1:8787，可用 BRIDGE_PORT / BRIDGE_HOST 覆盖。
  */
+import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import process from "node:process";
 
 // ============================================================================
@@ -34,8 +36,15 @@ import { createMemorySystem } from "./memory-entry.mjs";
 const PORT = Number(process.env.BRIDGE_PORT || 8787);
 const HOST = process.env.BRIDGE_HOST || "127.0.0.1";
 const DATA_DIR = process.env.BRIDGE_DATA_DIR || "./.bridge-data";
+// 清空前快照（默认关闭）："" = 不做；"run" = 落到本次评测 run 目录的
+// run_snapshots/（run_dir 由 membench 通过 /reset 请求体带过来）；其它值 = 固定目录。
+// 注意成本：reset 每个对话调一次，开启后等于每对话复制一份记忆目录——调试/复现时开，
+// 长跑批量评测建议关。
+const RESET_BACKUP = process.env.BRIDGE_RESET_BACKUP || "";
 
 const memory = createMemorySystem({ dataDir: DATA_DIR });
+
+let resetSeq = 0;
 
 /** 读取并解析 JSON 请求体（空体视为 {}）。 */
 function readJson(req) {
@@ -67,12 +76,50 @@ function num(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
+/** 递归复制目录（零依赖实现；目标存在则先清掉）。 */
+function copyDir(src, dest) {
+  if (!fs.existsSync(src)) return false;
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.cpSync(src, dest, { recursive: true });
+  return true;
+}
+
+/**
+ * 清空前快照：把当前记忆目录复制一份，便于评测后回溯"这一刻记忆里有什么"。
+ * 目录名带 reset 序号与对话 id，与 results.jsonl 的 dialogue_id 直接对得上。
+ * 返回快照路径；未开启或记忆目录不存在时返回 null（不阻断 reset）。
+ */
+function snapshotBeforeReset(body) {
+  if (!RESET_BACKUP) return null;
+  const base =
+    RESET_BACKUP === "run"
+      ? body.run_dir
+        ? path.join(String(body.run_dir), "run_snapshots")
+        : null
+      : RESET_BACKUP;
+  if (!base) return null;
+  const tag = body.dialogue_id ? String(body.dialogue_id) : "unknown";
+  const dest = path.join(base, `reset_${String(resetSeq).padStart(4, "0")}_${tag}`);
+  try {
+    copyDir(DATA_DIR, dest);
+    return dest;
+  } catch (err) {
+    console.error(`[bridge] 快照失败（不影响 reset）：${err?.message || err}`);
+    return null;
+  }
+}
+
 const routes = new Map([
   [
     "/reset",
-    async () => {
+    async (body) => {
+      resetSeq += 1;
+      const backup = snapshotBeforeReset(body);
       await memory.reset();
-      return {};
+      const payload = { reset_seq: resetSeq };
+      if (backup) payload.backup_path = backup;
+      return payload;
     },
   ],
   [

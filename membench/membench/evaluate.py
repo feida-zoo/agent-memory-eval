@@ -33,7 +33,14 @@ from membench import layout, paths
 from membench.data.info import resolve_available_path
 from membench.data.schema import load_dataset, question_capabilities
 from membench.ratings import format_metric, overall_rating
-from membench.report import _md_table, _fmt_opt, fig_dataset_overview, metric_label
+from membench.report import (
+    TOKEN_USAGE_FIELD_ZH,
+    _md_table,
+    _fmt_opt,
+    fig_dataset_overview,
+    metric_label,
+    token_usage_totals,
+)
 from membench.runner import Runner
 from membench.userdata import resolve_dataset
 
@@ -604,6 +611,41 @@ def run_datasets(
     return results
 
 
+def _token_usage_summary(results: list[DatasetResult]) -> dict[str, Any]:
+    """各数据集的 ``token_usage`` 与「已上报部分」合计（报告与 summary.json 共用）。
+
+    Returns:
+        ``{"per_dataset": {key: usage | None}, "total": {...}, "datasets_reported": n,
+        "datasets_total": m}``；``total`` 只求和已落账的 run——未落账记 ``None``
+        而不是 0，``datasets_reported`` 让调用方知道合计的覆盖范围。
+    """
+    per_dataset: dict[str, Union[dict[str, Any], None]] = {}
+    total = {
+        "ingest_input_tokens": 0,
+        "ingest_llm_calls": 0,
+        "query_input_tokens": 0,
+        "query_output_tokens": 0,
+        "query_llm_calls": 0,
+    }
+    reported = 0
+    for r in results:
+        usage = r.metrics.get("token_usage")
+        if isinstance(usage, dict):
+            reported += 1
+            totals = token_usage_totals(usage)
+            for key in total:
+                total[key] += totals.get(key, 0)
+            per_dataset[r.spec.key] = usage
+        else:
+            per_dataset[r.spec.key] = None
+    return {
+        "per_dataset": per_dataset,
+        "total": total if reported else None,
+        "datasets_reported": reported,
+        "datasets_total": len(results),
+    }
+
+
 def write_evaluate_report(
     eval_dir: str,
     adapter_name: str,
@@ -831,6 +873,67 @@ def write_evaluate_report(
     )
     lines.append("")
     lines.append("![各数据集质量与效率](fig_dataset_overview.png)")
+    lines.append("")
+
+    # Token 消耗（全流程）：被测系统上报口径的累计值——回答"这次评测烧了多少"
+    lines.append("## Token 消耗（全流程）")
+    lines.append("")
+    lines.append(
+        "<sub>被测系统（适配器）上报口径的累计消耗：ingest 写入按每次对话计、"
+        "query 输入/输出逐题累计；不含判分器 / 驱动侧消耗。0 = 适配器未上报该字段，"
+        "「—」= 该 run 未落账 `token_usage`（旧版本产物）。</sub>"
+    )
+    lines.append("")
+    token_summary = _token_usage_summary(results)
+    token_rows: list[list[str]] = []
+    for r in results:
+        usage = token_summary["per_dataset"].get(r.spec.key)
+        if isinstance(usage, dict):
+            totals = token_usage_totals(usage)
+            grand = (
+                totals.get("ingest_input_tokens", 0)
+                + totals.get("query_input_tokens", 0)
+                + totals.get("query_output_tokens", 0)
+            )
+            calls = totals.get("ingest_llm_calls", 0) + totals.get("query_llm_calls", 0)
+            token_rows.append(
+                [
+                    r.spec.name,
+                    str(totals.get("ingest_input_tokens", 0)),
+                    str(totals.get("query_input_tokens", 0)),
+                    str(totals.get("query_output_tokens", 0)),
+                    str(grand),
+                    str(calls),
+                ]
+            )
+        else:
+            token_rows.append([r.spec.name, "—", "—", "—", "—", "—"])
+    cols = ["数据集", "ingest 写入", "query 输入", "query 输出", "合计", "LLM 调用"]
+    total = token_summary["total"]
+    reported = token_summary["datasets_reported"]
+    if total is not None:
+        grand_total = (
+            total["ingest_input_tokens"] + total["query_input_tokens"] + total["query_output_tokens"]
+        )
+        calls_total = total["ingest_llm_calls"] + total["query_llm_calls"]
+        token_rows.append(
+            [
+                f"**合计（{reported}/{len(results)} 个数据集上报）**",
+                str(total["ingest_input_tokens"]),
+                str(total["query_input_tokens"]),
+                str(total["query_output_tokens"]),
+                f"**{grand_total}**",
+                str(calls_total),
+            ]
+        )
+        lines.append(_md_table(cols, token_rows))
+        if reported < len(results):
+            lines.append("")
+            lines.append(
+                f"<sub>⚠️ 仅 {reported}/{len(results)} 个数据集的 run 落了账，合计为已上报部分的求和。</sub>"
+            )
+    else:
+        lines.append("（本次评测各 run 均未落账 `token_usage`：适配器未上报或产物来自旧版本）")
     lines.append("")
 
     # 各数据集 run 目录链接（指向报告目录下复制后的 runs/<run_id>/）
@@ -1070,6 +1173,7 @@ def evaluate(
         },
         "fused": fused,
         "gate": gate,
+        "token_usage": _token_usage_summary(results),
     }
     with open(os.path.join(report_dir, "evaluate_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)

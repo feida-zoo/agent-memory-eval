@@ -121,3 +121,71 @@ class TestMdTableEscaping:
 
         assert _md_cell("normal text") == "normal text"
         assert _md_cell(123) == "123"
+
+
+class TestCompareFigureLegend:
+    """对比报告图例：必须标出 A/B 身份，高亮色不冒充当身份色。"""
+
+    @staticmethod
+    def _legend_texts(fig) -> list[str]:
+        return [
+            t.get_text()
+            for ax in fig.axes
+            for leg in [ax.get_legend()]
+            if leg is not None
+            for t in leg.get_texts()
+        ]
+
+    def test_metric_diff_legend_marks_ab_and_short_names(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        pytest.importorskip("matplotlib")
+        import matplotlib.pyplot as plt
+
+        monkeypatch.setattr(plt, "close", lambda fig=None: None)  # 留住 figure 以便断言图例
+        report.fig_metric_diff(
+            {"accuracy": 0.50, "token_f1": 0.20, "evidence_recall": 0.90},
+            {"accuracy": 0.80, "token_f1": 0.22, "evidence_recall": 0.60},
+            "mock-a@v1",
+            "mock-b@v2",
+            str(tmp_path / "diff.png"),
+        )
+        texts = self._legend_texts(plt.gcf())
+        plt.close(plt.gcf())
+        assert any("A（基线）· mock-a@v1" in t for t in texts)
+        assert any("B（候选）· mock-b@v2" in t for t in texts)
+        # B 的明显优化/劣化另立图例项（accuracy +0.30 优化、evidence_recall -0.30 劣化）
+        assert any("B 明显优化" in t for t in texts)
+        assert any("B 明显劣化" in t for t in texts)
+
+    def test_category_diff_legend_marks_ab(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        pytest.importorskip("matplotlib")
+        import matplotlib.pyplot as plt
+
+        monkeypatch.setattr(plt, "close", lambda fig=None: None)
+        report.fig_category_diff(
+            {"single_hop": {"accuracy": 0.5}},
+            {"single_hop": {"accuracy": 1.0}},
+            "mock-a@v1",
+            "mock-b@v2",
+            str(tmp_path / "cat.png"),
+        )
+        texts = self._legend_texts(plt.gcf())
+        plt.close(plt.gcf())
+        assert any("A（基线）· mock-a@v1" in t for t in texts)
+        assert any("B（候选）· mock-b@v2" in t for t in texts)
+
+    def test_ab_series_labels_prefers_adapter_and_commit(self) -> None:
+        """短名首选 adapter@commit；两侧完全相同才退回 run_id 以免图例分不出。"""
+        a, b = report.ab_series_labels(
+            {"adapter": "mock-a", "commit": "abcdef1234", "run_id": "r1"},
+            {"adapter": "mock-b", "run_id": "r2"},
+        )
+        assert (a, b) == ("mock-a@abcdef12", "mock-b")
+
+        same_a, same_b = report.ab_series_labels(
+            {"adapter": "mock-a", "run_id": "r1"}, {"adapter": "mock-a", "run_id": "r2"}
+        )
+        assert (same_a, same_b) == ("r1", "r2")

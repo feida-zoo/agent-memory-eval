@@ -16,7 +16,8 @@
 metadata 标记 ``"fused": true`` 及来源分片列表 ``"fused_from"``，并透传可比性
 元数据（adapter_version / judge_model / driver_llm / dataset_fingerprint /
 retrieval_match / adapter_meta / adapter_describe / schema_version）——融合产物
-可直接参与 ``compare --require-comparable``。
+可直接参与 ``compare --require-comparable``。各分片的 ``token_usage`` 账本
+逐片相加（任一分片未落账则融合产物不落账，避免"部分求和"被读成全量消耗）。
 """
 
 from __future__ import annotations
@@ -58,14 +59,21 @@ def fuse_gate(
     """融合结果的 stale 门禁（一票否决，与 evaluate 办公域门禁同阈值）。
 
     融合结果中存在 knowledge_update 题时：stale_rate > threshold -> FAIL
-    （退出码 1）；无 knowledge_update 题 -> SKIP。
+    （退出码 1）；无 knowledge_update 题、或 stale_rate 未计算（``None``，
+    如数据集缺 gold_stale 标注）-> SKIP——不把"未计算"当 0 判 PASS。
 
     Returns:
         ``{"status": "PASS"|"FAIL"|"SKIP", "detail": 说明}``。
     """
     if not any(r.get("category") == "knowledge_update" for r in records):
         return {"status": "SKIP", "detail": "融合结果中无 knowledge_update 题，stale 门禁跳过。"}
-    stale_rate = float(metrics.get("overall", {}).get("stale_rate", 0.0))
+    stale_raw = metrics.get("overall", {}).get("stale_rate")
+    if stale_raw is None:
+        return {
+            "status": "SKIP",
+            "detail": "融合结果 stale_rate 未计算（None，数据缺 stale 标注或分片未落账），stale 门禁跳过。",
+        }
+    stale_rate = float(stale_raw)
     if stale_rate > threshold:
         return {
             "status": "FAIL",
@@ -199,6 +207,26 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
     match_fallbacks = sum(int(m.get("retrieval_match_fallbacks", 0) or 0) for m in metas)
     if match_fallbacks:
         metrics["retrieval_match_fallbacks"] = match_fallbacks
+    # token 记账：各分片各记各的（question 分片下同一对话可能被多片 ingest，
+    # 只有分片自己的计数才是真实成本），故直接相加；任一分片未落账则整体不落账
+    # （避免"部分求和"被读成全量消耗）。
+    if all(isinstance(m.get("token_usage"), dict) for m in metas):
+
+        def _sum_usage(field: str) -> int:
+            return sum(int((m.get("token_usage") or {}).get(field, 0) or 0) for m in metas)
+
+        metrics["token_usage"] = {
+            field: _sum_usage(field)
+            for field in (
+                "ingest_input_tokens",
+                "ingest_llm_calls",
+                "query_input_tokens",
+                "query_output_tokens",
+                "query_llm_calls",
+                "n_dialogues",
+                "n_questions",
+            )
+        }
     gate = fuse_gate(records, metrics)
     metrics["stale_gate"] = gate
 
