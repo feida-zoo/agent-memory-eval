@@ -42,7 +42,36 @@ const DATA_DIR = process.env.BRIDGE_DATA_DIR || "./.bridge-data";
 // 长跑批量评测建议关。
 const RESET_BACKUP = process.env.BRIDGE_RESET_BACKUP || "";
 
-const memory = createMemorySystem({ dataDir: DATA_DIR });
+let memory = createMemorySystem({ dataDir: DATA_DIR });
+
+/**
+ * 清空前快照（BRIDGE_RESET_BACKUP，默认关闭，人类可读布局）：把当前记忆目录
+ * 复制一份，便于评测后回溯"这一刻记忆里有什么"。目录名带 reset 序号与对话 id，
+ * 与 results.jsonl 的 dialogue_id 直接对得上。
+ */
+function snapshotBeforeReset(body) {
+  if (!RESET_BACKUP) return null;
+  const base =
+    RESET_BACKUP === "run"
+      ? body.run_dir
+        ? path.join(String(body.run_dir), "run_snapshots")
+        : null
+      : RESET_BACKUP;
+  if (!base) return null;
+  const tag = body.dialogue_id ? String(body.dialogue_id) : "unknown";
+  const dest = path.join(base, `reset_${String(resetSeq).padStart(4, "0")}_${tag}`);
+  try {
+    copyDir(DATA_DIR, dest);
+    return dest;
+  } catch (err) {
+    console.error(`[bridge] 快照失败（不影响 reset）：${err?.message || err}`);
+    return null;
+  }
+}
+
+// 状态快照格式版本：改快照布局时递增，并在 capabilities 里声明可兼容的旧版本。
+const SNAPSHOT_FORMAT_VERSION = 1;
+const SNAPSHOT_MARKER = ".membench-snapshot.json";
 
 let resetSeq = 0;
 
@@ -85,29 +114,56 @@ function copyDir(src, dest) {
   return true;
 }
 
-/**
- * 清空前快照：把当前记忆目录复制一份，便于评测后回溯"这一刻记忆里有什么"。
- * 目录名带 reset 序号与对话 id，与 results.jsonl 的 dialogue_id 直接对得上。
- * 返回快照路径；未开启或记忆目录不存在时返回 null（不阻断 reset）。
- */
-function snapshotBeforeReset(body) {
-  if (!RESET_BACKUP) return null;
-  const base =
-    RESET_BACKUP === "run"
-      ? body.run_dir
-        ? path.join(String(body.run_dir), "run_snapshots")
-        : null
-      : RESET_BACKUP;
-  if (!base) return null;
-  const tag = body.dialogue_id ? String(body.dialogue_id) : "unknown";
-  const dest = path.join(base, `reset_${String(resetSeq).padStart(4, "0")}_${tag}`);
-  try {
-    copyDir(DATA_DIR, dest);
-    return dest;
-  } catch (err) {
-    console.error(`[bridge] 快照失败（不影响 reset）：${err?.message || err}`);
-    return null;
+/** 统计目录下的文件数（登记到快照标记里，便于人工核对）。 */
+function countFiles(dir) {
+  let n = 0;
+  if (!fs.existsSync(dir)) return 0;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    n += entry.isDirectory() ? countFiles(full) : 1;
   }
+  return n;
+}
+
+/**
+ * 状态快照：把当前记忆目录整体导出到 target_dir（框架在"每个对话 ingest 完成、
+ * query 之前"调用）。布局 = memory/（记忆本体）+ 标记文件（格式版本/来源/条目数）。
+ */
+function writeSnapshot(targetDir) {
+  const abs = path.resolve(String(targetDir));
+  fs.rmSync(abs, { recursive: true, force: true });
+  fs.mkdirSync(abs, { recursive: true });
+  const items = copyDir(DATA_DIR, path.join(abs, "memory"));
+  const marker = {
+    bridge: "http_bridge_node",
+    format_version: SNAPSHOT_FORMAT_VERSION,
+    created_at: new Date().toISOString(),
+    items: items ? countFiles(path.join(abs, "memory")) : 0,
+  };
+  fs.writeFileSync(path.join(abs, SNAPSHOT_MARKER), JSON.stringify(marker, null, 2));
+  return { path: abs, items: marker.items, format_version: SNAPSHOT_FORMAT_VERSION };
+}
+
+/**
+ * 从快照恢复：只认带标记文件的快照（防止误传路径把记忆库清空）。
+ * 替换整个 DATA_DIR，并**重建记忆实例**（真实系统若在内存里缓存了索引/状态，
+ * 必须在这里重新创建实例或触发它重新加载，否则恢复的只是磁盘、跑的还是旧内存）。
+ */
+function restoreSnapshot(sourceDir) {
+  const abs = path.resolve(String(sourceDir));
+  const markerPath = path.join(abs, SNAPSHOT_MARKER);
+  if (!fs.existsSync(markerPath)) {
+    throw new Error(`快照缺少标记文件 ${SNAPSHOT_MARKER}（拒绝恢复，避免覆盖成空库）：${abs}`);
+  }
+  const memDir = path.join(abs, "memory");
+  if (!fs.existsSync(memDir)) {
+    throw new Error(`快照缺少 memory/ 目录：${abs}`);
+  }
+  fs.rmSync(DATA_DIR, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(path.resolve(DATA_DIR)), { recursive: true });
+  fs.cpSync(memDir, DATA_DIR, { recursive: true });
+  memory = createMemorySystem({ dataDir: DATA_DIR });
+  return { restored: true, from: abs };
 }
 
 const routes = new Map([
@@ -121,6 +177,24 @@ const routes = new Map([
       if (backup) payload.backup_path = backup;
       return payload;
     },
+  ],
+  [
+    "/snapshot-capabilities",
+    async () => ({
+      supported: true,
+      restore: true,
+      rebuild: false,
+      format_version: SNAPSHOT_FORMAT_VERSION,
+      compatible_from: [SNAPSHOT_FORMAT_VERSION],
+    }),
+  ],
+  [
+    "/snapshot",
+    async (body) => writeSnapshot(body.target_dir),
+  ],
+  [
+    "/restore",
+    async (body) => restoreSnapshot(body.source_dir),
   ],
   [
     "/ingest",

@@ -38,6 +38,8 @@ npm start             # = node bridge.mjs，默认 http://127.0.0.1:8787
 #   /reset 前把记忆目录快照到本次评测 run 目录的 run_snapshots/
 #   （目录名带 reset 序号与 dialogue_id，与 results.jsonl 对得上）；
 #   设成具体目录则快照到该目录。默认关闭（每个对话调一次 reset，长跑别开）。
+#   另有一组快照回放端点（无需环境变量）：POST /snapshot-capabilities|/snapshot|/restore，
+#   配合 membench run --snapshot-out / --replay 使用（改读取侧代码免重跑 ingest）。
 
 # 4) 自检（另开一个终端）
 cd <仓库根>/membench
@@ -81,6 +83,11 @@ python -m membench.cli run --adapter http --judge heuristic \
   不读不写你的记忆存储（黑盒契约），只通过 `/reset` 请求体告诉你本次 run 目录、对话 id
   与序号；要不要快照、落到哪里，由桥决定。逐题 `retrieved` 已在 `results.jsonl` 里，
   快照只用来查"内部存储为什么这样"，别在所有长跑里常开（每对话一份 = 磁盘翻倍）。
+- **快照回放端点**：`/snapshot` 把记忆整体导出到 `target_dir`（模板布局 = `memory/` +
+  `.membench-snapshot.json` 标记），`/restore` 替换 `DATA_DIR` 并**重建记忆实例**
+  （真实系统若在内存缓存索引，必须在这里重新创建实例，否则恢复的只是磁盘）；
+  `/restore` 只认带标记的快照目录，防止路径传错把库清空。用法：
+  `run --snapshot-out DIR`（导出）→ 改代码 → `run --replay DIR --replay-verify-source <源run>`。
 - **别用 express 等额外框架**：三端点用 `node:http` 足够，少一个依赖少一类 native/构建坑。
 
 对应 checklist（打包 / stub / external / define / 契约字段 / doctor 用法）见

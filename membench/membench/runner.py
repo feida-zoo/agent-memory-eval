@@ -43,6 +43,7 @@ from membench.metrics.evidence import SubstringMatcher
 from membench.metrics.text import bleu1, token_f1
 from membench.paths import runs_dir
 from membench.report import format_token_usage, render_run_report
+from membench import snapshot as snapshot_mod
 
 
 def _judge_result_to_dict(jr: Any) -> dict[str, Any]:
@@ -160,6 +161,17 @@ class Runner:
             ``<report_out>/eval_<adapter>_<platform>_<ts>/``（报告 + metrics +
             结果 + run 副本），并把 ``experiment_dir`` 写回 metrics.json；
             缺省 None 时不额外落盘。
+        snapshot_out: 非空时，每个对话 ingest 完成后（query 之前）调用适配器的
+            ``snapshot()`` 把状态导出到该目录，并写 ``manifest.json``——之后改
+            读取侧代码可用 ``replay`` 免重跑 ingest。与 ``replay`` 互斥。
+        replay: 快照根目录；给定时跳过 reset+ingest，按对话 ``restore()``（或
+            ``rebuild()``）后只跑 query。数据集指纹不符、快照缺对话、适配器不
+            支持快照都会在**开跑前**拒绝。
+        replay_mode: ``auto``（默认，优先 restore，格式不兼容时退回 rebuild）/
+            ``restore`` / ``rebuild``。
+        replay_verify_source: 给定源 run 目录时，回放结束与之逐题比对
+            （answer / retrieved / 判分），结果写进 metrics 与报告——这就是
+            "回放误差地板"，读取侧 A/B 的差值必须大于它才有意义。
     """
 
     def __init__(
@@ -182,9 +194,23 @@ class Runner:
         evidence_matcher: Any = None,
         adapter_version: Union[str, None] = None,
         report_out: Union[str, None] = None,
+        snapshot_out: Union[str, None] = None,
+        replay: Union[str, None] = None,
+        replay_mode: str = "auto",
+        replay_verify_source: Union[str, None] = None,
     ) -> None:
         if jobs < 1:
             raise ValueError(f"jobs 必须 >= 1，当前为 {jobs}")
+        if snapshot_out and replay:
+            raise ValueError("snapshot_out 与 replay 互斥（导快照 / 用快照回放，二选一）")
+        if replay_verify_source and not replay:
+            raise ValueError("replay_verify_source 只在 replay 模式下有意义（需同时给 replay）")
+        if replay_mode not in ("auto", "restore", "rebuild"):
+            raise ValueError(f"replay_mode 必须是 auto / restore / rebuild，当前为 {replay_mode!r}")
+        self.snapshot_out = snapshot_out
+        self.replay = replay
+        self.replay_mode = replay_mode
+        self.replay_verify_source = replay_verify_source
         self.jobs = int(jobs)
         if limit is not None and limit < 1:
             raise ValueError(f"limit 必须 >= 1，当前为 {limit}")
@@ -305,6 +331,21 @@ class Runner:
             dialogues = _select_questions(
                 dialogues, shards, self.shard_index, self.limit, self.shard_by
             )
+        # 回放跑前校验（失败即停，不留下半成品 run 目录）：清单/指纹/覆盖/模式协商
+        replay_plan: Union[dict, None] = None
+        if self.replay:
+            replay_plan = snapshot_mod.plan_replay(
+                self.adapter,
+                self.replay,
+                dataset_fingerprint=dataset_fingerprint(self.dataset_path),
+                dialogue_ids=[str(d.dialogue_id) for d in dialogues],
+                requested_mode=self.replay_mode,
+            )
+            print(
+                f"[membench] 快照回放：{replay_plan['run_mode']}（源 run "
+                f"{replay_plan['source_run']}，格式 v{replay_plan['format_version']}，"
+                f"{len(dialogues)} 个对话）——写入侧固定，结论只覆盖读取/回答层"
+            )
         adapter_name = str(getattr(self.adapter, "name", self.adapter.__class__.__name__))
         dataset_name = os.path.splitext(os.path.basename(self.dataset_path))[0]
         platform_tag = self.platform or "default"
@@ -339,6 +380,45 @@ class Runner:
 
         records: list[dict[str, Any]] = []
         done = 0
+        # 快照清单（--snapshot-out）：逐对话增量登记，跑完置 complete=true；
+        # 覆盖旧清单时只提示不报错（快照可再生，重 ingest 才是贵的）。
+        snapshot_manifest: Union[dict, None] = None
+        snapshot_root: Union[str, None] = None
+        if self.snapshot_out:
+            snapshot_root = os.path.abspath(self.snapshot_out)
+            caps = snapshot_mod.read_capabilities(self.adapter)
+            if not caps.get("supported"):
+                raise SystemExit(
+                    "该适配器未声明快照能力，无法 --snapshot-out："
+                    "请实现 snapshot()（可选 restore()/rebuild()）并让 "
+                    "snapshot_capabilities() 返回 supported=True；HTTP 桥同理"
+                )
+            previous = os.path.join(snapshot_root, snapshot_mod.MANIFEST_NAME)
+            if os.path.isfile(previous):
+                try:
+                    with open(previous, encoding="utf-8") as handle:
+                        old = json.load(handle)
+                    print(
+                        f"[membench] 提示: 覆盖已有快照清单（旧 run_id={old.get('run_id')}，"
+                        f"{len(old.get('dialogues') or {})} 个对话）: {previous}"
+                    )
+                except ValueError:
+                    print(f"[membench] 提示: 覆盖无法解析的旧快照清单: {previous}")
+            snapshot_manifest = snapshot_mod.new_manifest(
+                run_id=run_id,
+                adapter=adapter_name,
+                adapter_version=self.adapter_version,
+                platform=platform_tag,
+                dataset=dataset_name,
+                dataset_path=os.path.abspath(self.dataset_path),
+                dataset_fingerprint=dataset_fingerprint(self.dataset_path),
+                shard_by=self.shard_by,
+                shards=shards,
+                shard_index=self.shard_index,
+                capabilities=caps,
+            )
+            snapshot_mod.save_manifest(snapshot_root, snapshot_manifest)
+
         # 全流程 token / LLM 调用记账（ingest 按对话真实调用计一次；query 逐题累加）：
         # 与 records 的「每题归属」不同，这里是总量的唯一真相来源——question 分片下
         # 同一对话可能被多个分片各自 ingest，只有各分片自己的计数才是真实成本。
@@ -349,38 +429,69 @@ class Runner:
             "query_output_tokens": 0,
             "query_llm_calls": 0,
         }
+        if replay_plan:
+            # 回放跳过 reset + ingest：账目里必须显式标注，避免被读成"写入零成本"
+            token_usage["ingest_skipped"] = 1
         # 检索回退数按本次 run 增量统计（matcher 实例可在多数据集间共享）
         match_fallbacks_start = int(
             getattr(self._evidence_matcher, "fallbacks", 0) or 0
         )
 
         for di, dialogue in enumerate(dialogues, 1):
-            # reset 上下文：只作为「适配器可选提示」暴露（环境变量 + HTTP 桥透传），
-            # 框架不读不写适配器的记忆存储——要不要在清空前快照、落到哪里，由接入侧
-            # 决定（见 examples/http_bridge_node 的 BRIDGE_RESET_BACKUP）。
-            os.environ["MEMBENCH_RUN_DIR"] = run_dir
-            os.environ["MEMBENCH_DIALOGUE_ID"] = str(dialogue.dialogue_id)
-            os.environ["MEMBENCH_DIALOGUE_INDEX"] = str(di)
-            self.adapter.reset()
-            ingest_latency_ms = 0.0
-            ingest_llm_calls = 0
-            ingest_input_tokens = 0
-            for session in dialogue.sessions:
-                stats = self.adapter.ingest(session)
-                ingest_latency_ms += float(getattr(stats, "latency_ms", 0.0) or 0.0)
-                ingest_llm_calls += int(getattr(stats, "llm_calls", 0) or 0)
-                ingest_input_tokens += int(getattr(stats, "input_tokens", 0) or 0)
+            if replay_plan:
+                # 回放：恢复该对话的快照（restore 或 rebuild），不 reset、不 ingest
+                snapshot_mod.replay_dialogue(self.adapter, replay_plan, str(dialogue.dialogue_id))
+                ingest_latency_ms = 0.0
+                ingest_llm_calls = 0
+                ingest_input_tokens = 0
+                print(
+                    f"[membench] dialogue {di}/{len(dialogues)} {dialogue.dialogue_id}: "
+                    f"从快照恢复（{replay_plan['run_mode']}）"
+                )
+            else:
+                # reset 上下文：只作为「适配器可选提示」暴露（环境变量 + HTTP 桥透传），
+                # 框架不读不写适配器的记忆存储——要不要在清空前快照、落到哪里，由接入侧
+                # 决定（见 examples/http_bridge_node 的 BRIDGE_RESET_BACKUP）。
+                os.environ["MEMBENCH_RUN_DIR"] = run_dir
+                os.environ["MEMBENCH_DIALOGUE_ID"] = str(dialogue.dialogue_id)
+                os.environ["MEMBENCH_DIALOGUE_INDEX"] = str(di)
+                self.adapter.reset()
+                ingest_latency_ms = 0.0
+                ingest_llm_calls = 0
+                ingest_input_tokens = 0
+                for session in dialogue.sessions:
+                    stats = self.adapter.ingest(session)
+                    ingest_latency_ms += float(getattr(stats, "latency_ms", 0.0) or 0.0)
+                    ingest_llm_calls += int(getattr(stats, "llm_calls", 0) or 0)
+                    ingest_input_tokens += int(getattr(stats, "input_tokens", 0) or 0)
             token_usage["ingest_input_tokens"] += ingest_input_tokens
             token_usage["ingest_llm_calls"] += ingest_llm_calls
 
-            print(
-                f"[membench] dialogue {di}/{len(dialogues)} "
-                f"{dialogue.dialogue_id}: ingested {len(dialogue.sessions)} session(s), "
-                f"{ingest_latency_ms:.0f} ms"
-            )
+            if not replay_plan:
+                print(
+                    f"[membench] dialogue {di}/{len(dialogues)} "
+                    f"{dialogue.dialogue_id}: ingested {len(dialogue.sessions)} session(s), "
+                    f"{ingest_latency_ms:.0f} ms"
+                )
             active_questions = [
                 q for q in dialogue.questions if not getattr(q, "ignore", False)
             ]
+
+            # 快照打点：该对话 ingest 完成后、第一道 query 之前（回放的入口状态）
+            if snapshot_manifest is not None and snapshot_root is not None:
+                entry = snapshot_mod.write_snapshot(
+                    snapshot_root,
+                    self.adapter,
+                    snapshot_manifest,
+                    dialogue_id=str(dialogue.dialogue_id),
+                    sessions=dialogue.sessions,
+                    n_questions=len(active_questions),
+                )
+                snapshot_mod.save_manifest(snapshot_root, snapshot_manifest)
+                print(
+                    f"[membench] 快照: {entry['dir']}/（{entry['bytes']} 字节，"
+                    f"sha256 {entry['sha256'][:12]}）"
+                )
 
             def _eval(q: Any) -> dict[str, Any]:
                 # 单题内部计时：latency_ms 是该题 query 调用的墙钟时间，不受并发影响。
@@ -414,6 +525,53 @@ class Runner:
         # reset 上下文用完即撤（异常中断时残留也无害：下一次 reset 前会被覆写）
         for _key in ("MEMBENCH_RUN_DIR", "MEMBENCH_DIALOGUE_ID", "MEMBENCH_DIALOGUE_INDEX"):
             os.environ.pop(_key, None)
+
+        # 快照清单收尾：置 complete=true（回放前会校验覆盖是否齐全）
+        snapshot_meta: Union[dict, None] = None
+        if snapshot_manifest is not None and snapshot_root is not None:
+            snapshot_manifest["complete"] = True
+            manifest_sha = snapshot_mod.save_manifest(snapshot_root, snapshot_manifest)
+            snapshot_meta = {
+                "role": "exported",
+                "root": snapshot_root,
+                "manifest_sha256": manifest_sha,
+                "format_version": (snapshot_manifest.get("capabilities") or {}).get(
+                    "format_version", 1
+                ),
+                "n_dialogues": len(snapshot_manifest["dialogues"]),
+            }
+            print(
+                f"[membench] 快照清单: {snapshot_root}/{snapshot_mod.MANIFEST_NAME}"
+                f"（{snapshot_meta['n_dialogues']} 个对话，格式 v{snapshot_meta['format_version']}）"
+            )
+        if replay_plan:
+            snapshot_meta = {
+                "role": "replayed",
+                "root": replay_plan["root"],
+                "manifest_sha256": replay_plan["manifest_sha256"],
+                "format_version": replay_plan["format_version"],
+                "source_run": replay_plan["source_run"],
+                "replay_mode": replay_plan["mode"],
+                "n_dialogues": len(dialogues),
+            }
+        replay_verify: Union[dict, None] = None
+        if self.replay_verify_source:
+            replay_verify = snapshot_mod.verify_replay(self.replay_verify_source, records)
+            if "error" in replay_verify:
+                print(f"[membench] ⚠️ 回放保真校验失败：{replay_verify['error']}")
+            else:
+                print(
+                    "[membench] 回放保真校验（对比源 run "
+                    f"{replay_verify['source_run']}）：共同题 {replay_verify['n_common']}，"
+                    f"答案不一致 {replay_verify['n_answer_diff']}、"
+                    f"检索不一致 {replay_verify['n_retrieved_diff']}、"
+                    f"判分不一致 {replay_verify['n_correct_diff']}"
+                    + (
+                        f"（答案一致率 {replay_verify['answer_match_rate']:.1%}）"
+                        if replay_verify.get("answer_match_rate") is not None
+                        else ""
+                    )
+                )
 
         # 适配器可选的 describe() -> dict：记录其配置/版本等自描述信息；
         # 调用失败记 None，不中断评测。
@@ -456,6 +614,9 @@ class Runner:
                 "judge_model": self.judge_model,
                 "adapter_version": self.adapter_version,
                 "dataset_fingerprint": dataset_fingerprint(self.dataset_path),
+                # 运行模式：full（默认）/ replay-restore / replay-rebuild；compare
+                # 把 run_mode 当关键维度——回放分不得与全量分被静默对比
+                "run_mode": replay_plan["run_mode"] if replay_plan else "full",
                 # 全流程 token / 调用记账（被测系统上报口径；适配器未上报时为 0，
                 # 报告按「未上报」提示，不当作真实 0 消耗）。这不是指标，不参与
                 # 评级/门禁，只回答"这次评测烧了多少"。
@@ -478,6 +639,10 @@ class Runner:
         if match_fallbacks:
             retrieval_meta["retrieval_match_fallbacks"] = match_fallbacks
         metrics.update(retrieval_meta)
+        if snapshot_meta is not None:
+            metrics["state_snapshot"] = snapshot_meta
+        if replay_verify is not None:
+            metrics["replay_verify"] = replay_verify
 
         results_path = os.path.join(run_dir, "results.jsonl")
         with open(results_path, "w", encoding="utf-8") as f:

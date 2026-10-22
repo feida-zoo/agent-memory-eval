@@ -7,7 +7,11 @@ matrix / doctor / adapter / user-data / dataset / list-datasets。
         [--platform wx --commit a1b2c3] [--driver-llm gpt-4o] \
         [--adapter-version a1b2c3] [--report-out DIR] \
         [--shards N|max --shard-index I --shard-by question|dialogue] \
-        [--evidence-match substring|overlap|llm]
+        [--evidence-match substring|overlap|llm] \
+        [--snapshot-out DIR]   # 每对话 ingest 后导出状态快照（需适配器支持）
+    python -m membench.cli run --adapter mock-strong --dataset ... \
+        --replay <快照根目录> [--replay-mode auto|restore|rebuild] \
+        [--replay-verify-source <源run目录>]   # 快照回放：跳过 ingest，只跑 query
     python -m membench.cli evaluate --adapter mock-strong \
         [--judge heuristic] [--platform wx --commit a1b2c3] [--out runs/] \
         [--driver-llm gpt-4o] [--adapter-version a1b2c3] \
@@ -100,6 +104,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--client-llm", default=None, help="judge=client 时的 agent 内置 LLM 类路径，如 'my_agent.llm:LLMClient'")
     p_run.add_argument("--limit", type=int, default=None, help="冒烟模式：只评测（分片后的）前 N 道题，run_id 与 metadata 记录 limit")
     p_run.add_argument("--adapter-meta", default=None, help='适配器配置自由文本（"key=value;..."），原样记入 metadata["adapter_meta"]')
+    p_run.add_argument(
+        "--snapshot-out",
+        default=None,
+        help="把每个对话 ingest 完成后的记忆状态导出到该目录（可选能力，需适配器实现 snapshot()）——之后改读取侧代码可用 --replay 免重跑 ingest",
+    )
+    p_run.add_argument(
+        "--replay",
+        default=None,
+        help="快照根目录：跳过 reset+ingest，按对话恢复快照后只跑 query（写入侧固定，结论只覆盖读取/回答层）",
+    )
+    p_run.add_argument(
+        "--replay-mode",
+        choices=("auto", "restore", "rebuild"),
+        default="auto",
+        help="回放模式（默认 auto：优先 restore，快照格式不兼容时退回 rebuild）",
+    )
+    p_run.add_argument(
+        "--replay-verify-source",
+        default=None,
+        help="回放时与源 run 逐题比对（答案/检索/判分），写进 metrics 与报告——回放误差地板",
+    )
     p_run.add_argument(
         "--shards",
         type=_parse_shards,
@@ -392,6 +417,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         adapter_version=args.adapter_version,
         report_out=args.report_out,
         evidence_matcher=evidence_matcher,
+        snapshot_out=args.snapshot_out,
+        replay=args.replay,
+        replay_mode=args.replay_mode,
+        replay_verify_source=args.replay_verify_source,
     )
     try:
         run_dir = runner.run()

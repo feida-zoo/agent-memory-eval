@@ -56,6 +56,9 @@ CRITICAL_COMPARABILITY_DIMS: tuple[str, ...] = (
     "judge_model",
     "driver_llm",
     "platform",
+    # 运行模式：full / replay-restore / replay-rebuild。回放固定写入侧，
+    # 与全量分**不可比**（缺省视为 full——本特性之前的所有 run 都是全量跑）。
+    "run_mode",
 )
 
 #: 次要维度：不一致仅降级为 WARN 门禁，不判 FAIL。
@@ -194,10 +197,16 @@ def _eval_gates(
 
 
 def _comparability_value(metrics: dict[str, Any], dim: str) -> Any:
-    """取某维度在 metrics 中的值（``dataset_sha256`` 走指纹子字段）。"""
+    """取某维度在 metrics 中的值（``dataset_sha256`` 走指纹子字段）。
+
+    ``run_mode`` 缺省归一为 ``"full"``：本特性之前的所有 run 都是全量跑，
+    旧 run 不该因为"没落账这个字段"被记成无法核验。
+    """
     if dim == "dataset_sha256":
         fingerprint = metrics.get("dataset_fingerprint") or {}
         return fingerprint.get("sha256") if isinstance(fingerprint, dict) else None
+    if dim == "run_mode":
+        return metrics.get("run_mode") or "full"
     return metrics.get(dim)
 
 

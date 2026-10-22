@@ -56,6 +56,7 @@ description: >
 1. 阅读 `references/adapter_guide.md`（含第 3 节真实性红线：真实写入/读取路径是完整评测的唯一前提；旁路不得自行采用，走不通时停下、由用户决定降级口径），在被测 Agent 源码中定位三个挂点：记忆清空、记忆写入、记忆读取+回答。
 2. 实现 `BaseMemoryAdapter` 三方法（`reset` / `ingest` / `query`），或在 Agent 侧暴露 `POST /reset|/ingest|/query` 三个端点后用内置 HttpAdapter。
    - **`query` 必须回填 `retrieved`**：= 实际拼进回答 prompt 的**记忆条目原文**，按注入优先级排序，多轮检索**先合并去重**再返回，报**注入的那一份全量**（框架不合并、不去重、不截断；返回空列表 = 静默按 0 召回计）。它决定 `evidence_recall` / `recall@5` 是否成立，细则见 `references/adapter_guide.md` §2.3。
+   - 需要「快照回放」（改读取侧免重跑 ingest）时，额外实现可选接口 `snapshot_capabilities()` / `snapshot()` / `restore()`（`rebuild()` 可选，覆盖跨版本/重建派生结构）——框架只传目录与 tag，导出什么由你决定；细则见 `references/adapter_guide.md` §2.7。
    - **若被测 Agent 的记忆能力本身就是"LLM + 工具调用"**（ingest 与 query 是同构的 tool-call 循环），不要各写一遍骨架——直接用 `membench.agent_loop.AgentLoopAdapter` 复用循环（见「本波新能力」）。
 3. **生成的适配器必须显式持久化**（否则跨 session 丢失）：
    ```bash

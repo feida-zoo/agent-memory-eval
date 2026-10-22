@@ -15,6 +15,9 @@
 | `POST /reset` | `{}` 或 `{"run_dir","dialogue_id","dialogue_index"}`（可选提示） | 2xx 即可（体可空） | 真清空记忆库（向量 collection / 事实表 / 情景缓冲 / 图谱），测试库与生产库隔离；上下文只用于"清空前快照"等回溯能力，可忽略 |
 | `POST /ingest` | `{"messages":[{"role","content","timestamp"}]}` | `{"input_tokens":int,"llm_calls":int,"latency_ms":float}` | 走**记忆写入路径**；拿不到 token/调用数填 `0`（报告标「未上报」） |
 | `POST /query` | `{"question":str}` | `{"answer":str,"retrieved":[str],...}` | 走**记忆读取+回答**；`retrieved` 填实际注入 prompt 的**记忆原文**，注入即口径（优先级顺序、多轮检索先合并去重、报全量，见下方常见坑）；`input_tokens`/`output_tokens` 填了才会进「Token 消耗」账 |
+| `POST /snapshot-capabilities`（可选） | `{}` | `{"supported":true,"restore":true,"rebuild":false,"format_version":1}` | 声明快照能力；老桥缺该端点 → 框架按不支持处理 |
+| `POST /snapshot`（可选） | `{"target_dir","tag"}` | `{"items":int}` | 把当前记忆整体导出到 target_dir（**内容与布局由桥决定**；模板 = `memory/` + 标记文件） |
+| `POST /restore`（可选） | `{"source_dir","tag"}` | `{"restored":true}` | 从快照恢复；**只认带标记文件的快照**，并重建进程内实例（只换磁盘不重建缓存等于没恢复） |
 
 - `Content-Type: application/json`；如果服务要求鉴权，客户端用 `api_key` 时发
   `Authorization: Bearer <key>`，bridge 侧做对应校验即可。
@@ -67,6 +70,8 @@
   （重复条目白占前 5 窗口）；③ 报注入的那一份全量（只报 top-k 会让 `evidence_recall` 虚低，
   报未经注入裁剪的内部 top-N 会虚高）；④ 在构造 prompt 的那一处直接记下列表，别事后另算。
 - 拿不到 token / 调用数就填 `0`，不要瞎填——成本指标失真比缺省更糟。
+- **快照回放要"真恢复"**：`/restore` 必须把记忆库换回快照那一刻（含内存里的索引/缓存），
+  并拒绝不认识的目录（防误传路径把库清空）；回放模式下框架不再调 `/reset`、`/ingest`。
 - `reset` 只清会话不清记忆库 → 跨 dialogue 串扰，`single_hop` 异常高、`abstention` 异常低。
 
 ### 6. 自检：`doctor.check_target`

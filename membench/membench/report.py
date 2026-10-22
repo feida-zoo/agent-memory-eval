@@ -181,7 +181,9 @@ def format_token_usage(usage: "dict[str, Any] | None") -> str:
         f"ingest {ingest} + query 输入 {q_in} / 输出 {q_out}"
         f"（合计约 {ingest + q_in + q_out}），LLM 调用 {calls} 次"
     )
-    if ingest == 0 and q_in == 0 and q_out == 0:
+    if usage.get("ingest_skipped"):
+        text += "；快照回放：ingest 已跳过（0 = 没跑，非零成本）"
+    elif ingest == 0 and q_in == 0 and q_out == 0:
         text += "；全为 0 = 适配器未上报该字段，非真实零消耗"
     return text
 
@@ -203,6 +205,7 @@ DIM_LABEL_ZH: dict[str, str] = {
     "platform": "平台",
     "commit": "commit",
     "retrieval_match": "检索匹配口径",
+    "run_mode": "运行模式",
     "limit": "题目上限",
     "shards": "分片数",
     "shard_index": "分片序号",
@@ -231,6 +234,7 @@ METADATA_FIELD_ZH: dict[str, str] = {
     "judge_model": "判分模型",
     "adapter_version": "adapter 版本",
     "adapter_meta": "adapter 元数据",
+    "run_mode": "运行模式",
     "n_questions": "题目数",
     "n_ignored": "忽略题数",
     "timestamp": "时间戳",
@@ -826,7 +830,73 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
         lines.append(_md_table(["项目", "值"], token_rows))
     else:
         lines.append("（本次 run 未落账 `token_usage`：适配器未上报或产物来自旧版本）")
+    if isinstance(usage, dict) and usage.get("ingest_skipped"):
+        lines.append("")
+        lines.append(
+            "<sub>⚠️ 本 run 为快照回放：**ingest 被跳过**，上表 ingest 行为 0 是"
+            "「没跑」而非「零成本」。</sub>"
+        )
     lines.append("")
+
+    # 3.6 快照与回放（写入侧固定时必须在报告里说清，避免被当完整评测读）
+    state = metrics.get("state_snapshot") or {}
+    verify = metrics.get("replay_verify") or {}
+    if state or verify:
+        lines.append("## 快照与回放")
+        lines.append("")
+        if state.get("role") == "replayed":
+            lines.append(
+                "> ⚠️ **本 run 为快照回放（写入侧固定）**：跳过 reset + ingest，"
+                "分数只覆盖**读取 / 检索 / 回答层**，不得与全量 run 直接对比"
+                "（compare 会把 `run_mode` 判为关键维度不一致）。涉及写入侧改动"
+                "的结论必须来自重新 ingest。"
+            )
+            lines.append("")
+        snapshot_rows = [
+            ["快照角色", {"replayed": "回放（读取侧口径）", "exported": "导出（本次为全量 run）"}.get(
+                str(state.get("role")), "n/a"
+            )],
+            ["快照根目录", f"`{state.get('root', 'n/a')}`"],
+            ["格式版本", f"v{state.get('format_version', 'n/a')}"],
+            ["清单 sha256", f"`{state.get('manifest_sha256', 'n/a')}`"],
+            ["对话数", str(state.get("n_dialogues", "n/a"))],
+        ]
+        if state.get("role") == "replayed":
+            snapshot_rows.append(["源 run", f"`{state.get('source_run', 'n/a')}`"])
+            snapshot_rows.append(["回放模式", str(state.get("replay_mode", "n/a"))])
+        lines.append(_md_table(["项目", "值"], snapshot_rows))
+        lines.append("")
+        if state.get("role") == "exported":
+            lines.append(
+                "改**读取侧**代码后可用 `--replay <快照根目录>` 免重跑 ingest；"
+                "改写入侧（抽取 / 更新 / 去重）则必须重新 ingest。"
+            )
+            lines.append("")
+        if verify:
+            if "error" in verify:
+                lines.append(f"> ⚠️ 回放保真校验未完成：{verify['error']}")
+            else:
+                lines.append("### 回放保真校验（与源 run 逐题比对）")
+                lines.append("")
+                lines.append(
+                    "<sub>这是**回放误差地板**：读取侧 A/B 的差值必须大于它才有意义。"
+                    "未改动系统时答案应逐题一致。</sub>"
+                )
+                lines.append("")
+                rate = verify.get("answer_match_rate")
+                verify_rows = [
+                    ["共同题数", f"{verify.get('n_common')}（源 {verify.get('n_source')} / 回放 {verify.get('n_replay')}）"],
+                    ["答案不一致", str(verify.get("n_answer_diff"))],
+                    ["检索不一致", str(verify.get("n_retrieved_diff"))],
+                    ["判分不一致", str(verify.get("n_correct_diff"))],
+                    ["答案一致率", f"{rate:.1%}" if isinstance(rate, (int, float)) else "n/a"],
+                ]
+                lines.append(_md_table(["项目", "值"], verify_rows))
+                mismatches = verify.get("mismatch_qids") or []
+                if mismatches:
+                    lines.append("")
+                    lines.append(f"- 不一致示例：{'、'.join('`' + str(q) + '`' for q in mismatches)}")
+            lines.append("")
 
     # 4. 失败样例 Top10
     lines.append("## 失败样例 Top10")

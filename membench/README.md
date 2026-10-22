@@ -55,6 +55,13 @@ python -m membench.cli run --adapter mock-weak \
 python -m membench.cli compare --baseline runs/<run_weak> --candidate runs/<run_strong> \
     --require-comparable --tag weak-vs-strong --report-out output/
 
+# 4. 改了「读取侧」（检索/排序/回答）代码：用快照回放，免重跑 ingest
+python -m membench.cli run --adapter <你的适配器> --dataset <同一数据集> \
+    --snapshot-out ~/.membench/state_snapshots/<名>     # 先导出（需适配器支持）
+python -m membench.cli run --adapter <你的适配器> --dataset <同一数据集> \
+    --replay ~/.membench/state_snapshots/<名> \
+    --replay-verify-source runs/<源run目录>            # 回放 + 逐题保真校验
+
 # 查看内置数据集
 python -m membench.cli list-datasets
 ```
@@ -214,12 +221,12 @@ python -m membench.cli run --adapter my-system --dataset membench/data/office_da
 
 | 级别 | 维度 | 不一致的后果 |
 |---|---|---|
-| 关键 | `adapter`、`adapter_version`、`dataset_sha256`（取 `dataset_fingerprint.sha256`）、`judge`、`judge_model`、`driver_llm`、`platform` | 非 strict 下门禁降级 WARN；`--require-comparable`（strict）下直接 FAIL |
+| 关键 | `adapter`、`adapter_version`、`dataset_sha256`（取 `dataset_fingerprint.sha256`）、`judge`、`judge_model`、`driver_llm`、`platform`、`run_mode`（全量 / 快照回放） | 非 strict 下门禁降级 WARN；`--require-comparable`（strict）下直接 FAIL |
 | 次要 | `limit`、`shards`、`shard_index`、`n_questions`、`adapter_meta` | 降级 WARN，不 FAIL |
 | 提示 | `commit`、`dataset_path`、`dataset` | 仅记录（`same=false`），不影响结论 |
 
 - 关键维度**任一值缺失**（如旧 run 没有 `driver_llm`）记入 `unverifiable`：非 strict 下不判不可比，strict 下与不一致同等处理（判 FAIL）——没填就核验不了，strict 模式不允许"没填当通过"。
-- `commit` 不同是 A/B 的被测变量本身，**不算**不可比。
+- `commit` 不同是 A/B 的被测变量本身，**不算**不可比；`run_mode` 缺省按 `full` 归一（本特性之前的所有 run 都是全量跑），故历史 run 不会因缺该字段被误判。
 
 门禁语义：
 
@@ -237,6 +244,46 @@ python -m membench.cli compare --baseline runs/<run_a> --candidate runs/<run_b> 
 ```
 
 `--tag` 决定 `ab_<tag>_<ts>/` 目录名（缺省由两个 run_id 拼）。退出码：verdict=FAIL → 1，否则 0。
+
+## 状态快照与回放（改读取侧免重跑 ingest）
+
+改了**检索/排序/回答**这类读取侧代码后，不必重新把数据集写进记忆系统——用上一次
+评测导出的「逐对话状态快照」直接回放即可（省掉 ingest 的算力与 LLM 抽取成本，也让
+A/B 摆脱"写入漂移"噪声）。
+
+```bash
+# 1) 全量跑一次并导出快照（需适配器实现 snapshot()；HTTP 桥同款端点见接入章节）
+python -m membench.cli run --adapter <你的适配器> --dataset <数据集> \
+    --snapshot-out ~/.membench/state_snapshots/<名> --judge heuristic
+
+# 2) 改了读取侧代码后回放（跳过 reset + ingest，只跑 query）+ 保住真校验地板
+python -m membench.cli run --adapter <你的适配器> --dataset <同一个数据集> \
+    --replay ~/.membench/state_snapshots/<名> \
+    --replay-verify-source runs/<源run目录> --judge heuristic
+```
+
+- **快照时机**：每个对话 ingest 完成后、第一道 query 之前（runner 每对话 `reset()`，
+  评测本身是"一个对话一个独立记忆生命周期"，所以按对话切片天然等价）；
+  清单 `manifest.json` 记 run_id / 数据集指纹 / 每对话 sha256、字节数、输入指纹与
+  `complete` 标记；
+- **谁产出快照**：被测系统自己（适配器可选接口 `snapshot_capabilities()` /
+  `snapshot()` / `restore()` / `rebuild()`）——框架只给目录与 tag、算哈希、做校验，
+  不解析快照内容（HTTP 桥对应 `POST /snapshot-capabilities|/snapshot|/restore`）；
+- **三种模式**（`metrics.json` 的 `run_mode`）：`full` / `replay-restore`（格式兼容，
+  直接恢复）/ `replay-rebuild`（格式不兼容或需重建派生结构，走系统的 `rebuild`）；
+  `--replay-mode auto|restore|rebuild` 控制协商，**不兼容且无 rebuild 会在开跑前拒绝**；
+- **跑前校验**：清单缺失/损坏、数据集指纹不符、本 run 需要的对话没快照，一律拒绝，
+  不产生半成品 run 目录；
+- **保真校验**：`--replay-verify-source <源run>` 逐题比对答案 / 检索 / 判分，写进报告
+  与 `metrics.json` 的 `replay_verify`——这就是**回放误差地板**，读取侧 A/B 的差值
+  必须大于它才有意义；未改代码时答案应 100% 一致；
+- **口径（重要）**：回放固定写入侧，结论只覆盖**读取/检索/回答层**，不得当"完整评测"
+  汇报；`run_mode` 是 compare 的**关键维度**，回放分与全量分会被判不可比；融合
+  （`fuse`）也拒绝混融两种模式的分片；回放的 token 账里 ingest 记 0 并标
+  `ingest_skipped`（"没跑"≠"零成本"）；
+- **该重跑的场景**：改动落在**写入侧**（抽取提示词、更新/去重决策、写入成本）或
+  **逻辑 schema**（字段/粒度变了且系统没有 `rebuild`）时，快照回放测不到——必须
+  重新 ingest（至少挑几个对话做子集）。
 
 ## 判分健壮性说明
 
@@ -361,6 +408,10 @@ class MyAdapter(BaseMemoryAdapter):
 Runner(MyAdapter(), "membench/data/sample_dataset.jsonl").run()
 ```
 
+可选能力：需要「快照回放」（改读取侧免重跑 ingest，见「状态快照与回放」）时，再实现
+`snapshot_capabilities()`（声明 `supported/restore/rebuild/format_version`）、`snapshot(target_dir, tag)`、
+必要时 `restore(source_dir, tag)` / `rebuild(source_dir, tag)`——框架只传目录与 tag，导出什么由你决定。
+
 完整可运行示例见 `examples/quickstart.py`。token / llm_calls 填不了就填 0（报告中视为 n/a /「未上报」）。`reset()` 里若要实现"清空前快照"这类回溯能力，可读框架给的可选提示环境变量 `MEMBENCH_RUN_DIR` / `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`（框架不读也不写你的存储）。
 
 `query` 返回的 `retrieved` 决定 `evidence_recall` / `recall@5` 是否成立，口径 = **注入即口径**：填实际拼进回答 prompt 的**记忆条目原文**，按注入优先级排序，多轮检索先合并去重再返回，报注入的那一份全量（框架不合并、不去重、不截断；空列表 = 静默按 0 召回计）。
@@ -372,6 +423,11 @@ Runner(MyAdapter(), "membench/data/sample_dataset.jsonl").run()
 - `POST /reset`：清空全部记忆状态。请求体带**可选**上下文 `{"run_dir", "dialogue_id", "dialogue_index"}`——供服务端在清空前自行快照/归档；不认识就忽略，不影响契约。
 - `POST /ingest`：body `{"messages": [{"role", "content", "timestamp"}]}`
 - `POST /query`：body `{"question": "..."}`，返回 `{"answer": str, "retrieved": [str], ...}`
+
+可选端点（需要快照回放时实现，缺失按不支持处理；`HttpAdapter` 会转发目录与 tag，
+内容由桥自己决定）：`POST /snapshot-capabilities`、`POST /snapshot`、
+`POST /restore`、`POST /rebuild`；参考模板 `examples/http_bridge_node` 已实现前三个
+（文件级快照，带标记文件防误恢复）。
 
 然后在 Python 侧用内置 `HttpAdapter` 指向你的服务地址，照常跑 `Runner`。
 

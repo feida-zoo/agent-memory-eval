@@ -96,6 +96,41 @@ class BaseMemoryAdapter(ABC):
         """
         raise NotImplementedError
 
+    # ------------------------------------------------------------------
+    # 可选能力：状态快照与回放（默认不支持）
+    # 见 membench/snapshot.py 与 references/adapter_guide.md「状态快照与回放」。
+    # ------------------------------------------------------------------
+
+    def snapshot_capabilities(self) -> dict:
+        """声明快照能力（**可选**，默认不支持）。
+
+        Returns:
+            ``{"supported": False}``，或 ``{"supported": True, "restore": bool,
+            "rebuild": bool, "format_version": Any, "compatible_from": [...]}``
+            —— 声明 supported/restore/rebuild 就必须实现对应方法（缺了直接报错，
+            不静默降级）。
+        """
+        return {"supported": False}
+
+    def snapshot(self, target_dir: str, tag: str) -> dict:
+        """把当前记忆状态导出到 ``target_dir``（tag 通常为对话 id）。
+
+        由被测系统自己决定导出什么（原文 / 结构化记录 / 含派生结构的状态包）
+        与格式版本；框架只给目录与 tag、算哈希、登记清单。
+
+        Returns:
+            可选的清单补充信息（如条目数、层级），会写进快照清单。
+        """
+        raise NotImplementedError
+
+    def restore(self, source_dir: str, tag: str) -> None:
+        """从快照恢复状态（同 ``format_version`` 前提下）。"""
+        raise NotImplementedError
+
+    def rebuild(self, source_dir: str, tag: str) -> None:
+        """从快照重建（跨格式版本 / 重建派生结构），走系统自己的构建代码。"""
+        raise NotImplementedError
+
 
 def estimate_tokens(text: str) -> int:
     """按字符数 / 2 粗估 token 数（中英文混合文本的经验值）。"""

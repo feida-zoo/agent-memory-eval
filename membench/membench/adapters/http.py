@@ -10,6 +10,11 @@
 - ``POST {base_url}/query``  ：请求体 ``{"question": "..."}``；
   响应 ``{"answer": str, "retrieved": [str], "input_tokens": int,
   "output_tokens": int, "llm_calls": int}``（除 answer 外均可缺省）。
+- **可选**状态快照与回放（桥实现时可用，缺失按不支持处理）：
+  ``POST /snapshot-capabilities`` → ``{"supported", "restore", "rebuild",
+  "format_version", "compatible_from"}``；``POST /snapshot {target_dir, tag}``；
+  ``POST /restore {source_dir, tag}``；``POST /rebuild {source_dir, tag}``。
+  用途：改读取侧代码后用 ``membench run --replay <快照根>`` 免重跑 ingest。
 
 延迟（latency_ms）由客户端本地用 ``time.perf_counter`` 实测；
 token / 调用数优先取服务端返回值，缺省填 0（报告中标注 n/a）。
@@ -120,3 +125,27 @@ class HttpAdapter(BaseMemoryAdapter):
             output_tokens=int(data.get("output_tokens", 0)),
             llm_calls=int(data.get("llm_calls", 0)),
         )
+
+    # ------------------------------------------------------------------
+    # 可选能力：状态快照与回放（桥实现对应端点时可用；老桥 404 视为不支持）
+    # ------------------------------------------------------------------
+
+    def snapshot_capabilities(self) -> dict:
+        """探测桥的快照能力（``POST /snapshot-capabilities``）。"""
+        try:
+            data = self._post("/snapshot-capabilities", {})
+        except Exception as exc:  # noqa: BLE001 - 老桥无该端点：按不支持处理，不中断评测
+            return {"supported": False, "reason": str(exc)}
+        return data if isinstance(data, dict) else {"supported": False}
+
+    def snapshot(self, target_dir: str, tag: str) -> dict:
+        """把当前记忆状态导出到 ``target_dir``（桥侧执行，框架只传目录与 tag）。"""
+        return self._post("/snapshot", {"target_dir": target_dir, "tag": tag})
+
+    def restore(self, source_dir: str, tag: str) -> None:
+        """从快照恢复状态（桥侧执行；同 format_version 前提下）。"""
+        self._post("/restore", {"source_dir": source_dir, "tag": tag})
+
+    def rebuild(self, source_dir: str, tag: str) -> None:
+        """从快照重建（桥侧执行；跨格式版本 / 重建派生结构）。"""
+        self._post("/rebuild", {"source_dir": source_dir, "tag": tag})

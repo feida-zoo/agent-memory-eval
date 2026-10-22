@@ -275,7 +275,21 @@ _IDENTITY_KEYS = (
     "judge_model",
     "retrieval_match",
     "retrieval_match_threshold",
+    # 运行模式：full / replay-*。回放固定写入侧，与全量跑**不可放在同一次汇总里**
+    # （分数不可归因）；缺省视为 full（本特性之前的所有 run 都是全量）。
+    "run_mode",
 )
+
+
+def _identity_value(metrics: dict[str, Any], key: str) -> Any:
+    """身份/口径维度的取值（``run_mode`` 缺省归一为 ``"full"``）。
+
+    本特性之前的所有 run 都是全量跑，旧 run 未落账 ``run_mode`` 时按 full 计——
+    否则"旧 run + 新 run"会被误判成混用两种模式。
+    """
+    if key == "run_mode":
+        return metrics.get(key) or "full"
+    return metrics.get(key)
 
 
 def assert_single_identity(results: list[DatasetResult], label: str) -> None:
@@ -286,7 +300,7 @@ def assert_single_identity(results: list[DatasetResult], label: str) -> None:
     """
     seen: dict[tuple, list[str]] = {}
     for r in results:
-        key = tuple(r.metrics.get(k) for k in _IDENTITY_KEYS)
+        key = tuple(_identity_value(r.metrics, k) for k in _IDENTITY_KEYS)
         seen.setdefault(key, []).append(r.spec.key)
     if len(seen) > 1:
         detail = "；".join(
@@ -329,6 +343,8 @@ def expected_fresh_metadata(
         "retrieval_match_threshold": (
             getattr(matcher, "threshold", None) if matcher is not None else None
         ),
+        # 补跑出的是全量 run；与回放 run 混用会在跑前被这条拒绝
+        "run_mode": "full",
     }
 
 
@@ -340,9 +356,10 @@ def assert_gap_matches_provided(
         return
     sample = next(iter(provided.values()))
     diffs = [
-        f"{key}: 现有 run={sample.metrics.get(key)!r} vs 本轮补跑={expected.get(key)!r}"
+        f"{key}: 现有 run={_identity_value(sample.metrics, key)!r}"
+        f" vs 本轮补跑={expected.get(key)!r}"
         for key in _IDENTITY_KEYS
-        if sample.metrics.get(key) != expected.get(key)
+        if _identity_value(sample.metrics, key) != expected.get(key)
     ]
     if diffs:
         raise SystemExit(

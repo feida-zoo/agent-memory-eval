@@ -133,6 +133,8 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
             "retrieval_match",
             "retrieval_match_threshold",
             "schema_version",
+            # 运行模式：全量分片与快照回放分片不得混融（写入侧口径不同，分数不可归因）
+            "run_mode",
         ):
             if m.get(key) != first.get(key):
                 raise _err(f"{key} 不一致: {first.get(key)!r} vs {m.get(key)!r}（{d}）")
@@ -198,6 +200,8 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
             "adapter_version": first.get("adapter_version"),
             "dataset_fingerprint": first.get("dataset_fingerprint"),
             "retrieval_match": first.get("retrieval_match"),
+            # 运行模式透传（前面已校验各分片一致）
+            "run_mode": first.get("run_mode") or "full",
             "fused": True,
             "fused_from": [str(m.get("run_id", d)) for m, d in zip(metas, run_dirs)],
         }
@@ -227,6 +231,9 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
                 "n_questions",
             )
         }
+        if any((m.get("token_usage") or {}).get("ingest_skipped") for m in metas):
+            # 回放分片：融合产物同样标"ingest 被跳过"，避免 0 被读成零成本
+            metrics["token_usage"]["ingest_skipped"] = 1
     gate = fuse_gate(records, metrics)
     metrics["stale_gate"] = gate
 

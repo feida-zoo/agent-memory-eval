@@ -125,6 +125,37 @@ membench 与被测系统之间**只有一个协议**：`BaseMemoryAdapter`
 回放注入。适合先量现状、复现 badcase；**它固定了写入侧**，属降级口径：按第 3 节
 由用户拍板、元数据声明、A/B 同口径，结论限定为"读取/回答层评测"。
 
+### 2.7 状态快照与回放（可选能力）
+
+改了**读取侧**（检索/排序/回答）代码后，不必重新 ingest 整个数据集：用上一次评测导出的
+「逐对话状态快照」直接回放。框架只做编排（目录与 tag、清单、哈希、跑前校验、保真校验），
+状态的产出与消费**全部走你的代码**——框架不解析快照内容，也不读你的存储格式。
+
+需要实现四个可选方法（不实现 = 不支持本能力，框架明确提示而不是静默跳过）：
+
+```python
+def snapshot_capabilities(self) -> dict:
+    return {"supported": True, "restore": True, "rebuild": False,
+            "format_version": 1, "compatible_from": [1]}   # 声明了就必须实现对应方法
+
+def snapshot(self, target_dir: str, tag: str) -> dict:   # 导出当前状态（tag=对话 id）
+def restore(self, source_dir: str, tag: str) -> None:    # 同版本恢复
+def rebuild(self, source_dir: str, tag: str) -> None:    # 跨版本/重建派生结构（可选）
+```
+
+- **时机**：runner 在每个对话 ingest 完成后、第一道 query 之前调用 `snapshot()`——回放
+  就是"恢复这个状态，然后跑该对话的题"；runner 每对话 `reset()`，所以按对话切片天然等价；
+- **模式**：`full` / `replay-restore`（格式兼容）/ `replay-rebuild`（格式不兼容或需重建
+  派生结构）——不兼容且没声明 `rebuild` 会被**拒绝**，提示必须重新 ingest；
+- **口径**：回放固定写入侧，结论只覆盖读取/回答层；`run_mode` 是 compare 的关键维度，
+  回放分与全量分判不可比；`--replay-verify-source` 给出**回放误差地板**（未改代码时答案
+  应逐题一致，不一致说明恢复不保真——先修这个再谈 A/B）；
+- **必须重跑的场景**：改动落在写入侧（抽取/更新/去重/写入成本）或逻辑 schema 变更且系统
+  没有 `rebuild`；
+- **HTTP 桥**：同款端点 `POST /snapshot-capabilities|/snapshot|/restore|/rebuild`（见
+  `references/http_bridge_guide.md`）——桥侧要注意"恢复后重建进程内实例"，只换磁盘不重建
+  缓存等于没恢复。
+
 ## 3. 真实性红线（评测有效性的前提，必读）
 
 **原则：adapter 内调用的应当是线上同一套代码/服务，只有环境不同（独立测试库/命名空间）。
