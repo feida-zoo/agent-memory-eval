@@ -382,6 +382,7 @@ python -m membench.cli matrix \
 ```
 
 - `--out DIR` 直接指定**完整实验目录**（优先；产物落其 `reports/` 与 `runs/<label>/`）；`--report-out DIR` 是实验目录的**父目录**（给出时落 `DIR/matrix_<ts>/`）；都不给时落 `output_root()/matrix_<ts>/`。
+- 退出码：任一两两组合的门禁判 FAIL → 1，否则 0（与 `compare` 同口径，可直接接 CI）。
 
 label 推荐 `platform@commit` 格式（也接受任意字符串）。实验目录自包含（各组产物的数据集树副本落 `runs/<label>/`，内部同 eval 的 `runs/<dataset>/…` 形态），产出 `reports/report.md` +
 `reports/matrix_result.json` + `reports/fig_matrix_accuracy.png`：

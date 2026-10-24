@@ -274,6 +274,7 @@ python -m membench.cli matrix \
 ```
 
 产出矩阵透视表（每指标一张 平台×commit 表）+ 全部两两门禁 + 分组条形图。
+任一两两组合门禁 FAIL → 退出码 1（与 `compare` 同口径，可接 CI）。
 
 ## 本波新能力速查
 

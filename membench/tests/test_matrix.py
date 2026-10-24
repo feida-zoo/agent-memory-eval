@@ -188,12 +188,13 @@ def test_cli_matrix_rejects_too_few_labels_without_leftovers(tmp_path: Path) -> 
     assert not out.exists() or not list(out.iterdir()), "入参不足却留下空实验目录"
 
     # 入参够时同一批产物正常出矩阵；报告落 <report-out>/matrix_<ts>/reports/
+    # 两个 label 都用同一适配器（同档强度）→ 各两两组合 PASS → 退出码 0
     rc = cli.main(
         [
             "matrix",
             "--runs",
             f"wx@a1b2c3={labeled[0][1]}",
-            f"fs@a1b2c3={labeled[1][1]}",
+            f"fs@a1b2c3={labeled[2][1]}",
             "--report-out",
             str(out),
         ]
@@ -203,3 +204,17 @@ def test_cli_matrix_rejects_too_few_labels_without_leftovers(tmp_path: Path) -> 
     assert len(matrix_dirs) == 1, "失败路径不该留下目录（否则这里会多于一个）"
     assert matrix_dirs[0].name.startswith("matrix_")
     assert (matrix_dirs[0] / layout.DIR_REPORTS / layout.FILE_REPORT_MD).is_file()
+
+    # 强弱两档配对 → 门禁 FAIL → 退出码 1（与 compare 同口径，可接 CI）
+    fail_out = tmp_path / "cli_out_fail"
+    rc = cli.main(
+        [
+            "matrix",
+            "--runs",
+            f"wx@a1b2c3={labeled[0][1]}",
+            f"fs@a1b2c3={labeled[1][1]}",
+            "--report-out",
+            str(fail_out),
+        ]
+    )
+    assert rc == 1

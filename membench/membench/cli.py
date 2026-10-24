@@ -685,7 +685,8 @@ def _cmd_matrix(args: argparse.Namespace) -> int:
     print(f"[membench] matrix verdict: {worst}")
     print(f"[membench] 实验目录: {result['out_dir']}")
     print(f"[membench] report: {result['report_path']}")
-    return 0
+    # 任一两两组合判 FAIL 时以非零码退出（与 compare 同口径，可直接接 CI）
+    return 1 if worst == "FAIL" else 0
 
 
 def _cmd_user_data_install(args: argparse.Namespace) -> int:
