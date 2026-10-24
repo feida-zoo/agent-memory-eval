@@ -318,3 +318,97 @@ def test_fuse_rejects_mixed_metadata(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="driver_llm 不一致"):
         fuse_runs([s0, s1], str(tmp_path / "bad"))
+
+
+def _limit_shard(tmp_path: Path, name: str, index: int, limit: int | None) -> str:
+    """跑一个带 ``limit`` 的分片 run，返回其数据集目录。"""
+    return Runner(
+        MockStrongAdapter(),
+        str(SAMPLE_DATASET_PATH),
+        judge="heuristic",
+        out_dir=str(tmp_path / name),
+        shards=2,
+        shard_index=index,
+        limit=limit,
+    ).run()
+
+
+def test_fuse_rejects_mixed_limit(tmp_path: Path) -> None:
+    """全量分片与 --limit 冒烟分片混融 -> 拒绝（否则得到"部分全量"的假完整结果）。"""
+    smoke = _limit_shard(tmp_path, "lim0", 0, 3)
+    full = _limit_shard(tmp_path, "lim1", 1, None)
+
+    with pytest.raises(ValueError, match="limit 不一致"):
+        fuse_runs([smoke, full], str(tmp_path / "fused_bad"))
+
+
+def test_fuse_passes_limit_through_and_marks_run_id(tmp_path: Path) -> None:
+    """融合产物透传 limit，run_id 带 fused / 分片 / limit（与 commit）标记。
+
+    回归：limit 曾被硬编码为 None、run_id 由 fuse 手写（漏 commit 与分片标记），
+    冒烟融合产物与全量融合产物因此完全不可区分。
+    """
+    smoke0 = _limit_shard(tmp_path, "m0", 0, 3)
+    smoke1 = _limit_shard(tmp_path, "m1", 1, 3)
+    full0 = _limit_shard(tmp_path, "f0", 0, None)
+    full1 = _limit_shard(tmp_path, "f1", 1, None)
+
+    smoke = fuse_runs([smoke0, smoke1], str(tmp_path / "fused_smoke"))
+    full = fuse_runs([full0, full1], str(tmp_path / "fused_full"))
+
+    assert smoke["metrics"]["limit"] == 3
+    assert full["metrics"]["limit"] is None
+    # 冒烟融合产物的题集确实只是全量的一部分（不是"假全量"）
+    assert 0 < smoke["n_questions"] < full["n_questions"]
+
+    smoke_id = smoke["metrics"]["run_id"]
+    assert "_fused" in smoke_id
+    assert "_shard2" in smoke_id  # 分片数进身份（无具体分片序号：这是整体融合产物）
+    assert "_limit3" in smoke_id
+    full_id = full["metrics"]["run_id"]
+    assert "_fused" in full_id and "_shard2" in full_id
+    assert "limit" not in full_id
+    assert smoke_id != full_id
+
+
+def test_fused_smoke_and_full_products_are_incomparable(tmp_path: Path) -> None:
+    """核心回归：--limit 冒烟融合产物 vs 全量融合产物，strict 下判不可比（FAIL）。
+
+    两侧只有题目集不同（6 题 vs 27 题），此前 comparability 记 0 项不一致、
+    verdict PASS、退出码 0；现在题目数（关键维度）不一致 -> FAIL。
+    """
+    def _shard(name: str, index: int, limit: int | None) -> str:
+        return Runner(
+            MockStrongAdapter(),
+            str(SAMPLE_DATASET_PATH),
+            judge="heuristic",
+            out_dir=str(tmp_path / name),
+            shards=2,
+            shard_index=index,
+            limit=limit,
+            driver_llm="gpt-4o",
+            adapter_version="v1",
+        ).run()
+
+    smoke = fuse_runs(
+        [_shard("s0", 0, 3), _shard("s1", 1, 3)], str(tmp_path / "fused_smoke")
+    )["dataset_dir"]
+    full = fuse_runs(
+        [_shard("t0", 0, None), _shard("t1", 1, None)], str(tmp_path / "fused_full")
+    )["dataset_dir"]
+
+    from membench.compare import compare_runs
+
+    result = compare_runs(
+        smoke, full, require_comparable=True, out_dir=str(tmp_path / "cmp")
+    )
+    comparability = result["comparability"]
+    # 除题目集之外的维度都已一致：不可比必须来自题目数本身
+    assert comparability["unverifiable"] == []
+    assert comparability["comparable"] is False
+    assert result["verdict"] == "FAIL"
+    dims = {c["dimension"]: c for c in comparability["checks"]}
+    assert dims["n_questions"]["same"] is False
+    assert dims["n_questions"]["a"] != dims["n_questions"]["b"]
+    assert dims["n_questions"]["severity"] == "critical"
+    assert any("n_questions" in reason for reason in comparability["reasons"])

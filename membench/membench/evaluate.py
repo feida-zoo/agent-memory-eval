@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Union
 
 from membench import layout
-from membench.data.info import resolve_available_path
+from membench.data.info import get_dataset_info, resolve_available_path
 from membench.data.schema import load_dataset, question_capabilities
 from membench.layout import resolve_dataset_dir
 from membench.ratings import format_metric, overall_rating
@@ -48,7 +48,11 @@ from membench.report import (
     token_usage_totals,
 )
 from membench.runner import Runner
-from membench.userdata import resolve_dataset
+from membench.userdata import (
+    USER_DATASET_FILENAME,
+    builtin_office_dataset_path,
+    resolve_dataset,
+)
 
 #: 参与融合的六项质量指标（宏平均口径）。
 QUALITY_METRICS: tuple[str, ...] = (
@@ -144,8 +148,10 @@ def dataset_specs(values: list[str]) -> list[DatasetSpec]:
     - ``office`` -> 办公域槽位（优先级：用户测试集 > 内置 office）；
     - 其余按数据集 key 经 ``resolve_available_path`` 解析（内置文件优先，
       其次 ``dataset fetch`` 下载目录）；解析不到报错提示先 fetch；
-    - 列表中第一个数据集承担办公域槽位（stale 门禁作用域；显式给出
-      ``office`` 时以它为准）。若该集无 gold_stale 标注，门禁自动 SKIP。
+    - 办公域槽位（stale 门禁作用域）按**数据集身份**标出：身份命中办公域
+      （内置 office / 用户测试集）的条目承担槽位，否则沿用既有口径由列表中第一个
+      数据集承担（见 :func:`mark_office_slot`）。若该集无 gold_stale 标注，
+      门禁自动 SKIP。
 
     Args:
         values: ``--dataset`` 原始字符串列表（key 或路径）。
@@ -200,9 +206,7 @@ def dataset_specs(values: list[str]) -> list[DatasetSpec]:
             specs.append(
                 DatasetSpec(key=value, name=value, path=str(resolved), source="fetch")
             )
-    # 标出办公域槽位：显式 office 优先，否则列表第一个数据集承担
-    if not any(spec.is_office_slot for spec in specs):
-        specs[0].is_office_slot = True
+    mark_office_slot(specs)
     return specs
 
 
@@ -228,6 +232,53 @@ def parse_run_kv(values: Union[list[str], None], option: str) -> dict[str, str]:
             raise SystemExit(f"{option} 的 run 目录不存在: {run_dir}（{key}）")
         out[key] = run_dir
     return out
+
+
+def office_slot_dataset_stems() -> set[str]:
+    """办公域槽位候选的数据集文件 stem。
+
+    办公域槽位（stale 门禁的作用对象）由 :func:`membench.userdata.resolve_dataset`
+    决定：用户测试集 > 内置 office 黄金集，故这里给的是该槽位的**全部候选身份**——
+    内置办公集、用户测试集，以及 ``resolve_dataset(None)`` 当前解析到的那一份
+    （用户测试集目录挂在别处时文件名不一定是 ``user_dataset.jsonl``）。
+
+    判定"这份产物是不是办公域槽位"因此看**数据集身份**而不是 key 字面量：
+    ``--dataset office``、``--dataset <office_dataset.jsonl 路径>`` 与
+    ``--from-runs <key>=<产物目录>`` 三条路径得到同一结论。
+
+    Returns:
+        目录名安全的 stem 集合（经 :func:`membench.layout.slug` 归一）。
+    """
+    stems = {builtin_office_dataset_path().stem, Path(USER_DATASET_FILENAME).stem}
+    current, _source = resolve_dataset(None)
+    if current:
+        stems.add(Path(current).stem)
+    return {layout.slug(stem) for stem in stems}
+
+
+def _identity_name(dataset_path: str, dataset_dir: str) -> str:
+    """数据集身份名：优先取数据集文件 stem，缺路径（旧产物）时退回产物目录名。"""
+    if dataset_path:
+        return layout.slug(Path(dataset_path).stem)
+    return layout.slug(os.path.basename(os.path.normpath(dataset_dir)))
+
+
+def is_office_slot_dataset(dataset_path: str, dataset_dir: str = "") -> bool:
+    """该数据集是否属于办公域槽位（stale 门禁作用域），按数据集身份判定。"""
+    return _identity_name(dataset_path, dataset_dir) in office_slot_dataset_stems()
+
+
+def mark_office_slot(specs: list[DatasetSpec]) -> None:
+    """就地标出办公域槽位：数据集身份命中办公域（内置 office / 用户测试集）的优先，
+    否则沿用既有口径——清单第一个数据集承担该槽位。
+
+    槽位判定看数据集身份而非 key 字面量，显式 ``office``、指向 office 数据集的路径、
+    以及汇总模式复用的产物因此得到同一个结论；该集无 gold_stale 标注时门禁自动 SKIP。
+    """
+    for spec in specs:
+        spec.is_office_slot = is_office_slot_dataset(spec.path)
+    if specs and not any(spec.is_office_slot for spec in specs):
+        specs[0].is_office_slot = True
 
 
 def _capabilities_from_metrics(metrics: dict[str, Any], dataset_path: str) -> dict[str, bool]:
@@ -279,9 +330,65 @@ def adopt_dataset_dir(experiment_dir: str, dataset_dir: str) -> str:
     return os.path.abspath(target)
 
 
+def _expected_dataset_dir_names(key: str) -> Union[set[str], None]:
+    """``key`` 期望的数据集产物目录名集合；key 不在数据集注册表里时返 None。
+
+    产物目录名 = 数据集文件名去扩展名（:class:`membench.runner.Runner` 的落盘口径），
+    故按注册表反推：内置条目取 ``builtin_file`` 的 stem（``office`` 期望
+    ``office_dataset``——不做 key 与目录名的字符串比较），按需下载条目即 ``<key>.jsonl``。
+    办公域槽位额外接受用户测试集那条通道（两个文件同属槽位身份）。
+    """
+    try:
+        info = get_dataset_info(key)
+    except KeyError:
+        return None
+    if info.builtin_file is None:
+        return {layout.slug(key)}
+    stem = layout.slug(Path(info.builtin_file).stem)
+    office_stems = office_slot_dataset_stems()
+    # 内置办公集与用户测试集都满足办公域槽位，两条通道都算命中
+    return office_stems if stem in office_stems else {stem}
+
+
+def _assert_dataset_identity(key: str, dataset_dir: str) -> None:
+    """校验 ``KEY=DIR`` 的 key 与实际解析出的数据集产物是不是同一个数据集。
+
+    :func:`membench.layout.resolve_dataset_dir` 在 key 提示不命中时**回退**到实验目录下
+    唯一的数据集子目录（回退本身是契约的一部分），于是"key 认错"不会报错，只会把 A
+    数据集的分数记到 B 名下。这里补一层身份校验：能确定 key 期望的目录名时必须一致，
+    否则直接拒绝；key 不在注册表里（自定义 key）无法判断，只在目录名与 key 不一致时
+    打显著警告。
+
+    Raises:
+        SystemExit: 实际数据集目录名与 key 期望的目录名不一致。
+    """
+    actual = layout.slug(os.path.basename(os.path.normpath(dataset_dir)))
+    expected = _expected_dataset_dir_names(key)
+    if expected is None:
+        if actual != layout.slug(key):
+            print(
+                f"[membench] ⚠️ 汇总模式：key {key!r} 不在数据集注册表里，无法核对身份，"
+                f"已采用 {actual!r}（{dataset_dir}）——不是想要的数据集请改 KEY"
+            )
+        return
+    if actual not in expected:
+        names = "、".join(sorted(expected))
+        raise SystemExit(
+            f"--from-runs {key} 与实际产物不符：key 期望的数据集目录是 {names}，"
+            f"实际解析到 {actual}（{dataset_dir}）——key 认错会把别的数据集的分数记到 "
+            f"{key} 名下；请把 KEY 改成实际数据集名，或把入参指向正确的产物目录"
+        )
+
+
 def load_provided_result(key: str, product_dir: str) -> DatasetResult:
-    """从现成产物目录（实验目录或数据集目录）加载 DatasetResult（汇总模式复用）。"""
+    """从现成产物目录（实验目录或数据集目录）加载 DatasetResult（汇总模式复用）。
+
+    key 与产物身份先经 :func:`_assert_dataset_identity` 核对（回退解析不会报错，
+    所以必须在这里拦下认错的 key）；办公域槽位按产物身份标注（:func:`is_office_slot_dataset`），
+    使纯汇总模式与 ``--dataset`` 路径的门禁结论一致。
+    """
     dataset_dir = resolve_dataset_dir(product_dir, key)
+    _assert_dataset_identity(key, dataset_dir)
     with open(
         os.path.join(dataset_dir, layout.DIR_REPORT, layout.FILE_METRICS), encoding="utf-8"
     ) as f:
@@ -292,7 +399,13 @@ def load_provided_result(key: str, product_dir: str) -> DatasetResult:
         name = "office（用户测试集）" if source == "user" else "office（内置办公黄金集）"
     else:
         name = key
-    spec = DatasetSpec(key=key, name=name, path=dataset_path, source=source)
+    spec = DatasetSpec(
+        key=key,
+        name=name,
+        path=dataset_path,
+        source=source,
+        is_office_slot=is_office_slot_dataset(dataset_path, dataset_dir),
+    )
     return DatasetResult(
         spec=spec,
         run_dir=dataset_dir,
@@ -1153,8 +1266,11 @@ def evaluate(
 
     if specs is None:
         if provided:
-            # 纯汇总：目标清单即提供的 key（保持输入顺序）
+            # 纯汇总：目标清单即提供的 key（保持输入顺序）；办公域槽位用与
+            # --dataset 路径同一套判定（见 mark_office_slot），否则同一份 office
+            # 产物在"纯汇总"下会漏掉 stale 门禁
             specs = [r.spec for r in provided.values()]
+            mark_office_slot(specs)
         else:
             specs = plan_datasets(quick=quick, beam_10m=beam_10m, no_beam=no_beam, no_lme_s=no_lme_s)
     else:

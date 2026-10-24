@@ -288,3 +288,35 @@ def test_incomplete_product_rejected_before_copy(tmp_path: Path) -> None:
 
     # 拒绝在建目录 / 复制之前：既不残留 compare_* 实验目录，也没有 A/B 副本
     assert not out.exists()
+
+
+def test_n_questions_mismatch_is_critical(tmp_path: Path) -> None:
+    """两侧题目数不同 -> 该维度不一致（关键）：分数算在不同题集上，不可比。
+
+    回归：``n_questions`` 由 ``aggregate`` 写在 ``overall`` 下，此前只读顶层
+    metrics，该维度恒为 ``None == None``（死维度）——``--limit`` 冒烟产物与全量
+    产物因此被当成可比。
+    """
+    overall_a = dict(_metrics()["overall"])
+    overall_b = {**overall_a, "n_questions": 6}
+    a = _arm(tmp_path, "a", _metrics("run_a", overall=overall_a))
+    b = _arm(tmp_path, "b", _metrics("run_b", overall=overall_b))
+
+    result = compare_runs(a, b, out_dir=str(tmp_path / "out"))
+    check = next(
+        c for c in result["comparability"]["checks"] if c["dimension"] == "n_questions"
+    )
+    # 取值确实来自 overall（顶层没有 n_questions）
+    assert check["a"] == 24 and check["b"] == 6
+    assert check["same"] is False
+    assert check["severity"] == "critical"
+    assert result["comparability"]["comparable"] is False
+    assert any("n_questions" in reason for reason in result["comparability"]["reasons"])
+    assert result["verdict"] == "WARN"
+
+    strict = compare_runs(
+        a, b, out_dir=str(tmp_path / "strict"), require_comparable=True
+    )
+    assert strict["verdict"] == "FAIL"
+    assert strict["gates"][0]["name"] == "comparability"
+    assert strict["gates"][0]["status"] == "FAIL"

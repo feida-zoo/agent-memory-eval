@@ -62,6 +62,12 @@ from membench.evaluate import (
     scan_capabilities,
     write_task_reports,
 )
+from membench.layout import (
+    DIR_ARM_A,
+    DIR_ARM_B,
+    FIG_FUSED_DIFF,
+    FIG_PER_DATASET_DIFF,
+)
 from membench.report import (
     PALETTE,
     EFFICIENCY_DIFF_METRICS,
@@ -74,11 +80,6 @@ from membench.report import (
     metric_labels,
 )
 from membench.ratings import format_metric, format_metric_delta, format_metric_value, overall_rating
-
-
-#: A/B 两侧的目录名（layout 暂未收录；A = 基线、B = 候选），兼作报告里的侧标签。
-ARM_A = "A"
-ARM_B = "B"
 
 
 @dataclass
@@ -476,10 +477,6 @@ def _per_dataset_gates(
 # 图表：每数据集 diff / 融合 diff
 # ---------------------------------------------------------------------------
 
-#: 本模块专属的两张对比图（layout 暂未收录；写盘与报告内引用共用这两个常量）。
-FIG_PER_DATASET_DIFF = "fig_per_dataset_diff.png"
-FIG_FUSED_DIFF = "fig_fused_diff.png"
-
 
 def _fig_per_dataset_diff(
     per_dataset: list[dict[str, Any]], out_path: str, metric: str = "accuracy"
@@ -726,8 +723,8 @@ def evaluate_compare(
     print(f"[membench] 对比实验目录: {compare_dir}")
 
     # A/B 两侧各摆成完整 eval 实验形态（产物齐备与身份预检已在上方做完，再复制 / 补跑）
-    baseline_provided = _stage_side_dir(compare_dir, ARM_A, baseline_provided, baseline_runs)
-    candidate_provided = _stage_side_dir(compare_dir, ARM_B, candidate_provided, candidate_runs)
+    baseline_provided = _stage_side_dir(compare_dir, DIR_ARM_A, baseline_provided, baseline_runs)
+    candidate_provided = _stage_side_dir(compare_dir, DIR_ARM_B, candidate_provided, candidate_runs)
 
     # 两侧组装：已有产物直接复用，缺失数据集用该侧 adapter 补跑
     def _assemble_side(
@@ -773,7 +770,7 @@ def evaluate_compare(
     print(f"[membench] ===== 基线 adapter: {baseline_name} =====")
     baseline_results = _assemble_side(
         "基线侧",
-        ARM_A,
+        DIR_ARM_A,
         baseline_adapter,
         baseline_provided,
         platform_a,
@@ -783,7 +780,7 @@ def evaluate_compare(
     print(f"[membench] ===== 候选 adapter: {candidate_name} =====")
     candidate_results = _assemble_side(
         "候选侧",
-        ARM_B,
+        DIR_ARM_B,
         candidate_adapter,
         candidate_provided,
         platform_b,
@@ -869,8 +866,8 @@ def evaluate_compare(
     # 对比报告与两张对比图写对比实验目录的 reports/。
     _check_plt()
     for arm_label, arm_name, side_results, side_platform, side_fused in (
-        (ARM_A, baseline_name, baseline_results, platform_a, fused_baseline),
-        (ARM_B, candidate_name, candidate_results, platform_b, fused_candidate),
+        (DIR_ARM_A, baseline_name, baseline_results, platform_a, fused_baseline),
+        (DIR_ARM_B, candidate_name, candidate_results, platform_b, fused_candidate),
     ):
         write_task_reports(
             os.path.join(compare_dir, arm_label),

@@ -16,6 +16,7 @@
 | 适配器实现 / 版本 | `adapter_version` | 接入层改动被误当成记忆能力改动 |
 | 数据集 | `dataset_fingerprint`（`sha256` / `bytes` / `name`） | 题目不同，逐指标 diff 无意义 |
 | 平台 | run 的 `platform`（`--platform`） | A/B 分组错配 |
+| 题目数 | `overall.n_questions` | 分数算在**不同题集**上（典型：`--limit` 冒烟 vs 全量、分片融合只覆盖一部分），diff 不可归因 |
 
 - `run` 用 `--driver-llm` / `--adapter-version` 显式落账这些字段。
 - `compare --require-comparable` 做**前置校验**（strict）：任一关键维度**不一致**或**无法核验**（元数据缺失）→ 可比性门禁 **FAIL**，整体 verdict=FAIL、退出码 1（即拒绝当 A/B 用）；报告含「可比性前置校验」小节与「不可比原因」清单。

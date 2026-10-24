@@ -4,10 +4,10 @@
 用 ``membench fuse --runs dir1,dir2,... --out DIR`` 融合；入参既可以是实验目录，也可以
 是数据集目录（``<实验目录>/runs/<dataset>``）。
 
-- 校验各分片的 adapter / dataset / shards / shard_by 一致，且 shard_index 恰好覆盖
-  0..N-1；判分与可比性元数据（judge / judge_model / driver_llm / adapter_version /
+- 校验各分片的 adapter / dataset / shards / shard_by / limit 一致，且 shard_index 恰好
+  覆盖 0..N-1；判分与可比性元数据（judge / judge_model / driver_llm / adapter_version /
   adapter_meta / dataset_fingerprint / retrieval_match / run_mode / schema_version）
-  也必须一致，防止混片；
+  也必须一致，防止混片（含"全量分片与 --limit 冒烟分片混融"这种假全量）；
 - 在**对话粒度**合并各分片的逐对话 ``report/results.jsonl``：题目级分片下同一对话的
   记录来自多个分片，对话级分片下同一对话只出现在一片；源数据集可读时按数据集里的
   对话 / 题目顺序重排，使融合结果与不分片直接跑逐题对齐；
@@ -20,7 +20,9 @@
 ``reports/``（任务级报告，同 Runner 的 write_task_reports 形态）。metrics 标记
 ``"fused": true`` 及来源分片列表 ``"fused_from"``，并透传可比性元数据（adapter_version /
 judge_model / driver_llm / dataset_fingerprint / retrieval_match / adapter_meta /
-adapter_describe / schema_version）——融合产物可直接参与 ``compare --require-comparable``。
+adapter_describe / schema_version）与冒烟范围 ``limit``——融合产物可直接参与
+``compare --require-comparable``：``--limit`` 冒烟分片的融合产物带 ``limitN`` 与
+``fused`` 标记，不会被当成全量融合产物。
 各分片的 ``token_usage`` 账本逐片相加（任一分片未落账则融合产物不落账，避免"部分求和"
 被读成全量消耗）。
 """
@@ -230,6 +232,8 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
             "schema_version",
             # 运行模式：全量分片与快照回放分片不得混融（写入侧口径不同，分数不可归因）
             "run_mode",
+            # 冒烟截断范围：全量分片与 --limit 分片混融会得到"部分全量"的假完整结果
+            "limit",
         ):
             if m.get(key) != first.get(key):
                 raise _err(f"{key} 不一致: {first.get(key)!r} vs {m.get(key)!r}（{target}）")
@@ -287,9 +291,21 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
     dataset_name = str(first.get("dataset") or "unknown")
     experiment_dir = os.path.abspath(out_dir)
     dataset_dir = layout.dataset_dir(experiment_dir, dataset_name)
-    run_id = (
-        f"{first.get('adapter', 'unknown')}_{first.get('platform', 'default')}"
-        f"_{dataset_name}_{now.strftime('%Y%m%d_%H%M%S')}"
+    # run_id 走 layout 的唯一组装入口：commit、分片与冒烟范围都进身份，另有 "fused"
+    # 标出这是融合产物——融合结果（尤其 --limit 冒烟分片的融合）不得与全量结果撞身份。
+    # 各分片的 limit 前面已校验一致，这里直接透传。
+    run_id = layout.run_id(
+        str(first.get("adapter") or "unknown"),
+        first.get("platform"),
+        dataset_name,
+        now.strftime("%Y%m%d_%H%M%S"),
+        commit=str(first.get("commit") or "") or None,
+        tags=[
+            "fused",
+            *layout.run_id_tags(
+                shards, None, first.get("shard_by") or "question", first.get("limit")
+            ),
+        ],
     )
     # 数据集级与逐对话共用的身份 / 口径元数据；可比性字段透传，融合产物与普通 run
     # 同等可校验、可对比。
@@ -303,7 +319,8 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
         "commit": first.get("commit"),
         "judge": first.get("judge"),
         "timestamp": now.isoformat(timespec="seconds"),
-        "limit": None,
+        # 冒烟范围透传（各分片一致）：冒烟融合产物与全量融合产物必须能被 compare 区分
+        "limit": first.get("limit"),
         "shards": shards,
         "shard_index": None,
         "shard_by": first.get("shard_by") or "question",

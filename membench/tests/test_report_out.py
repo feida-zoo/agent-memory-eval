@@ -392,5 +392,85 @@ def test_removed_flags_rejected(tmp_path: Path) -> None:
         assert excinfo.value.code == 2, f"{command} 应被 argparse 拒绝（参数已删除）"
 
 
+# ---------------------------------------------------------------------------
+# CLI 失败收口：预检失败不留空实验目录
+# ---------------------------------------------------------------------------
+
+
+def _subdirs(parent: Path) -> list[Path]:
+    """parent 下的子目录（parent 不存在时为空列表）。"""
+    return sorted(p for p in parent.iterdir() if p.is_dir()) if parent.is_dir() else []
+
+
+def test_cli_run_failure_leaves_no_empty_experiment_dir(tmp_path: Path) -> None:
+    """run 的失败路径不留空 eval_*（Runner 层"失败不留半成品"不能在 CLI 层失效）。"""
+    out = tmp_path / "out"
+    empty_ds = tmp_path / "empty.jsonl"
+    empty_ds.write_text("", encoding="utf-8")
+    base = [
+        "run",
+        "--adapter",
+        "mock-strong",
+        "--dataset",
+        str(SAMPLE_DATASET_PATH),
+        "--judge",
+        "heuristic",
+        "--report-out",
+        str(out),
+    ]
+
+    # ① --snapshot 与 --replay 互斥（Runner 构造期报错）
+    with pytest.raises(SystemExit, match="互斥"):
+        cli.main([*base, "--snapshot", "--replay", str(tmp_path / "nope")])
+    assert _subdirs(out) == [], "互斥参数失败后残留空实验目录"
+
+    # ② --replay 指向不存在的产物目录（回放源校验失败）
+    with pytest.raises(SystemExit, match="产物目录不存在"):
+        cli.main([*base, "--replay", str(tmp_path / "nope")])
+    assert _subdirs(out) == [], "坏 --replay 失败后残留空实验目录"
+
+    # ③ 空数据集：runner 明确"不产生产物"，退出码 0 也不该留下空实验目录
+    assert (
+        cli.main(
+            [
+                "run",
+                "--adapter",
+                "mock-strong",
+                "--dataset",
+                str(empty_ds),
+                "--judge",
+                "heuristic",
+                "--report-out",
+                str(out),
+            ]
+        )
+        == 0
+    )
+    assert _subdirs(out) == [], "空数据集跳过时残留空实验目录"
+
+
+def test_cli_evaluate_failure_leaves_no_empty_experiment_dir(tmp_path: Path) -> None:
+    """evaluate 的空数据集路径同样不留空 eval_*（目录由 evaluate 内部创建）。"""
+    out = tmp_path / "out"
+    empty_ds = tmp_path / "empty.jsonl"
+    empty_ds.write_text("", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        cli.main(
+            [
+                "evaluate",
+                "--adapter",
+                "mock-strong",
+                "--judge",
+                "heuristic",
+                "--dataset",
+                str(empty_ds),
+                "--report-out",
+                str(out),
+            ]
+        )
+    assert _subdirs(out) == [], "空数据集失败后残留空实验目录"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

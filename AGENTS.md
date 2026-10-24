@@ -55,15 +55,16 @@ docs/                     # 深度研究报告 + 配图
 ## 核心约定（改代码前必读）
 
 1. **一次实验一个自包含子目录**（报告与对应数据就近归属）：
-   - `output/eval_<name>_<platform>_<ts>/`（`ts` = `YYYYMMDD-HHMMSS`）：
+   - `output/eval_<name>_<platform>_<ts>[_s<i>][_l<limit>]/`（`ts` = `YYYYMMDD-HHMMSS`；`_s<i>` = `--shards` 的分片序号、`_l<limit>` = `--limit`，无分片无 limit 时不带后缀，词表见 `layout.experiment_tags`）：
      - `runs/<dataset>/report/`：数据集级 `report.md`、`metrics.json`、`results.jsonl`、`fig_*.png`
      - `runs/<dataset>/<dialogue_id>/`：对话级 `runtime/`（桥的 reset 前备份落 `runtime/reset_backup/`；`MEMBENCH_RUN_DIR` 指本对话目录）、`memory_snapshot/`（`--snapshot` 时含 `manifest.json`）、`report/`（`report.md`、`metrics.json`、`results.jsonl`，不出图）
-     - `reports/`：任务级报告（多数据集 `evaluate` 另含 `evaluate_summary.json`）
-   - `output/compare_<name>_<platform>_<ts>/`：`A/`、`B/`（各为完整 eval 实验形态，含自己的 `runs/` 与 `reports/`）+ `reports/{comparison.md,fig_*.png}`
+     - `reports/`：任务级报告（`report.md`、`metrics.json`、`evaluate_summary.json`、`fig_dataset_overview.png`——`evaluate_summary.json` **无条件产出**，不区分单/多数据集）
+   - `output/compare_<name>_<platform>_<ts>/`：`A/`、`B/`（`layout.DIR_ARM_A` / `DIR_ARM_B`；各为完整 eval 实验形态，含自己的 `runs/` 与 `reports/`）+ `reports/{comparison.md,fig_*.png}`
    - `output/matrix_<ts>/`：`reports/{report.md,matrix_result.json,fig_matrix_accuracy.png}` + `runs/<label>/`
    - CLI `--report-out DIR` 一律指**实验目录的父目录**（缺省 `output_root()`）；`fuse --out` / `matrix --out` 指**完整实验目录**。
-   - 「产物目录」入参（`--baseline` / `--candidate` / `--from-runs` / `--baseline-run` / `--candidate-run` / `fuse --runs` 各项 / `matrix --runs` 的 `=` 右值 / `--replay`）统一接受**实验目录**或 `runs/<dataset>` 数据集目录，经 `layout.resolve_dataset_dir` 解析。
-   - 旧版产物（平铺 run 目录、缺 `report/` 层级、旧版对比实验目录）一律报错拒绝，不留兼容层。命名与落位**只走** `membench/layout.py`，不要在业务代码里手写目录名或手抄复制逻辑。
+   - 「产物目录」入参（`--baseline` / `--candidate` / `--from-runs` / `--baseline-run` / `--candidate-run` / `fuse --runs` 各项 / `matrix --runs` 的 `=` 右值 / `--replay` / `--replay-verify-source`）统一接受**实验目录**或 `runs/<dataset>` 数据集目录，经 `layout.resolve_dataset_dir` 解析。`--from-runs` 的 `KEY` 另按数据集注册表核对身份（`office` ↔ `office_dataset` / `user_dataset`），key 认错直接报错——`resolve_dataset_dir` 的"提示不命中回退到唯一数据集目录"只服务真正的自定义 key。
+   - 旧版产物（平铺 run 目录、缺 `report/` 层级、旧版对比实验目录）一律报错拒绝，不留兼容层；目录里**根本没有**数据集产物（空目录、跑到一半中断）走另一条文案（`layout.NO_DATASET_PRODUCT_MSG`），别把"没有产物"说成"版本旧"。命名与落位**只走** `membench/layout.py`，不要在业务代码里手写目录名或手抄复制逻辑；`run_id` 一律经 `layout.run_id` 组装（词表 `layout.run_id_tags`）。
+   - CLI 各命令在创建实验目录后失败时要把**本次新建且仍为空**的目录清掉（`cli._no_leftover_experiment` / `_discard_empty_experiment`）：`Runner` 层"失败不留半成品"的约定不能被 CLI 的提前建目录破坏；有任何产物的目录保留现场。
 2. **默认根目录只由 `membench/paths.py` 判定**（`output_root()`；`MEMBENCH_OUTPUT_DIR` > skill 的 `output/` > 工程根）。历史上的多处 SKILL.md 探测已收敛到这里，不要再复制一份。
 3. **可比性前置校验**：`compare` 按 `membench/compare.py` 的维度表核对 A/B 元数据（关键维度不一致 → 不可比）。新增关键维度要同步三处：维度表、`Runner` 的元数据写入、文档。**`commit` 不同是 A/B 的被测变量，不得判为不可比。** 纪律：compare 只测量差异，不判定两组是否只差一个变量。
 4. **数据集政策**：仓库**不内置**开源大数据集。`office_dataset.jsonl` / `sample_dataset.jsonl` 是自造演示集；`locomo` / `longmemeval_*` / `gatemem_office` / `beam_*` 一律 `dataset fetch` 到 `~/.membench/datasets/`。

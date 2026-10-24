@@ -48,19 +48,13 @@ python -m membench.cli doctor --target http://127.0.0.1:8787
 #   需要结构化结果时也可用 Python API：
 #   python -c "import json; from membench.doctor import check_target; print(json.dumps(check_target('http://127.0.0.1:8787'), ensure_ascii=False, indent=2))"
 
-# 5) 用 HttpAdapter 跑评测：内置类的 base_url 是构造参数，先用持久化适配器把桥地址绑上去
-cat > /tmp/my-bridge-adapter.py <<'EOF'
-from membench.adapters.http import HttpAdapter
-
-
-def register(registry):
-    registry["my-bridge"] = lambda: HttpAdapter("http://127.0.0.1:8787")
-EOF
-python -m membench.cli adapter install /tmp/my-bridge-adapter.py --name my-bridge
-
-# --report-out 是实验目录的父目录
-python -m membench.cli run --adapter my-bridge --judge heuristic \
-  --dataset membench/data/office_dataset.jsonl --report-out ../output/
+# 5) 用内置 HttpAdapter 跑评测：桥地址用 --adapter-arg 直连（无需包装适配器）
+#    --report-out 是实验目录的父目录
+python -m membench.cli run --adapter http \
+  --adapter-arg base_url=http://127.0.0.1:8787 \
+  --judge heuristic --dataset membench/data/office_dataset.jsonl --report-out ../output/
+# 可选构造参数：--adapter-arg timeout=10 / --adapter-arg api_key=<token>；
+# 缺 base_url 或 key 写错会在开跑前报错并列出可接受的参数名。
 # 产物: ../output/eval_http_default_<ts>/      （实验目录名取适配器的 name 属性 = http）
 #   ├── runs/office_dataset/report/{report.md, metrics.json, results.jsonl, fig_*.png}
 #   ├── runs/office_dataset/<对话目录>/{report/, runtime/}   # 对话级（report/ 不出图）
@@ -90,7 +84,8 @@ python -m membench.cli run --adapter my-bridge --judge heuristic \
   丢时间戳会系统性失败。
 - **并行分片要起多个实例**：一个桥进程只服务一个分片——评测对每个 dialogue 调
   `reset()`，两片共享一个实例会互相清库（跨片串扰）。N 分片并行 = N 个进程，
-  各自 `BRIDGE_PORT` + `BRIDGE_DATA_DIR`；单实例时只能串行跑分片。
+  各自 `BRIDGE_PORT` + `BRIDGE_DATA_DIR`；单实例时只能串行跑分片。各分片可共用
+  同一个 `--report-out`（实验目录名末尾带分片序号 `_s<i>`，不会互相覆盖）。
 - **query 要真的走检索**：别把问题直接丢给底座模型。`retrieved` 填**实际注入 prompt 的
   记忆原文**，否则 `evidence_recall` 会暴露"没走记忆路径"。
 - **回溯记忆内部状态用 `BRIDGE_RESET_BACKUP`**：它把"清空"变成"先快照再清空"。框架本身

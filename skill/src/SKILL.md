@@ -54,7 +54,7 @@ description: >
 ## 工作流 0：接入被测 Agent（首次使用必做）
 
 1. 阅读 `references/adapter_guide.md`（含第 3 节真实性红线：真实写入/读取路径是完整评测的唯一前提；旁路不得自行采用，走不通时停下、由用户决定降级口径），在被测 Agent 源码中定位三个挂点：记忆清空、记忆写入、记忆读取+回答。
-2. 实现 `BaseMemoryAdapter` 三方法（`reset` / `ingest` / `query`），或在 Agent 侧暴露 `POST /reset|/ingest|/query` 三个端点后用内置 HttpAdapter。
+2. 实现 `BaseMemoryAdapter` 三方法（`reset` / `ingest` / `query`），或在 Agent 侧暴露 `POST /reset|/ingest|/query` 三个端点后用内置 HttpAdapter（`run --adapter http --adapter-arg base_url=<服务地址>`，无需再包适配器）。
    - **`query` 必须回填 `retrieved`**：= 实际拼进回答 prompt 的**记忆条目原文**，按注入优先级排序，多轮检索**先合并去重**再返回，报**注入的那一份全量**（框架不合并、不去重、不截断；返回空列表 = 静默按 0 召回计）。它决定 `evidence_recall` / `recall@5` 是否成立，细则见 `references/adapter_guide.md` §2.3。
    - 需要「快照回放」（改读取侧免重跑 ingest）时，额外实现可选接口 `snapshot_capabilities()` / `snapshot()` / `restore()`（`rebuild()` 可选，覆盖跨版本/重建派生结构）——框架只传目录与 tag，导出什么由你决定；细则见 `references/adapter_guide.md` §2.7。
    - **若被测 Agent 的记忆能力本身就是"LLM + 工具调用"**（ingest 与 query 是同构的 tool-call 循环），不要各写一遍骨架——直接用 `membench.agent_loop.AgentLoopAdapter` 复用循环（见「本波新能力」）。
@@ -145,15 +145,15 @@ python -m membench.cli run --adapter <adapter> --dataset ~/.membench/datasets/lo
 
 | 命令 | 实验目录（`--report-out DIR` 的产出） | 内含 |
 |---|---|---|
-| `run --report-out DIR` | `DIR/eval_<adapter>_<platform>_<ts>/` | `runs/<dataset>/{report/{report.md,metrics.json,results.jsonl,fig_*.png},<对话目录>/{runtime/,memory_snapshot/,report/}}` + 任务级 `reports/` |
+| `run --report-out DIR` | `DIR/eval_<adapter>_<platform>_<ts>[_s<i>][_l<limit>]/` | `runs/<dataset>/{report/{report.md,metrics.json,results.jsonl,fig_*.png},<对话目录>/{runtime/,memory_snapshot/,report/}}` + 任务级 `reports/` |
 | `evaluate --report-out DIR` | `DIR/eval_<adapter>_<platform>_<ts>/` | 各数据集落 `runs/<dataset>/…`；任务级 `reports/{report.md,metrics.json,evaluate_summary.json,fig_dataset_overview.png}` |
 | `compare` / `evaluate-compare` `--report-out DIR` | `DIR/compare_<name>_<platform>_<ts>/` | `A/`、`B/`（各一个完整 eval 实验形态，自带 `runs/` 与 `reports/`）+ `reports/{comparison.md,fig_metric_diff.png,fig_category_diff.png}`（evaluate-compare 为 `fig_per_dataset_diff.png`、`fig_fused_diff.png`） |
 | `matrix --report-out DIR` | `DIR/matrix_<ts>/` | `reports/{report.md,matrix_result.json,fig_matrix_accuracy.png}` + `runs/<label>/`（各 label 的数据集树副本） |
 | `fuse --out DIR` | `DIR`（必填，就是实验目录本身） | `runs/<dataset>/…` + `reports/` |
 
-- `<ts>` = `YYYYMMDD-HHMMSS`；`<platform>` 缺省 `default`；目录名精确到秒，同名且非空会被直接拒绝（不会静默覆盖）。
-- **读产物的入参**统一接受**实验目录**或**数据集目录**（`<实验目录>/runs/<dataset>`）：`compare --baseline/--candidate`、`evaluate --from-runs KEY=DIR`、`evaluate-compare --baseline-run/--candidate-run`、`matrix --runs`、`fuse --runs`、`run --replay`，都经 `membench.layout.resolve_dataset_dir` 解析；旧版平铺 run 产物（缺 `report/` 层级）一律报错，要求重跑。
-- 不传 `--report-out` 时用 `output_root()`：`MEMBENCH_OUTPUT_DIR` > skill 包 `output/` > 工程根 `membench/output/`。目录命名只走 `membench/layout.py`（`eval_subdir` / `compare_subdir` / `matrix_subdir`），不要自己拼目录名。
+- `<ts>` = `YYYYMMDD-HHMMSS`；`<platform>` 缺省 `default`；`--shards` 分片时目录名末尾加 `_s<分片序号>`、`--limit` 追加 `_l<limit>`（不分片无 limit 时不带后缀）——并行分片因此**可以共用同一个 `--report-out`**；同名且非空会被直接拒绝（不会静默覆盖）。
+- **读产物的入参**统一接受**实验目录**或**数据集目录**（`<实验目录>/runs/<dataset>`）：`compare --baseline/--candidate`、`evaluate --from-runs KEY=DIR`、`evaluate-compare --baseline-run/--candidate-run`、`matrix --runs`、`fuse --runs`、`run --replay`、`run --replay-verify-source`，都经 `membench.layout.resolve_dataset_dir` 解析；旧版平铺 run 产物（缺 `report/` 层级）一律报错，要求重跑；目录里根本没有数据集产物（空目录、跑到一半中断）另有一条"没有产物"的报错，不要说成版本问题。
+- 不传 `--report-out` 时用 `output_root()`：`MEMBENCH_OUTPUT_DIR` > skill 包 `output/` > 工程根 `membench/output/`。目录命名只走 `membench/layout.py`（`eval_subdir` / `compare_subdir` / `matrix_subdir` / `experiment_tags` / `run_id` / `run_id_tags`），不要自己拼目录名。
 
 ### 工作流 2.5：全量评估（多数据集融合总分）
 
@@ -306,6 +306,12 @@ adapter = AgentLoopAdapter(
 
 ```bash
 python -m membench.cli doctor --target <url>     # 连通性 + 三端点契约字段校验（reset/ingest/query）
+
+# 直连跑评测：桥地址用 --adapter-arg 传入（无需再包一层适配套件或 adapter install）
+python -m membench.cli run --adapter http --adapter-arg base_url=<url> \
+  --adapter-arg timeout=10 --dataset membench/data/office_dataset.jsonl \
+  --judge heuristic --report-out ../output/
+# HttpAdapter 接受的构造参数：base_url（必填）、api_key、timeout
 ```
 
 - 校验 `/reset` 2xx、`/ingest` 2xx（含 `input_tokens`/`llm_calls` 数值校验）、`/query` 2xx + JSON + 字符串 `answer`（`retrieved` 若出现须为字符串列表）。
@@ -321,7 +327,7 @@ python -m membench.cli doctor --target <url>     # 连通性 + 三端点契约�
 
 ### `--shards` 的分片维度
 
-- `--shards N --shard-index I` 配 `fuse` 融合同一评测的多个分片 run；`--shard-by` 决定分片维度。
+- `--shards N --shard-index I` 配 `fuse` 融合同一评测的多个分片 run；`--shard-by` 决定分片维度。分片时实验目录名末尾带 `_s<I>`（`--limit` 另带 `_l<N>`），**各分片可共用同一个 `--report-out`**（同秒起跑不撞名）；同片重跑落同名目录仍被非空守卫拒绝。
 - `--shard-by question`（默认）按**全局题号**分片（`i % N == I`），不含入选题的对话整段跳过——适合"少量超长对话承载大量题"的集，ingest 真省。
 - `--shard-by dialogue` 按**对话整段**分片（`d % N == I`），分片之间 ingest 互不重复——"几乎每个对话都有题"的 ingest 密集型数据集（如 office、BEAM-1M）**必须用这个**；用题目级分片会让每个分片仍对全部对话 ingest，成本 ×N 反而更慢。
 - 两种维度都能用 `fuse` 融合，但**不许混维融合**（fuse 会明确报错）。

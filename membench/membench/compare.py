@@ -73,6 +73,10 @@ CRITICAL_COMPARABILITY_DIMS: tuple[str, ...] = (
     # 运行模式：full / replay-restore / replay-rebuild。回放固定写入侧，
     # 与全量分**不可比**（缺省视为 full——本特性之前的所有 run 都是全量跑）。
     "run_mode",
+    # 题目数：分数算在哪个题集上。两侧题目数不同说明分数来自不同题目总体
+    # （典型如 --limit 冒烟 vs 全量、分片融合只覆盖一部分），diff 不可归因；
+    # 与数据集指纹同级——数据集身份没变但题目集变了，同样不能当 A/B。
+    "n_questions",
 )
 
 #: 次要维度：不一致仅降级为 WARN 门禁，不判 FAIL。
@@ -80,7 +84,6 @@ WARN_COMPARABILITY_DIMS: tuple[str, ...] = (
     "limit",
     "shards",
     "shard_index",
-    "n_questions",
     "adapter_meta",
     # 检索命中口径（substring / overlap / llm）不同则分数不可直接对比，
     # 降级 WARN 提示；旧版 run 未落账该字段时两侧同缺，不判不一致。
@@ -102,11 +105,6 @@ _SEVERITY_BY_DIM: dict[str, str] = {
 _COMPARABILITY_DIMS: tuple[str, ...] = (
     CRITICAL_COMPARABILITY_DIMS + WARN_COMPARABILITY_DIMS + INFO_COMPARABILITY_DIMS
 )
-
-
-#: A/B 两臂的目录名——compare 实验目录下固定为这两棵完整的 eval 树。
-_DIR_A = "A"
-_DIR_B = "B"
 
 
 def _load_metrics(target: str) -> dict[str, Any]:
@@ -224,12 +222,22 @@ def _comparability_value(metrics: dict[str, Any], dim: str) -> Any:
 
     ``run_mode`` 缺省归一为 ``"full"``：本特性之前的所有 run 都是全量跑，
     旧 run 不该因为"没落账这个字段"被记成无法核验。
+
+    ``n_questions`` 顶层没有——它由 :func:`membench.metrics.summary.aggregate`
+    写在 ``overall`` 下，故取 ``overall`` 兜底；只读顶层会让该维度恒为
+    ``None == None``（死维度，冒烟产物与全量产物因此被当成可比）。
     """
     if dim == "dataset_sha256":
         fingerprint = metrics.get("dataset_fingerprint") or {}
         return fingerprint.get("sha256") if isinstance(fingerprint, dict) else None
     if dim == "run_mode":
         return metrics.get("run_mode") or "full"
+    if dim == "n_questions":
+        value = metrics.get("n_questions")
+        if value is not None:
+            return value
+        overall = metrics.get("overall")
+        return overall.get("n_questions") if isinstance(overall, dict) else None
     return metrics.get(dim)
 
 
@@ -538,8 +546,8 @@ def compare_runs(
     render_compare_report(
         reports_dir, metrics_a, metrics_b, diffs, gates, verdict, comparability=comparability
     )
-    arm_a = _copy_arm(compare_dir, _DIR_A, dir_a, metrics_a)
-    arm_b = _copy_arm(compare_dir, _DIR_B, dir_b, metrics_b)
+    arm_a = _copy_arm(compare_dir, layout.DIR_ARM_A, dir_a, metrics_a)
+    arm_b = _copy_arm(compare_dir, layout.DIR_ARM_B, dir_b, metrics_b)
     report_path = os.path.join(reports_dir, layout.FILE_COMPARISON_MD)
     sources = {
         "A（基线）": {

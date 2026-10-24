@@ -233,6 +233,16 @@ python -m membench.cli adapter remove <名>  # 删除
 python -m membench.cli doctor --target http://127.0.0.1:8787 [--timeout 10.0] [--api-key K]
 ```
 
+自检通过后直连跑评测：`base_url` 是 `HttpAdapter` 的构造参数，用通用参数
+`--adapter-arg` 传（不需要为桥再包一层适配套件）：
+
+```bash
+python -m membench.cli run --adapter http \
+  --adapter-arg base_url=http://127.0.0.1:8787 --adapter-arg timeout=10 \
+  --dataset membench/data/sample_dataset.jsonl --judge heuristic --report-out <skill目录>/output
+# 接受的构造参数：base_url（必填）、api_key、timeout；缺必填参数 / key 写错会在开跑前报错
+```
+
 ## 7. 冒烟与验收
 
 ```bash

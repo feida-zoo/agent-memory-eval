@@ -174,8 +174,8 @@ python -m membench.cli run --adapter mock-strong \
 ## 大数据集：冒烟与分片
 
 冒烟（快速验证链路，可选）：`run --limit N` 每个数据集只取前 N 道题。
-run_id 带 `_limit{N}` 后缀、metrics.json 记入 `"limit": N`，冒烟结果不会
-被误当全量结果对比。
+run_id 带 `_limit{N}` 后缀、实验目录名带 `_l<N>` 后缀、metrics.json 记入
+`"limit": N`，冒烟结果不会被误当全量结果对比。
 
 数据集级分片（BEAM / LongMemEval 这类大集，可选）：
 
@@ -183,24 +183,29 @@ run_id 带 `_limit{N}` 后缀、metrics.json 记入 `"limit": N`，冒烟结果�
 # 先下载（落 ~/.membench/datasets/beam_1m.jsonl）：
 #   python -m membench.cli dataset fetch beam_1m
 # 按对话分 4 片（整段对话归片 d % 4，分片间不重复 ingest；可在多台机器上并行）。
-# 每个分片各落一个独立实验目录：同机并发时用不同的 --report-out（或错开启动），
-# 实验目录名精确到秒，同一秒内起跑会撞名被拒
+# 每片各落一个独立实验目录，目录名末尾带分片序号 `_s<index>`（_s0 … _s3），
+# 所以 N 片可以共用同一个 --report-out —— 同一秒起跑也不会撞名；
+# 同片重跑落在同名目录时仍会被非空守卫拒绝（换个 --report-out 或错开一秒）
 python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/beam_1m.jsonl \
-    --shards 4 --shard-index 0 --shard-by dialogue --report-out output/shard0
+    --shards 4 --shard-index 0 --shard-by dialogue --report-out output/
 ...
 python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/beam_1m.jsonl \
-    --shards 4 --shard-index 3 --shard-by dialogue --report-out output/shard3
+    --shards 4 --shard-index 3 --shard-by dialogue --report-out output/
 
 # 融合为完整实验目录（校验分片齐全、adapter/dataset/shard 维度一致、题目无重复；
 # 指标重新计算，stale 门禁对融合结果同样生效，FAIL 时退出码 1）
 # --runs 每项 = 分片的实验目录，或其中的 runs/<dataset> 数据集目录；
 # --out = 融合产物的完整实验目录（产物落其 runs/<dataset>/ 与 reports/）
 python -m membench.cli fuse \
-    --runs output/shard0/eval_my-sys_<平台>_<ts0>/runs/beam_1m,output/shard1/eval_my-sys_<平台>_<ts1>/runs/beam_1m \
+    --runs output/eval_my-sys_<平台>_<ts0>_s0/runs/beam_1m,output/eval_my-sys_<平台>_<ts1>_s1/runs/beam_1m \
     --out output/beam_1m_full
 ```
 
 `--shards` 与 `--limit` 可组合（先分片再截断），用于分片链路的廉价验证。
+
+**分片 / 冒烟怎么进目录名**：`--shards != 1` 时实验目录名末尾追加 `_s<分片序号>`，`--limit N` 追加 `_l<N>`（如 `eval_my-sys_wx_20261024-193000_s1_l50`）；不分片且无 limit 时目录名保持 `eval_<name>_<platform>_<ts>` 原样。`run_id`（`metrics.json` 里的身份字符串）用的是另一套更完整的词表 `_shardIofN` / `_dshardIofN` / `_limitN`——含分片总数与分片维度，两者都只由 `membench/layout.py` 生成。**已知取舍**：`--shards max` 落在单分片数据集上时实际只跑 1 片，但实际分片数要解析数据集才知道，CLI 建目录时已按"传了 `--shards`"记下 `_s0`——目录名宁可多带标记，也不能让分片产物与不分片产物撞进同一个目录名（`run_id` 里则不出分片标记，因为那里用的是结算后的有效分片数）。
+
+**分片 / 冒烟怎么进融合产物**：`fuse` 校验各分片的 `limit` 一致（全量分片与 `--limit` 冒烟分片混融会得到"部分全量"的假完整结果，直接拒绝），并把 `limit` 透传到融合产物的 `metrics["limit"]`；融合产物的 `run_id` 带 `_fused`、`_shard<N>`/`_dshard<N>` 与 `_limitN` 标记——冒烟融合产物与全量融合产物因此不会被当成同一身份，`compare --require-comparable` 会按题目数（关键维度）判它们不可比。
 
 **并行分片的实例隔离**：分片是进程级并行——每个分片必须独占一个记忆实例（HTTP 桥 → 每分片独立桥进程 / `BRIDGE_PORT` / `BRIDGE_DATA_DIR`；Python 适配器 → 每分片独立进程）。runner 对每个 dialogue 调 `reset()`，共享同一实例并行会互相清库（跨片串扰）；只有一个实例时请串行跑分片，`fuse` 结果不受影响。
 
@@ -247,12 +252,13 @@ python -m membench.cli run --adapter my-system --dataset membench/data/office_da
 
 | 级别 | 维度 | 不一致的后果 |
 |---|---|---|
-| 关键 | `adapter`、`adapter_version`、`dataset_sha256`（取 `dataset_fingerprint.sha256`）、`judge`、`judge_model`、`driver_llm`、`platform`、`run_mode`（全量 / 快照回放） | 非 strict 下门禁降级 WARN；`--require-comparable`（strict）下直接 FAIL |
-| 次要 | `limit`、`shards`、`shard_index`、`n_questions`、`adapter_meta` | 降级 WARN，不 FAIL |
+| 关键 | `adapter`、`adapter_version`、`dataset_sha256`（取 `dataset_fingerprint.sha256`）、`judge`、`judge_model`、`driver_llm`、`platform`、`run_mode`（全量 / 快照回放）、`n_questions`（分数算在哪个题集上：`--limit` 冒烟 vs 全量即走这里） | 非 strict 下门禁降级 WARN；`--require-comparable`（strict）下直接 FAIL |
+| 次要 | `limit`、`shards`、`shard_index`、`adapter_meta` | 降级 WARN，不 FAIL |
 | 提示 | `commit`、`dataset_path`、`dataset` | 仅记录（`same=false`），不影响结论 |
 
-- 关键维度**任一值缺失**（如旧 run 没有 `driver_llm`）记入 `unverifiable`：非 strict 下不判不可比，strict 下与不一致同等处理（判 FAIL）——没填就核验不了，strict 模式不允许"没填当通过"。
+- 关键维度**任一值缺失**（如旧 run 没有 `driver_llm`）记入 `unverifiable`：非 strict 下不判不可比，strict 下与不一致同等处理（判 FAIL）——没填就核验不了，strict 模式不允许"没填当通过"。`n_questions` 取自 `overall.n_questions`（`aggregate` 的落账位置，顶层没有该字段）。
 - `commit` 不同是 A/B 的被测变量本身，**不算**不可比；`run_mode` 缺省按 `full` 归一（本特性之前的所有 run 都是全量跑），故历史 run 不会因缺该字段被误判。
+- **`--limit` 冒烟产物不得与全量产物对比**：`fuse` 把各分片一致的 `limit` 透传到融合产物，`run_id` 另带 `_fused` / `_shard<N>` / `_limitN` 标记；两侧题目数不同（关键维度）时 strict 直接判 FAIL——冒烟分部署到全量门槛上会被拦下。
 
 门禁语义：
 
@@ -287,8 +293,8 @@ python -m membench.cli run --adapter <你的适配器> --dataset <数据集> \
 
 # 2) 改了读取侧代码后回放（跳过 reset + ingest，只跑 query）+ 保住真校验地板
 #    --replay 传导过快照的实验目录（或其中的 runs/<数据集目录>）；
-#    --replay-verify-source 传源产物（实验目录或其中 runs/<数据集目录>），
-    按 <数据集目录>/report/results.jsonl 逐题比对）
+#    --replay-verify-source 传源产物（实验目录或其中 runs/<数据集目录>）：
+#    按 <数据集目录>/report/results.jsonl 逐题比对
 python -m membench.cli run --adapter <你的适配器> --dataset <同一个数据集> \
     --replay output/eval_<名>_<平台>_<ts> \
     --replay-verify-source output/eval_<名>_<平台>_<ts>/runs/<数据集目录> --judge heuristic
@@ -393,7 +399,7 @@ label 推荐 `platform@commit` 格式（也接受任意字符串）。实验目�
 ```bash
 # 单次评测（run / evaluate --report-out DIR）：DIR 是实验目录的父目录（缺省 output_root()）
 # fuse --out DIR 直接给完整实验目录，形态与本棵树相同（runs/<dataset>/ + reports/）
-DIR/eval_<adapter>_<platform>_<ts>/      # ts = YYYYMMDD-HHMMSS
+DIR/eval_<adapter>_<platform>_<ts>[_s<i>][_l<limit>]/   # ts = YYYYMMDD-HHMMSS；分片/冒烟后缀见上
 ├── runs/<dataset>/                      # 每个数据集一棵子树
 │   ├── report/{report.md,metrics.json,results.jsonl,fig_category_accuracy.png,fig_latency_hist.png}
 │   └── <对话目录>/                       # 对话 id 归一成安全目录名（非法字符换 `_`，空值回退 dialogue）
@@ -419,10 +425,10 @@ DIR/matrix_<ts>/
 ```
 
 - 不传 `--report-out` / `--out` 时一律落 `output_root()`：`run` / `evaluate` 落 `output_root()/eval_<adapter>_<platform>_<ts>/`，`compare` / `evaluate-compare` 落 `output_root()/compare_<name>_<platform>_<ts>/`，`matrix` 落 `output_root()/matrix_<ts>/`。
-- 命名与落位 helper 是**公开 API**（不必自己重写约定）：`membench.layout` 的 `eval_subdir` / `compare_subdir` / `matrix_subdir` / `experiment_path` / `runs_root` / `dataset_dir` / `dataset_report_dir` / `dialogue_dir` / `dialogue_report_dir` / `dialogue_runtime_dir` / `dialogue_snapshot_dir` / `task_report_dir` / `resolve_dataset_dir`；产物根 `membench.paths.output_root()`。
-- **读取方的「产物目录」入参**（`compare --baseline/--candidate`、`evaluate --from-runs`、`evaluate-compare --baseline-run/--candidate-run`、`matrix --runs` 右值、`run --replay`、`fuse --runs`）统一经 `layout.resolve_dataset_dir` 解析：传**实验目录**（其下恰有一个数据集目录时自动定位；有多个则要求指向具体数据集目录）或**数据集目录**（`<实验目录>/runs/<dataset>`）都行；指标固定读 `<数据集目录>/report/metrics.json`。
+- 命名与落位 helper 是**公开 API**（不必自己重写约定）：`membench.layout` 的 `eval_subdir` / `compare_subdir` / `matrix_subdir` / `experiment_tags` / `run_id` / `run_id_tags` / `experiment_path` / `runs_root` / `dataset_dir` / `dataset_report_dir` / `dialogue_dir` / `dialogue_report_dir` / `dialogue_runtime_dir` / `dialogue_snapshot_dir` / `task_report_dir` / `resolve_dataset_dir`；产物根 `membench.paths.output_root()`。
+- **读取方的「产物目录」入参**（`compare --baseline/--candidate`、`evaluate --from-runs`、`evaluate-compare --baseline-run/--candidate-run`、`matrix --runs` 右值、`run --replay`、`run --replay-verify-source`、`fuse --runs`）统一经 `layout.resolve_dataset_dir` 解析：传**实验目录**（其下恰有一个数据集目录时自动定位；有多个则要求指向具体数据集目录）或**数据集目录**（`<实验目录>/runs/<dataset>`）都行；指标固定读 `<数据集目录>/report/metrics.json`。`--from-runs` 的 `KEY` 还会与实际产物身份核对：`office` ↔ `office_dataset`（或用户测试集的 `user_dataset`）这类"key 与目录名不同"的映射由数据集注册表反推，不会拿 key 与目录名直接比字符串；key 认错时直接报错，不把别的数据集的分数记到该 key 名下。
 - Runner API 使用者传 `Runner(..., out_dir=实验目录)`：Runner 直接写 `<实验目录>/runs/<dataset>/…`（数据集级报告 + 逐对话报告 + `runtime/`），任务级报告落 `<实验目录>/reports/`，并把 `experiment_dir` / `dataset_dir` 写回 `metrics.json`。
-- 旧版产物（平铺的 run 目录、缺 `report/` 层级）**不再兼容**：读取时统一报错「产物结构为旧版（缺少 report/ 层级），本版本不再兼容，请重新跑评测」。
+- 旧版产物（平铺的 run 目录、缺 `report/` 层级）**不再兼容**：读取时统一报错「产物结构为旧版（缺少 report/ 层级），本版本不再兼容，请重新跑评测」。目录里**根本没有**数据集产物（空目录、跑到一半中断）另有独立报错文案——那是"没有产物"而不是"版本旧"，别去改代码兼容，换个目录或重跑即可。
 
 ## 如何接入自己的记忆系统
 
@@ -478,7 +484,18 @@ Runner(MyAdapter(), "membench/data/sample_dataset.jsonl", out_dir=exp_dir).run()
 `POST /restore`、`POST /rebuild`；参考模板 `examples/http_bridge_node` 已实现前三个
 （文件级快照，带标记文件防误恢复）。
 
-然后在 Python 侧用内置 `HttpAdapter` 指向你的服务地址，照常跑 `Runner`。
+然后在 Python 侧用内置 `HttpAdapter` 指向你的服务地址，照常跑 `Runner`。服务地址经通用构造参数 `--adapter-arg` 传入，命令行一步到位，无需再包一层适配器：
+
+```bash
+python -m membench.cli run --adapter http \
+    --adapter-arg base_url=http://127.0.0.1:8787 \
+    --adapter-arg timeout=10 \
+    --dataset membench/data/office_dataset.jsonl --judge heuristic --report-out output/
+# HttpAdapter 接受的构造参数：base_url（必填）、api_key、timeout；
+# 必填参数缺失 / key 写错都会在开跑前报错并列出可接受的参数名
+```
+
+Python API 侧同理：`HttpAdapter(base_url="http://127.0.0.1:8787", timeout=10.0)`。
 
 #### 接入自检（doctor）
 
@@ -528,6 +545,23 @@ Runner(adapter, "membench/data/office_dataset.jsonl", judge="heuristic",
 ### 路径四：导出对话日志，用 TranscriptAdapter
 
 最低成本路径：把你系统线上真实的「记忆写入/检索」日志导出为离线 transcript（对话 + 每题实际检索到的记忆条目），用 `TranscriptAdapter` 回放注入。适合**不改系统、先量现状**的场景，也适合复现线上 badcase。
+
+### 适配器构造参数（--adapter-arg，通用机制）
+
+需要构造参数的适配器（`http` 的 `base_url`、`transcript` 的 `transcript_path`、`mock-weak` 的 `top_k` 等）一律用通用参数传入，不给单个适配器开专用开关：
+
+```bash
+python -m membench.cli run --adapter http \
+    --adapter-arg base_url=http://127.0.0.1:8787 --adapter-arg timeout=10 ...
+python -m membench.cli evaluate --adapter transcript \
+    --adapter-arg transcript_path=/path/to/transcript.jsonl ...
+# A/B 两侧各自一组：evaluate-compare 用 --adapter-arg-a / --adapter-arg-b
+python -m membench.cli evaluate-compare --baseline-adapter http --candidate-adapter http \
+    --adapter-arg-a base_url=http://127.0.0.1:8787 --adapter-arg-b base_url=http://127.0.0.1:8788 ...
+```
+
+- `KEY` 必须是该适配器构造函数的形参名（注册表项是工厂函数时按工厂签名判）：不认识 → 报错并**列出该适配器可接受的参数名**；缺 `=` 或值为空 → 报错说明 `KEY=VALUE` 形式；必填参数没给 → 报错提示用 `--adapter-arg` 传（如 `--adapter http` 缺 `base_url`）。
+- 值按形参注解做最小转换：`int` / `float` 注解转数字，其余保持字符串（值里的 `=` 原样保留，可放 URL query）；同一个 `KEY` 给多次时后者生效。
 
 ### 适配器持久化（adapter install）
 

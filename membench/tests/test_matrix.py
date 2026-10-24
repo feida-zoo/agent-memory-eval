@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from membench import layout
+from membench import cli, layout
 from membench.adapters import MockStrongAdapter, MockWeakAdapter
 from membench.data import SAMPLE_DATASET_PATH
 from membench.matrix import compare_matrix
@@ -171,3 +171,35 @@ def test_compare_matrix_rejects_label_dir_conflict(tmp_path: Path) -> None:
             [("a b", labeled[0][1]), ("a/b", labeled[1][1])], str(out_dir)
         )
     assert not (out_dir / layout.DIR_REPORTS).exists()
+
+
+def test_cli_matrix_rejects_too_few_labels_without_leftovers(tmp_path: Path) -> None:
+    """CLI matrix 入参不足 -> 友好报错（不是 Python 堆栈），且不留空 matrix_<ts>/。"""
+    labeled = _make_runs(tmp_path)
+    out = tmp_path / "cli_out"
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["matrix", "--runs", f"wx@a1={labeled[0][1]}", "--report-out", str(out)]
+        )
+    message = str(excinfo.value)
+    assert "matrix 至少需要 2 个" in message
+    assert "Traceback" not in message
+    assert not out.exists() or not list(out.iterdir()), "入参不足却留下空实验目录"
+
+    # 入参够时同一批产物正常出矩阵；报告落 <report-out>/matrix_<ts>/reports/
+    rc = cli.main(
+        [
+            "matrix",
+            "--runs",
+            f"wx@a1b2c3={labeled[0][1]}",
+            f"fs@a1b2c3={labeled[1][1]}",
+            "--report-out",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    matrix_dirs = [p for p in out.iterdir() if p.is_dir()]
+    assert len(matrix_dirs) == 1, "失败路径不该留下目录（否则这里会多于一个）"
+    assert matrix_dirs[0].name.startswith("matrix_")
+    assert (matrix_dirs[0] / layout.DIR_REPORTS / layout.FILE_REPORT_MD).is_file()

@@ -398,19 +398,16 @@ class Runner:
         )
         platform_tag = self.platform or "default"
         now = datetime.now()
-        # commit 短哈希进 run_id，避免矩阵评测中同 adapter+platform 同秒撞身份
-        commit_tag = f"_{str(self.commit)[:8]}" if self.commit else ""
-        # limit / shard 进 run_id，避免冒烟或分片结果被误当全量结果；
-        # dialogue 分片用 _dshard 标记，与题目级分片区分
-        limit_tag = f"_limit{self.limit}" if self.limit is not None else ""
-        if shards > 1:
-            shard_mode = "dshard" if self.shard_by == "dialogue" else "shard"
-            shard_tag = f"_{shard_mode}{self.shard_index}of{shards}"
-        else:
-            shard_tag = ""
-        run_id = (
-            f"{adapter_name}_{platform_tag}{commit_tag}_"
-            f"{dataset_name}{shard_tag}{limit_tag}_{now.strftime('%Y%m%d_%H%M%S')}"
+        # run_id 的唯一组装入口在 layout：commit 短哈希避免矩阵评测中同 adapter+platform
+        # 同秒撞身份；limit / 分片标记避免冒烟或分片结果被误当全量结果
+        # （词表见 layout.run_id_tags，格式见 layout.run_id）
+        run_id = layout.run_id(
+            adapter_name,
+            platform_tag,
+            dataset_name,
+            now.strftime("%Y%m%d_%H%M%S"),
+            commit=self.commit,
+            tags=layout.run_id_tags(shards, self.shard_index, self.shard_by, self.limit),
         )
         dialogue_ids = [str(d.dialogue_id) for d in dialogues]
 

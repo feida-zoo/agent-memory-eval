@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from membench import cli
+from membench import cli, layout
 from membench.adapters import MockStrongAdapter, MockWeakAdapter
 from membench.data import SAMPLE_DATASET_PATH
 from membench.evaluate import DatasetSpec, evaluate, parse_run_kv
@@ -499,3 +499,86 @@ def test_evaluate_compare_cross_side_ignores_tested_object_dims(
     )
     assert "（无：各数据集两侧关键与次要维度均一致且可核验）" in md
     assert "两侧可比性：各数据集关键维度一致且可核验" in md
+
+
+def test_from_runs_rejects_key_product_mismatch(tmp_path: Path) -> None:
+    """KEY 与实际产物身份不符 -> 直接拒绝，不把别的数据集的分数记到该 key 名下。
+
+    回归：``resolve_dataset_dir`` 的提示不命中回退（保留）让"key 认错"静默通过——
+    此前 ``--from-runs locomo=<只含 sample_dataset 的实验目录>`` 会把 sample_dataset
+    当 locomo 记账，退出码 0。
+    """
+    _, _, runs = _make_runs(tmp_path)  # key / 目录名都是 a / b
+    out = tmp_path / "out_bad_key"
+
+    with pytest.raises(SystemExit) as excinfo:
+        evaluate(None, None, report_out=str(out), from_runs={"locomo": runs["a"]})
+    message = str(excinfo.value)
+    assert "locomo" in message
+    assert "实际解析到 a" in message
+    # 认错的 key 在开跑前就被拦下：不建实验目录，更不留空目录
+    assert not out.exists()
+
+
+def test_from_runs_accepts_key_dir_name_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``office``(key) ↔ ``office_dataset``(目录名) 的映射继续可用（不直接比字符串）。
+
+    同一份 office 产物的 stale 门禁在纯汇总与 ``--dataset office`` 两条路径上结论一致
+    （回归：纯汇总此前不标办公域槽位 -> 门禁 SKIP、退出码 0）。
+    """
+    from membench.runner import Runner
+    from membench.userdata import builtin_office_dataset_path
+
+    monkeypatch.setenv("MEMBENCH_USER_DATA_DIR", str(tmp_path / "user_dataset"))
+    exp = tmp_path / "office_exp"
+    Runner(
+        MockWeakAdapter(),
+        str(builtin_office_dataset_path()),
+        judge="heuristic",
+        out_dir=str(exp),
+    ).run()
+    assert (exp / layout.DIR_RUNS / "office_dataset").is_dir()
+
+    rc_pure = cli.main(
+        ["evaluate", "--from-runs", f"office={exp}", "--report-out", str(tmp_path / "pure")]
+    )
+    rc_explicit = cli.main(
+        [
+            "evaluate",
+            "--dataset",
+            "office",
+            "--from-runs",
+            f"office={exp}",
+            "--report-out",
+            str(tmp_path / "explicit"),
+        ]
+    )
+    # mock-weak 在 office 上 stale_rate=0.1 > 阈值 0.03：两条路径都必须 FAIL（退出码 1）
+    assert rc_pure == 1 and rc_explicit == 1
+    for out in (tmp_path / "pure", tmp_path / "explicit"):
+        eval_dir = next(out.glob("eval_*"))
+        summary = json.loads(
+            (eval_dir / "reports" / "evaluate_summary.json").read_text(encoding="utf-8")
+        )
+        assert summary["gate"]["status"] == "FAIL"
+
+
+def test_from_runs_unknown_key_warns_and_keeps_fallback(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """自定义 key（不在数据集注册表里）无法核对身份：保留回退，但显著警告实际采用目录。"""
+    _, _, runs = _make_runs(tmp_path)
+    evaluate(
+        None,
+        None,
+        report_out=str(tmp_path / "out_custom"),
+        from_runs={"mykey": runs["a"]},
+    )
+    out = capsys.readouterr().out
+    assert "mykey" in out and "⚠️" in out
+
+    # key 与目录名一致时不该有任何警告
+    evaluate(None, None, report_out=str(tmp_path / "out_ok"), from_runs={"a": runs["a"]})
+    assert "⚠️ 汇总模式" not in capsys.readouterr().out

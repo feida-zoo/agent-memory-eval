@@ -121,6 +121,32 @@ def test_naming_helpers() -> None:
     assert layout.matrix_subdir(ts="20260101-120000") == "matrix_20260101-120000"
 
 
+def test_eval_subdir_tags_and_run_id_tags() -> None:
+    """实验目录名的分片/冒烟后缀（`_s<i>` / `_l<limit>`）与 run_id 标记词表。"""
+    base = layout.eval_subdir("mock-strong", "wx", ts="20260101-120000")
+    assert layout.eval_subdir("mock-strong", "wx", ts="20260101-120000", tags=[]) == base
+    assert layout.eval_subdir(
+        "mock-strong", "wx", ts="20260101-120000", tags=layout.experiment_tags(2, 1, 3)
+    ) == f"{base}_s1_l3"
+    # tag 与 name / platform 同口径经 slug 归一（非法字符不落进目录名）
+    assert layout.eval_subdir("a", ts="20260101-120000", tags=["s 0/x"]) == (
+        "eval_a_default_20260101-120000_s-0-x"
+    )
+
+    # 不分片且无 limit -> 无后缀；--shards max 只记得分片序号（总数要解析数据集才知道）
+    assert layout.experiment_tags(1, 0) == []
+    assert layout.experiment_tags(1, 0, 5) == ["l5"]
+    assert layout.experiment_tags(4, 2) == ["s2"]
+    assert layout.experiment_tags("max", 3) == ["s3"]
+
+    # run_id 词表：分片在前、limit 在后，分片/冒烟结果不会被误当全量结果
+    assert layout.run_id_tags(1, 0, "question") == []
+    assert layout.run_id_tags(2, 0, "question") == ["shard0of2"]
+    assert layout.run_id_tags(2, 1, "dialogue") == ["dshard1of2"]
+    assert layout.run_id_tags(2, 1, "dialogue", 3) == ["dshard1of2", "limit3"]
+    assert layout.run_id_tags(1, 0, "question", 7) == ["limit7"]
+
+
 def test_ts_now_follows_ts_format() -> None:
     """ts_now() 的产物是 TS_FORMAT 形状，实验目录名可被按 ts 解析出来。"""
     assert re.fullmatch(r"\d{8}-\d{6}", layout.ts_now())
@@ -309,3 +335,36 @@ def test_resolve_dataset_dir_rejects_legacy_layout(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as excinfo_half:
         layout.resolve_dataset_dir(str(half_baked))
     assert layout.LEGACY_LAYOUT_MSG in str(excinfo_half.value)
+
+
+def test_resolve_dataset_dir_reports_missing_product(tmp_path: Path) -> None:
+    """空 / 无效实验目录报"没有数据集产物"，不误报成旧版结构（原因不同，处置也不同）。"""
+    # 1) 空实验目录
+    empty = tmp_path / "eval_x_wx_20260101-000000"
+    empty.mkdir()
+    with pytest.raises(SystemExit) as excinfo:
+        layout.resolve_dataset_dir(str(empty))
+    message = str(excinfo.value)
+    assert layout.NO_DATASET_PRODUCT_MSG in message
+    assert layout.LEGACY_LAYOUT_MSG not in message
+
+    # 2) runs/ 下只有非法目录（跑到一半崩掉的现场：对话形状目录 + 空目录）
+    half = tmp_path / "eval_y_wx_20260101-000000"
+    stray = half / layout.DIR_RUNS / "stray_dialogue" / layout.DIR_REPORT
+    stray.mkdir(parents=True)
+    (stray / layout.FILE_METRICS).write_text(
+        json.dumps({"run_id": "stray", "dialogue_id": "d_stray"}), encoding="utf-8"
+    )
+    (half / layout.DIR_RUNS / "empty_dir").mkdir()
+    with pytest.raises(SystemExit) as excinfo_half:
+        layout.resolve_dataset_dir(str(half))
+    assert layout.NO_DATASET_PRODUCT_MSG in str(excinfo_half.value)
+
+    # 3) 对照组：平铺产物仍按旧版结构报错（两者文案必须区分开）
+    legacy = tmp_path / "legacy_run"
+    legacy.mkdir()
+    (legacy / layout.FILE_METRICS).write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit) as excinfo_legacy:
+        layout.resolve_dataset_dir(str(legacy))
+    assert layout.LEGACY_LAYOUT_MSG in str(excinfo_legacy.value)
+    assert layout.NO_DATASET_PRODUCT_MSG not in str(excinfo_legacy.value)

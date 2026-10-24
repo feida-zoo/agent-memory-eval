@@ -93,7 +93,22 @@ result = check_target("http://127.0.0.1:8787", timeout=10.0, api_key=None)
 - `ok=True` 表示没有任何 check FAIL；只要有一项 FAIL 就别急着跑评测，先修契约。
 - 只用标准库 `urllib`，最小环境也能跑。
 
-### 7. 与模板的对应关系
+### 7. 跑评测（内置 HttpAdapter 直连）
+
+`HttpAdapter` 的 `base_url` 是构造参数，用通用参数 `--adapter-arg` 传（不需要再包一层适配套件）：
+
+```bash
+# 建议先 doctor 自检，再跑评测；--report-out 是实验目录的父目录
+python -m membench.cli run --adapter http \
+  --adapter-arg base_url=http://127.0.0.1:8787 --adapter-arg timeout=10 \
+  --dataset membench/data/office_dataset.jsonl --judge heuristic --report-out <实验目录父目录>
+# 接受的构造参数：base_url（必填）、api_key、timeout；缺 base_url / key 写错会在开跑前报错
+```
+
+并行分片时各分片可共用同一个 `--report-out`——实验目录名末尾带分片序号 `_s<i>`
+（`--limit` 另带 `_l<N>`），不会互相覆盖；同片重跑落同名目录仍会被非空守卫拒绝。
+
+### 8. 与模板的对应关系
 
 | checklist 项 | 模板位置 |
 |---|---|
@@ -110,5 +125,5 @@ result = check_target("http://127.0.0.1:8787", timeout=10.0, api_key=None)
 - 若系统只在 UI 事件里触发记忆写入，注意 bridge 调用的是**纯函数/服务层**，绕开 UI 依赖
   （stub 掉 `ipcMain`/`BrowserWindow` 即可），否则会因缺窗口上下文而失败。
 - 评测用独立数据目录（`BRIDGE_DATA_DIR`）与独立实例：`reset` 必须真清空，且**绝不能碰生产数据**。
-- **并行分片 = 每分片一个桥实例**：评测对每个 dialogue 调 `reset()`，两个分片共享一个实例会互相清库（跨片串扰）。N 分片并行就起 N 个桥（各自 `BRIDGE_PORT` + `BRIDGE_DATA_DIR`）；只有一个实例时请串行跑分片。被测系统若自带多命名空间隔离，可自行在桥上按命名空间路由——那是系统能力增强，不是本模板的默认行为。
+- **并行分片 = 每分片一个桥实例**：评测对每个 dialogue 调 `reset()`，两个分片共享一个实例会互相清库（跨片串扰）。N 分片并行就起 N 个桥（各自 `BRIDGE_PORT` + `BRIDGE_DATA_DIR`）；只有一个实例时请串行跑分片。被测系统若自带多命名空间隔离，可自行在桥上按命名空间路由——那是系统能力增强，不是本模板的默认行为。分片评测的输出目录不必各自指定 `--report-out`：实验目录名带 `_s<i>` 后缀，各片（乃至同秒起跑的 N 片）可共用同一个父目录。
 - **清空前快照（可选，回溯用）**：框架在每次 `reset` 前把上下文放进请求体（`run_dir` / `dialogue_id` / `dialogue_index`），**不读不写**你的记忆存储。`run_dir` 现在指向**该对话的目录**（`<实验目录>/runs/<dataset>/<对话目录>`，框架已把它的 `runtime/` 建好）：要"清空前留一份"就在桥里自己做，约定落 `runtime/reset_backup/reset_<序号>_<dialogue_id>/`，**默认关闭**。逐题 `retrieved` 已在 `results.jsonl`，快照只用于查"内部存储为什么长这样"（stale / 误改记忆 / 该记没记）；reset 每对话一次，长跑常开等于每对话复制一份记忆目录。

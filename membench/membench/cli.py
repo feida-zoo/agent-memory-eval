@@ -6,6 +6,7 @@ matrix / doctor / adapter / user-data / dataset / list-datasets。
         [--dataset membench/data/sample_dataset.jsonl] --judge heuristic \
         [--platform wx --commit a1b2c3] [--driver-llm gpt-4o] \
         [--adapter-version a1b2c3] [--report-out DIR] \
+        [--adapter-arg KEY=VALUE]...   # 适配器构造参数，如 base_url=http://127.0.0.1:8787 \
         [--shards N|max --shard-index I --shard-by question|dialogue] \
         [--evidence-match substring|overlap|llm] \
         [--snapshot]   # 每对话 ingest 后导出状态快照（需适配器支持）
@@ -15,7 +16,8 @@ matrix / doctor / adapter / user-data / dataset / list-datasets。
     python -m membench.cli evaluate --adapter mock-strong \
         [--judge heuristic] [--platform wx --commit a1b2c3] \
         [--driver-llm gpt-4o] [--adapter-version a1b2c3] \
-        [--report-out DIR] [--quick | --beam-10m | --no-beam] [--no-lme-s] \
+        [--report-out DIR] [--adapter-arg KEY=VALUE]... \
+        [--quick | --beam-10m | --no-beam] [--no-lme-s] \
         [--evidence-match substring|overlap|llm] \
         [--dataset KEY|PATH]...   # 显式数据集清单（与预设开关互斥） \
         [--from-runs KEY=DIR]...   # 复用已有产物；缺失数据集用 --adapter 补跑
@@ -23,6 +25,7 @@ matrix / doctor / adapter / user-data / dataset / list-datasets。
         [--judge heuristic] [--platform wx --commit a1b2c3] \
         [--driver-llm-a gpt-4o] [--adapter-version-a a1b2c3] \
         [--driver-llm-b gpt-4o-mini] [--adapter-version-b d4e5f6] \
+        [--adapter-arg-a KEY=VALUE]... [--adapter-arg-b KEY=VALUE]... \
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
         [--report-out DIR] [--tag <name>] [--quick | --beam-10m | --no-beam] \
         [--no-lme-s] [--evidence-match substring|overlap|llm] \
@@ -43,15 +46,16 @@ matrix / doctor / adapter / user-data / dataset / list-datasets。
 
 产物一律落「一次实验一个自包含子目录」（见 :mod:`membench.layout`）::
 
-    <report-out>/eval_<name>_<platform>_<ts>/   # 例 eval_mock-strong_default_20261024-193000
+    <report-out>/eval_<name>_<platform>_<ts>[_s<i>][_l<limit>]/   # 例 eval_mock-strong_default_20261024-193000（分片/冒烟带后缀，见 layout.experiment_tags）
     ├── runs/<dataset>/{report/,<对话>/{report/,runtime/,memory_snapshot/}}
-    └── reports/                                # 任务级（多数据集 evaluate 另含 evaluate_summary.json）
+    └── reports/                                # 任务级（report.md / metrics.json / evaluate_summary.json / fig_dataset_overview.png）
     <report-out>/compare_<name>_<platform>_<ts>/{A/,B/,reports/comparison.md}
     <report-out>/matrix_<ts>/{reports/,runs/<label>/}
 
 "产物目录"入参（``--baseline`` / ``--candidate`` / ``--from-runs`` / ``--baseline-run`` /
-``--candidate-run`` / matrix 的 label 右值 / ``--replay``）接受**实验目录**或**数据集目录**
-（``<实验目录>/runs/<dataset>``），统一经 :func:`membench.layout.resolve_dataset_dir` 解析。
+``--candidate-run`` / matrix 的 label 右值 / ``--replay`` / ``--replay-verify-source``）
+接受**实验目录**或**数据集目录**（``<实验目录>/runs/<dataset>``），统一经
+:func:`membench.layout.resolve_dataset_dir` 解析。
 
 --report-out 统一语义：实验目录（``eval_*`` / ``compare_*`` / ``matrix_*``）的
 父目录；缺省时用 paths.output_root()（MEMBENCH_OUTPUT_DIR > skill 的 output/ >
@@ -61,14 +65,18 @@ matrix / doctor / adapter / user-data / dataset / list-datasets。
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import sys
-from typing import Optional, Sequence
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any, Optional, Sequence
 
 from membench import layout
 from membench.adapters import ADAPTERS
 from membench.compare import compare_runs
 from membench.matrix import compare_matrix
+from membench.paths import output_root
 from membench.runner import Runner
 from membench.userdata import (
     delete_user_dataset,
@@ -88,6 +96,14 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- run ---
     p_run = sub.add_parser("run", help="对一个记忆系统运行评测数据集")
     p_run.add_argument("--adapter", required=True, help="适配器名（见 list-datasets 提示 / ADAPTERS 注册表）")
+    p_run.add_argument(
+        "--adapter-arg",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="适配器构造参数（可重复），如 --adapter-arg base_url=http://127.0.0.1:8787 --adapter-arg timeout=10；"
+        "KEY 必须是该适配器构造函数的形参名（不认识会报错并列出可接受的参数名），值按形参注解转换（int/float 转数字，其余按字符串）",
+    )
     p_run.add_argument(
         "--dataset",
         default=None,
@@ -191,6 +207,14 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- evaluate ---
     p_ev = sub.add_parser("evaluate", help="全量评估：多数据集依次评测 + 宏平均融合综合评分 + 办公域 stale 门禁")
     p_ev.add_argument("--adapter", default=None, help="适配器名（见 list-datasets 提示 / ADAPTERS 注册表）；--from-runs 全复用时可省略")
+    p_ev.add_argument(
+        "--adapter-arg",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="适配器构造参数（可重复），如 --adapter-arg base_url=http://127.0.0.1:8787；"
+        "KEY 必须是该适配器构造函数的形参名（不认识会报错并列出可接受的参数名），值按形参注解转换（int/float 转数字，其余按字符串）",
+    )
     p_ev.add_argument("--judge", default=None, choices=["heuristic", "llm", "client"], help="判分器（默认 heuristic；--from-runs 全复用/纯汇总时以已有 run 判分器为准）")
     p_ev.add_argument("--platform", default=None, help="平台标签（如 wx / fs），记入元数据与实验目录名")
     p_ev.add_argument("--commit", default=None, help="commit 标签（如 a1b2c3），记入元数据")
@@ -238,6 +262,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ev_cmp.add_argument("--baseline-adapter", default=None, help="基线适配器名；该侧全复用时可省略")
     p_ev_cmp.add_argument("--candidate-adapter", default=None, help="候选适配器名；该侧全复用时可省略")
+    p_ev_cmp.add_argument(
+        "--adapter-arg-a",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="基线侧适配器构造参数（可重复），如 --adapter-arg-a base_url=http://127.0.0.1:8787；"
+        "KEY 必须是该适配器构造函数的形参名，值按形参注解转换（int/float 转数字，其余按字符串）",
+    )
+    p_ev_cmp.add_argument(
+        "--adapter-arg-b",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="候选侧适配器构造参数（可重复），语义同 --adapter-arg-a",
+    )
     p_ev_cmp.add_argument(
         "--baseline-run",
         action="append",
@@ -343,12 +382,89 @@ def _parse_shards(value: str) -> int | str:
     return n
 
 
-def _make_adapter(name: str):
-    """按注册表名实例化适配器。"""
+def _adapter_ctor_spec(target: object) -> tuple[dict[str, inspect.Parameter], bool]:
+    """适配器构造形参表（形参名 -> Parameter）与是否接受任意关键字（``**kwargs``）。
+
+    注册表项可以是类，也可以是工厂函数（插件常用 ``lambda: MyAdapter(...)``），
+    故内省对象本身而非 ``__init__``。无法内省（C 实现等）时返回 ``({}, True)``：
+    不做 key 校验，交给实例化时的 TypeError 兜底。
+    """
+    try:
+        signature = inspect.signature(target)
+    except (TypeError, ValueError):
+        return {}, True
+    accepted: dict[str, inspect.Parameter] = {}
+    variadic_keywords = False
+    for param in signature.parameters.values():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            variadic_keywords = True
+        elif param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            accepted[param.name] = param
+    return accepted, variadic_keywords
+
+
+def _adapter_arg_value(param: inspect.Parameter | None, key: str, raw: str) -> object:
+    """按构造形参的注解做最小强制转换：``int`` / ``float`` 注解转数字，其余保持字符串。"""
+    annotation = param.annotation if param is not None else inspect.Parameter.empty
+    # 适配器模块常用 ``from __future__ import annotations``，此时注解是字符串
+    label = annotation if isinstance(annotation, str) else getattr(annotation, "__name__", "")
+    if label in ("int", "float"):
+        caster = int if label == "int" else float
+        try:
+            return caster(raw)
+        except ValueError:
+            raise SystemExit(f"--adapter-arg {key}={raw} 无法按 {label} 解析")
+    return raw
+
+
+def _parse_adapter_args(
+    name: str, target: object, adapter_args: Sequence[str]
+) -> dict[str, Any]:
+    """解析 ``--adapter-arg KEY=VALUE``：校验 key 是构造形参名，值按注解转换。
+
+    同一个 key 给多次时后者生效。key 不认识 / ``KEY=VALUE`` 格式非法都直接
+    SystemExit——参数错误必须在开跑前暴露，而不是等实例化时的 TypeError 堆栈。
+    """
+    accepted, variadic_keywords = _adapter_ctor_spec(target)
+    kwargs: dict[str, Any] = {}
+    for item in adapter_args:
+        key, sep, raw = str(item).partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise SystemExit(
+                f"--adapter-arg 需要 KEY=VALUE 形式（如 base_url=http://127.0.0.1:8787），"
+                f"当前为: {item!r}"
+            )
+        if key not in accepted and not variadic_keywords:
+            names = ", ".join(sorted(accepted)) or "(该适配器不接受构造参数)"
+            raise SystemExit(f"适配器 {name} 不认识参数 {key}；可接受的参数: {names}")
+        kwargs[key] = _adapter_arg_value(accepted.get(key), key, raw)
+    return kwargs
+
+
+def _make_adapter(name: str, adapter_args: Sequence[str] = ()) -> Any:
+    """按注册表名实例化适配器；``adapter_args`` 为 ``KEY=VALUE`` 形式的构造参数。
+
+    构造参数走通用机制（``--adapter-arg``），不给单个适配器开专用开关；必填参数
+    没给时把 TypeError 转成可操作的 SystemExit（提示用 ``--adapter-arg`` 传参）。
+    """
     if name not in ADAPTERS:
         available = ", ".join(sorted(ADAPTERS)) or "(空)"
         raise SystemExit(f"未知适配器: {name}。可用: {available}")
-    return ADAPTERS[name]()
+    target = ADAPTERS[name]
+    kwargs = _parse_adapter_args(name, target, adapter_args)
+    try:
+        return target(**kwargs)
+    except TypeError as exc:
+        accepted, _ = _adapter_ctor_spec(target)
+        names = ", ".join(sorted(accepted)) or "(该适配器不接受构造参数)"
+        raise SystemExit(
+            f"适配器 {name} 实例化失败: {exc}；构造参数用 --adapter-arg KEY=VALUE 传入，"
+            f"{name} 接受: {names}"
+        ) from exc
 
 
 def _make_judge(args: argparse.Namespace):
@@ -395,6 +511,46 @@ def _make_evidence_matcher(args: argparse.Namespace):
         raise SystemExit(f"[membench] 参数错误: {exc}")
 
 
+def _discard_empty_experiment(path: str | None) -> None:
+    """删掉存在的空目录（异常吞掉，失败收口用）。
+
+    只删**空**目录：任何已有产物的一律原样保留——那是定位问题要看的现场。
+    """
+    if not path:
+        return
+    try:
+        if os.path.isdir(path) and not os.listdir(path):
+            os.rmdir(path)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _no_leftover_experiment(base_dir: str | None) -> Iterator[None]:
+    """失败收口：本命令在 ``base_dir`` 下新建实验目录后失败时，把仍为空的目录删掉。
+
+    实验目录名（``eval_*`` / ``compare_*`` / ``matrix_*``）在命令内部生成，CLI 事前
+    拿不到名字，故进入时先记下 ``base_dir`` 的既有条目，出错时只清理**本次新建且仍为
+    空**的目录（含本次新建的 ``base_dir`` 本身）——Runner 层"失败不留半成品"的约定
+    不会被 CLI 的提前建目录破坏；有任何产物的目录一律保留。
+    """
+    root = base_dir or output_root()
+    existed = os.path.isdir(root)
+    before = set(os.listdir(root)) if existed else set()
+    try:
+        yield
+    except BaseException:
+        try:
+            after = set(os.listdir(root))
+        except OSError:
+            after = set()
+        for name in sorted(after - before):
+            _discard_empty_experiment(os.path.join(root, name))
+        if not existed:
+            _discard_empty_experiment(root)
+        raise
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     if args.limit is not None and args.limit < 1:
         raise SystemExit(f"--limit 必须 >= 1，当前为 {args.limit}")
@@ -404,61 +560,72 @@ def _cmd_run(args: argparse.Namespace) -> int:
         raise SystemExit(
             f"--shard-index 必须满足 0 <= I < --shards，当前为 {args.shard_index}/{args.shards}"
         )
-    adapter = _make_adapter(args.adapter)
+    adapter = _make_adapter(args.adapter, args.adapter_arg)
     judge = _make_judge(args)
     evidence_matcher = _make_evidence_matcher(args)
     dataset_path, dataset_source = resolve_dataset(args.dataset)
     print(f"[membench] 测试集: {dataset_path} (来源: {dataset_source})")
     adapter_name = str(getattr(adapter, "name", adapter.__class__.__name__))
-    experiment_dir = layout.experiment_path(
-        args.report_out, layout.eval_subdir(adapter_name, args.platform, layout.ts_now())
-    )
-    print(f"[membench] 实验目录: {experiment_dir}")
-    try:
-        runner = Runner(
-            adapter,
-            dataset_path,
-            judge=judge,
-            out_dir=experiment_dir,
-            platform=args.platform,
-            commit=args.commit,
-            dataset_source=dataset_source,
-            jobs=args.jobs,
-            limit=args.limit,
-            shards=args.shards,
-            shard_index=args.shard_index,
-            shard_by=args.shard_by,
-            adapter_meta=args.adapter_meta,
-            driver_llm=args.driver_llm,
-            adapter_version=args.adapter_version,
-            evidence_matcher=evidence_matcher,
-            snapshot=args.snapshot,
-            replay=args.replay,
-            replay_mode=args.replay_mode,
-            replay_verify_source=args.replay_verify_source,
+    with _no_leftover_experiment(args.report_out):
+        # 分片 / limit 进实验目录名：同秒并行的两个分片可以共用一个 --report-out。
+        # 建目录与后续预检都包在收口里：校验失败不留空 eval_*（含本次新建的根目录）。
+        experiment_dir = layout.experiment_path(
+            args.report_out,
+            layout.eval_subdir(
+                adapter_name,
+                args.platform,
+                layout.ts_now(),
+                layout.experiment_tags(args.shards, args.shard_index, args.limit),
+            ),
         )
-        dataset_dir = runner.run()
-    except ValueError as exc:
-        # 参数错误（数据集 schema 校验失败、--snapshot 与 --replay 互斥等）→ 友好退出
-        raise SystemExit(f"[membench] 参数错误: {exc}")
+        print(f"[membench] 实验目录: {experiment_dir}")
+        try:
+            runner = Runner(
+                adapter,
+                dataset_path,
+                judge=judge,
+                out_dir=experiment_dir,
+                platform=args.platform,
+                commit=args.commit,
+                dataset_source=dataset_source,
+                jobs=args.jobs,
+                limit=args.limit,
+                shards=args.shards,
+                shard_index=args.shard_index,
+                shard_by=args.shard_by,
+                adapter_meta=args.adapter_meta,
+                driver_llm=args.driver_llm,
+                adapter_version=args.adapter_version,
+                evidence_matcher=evidence_matcher,
+                snapshot=args.snapshot,
+                replay=args.replay,
+                replay_mode=args.replay_mode,
+                replay_verify_source=args.replay_verify_source,
+            )
+            dataset_dir = runner.run()
+        except ValueError as exc:
+            # 参数错误（数据集 schema 校验失败、--snapshot 与 --replay 互斥等）→ 友好退出
+            raise SystemExit(f"[membench] 参数错误: {exc}")
     if dataset_dir is None:
-        # 分片无事可做（索引越界 / 空数据集）：runner 已打印说明，干净退出
+        # 分片无事可做（索引越界 / 空数据集）：runner 已打印说明，干净退出且不留空目录
+        _discard_empty_experiment(experiment_dir)
         return 0
     print(f"[membench] 完成: {dataset_dir}")
     return 0
 
 
 def _cmd_compare(args: argparse.Namespace) -> int:
-    result = compare_runs(
-        args.baseline,
-        args.candidate,
-        acc_threshold=args.acc_threshold,
-        stale_threshold=args.stale_threshold,
-        latency_warn=args.latency_warn,
-        require_comparable=args.require_comparable,
-        out_dir=args.report_out,
-        name=args.tag,
-    )
+    with _no_leftover_experiment(args.report_out):
+        result = compare_runs(
+            args.baseline,
+            args.candidate,
+            acc_threshold=args.acc_threshold,
+            stale_threshold=args.stale_threshold,
+            latency_warn=args.latency_warn,
+            require_comparable=args.require_comparable,
+            out_dir=args.report_out,
+            name=args.tag,
+        )
     # compare_runs 已打印 verdict / 逐门禁 / 不可比原因 / 报告路径；此处补实验目录便于脚本消费
     print(f"[membench] verdict: {result['verdict']}")
     print(f"[membench] compare_dir: {result['compare_dir']}")
@@ -491,10 +658,24 @@ def _cmd_matrix(args: argparse.Namespace) -> int:
         if not label or not run_dir:
             raise SystemExit(f"--runs 项格式非法: {spec}（形如 label=<产物目录>）")
         labeled_runs.append((label, run_dir))
+    # 可前置的入参检查要在**建目录之前**做完：失败不该在产物根留空 matrix_<ts>/
+    if len(labeled_runs) < 2:
+        raise SystemExit(
+            f"[membench] matrix 至少需要 2 个 labeled run（当前 {len(labeled_runs)} 个）："
+            "形如 --runs 'wx@a1b2c3=<产物目录>' 'fs@a1b2c3=<产物目录>'"
+        )
 
     # --out 优先；否则按 --report-out（缺省 output_root()）建 matrix_<ts>/
     out_dir = args.out or layout.experiment_path(args.report_out, layout.matrix_subdir())
-    result = compare_matrix(labeled_runs, out_dir)
+    try:
+        result = compare_matrix(labeled_runs, out_dir)
+    except ValueError as exc:
+        # 入参 / 产物问题（label 目录冲突、源产物不可解析等）→ 友好报错，不留空实验目录
+        _discard_empty_experiment(out_dir)
+        raise SystemExit(f"[membench] {exc}")
+    except BaseException:
+        _discard_empty_experiment(out_dir)
+        raise
     worst = "PASS"
     for pair in result["pairwise"]:
         if pair["verdict"] == "FAIL":
@@ -631,24 +812,25 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
         judge = None  # 全复用：报告头以已有 run 的元数据为准
     else:
         judge = "heuristic"
-    adapter = _make_adapter(args.adapter) if args.adapter else None
-    return evaluate(
-        adapter,
-        judge,
-        platform=args.platform,
-        commit=args.commit,
-        quick=args.quick,
-        beam_10m=args.beam_10m,
-        no_beam=args.no_beam,
-        no_lme_s=args.no_lme_s,
-        report_out=args.report_out,
-        jobs=args.jobs,
-        driver_llm=args.driver_llm,
-        adapter_version=args.adapter_version,
-        evidence_matcher=_make_evidence_matcher(args),
-        specs=specs,
-        from_runs=from_runs or None,
-    )
+    adapter = _make_adapter(args.adapter, args.adapter_arg) if args.adapter else None
+    with _no_leftover_experiment(args.report_out):
+        return evaluate(
+            adapter,
+            judge,
+            platform=args.platform,
+            commit=args.commit,
+            quick=args.quick,
+            beam_10m=args.beam_10m,
+            no_beam=args.no_beam,
+            no_lme_s=args.no_lme_s,
+            report_out=args.report_out,
+            jobs=args.jobs,
+            driver_llm=args.driver_llm,
+            adapter_version=args.adapter_version,
+            evidence_matcher=_make_evidence_matcher(args),
+            specs=specs,
+            from_runs=from_runs or None,
+        )
 
 
 def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
@@ -683,33 +865,38 @@ def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
             target_keys <= set(baseline_runs) and target_keys <= set(candidate_runs)
         )
         judge = None if (provided_union and both_covered) else "heuristic"
-    baseline_adapter = _make_adapter(args.baseline_adapter) if args.baseline_adapter else None
-    candidate_adapter = _make_adapter(args.candidate_adapter) if args.candidate_adapter else None
-    result = evaluate_compare(
-        baseline_adapter,
-        candidate_adapter,
-        judge,
-        platform=args.platform,
-        commit=args.commit,
-        quick=args.quick,
-        beam_10m=args.beam_10m,
-        no_beam=args.no_beam,
-        no_lme_s=args.no_lme_s,
-        report_out=args.report_out,
-        tag=args.tag,
-        jobs=args.jobs,
-        driver_llm_baseline=args.driver_llm_a,
-        driver_llm_candidate=args.driver_llm_b,
-        adapter_version_baseline=args.adapter_version_a,
-        adapter_version_candidate=args.adapter_version_b,
-        acc_threshold=args.acc_threshold,
-        stale_threshold=args.stale_threshold,
-        latency_warn=args.latency_warn,
-        evidence_matcher=_make_evidence_matcher(args),
-        specs=specs,
-        baseline_runs=baseline_runs or None,
-        candidate_runs=candidate_runs or None,
+    baseline_adapter = (
+        _make_adapter(args.baseline_adapter, args.adapter_arg_a) if args.baseline_adapter else None
     )
+    candidate_adapter = (
+        _make_adapter(args.candidate_adapter, args.adapter_arg_b) if args.candidate_adapter else None
+    )
+    with _no_leftover_experiment(args.report_out):
+        result = evaluate_compare(
+            baseline_adapter,
+            candidate_adapter,
+            judge,
+            platform=args.platform,
+            commit=args.commit,
+            quick=args.quick,
+            beam_10m=args.beam_10m,
+            no_beam=args.no_beam,
+            no_lme_s=args.no_lme_s,
+            report_out=args.report_out,
+            tag=args.tag,
+            jobs=args.jobs,
+            driver_llm_baseline=args.driver_llm_a,
+            driver_llm_candidate=args.driver_llm_b,
+            adapter_version_baseline=args.adapter_version_a,
+            adapter_version_candidate=args.adapter_version_b,
+            acc_threshold=args.acc_threshold,
+            stale_threshold=args.stale_threshold,
+            latency_warn=args.latency_warn,
+            evidence_matcher=_make_evidence_matcher(args),
+            specs=specs,
+            baseline_runs=baseline_runs or None,
+            candidate_runs=candidate_runs or None,
+        )
     return 1 if result["verdict"] == "FAIL" else 0
 
 

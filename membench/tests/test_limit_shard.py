@@ -265,15 +265,20 @@ def test_shard_by_invalid(tmp_path: Path) -> None:
 
 
 def _cli_experiment_dirs(root: Path) -> list[Path]:
-    """CLI 产物：``--report-out`` 下的实验目录（``eval_<adapter>_<platform>_<ts>``）。"""
+    """CLI 产物：``--report-out`` 下的实验目录（``eval_<adapter>_<platform>_<ts>[_<tag>]``）。"""
     return sorted(p for p in root.glob("eval_*") if p.is_dir())
+
+
+def _cli_run(args: list[str]) -> int:
+    """跑一次 CLI run，返回退出码。"""
+    from membench import cli
+
+    return cli.main(args)
 
 
 def test_cli_shard_by_dialogue(tmp_path: Path) -> None:
     """CLI 透传 --shard-by dialogue；实验目录与数据集目录按新结构落位。"""
-    from membench import cli
-
-    rc = cli.main(
+    rc = _cli_run(
         [
             "run",
             "--adapter",
@@ -296,14 +301,105 @@ def test_cli_shard_by_dialogue(tmp_path: Path) -> None:
     experiments = _cli_experiment_dirs(tmp_path)
     assert len(experiments) == 1
     assert experiments[0].name.startswith("eval_mock-strong_default_")
-    # 目录名末段是 TS_FORMAT 秒级时间戳（格式不符时 strptime 抛错即失败）
-    datetime.strptime(experiments[0].name.rsplit("_", 1)[-1], layout.TS_FORMAT)
+    # 目录名 = eval_<adapter>_<platform>_<ts>_s<I>：末尾是分片标签，
+    # 其前一段仍是 TS_FORMAT 秒级时间戳（格式不符时 strptime 抛错即失败）
+    head, _, shard_tag = experiments[0].name.rpartition("_")
+    assert shard_tag == "s0"
+    datetime.strptime(head.rsplit("_", 1)[-1], layout.TS_FORMAT)
 
     dataset_dir = experiments[0] / layout.DIR_RUNS / DATASET
     metrics, records = _dataset_artifacts(dataset_dir)
     assert metrics["shard_by"] == "dialogue"
     assert metrics["overall"]["n_questions"] == len(records) > 0
     assert (experiments[0] / layout.DIR_REPORTS / layout.FILE_REPORT_MD).is_file()
+
+
+def test_cli_shards_share_one_report_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同一 --report-out 跑两片：目录名为 _s0/_s1，各自产物完整、融合题数对齐全量。
+
+    冻结 layout.ts_now 让两片必然落在同一秒——目录名不带分片标签时第二片会被
+    非空守卫拒绝（用户就得为每片各指定一个 --report-out），这里正是回归该点。
+    """
+    from membench.fuse import fuse_runs
+
+    monkeypatch.setattr(layout, "ts_now", lambda now=None: "20260101-120000")
+    for index in (0, 1):
+        assert (
+            _cli_run(
+                [
+                    "run",
+                    "--adapter",
+                    "mock-strong",
+                    "--dataset",
+                    str(SAMPLE_DATASET_PATH),
+                    "--judge",
+                    "heuristic",
+                    "--report-out",
+                    str(tmp_path),
+                    "--shards",
+                    "2",
+                    "--shard-index",
+                    str(index),
+                ]
+            )
+            == 0
+        )
+
+    experiments = _cli_experiment_dirs(tmp_path)
+    assert [p.name for p in experiments] == [
+        "eval_mock-strong_default_20260101-120000_s0",
+        "eval_mock-strong_default_20260101-120000_s1",
+    ]
+
+    shard_qids: list[list[str]] = []
+    for exp in experiments:
+        dataset_dir = exp / layout.DIR_RUNS / DATASET
+        metrics, records = _dataset_artifacts(dataset_dir)
+        # 分片仍是完整实验形态：数据集级报告 + 任务级报告都在位
+        assert metrics["overall"]["n_questions"] == len(records) > 0
+        assert (dataset_dir / layout.DIR_REPORT / layout.FILE_REPORT_MD).is_file()
+        assert (exp / layout.DIR_REPORTS / layout.FILE_REPORT_MD).is_file()
+        shard_qids.append([r["qid"] for r in records])
+
+    _, full_metrics, full = _run(tmp_path, "full")
+    q0, q1 = shard_qids
+    assert set(q0).isdisjoint(q1)
+    assert set(q0) | set(q1) == {r["qid"] for r in full}
+    assert len(q0) + len(q1) == full_metrics["overall"]["n_questions"]
+
+    fused = fuse_runs(
+        [str(exp / layout.DIR_RUNS / DATASET) for exp in experiments],
+        str(tmp_path / "fused"),
+    )
+    assert fused["n_questions"] == full_metrics["overall"]["n_questions"]
+
+
+def test_cli_experiment_dir_tags_only_when_sharded_or_limited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """不传分片时目录名保持基础形态；--limit 只加 _l<limit>（不含 _s 后缀）。"""
+    monkeypatch.setattr(layout, "ts_now", lambda now=None: "20260101-120000")
+    base_args = [
+        "run",
+        "--adapter",
+        "mock-weak",
+        "--dataset",
+        str(SAMPLE_DATASET_PATH),
+        "--judge",
+        "heuristic",
+        "--report-out",
+        str(tmp_path),
+    ]
+    assert _cli_run(base_args) == 0
+    assert _cli_run([*base_args, "--limit", "2"]) == 0
+
+    names = {p.name for p in _cli_experiment_dirs(tmp_path)}
+    assert names == {
+        "eval_mock-weak_default_20260101-120000",
+        "eval_mock-weak_default_20260101-120000_l2",
+    }
 
 
 def test_shards_over_dialogue_count_clamped(tmp_path: Path) -> None:
