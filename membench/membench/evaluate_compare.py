@@ -2,20 +2,24 @@
 
 `compare_runs` 只对比**单数据集**两个 run；`evaluate` 只跑
 **单组**多数据集融合；`matrix` 只对同数据集跨 label。两组 × 多数据集的融合
-A/B 没有现成入口——本模块补齐，产出与 ``ab_<tag>_<ts>/`` 自包含结构一致的
-逐数据集 diff + 跨数据集融合 diff + 门禁 + 对比图。
+A/B 没有现成入口——本模块补齐：逐数据集 diff + 跨数据集融合 diff + 门禁 + 对比图。
 
 流程：
     plan_datasets（复用 evaluate.plan_datasets，与 evaluate 一致的数据集清单）
-    -> 对每个数据集分别用 baseline / candidate 两个 adapter 各跑一次 Runner
+    -> 建对比实验目录 ``<report_out>/compare_<name>_<platform>_<ts>/``，其下
+       ``A/``（基线）、``B/``（候选）各是一个完整 eval 实验形态（runs/ + reports/）
+    -> 每个数据集分别用 baseline / candidate 两个 adapter 各跑一次 Runner
+       （write_task_reports=False，直接落进该侧的 ``runs/<dataset>/``）
     -> 逐数据集 diff（精度复用 :mod:`membench.compare` 的 _diff_overall / 门禁）
-    -> 两组各自 fuse_metrics 得跨数据集宏平均融合值
+    -> 两组各自 fuse_metrics 得跨数据集宏平均融合值 + 各写该侧任务级 reports/
     -> 融合 diff（b - a）+ 门禁（accuracy / stale_rate / latency_p95）
-    -> 产物落 ``<root>/ab_<tag>_<ts>/``，按
-       :func:`membench.layout.materialize_ab_experiment` 落 A/B 两侧 run 副本
-       与 compare_report.md，外加两张图：
-       ``fig_per_dataset_diff.png``（各数据集关键指标 diff）、``fig_fused_diff.png``
-       （融合 diff）。
+    -> 对比产物落 ``reports/``：comparison.md + fig_per_dataset_diff.png
+       （各数据集关键指标 diff）+ fig_fused_diff.png（融合 diff）
+
+两侧复用的"产物目录"（``--baseline-run`` / ``--candidate-run`` 的 ``KEY=DIR``）
+统一经 :func:`membench.evaluate.resolve_dataset_dir` 解析（实验目录或数据集目录）；
+若某侧给的是**一个已存在的实验目录**，整树复制进该侧目录（可比性检查之后）——
+该侧的 runs/ 与 reports/ 一并带过来；其余情形按目标清单补跑 / 并入数据集产物。
 
 门禁与单数据集 compare 口径一致：
     accuracy 下降 > acc_threshold -> FAIL
@@ -34,18 +38,21 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Union
 
-from membench import layout, paths
+from membench import layout
 from membench.compare import _diff_overall, _eval_gates, check_comparability
 from membench.data.schema import is_abstention
 from membench.evaluate import (
     DatasetResult,
     DatasetSpec,
+    adopt_dataset_dir,
     assert_gap_matches_provided,
     assert_single_identity,
+    evaluate_gate,
     expected_fresh_metadata,
     fuse_metrics,
     load_provided_result,
@@ -53,6 +60,7 @@ from membench.evaluate import (
     plan_datasets,
     run_datasets,
     scan_capabilities,
+    write_task_reports,
 )
 from membench.report import (
     PALETTE,
@@ -68,27 +76,32 @@ from membench.report import (
 from membench.ratings import format_metric, format_metric_delta, format_metric_value, overall_rating
 
 
+#: A/B 两侧的目录名（layout 暂未收录；A = 基线、B = 候选），兼作报告里的侧标签。
+ARM_A = "A"
+ARM_B = "B"
+
+
 @dataclass
 class ArmDatasetResult:
     """A/B 两组下某数据集的指标：包含 baseline 与 candidate 两侧 metrics。
 
     Attributes:
         spec: 数据集槽位。
-        baseline: 基线 run 的 metrics.json。
-        candidate: 候选 run 的 metrics.json。
-        baseline_run_dir: 基线 run 目录。
-        candidate_run_dir: 候选 run 目录。
+        baseline: 基线侧的 metrics.json。
+        candidate: 候选侧的 metrics.json。
+        baseline_dataset_dir: 基线侧数据集产物目录（``<A>/runs/<dataset>``）。
+        candidate_dataset_dir: 候选侧数据集产物目录（``<B>/runs/<dataset>``）。
     """
 
     spec: DatasetSpec
     baseline: dict[str, Any]
     candidate: dict[str, Any]
-    baseline_run_dir: str
-    candidate_run_dir: str
+    baseline_dataset_dir: str
+    candidate_dataset_dir: str
     capabilities: dict[str, bool] = field(default_factory=dict)
 
 
-def _rescan_capabilities(run_dir: str, spec_path: str) -> tuple[dict[str, bool], str]:
+def _rescan_capabilities(dataset_dir: str, spec_path: str) -> tuple[dict[str, bool], str]:
     """重算 capabilities：数据集扫描（准确）→ results.jsonl 反推（近似）→ 缺失。
 
     Returns:
@@ -99,7 +112,7 @@ def _rescan_capabilities(run_dir: str, spec_path: str) -> tuple[dict[str, bool],
     except (OSError, ValueError):
         pass
 
-    jsonl_path = os.path.join(run_dir, "results.jsonl")
+    jsonl_path = os.path.join(dataset_dir, layout.DIR_REPORT, layout.FILE_RESULTS)
     if os.path.isfile(jsonl_path):
         try:
             has_evidence = False
@@ -142,12 +155,12 @@ def _rescan_capabilities(run_dir: str, spec_path: str) -> tuple[dict[str, bool],
 
 def _resolve_capabilities(
     metrics: dict[str, Any],
-    run_dir: str,
+    dataset_dir: str,
     spec_path: str,
 ) -> tuple[dict[str, bool], str]:
     """解析某侧数据集的能力标注，优先读 metrics.json 顶层落账字段。
 
-    旧版 run 的 metrics.json 顶层没有 has_evidence / has_stale / has_abstention
+    早期产物的 metrics.json 顶层没有 has_evidence / has_stale / has_abstention
     （或全 False 占位），直接读会把 evidence_recall 等三项判成"未定义 / 参与集
     （无）"，与真实融合值不一致；此函数按"落账优先、缺失/全 False 时重算核对"
     的顺序回退。重算结果与落账一致时仍按 ``"metrics"`` 标注，避免报告噪音。
@@ -162,20 +175,19 @@ def _resolve_capabilities(
     if complete and any(stored.values()):
         return dict(stored), "metrics"  # type: ignore[arg-type]
 
-    caps, source = _rescan_capabilities(run_dir, spec_path)
+    caps, source = _rescan_capabilities(dataset_dir, spec_path)
     if complete and caps == stored:
         return dict(stored), "metrics"  # type: ignore[arg-type]
     return caps, source
 
 
-def _arm_fuse(
-    results: list[ArmDatasetResult], side: str
+def _side_fuse(
+    results: list[DatasetResult],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
-    """对一侧（baseline / candidate）的各数据集结果做宏平均融合。
+    """对一侧（基线 / 候选）的各数据集结果做宏平均融合。
 
     Args:
-        results: 各数据集的 ArmDatasetResult。
-        side: ``"baseline"`` 或 ``"candidate"``。
+        results: 该侧各数据集的评测结果。
 
     Returns:
         ``(fused, sources)``：fused 为 ``{metric: {"value", "participants"}}``
@@ -183,23 +195,138 @@ def _arm_fuse(
         ``{数据集 key: capabilities 来源}``（metrics / dataset / results_jsonl /
         missing），供报告标注"未落账已自动推断"。
     """
-    # 直接复用 fuse_metrics：构造一组 DatasetResult-like 即可。
-    fake_results: list[DatasetResult] = []
+    # 直接复用 fuse_metrics：capabilities 落账优先、缺失或全 False 时重算核对。
+    resolved: list[DatasetResult] = []
     sources: dict[str, str] = {}
     for r in results:
-        metrics = r.baseline if side == "baseline" else r.candidate
-        run_dir = r.baseline_run_dir if side == "baseline" else r.candidate_run_dir
-        caps, src = _resolve_capabilities(metrics, run_dir, r.spec.path)
+        caps, src = _resolve_capabilities(r.metrics, r.run_dir, r.spec.path)
         sources[r.spec.key] = src
-        fake_results.append(
+        resolved.append(
             DatasetResult(
                 spec=r.spec,
-                run_dir=run_dir,
-                metrics=metrics,
+                run_dir=r.run_dir,
+                metrics=r.metrics,
                 capabilities=caps,
             )
         )
-    return fuse_metrics(fake_results), sources
+    return fuse_metrics(resolved), sources
+
+
+def _single_source_experiment(raw_runs: Union[dict[str, str], None]) -> Union[str, None]:
+    """该侧复用产物是否整体来自同一个已存在的实验目录（是则返回它）。
+
+    只有全部入参都指向同一个实验目录（含 ``runs/``）时才整树复制；入参是数据集
+    目录、或来自多个目录时返回 None——改为逐个并入数据集产物，避免误判复制范围。
+    """
+    if not raw_runs:
+        return None
+    paths = {os.path.abspath(raw) for raw in raw_runs.values()}
+    if len(paths) != 1:
+        return None
+    only = paths.pop()
+    if os.path.isdir(layout.runs_root(only)) and not os.path.isfile(
+        os.path.join(only, layout.DIR_REPORT, layout.FILE_METRICS)
+    ):
+        return only
+    return None
+
+
+def _stage_side_dir(
+    compare_dir: str,
+    arm_label: str,
+    provided: dict[str, DatasetResult],
+    raw_runs: Union[dict[str, str], None],
+) -> dict[str, DatasetResult]:
+    """把该侧复用的产物摆进 ``<compare_dir>/<arm_label>/``，返回重定位后的结果。
+
+    入参同为一个已存在的实验目录时整树复制（该侧的 ``runs/`` 与 ``reports/``
+    一并带过来）；其余情形逐个把数据集产物并入该侧目录的 ``runs/`` 下。产物本就
+    在该侧目录内时不做复制。
+    """
+    side_dir = os.path.join(compare_dir, arm_label)
+    source_exp = _single_source_experiment(raw_runs)
+    staged: dict[str, DatasetResult] = {}
+    if source_exp:
+        shutil.copytree(source_exp, side_dir, dirs_exist_ok=True)
+        print(f"[membench] {arm_label} 侧整树复制已有实验目录: {source_exp} -> {side_dir}")
+        for key, res in provided.items():
+            rel = os.path.relpath(res.run_dir, source_exp)
+            staged[key] = DatasetResult(
+                spec=res.spec,
+                run_dir=os.path.abspath(os.path.join(side_dir, rel)),
+                metrics=res.metrics,
+                capabilities=res.capabilities,
+            )
+        return staged
+    for key, res in provided.items():
+        staged[key] = DatasetResult(
+            spec=res.spec,
+            run_dir=adopt_dataset_dir(side_dir, res.run_dir),
+            metrics=res.metrics,
+            capabilities=res.capabilities,
+        )
+    return staged
+
+
+def _precheck_side(
+    label: str,
+    provided: dict[str, DatasetResult],
+    missing: list[DatasetSpec],
+    adapter: Any,
+    judge: Any,
+    driver_llm_value: Union[str, None],
+    adapter_version_value: Union[str, None],
+    evidence_matcher: Any,
+) -> None:
+    """某一侧的跑前预检：身份/口径唯一、补跑参数与已有产物一致、缺项可补跑。
+
+    调用方必须在**建实验目录与复制产物之前**调用：预检失败时 ``report_out`` 下
+    不留 ``compare_*/{A,B}/`` 半成品树（与单臂 ``evaluate`` 的预检位置对称）。
+
+    Args:
+        label: 侧标签（如 ``"基线侧"``），用于报错定位。
+        provided: 该侧复用的已有产物。
+        missing: 该侧需要补跑的数据集槽位。
+        adapter: 该侧适配器（补跑所需）；纯复用可为 None。
+        judge: judge 字符串或实例（补跑所需）；纯复用可为 None。
+        driver_llm_value / adapter_version_value: 该侧的驱动 LLM / 适配器版本标注。
+        evidence_matcher: 检索命中口径匹配器。
+
+    Raises:
+        SystemExit: 该侧混用多个被测对象身份或评测口径；需要补跑但缺 adapter /
+            judge；或补跑参数与已有产物不一致。
+    """
+    if provided:
+        assert_single_identity(list(provided.values()), label)
+    else:
+        missing_meta = [
+            option
+            for option, value in (
+                ("--driver-llm-a/-b", driver_llm_value),
+                ("--adapter-version-a/-b", adapter_version_value),
+            )
+            if value is None
+        ]
+        if missing_meta:
+            print(
+                f"[membench] 提示: {label}为全新评测且未标注 {' / '.join(missing_meta)}；"
+                "严格可比性（compare --require-comparable）会判这些关键维度「无法核验」。"
+                "建议补齐参数，省略的标注无法事后补记。"
+            )
+    if not missing:
+        return
+    if adapter is None or judge is None:
+        raise SystemExit(
+            f"{label} 以下数据集没有可复用的产物，补跑需要适配器与 judge: "
+            + "、".join(s.key for s in missing)
+        )
+    assert_gap_matches_provided(
+        provided,
+        expected_fresh_metadata(
+            adapter, judge, driver_llm_value, adapter_version_value, evidence_matcher
+        ),
+        label,
+    )
 
 
 def _per_dataset_diff(results: list[ArmDatasetResult]) -> list[dict[str, Any]]:
@@ -349,6 +476,10 @@ def _per_dataset_gates(
 # 图表：每数据集 diff / 融合 diff
 # ---------------------------------------------------------------------------
 
+#: 本模块专属的两张对比图（layout 暂未收录；写盘与报告内引用共用这两个常量）。
+FIG_PER_DATASET_DIFF = "fig_per_dataset_diff.png"
+FIG_FUSED_DIFF = "fig_fused_diff.png"
+
 
 def _fig_per_dataset_diff(
     per_dataset: list[dict[str, Any]], out_path: str, metric: str = "accuracy"
@@ -424,7 +555,6 @@ def evaluate_compare(
     baseline_adapter: Any = None,
     candidate_adapter: Any = None,
     judge: Any = None,
-    out_dir: Union[str, None] = None,
     platform: Union[str, None] = None,
     commit: Union[str, None] = None,
     quick: bool = False,
@@ -450,22 +580,22 @@ def evaluate_compare(
 
     Args:
         baseline_adapter / candidate_adapter: 两侧适配器实例；对应侧存在需要
-            补跑的数据集时必需，纯复用可为 None（此时该侧名称取已有 run 的
-            元数据）。
-        judge: judge 名字符串或 Judge 实例（与 Runner 约定一致）；纯复用可为
-            None。
-        baseline_runs / candidate_runs: 汇总模式：``{数据集 key: 已有 run 目录}``。
-            目标清单中有对应 run 的复用、缺失的**补跑**（需要该侧 adapter 与
-            judge 可用）；未给 ``specs`` 时目标清单即两侧 key 的并集。**每侧**
-            的被测对象与评测口径（:data:`membench.evaluate._IDENTITY_KEYS`）在
-            **开跑之前**校验：已有 run 之间混用、或补跑参数与已有 run 不一致，
-            直接拒绝（A/B 的差异变量只应发生在两侧之间）；某侧全新评测缺
+            补跑的数据集时必需，纯复用可为 None（此时该侧名称取已有产物的元数据）。
+        judge: judge 名字符串或 Judge 实例（与 Runner 约定一致）；纯复用可为 None。
+        baseline_runs / candidate_runs: 汇总模式：``{数据集 key: 产物目录}``，目录
+            可以是实验目录或数据集目录。目标清单中有对应产物的复用、缺失的**补跑**
+            （需要该侧 adapter 与 judge 可用）；未给 ``specs`` 时目标清单即两侧
+            key 的并集。某侧给的是同一个已存在的实验目录时，该侧整树复制进
+            ``A/``/``B/``（可比性检查之后）。**每侧**的被测对象与评测口径
+            （:data:`membench.evaluate._IDENTITY_KEYS`）在**开跑之前**（建对比
+            实验目录与复制产物之前）校验：已有产物之间混用、或补跑参数与已有产物
+            不一致，直接拒绝（A/B 的差异变量只应发生在两侧之间）；某侧全新评测缺
             driver_llm / adapter_version 时启动即提示（严格可比性会判无法核验）。
-        out_dir: run 输出父目录；None 时用 :func:`membench.paths.runs_dir`。
-        platform / commit: 平台与 commit 标签（写到两侧 run 元数据）。
+        platform / commit: 平台与 commit 标签（写到两侧 run 元数据）。platform
+            缺省取两侧产物的 platform；两侧不同时实验目录名用 ``p1-p2``（跨平台对比）。
         quick / beam_10m / no_beam / no_lme_s: 同 :func:`membench.evaluate.evaluate`。
-        report_out: 实验目录父目录；缺省 :func:`membench.paths.output_root`。
-        tag: A/B 实验目录标签；缺省由两个 adapter 名拼成 ``<baseline>_vs_<candidate>``。
+        report_out: 对比实验目录父目录；缺省 :func:`membench.paths.output_root`。
+        tag: 实验目录标签；缺省由两个 adapter 名拼成 ``<baseline>_vs_<candidate>``。
         specs: 显式数据集清单（默认 None 时按 quick/beam_10m/no_beam/no_lme_s 调 plan_datasets）。
         jobs: 透传给 Runner 的题目级并发参数。
         driver_llm_baseline / driver_llm_candidate: 两侧各自的 driver LLM 标识。
@@ -473,14 +603,12 @@ def evaluate_compare(
         acc_threshold: accuracy 允许最大下降（融合 diff 维度）。
         stale_threshold: stale_rate 允许最大上升（融合 diff 维度）。
         latency_warn: latency_p95 相对上升告警比例（融合 diff 维度）。
+        evidence_matcher: 检索命中口径匹配器（默认 substring）。
 
     Returns:
         ``{"compare_dir", "verdict", "gates", "fused_diffs", "per_dataset",
         "fused_baseline", "fused_candidate"}``。
     """
-    if out_dir is None:
-        out_dir = paths.runs_dir()
-
     if (
         (baseline_runs or candidate_runs)
         and specs is None
@@ -489,11 +617,11 @@ def evaluate_compare(
         raise SystemExit("--baseline-run/--candidate-run 与预设开关互斥")
 
     baseline_provided: dict[str, DatasetResult] = {}
-    for key, run_dir in (baseline_runs or {}).items():
-        baseline_provided[key] = load_provided_result(key, run_dir)
+    for key, product_dir in (baseline_runs or {}).items():
+        baseline_provided[key] = load_provided_result(key, product_dir)
     candidate_provided: dict[str, DatasetResult] = {}
-    for key, run_dir in (candidate_runs or {}).items():
-        candidate_provided[key] = load_provided_result(key, run_dir)
+    for key, product_dir in (candidate_runs or {}).items():
+        candidate_provided[key] = load_provided_result(key, product_dir)
 
     if specs is None:
         if baseline_provided or candidate_provided:
@@ -541,6 +669,10 @@ def evaluate_compare(
         platform = (first_b or first_c or {}).get("platform")
     if commit is None:
         commit = (first_b or first_c or {}).get("commit")
+    # 两侧 platform 各自解析：缺省取该侧产物元数据；两侧不同则目录名用 p1-p2
+    platform_a = str((first_b or {}).get("platform") or platform or "default")
+    platform_b = str((first_c or {}).get("platform") or platform or "default")
+    dir_platform = platform_a if platform_a == platform_b else f"{platform_a}-{platform_b}"
 
     if judge_name == "heuristic" and any(s.key.startswith("beam") for s in specs):
         print(
@@ -557,66 +689,74 @@ def evaluate_compare(
                 if s.key in baseline_provided and s.key in candidate_provided
             ]
         ),
-        "两侧可比性问题（两侧均复用 run，跑前检查）",
+        "两侧可比性问题（两侧均复用产物，跑前检查）",
     )
 
-    # 两侧组装：已有 run 直接复用，缺失数据集用该侧 adapter 补跑
+    # 跑前预检：两侧的身份 / 口径与补跑参数问题必须在**建实验目录与复制产物之前**
+    # 暴露——否则 report_out 下会残留 compare_*/{A,B}/ 半成品树（与单臂 evaluate 对称）。
+    _precheck_side(
+        "基线侧",
+        baseline_provided,
+        [s for s in specs if s.key not in baseline_provided],
+        baseline_adapter,
+        judge,
+        driver_llm_baseline,
+        adapter_version_baseline,
+        evidence_matcher,
+    )
+    _precheck_side(
+        "候选侧",
+        candidate_provided,
+        [s for s in specs if s.key not in candidate_provided],
+        candidate_adapter,
+        judge,
+        driver_llm_candidate,
+        adapter_version_candidate,
+        evidence_matcher,
+    )
+
+    # 产物落 <report_out>/compare_<name>_<platform>_<ts>/
+    now = datetime.now()
+    compare_dir = layout.experiment_path(
+        report_out,
+        layout.compare_subdir(
+            tag or f"{baseline_name}_vs_{candidate_name}", dir_platform, layout.ts_now(now)
+        ),
+    )
+    print(f"[membench] 对比实验目录: {compare_dir}")
+
+    # A/B 两侧各摆成完整 eval 实验形态（产物齐备与身份预检已在上方做完，再复制 / 补跑）
+    baseline_provided = _stage_side_dir(compare_dir, ARM_A, baseline_provided, baseline_runs)
+    candidate_provided = _stage_side_dir(compare_dir, ARM_B, candidate_provided, candidate_runs)
+
+    # 两侧组装：已有产物直接复用，缺失数据集用该侧 adapter 补跑
     def _assemble_side(
         label: str,
+        arm_label: str,
         adapter: Any,
         provided: dict[str, DatasetResult],
+        platform_value: Union[str, None],
         driver_llm_value: Union[str, None],
         adapter_version_value: Union[str, None],
     ) -> list[DatasetResult]:
+        side_dir = os.path.join(compare_dir, arm_label)
         by_key = dict(provided)
         for spec in specs:
             if spec.key in provided:
-                print(f"[membench] 复用已有 run（{label}）: {spec.key} <- {provided[spec.key].run_dir}")
-        missing = [s for s in specs if s.key not in by_key]
-        # 跑前预检：身份/口径问题必须在开跑之前暴露（避免昂贵评测跑完才发现对比不可用）
-        if provided:
-            assert_single_identity(list(provided.values()), label)
-        else:
-            missing_meta = [
-                option
-                for option, value in (
-                    ("--driver-llm-a/-b", driver_llm_value),
-                    ("--adapter-version-a/-b", adapter_version_value),
-                )
-                if value is None
-            ]
-            if missing_meta:
-                print(
-                    f"[membench] 提示: {label}为全新评测且未标注 {' / '.join(missing_meta)}；"
-                    "严格可比性（compare --require-comparable）会判这些关键维度「无法核验」。"
-                    "建议补齐参数，省略的标注无法事后补记。"
-                )
-        if missing:
-            if adapter is None or judge is None:
-                raise SystemExit(
-                    f"{label} 以下数据集没有可复用的 run，补跑需要适配器与 judge: "
-                    + "、".join(s.key for s in missing)
-                )
-            assert_gap_matches_provided(
-                provided,
-                expected_fresh_metadata(
-                    adapter, judge, driver_llm_value, adapter_version_value, evidence_matcher
-                ),
-                label,
-            )
-            for r in run_datasets(
-                adapter,
-                judge,
-                missing,
-                out_dir,
-                platform=platform,
-                commit=commit,
-                jobs=jobs,
-                driver_llm=driver_llm_value,
-                adapter_version=adapter_version_value,
-                evidence_matcher=evidence_matcher,
-            ):
-                by_key[r.spec.key] = r
+                print(f"[membench] 复用已有产物（{label}）: {spec.key} <- {provided[spec.key].run_dir}")
+        for r in run_datasets(
+            adapter,
+            judge,
+            [s for s in specs if s.key not in by_key],
+            side_dir,
+            platform=platform_value,
+            commit=commit,
+            jobs=jobs,
+            driver_llm=driver_llm_value,
+            adapter_version=adapter_version_value,
+            evidence_matcher=evidence_matcher,
+        ):
+            by_key[r.spec.key] = r
         out: list[DatasetResult] = []
         for spec in specs:
             res = by_key[spec.key]
@@ -632,11 +772,23 @@ def evaluate_compare(
 
     print(f"[membench] ===== 基线 adapter: {baseline_name} =====")
     baseline_results = _assemble_side(
-        "基线侧", baseline_adapter, baseline_provided, driver_llm_baseline, adapter_version_baseline
+        "基线侧",
+        ARM_A,
+        baseline_adapter,
+        baseline_provided,
+        platform_a,
+        driver_llm_baseline,
+        adapter_version_baseline,
     )
     print(f"[membench] ===== 候选 adapter: {candidate_name} =====")
     candidate_results = _assemble_side(
-        "候选侧", candidate_adapter, candidate_provided, driver_llm_candidate, adapter_version_candidate
+        "候选侧",
+        ARM_B,
+        candidate_adapter,
+        candidate_provided,
+        platform_b,
+        driver_llm_candidate,
+        adapter_version_candidate,
     )
 
     # 对齐 baseline / candidate 各数据集（按 spec.key 匹配）
@@ -652,8 +804,8 @@ def evaluate_compare(
                 spec=b.spec,
                 baseline=b.metrics,
                 candidate=c.metrics,
-                baseline_run_dir=b.run_dir,
-                candidate_run_dir=c.run_dir,
+                baseline_dataset_dir=b.run_dir,
+                candidate_dataset_dir=c.run_dir,
                 capabilities=b.capabilities,
             )
         )
@@ -663,13 +815,18 @@ def evaluate_compare(
         [(arm.spec, arm.baseline, arm.candidate) for arm in arms]
     )
 
-    # 汇总模式的元数据一致性提示（混 run 风险）
+    # 汇总模式的元数据一致性提示（混产物风险）；notes 直接作为报告顶部提示行
     notes: list[str] = []
     for label, side in (("基线侧", baseline_results), ("候选侧", candidate_results)):
         for note in metadata_inconsistencies(side):
-            notes.append(f"{label}内部：{note}")
-    for note in notes:
-        print(f"[membench] ⚠️ 汇总模式：{note}")
+            line = f"{label}内部：{note}"
+            notes.append(f"> ⚠️ **汇总模式**：{line}")
+            print(f"[membench] ⚠️ 汇总模式：{line}")
+    if platform_a != platform_b:
+        notes.append(
+            f"> ⚠️ 两侧 platform 不同（A=`{platform_a}` / B=`{platform_b}`）：跨平台对比，"
+            "平台差异同时计入「两侧可比性」维度。"
+        )
 
     # 两侧可比性问题（含本轮补跑的数据集）在控制台同步提示；详情见报告同名小节
     _print_cross_side_findings(comparability_findings, "两侧可比性问题（详见报告「两侧可比性」）")
@@ -678,8 +835,8 @@ def evaluate_compare(
     per_dataset = _per_dataset_diff(arms)
 
     # 两组融合（sources 记录 capabilities 来源，供报告标注）
-    fused_baseline, cap_sources_a = _arm_fuse(arms, "baseline")
-    fused_candidate, cap_sources_b = _arm_fuse(arms, "candidate")
+    fused_baseline, cap_sources_a = _side_fuse(baseline_results)
+    fused_candidate, cap_sources_b = _side_fuse(candidate_results)
     fused_diffs = _fused_diff(fused_baseline, fused_candidate)
     gates = _fused_gates(
         fused_baseline, fused_candidate, acc_threshold, stale_threshold, latency_warn
@@ -708,27 +865,31 @@ def evaluate_compare(
     ):
         per_dataset_verdict = "SKIP"
 
-    # 产物落 <root>/ab_<tag>_<ts>/
-    now = datetime.now()
-    base = report_out or paths.output_root()
-    ab_dir = layout.experiment_path(
-        base, layout.ab_subdir(tag or f"{baseline_name}_vs_{candidate_name}", layout.ts_now(now))
-    )
-
-    # 两侧 run 副本就近归属
-    for arm_label, results_iter in (
-        ("A", baseline_results),
-        ("B", candidate_results),
+    # 产物落位：A/B 两侧各写一份任务级 reports/（该侧自身就是一个完整 eval 实验形态），
+    # 对比报告与两张对比图写对比实验目录的 reports/。
+    _check_plt()
+    for arm_label, arm_name, side_results, side_platform, side_fused in (
+        (ARM_A, baseline_name, baseline_results, platform_a, fused_baseline),
+        (ARM_B, candidate_name, candidate_results, platform_b, fused_candidate),
     ):
-        arm_dir = os.path.join(ab_dir, arm_label)
-        os.makedirs(arm_dir, exist_ok=True)
-        run_dirs = [r.run_dir for r in results_iter]
-        labels = [f"{arm_label}_{r.spec.key}" for r in results_iter]
-        layout.copy_runs_into(os.path.join(arm_dir, "runs"), run_dirs, labels=labels)
+        write_task_reports(
+            os.path.join(compare_dir, arm_label),
+            adapter_name=arm_name,
+            judge_name=judge_name,
+            platform=side_platform,
+            commit=commit,
+            timestamp=now,
+            results=side_results,
+            fused=side_fused,
+            gate=evaluate_gate(side_results),
+        )
 
-    # 报告 + 图表
+    reports_dir = layout.task_report_dir(compare_dir)
+    os.makedirs(reports_dir, exist_ok=True)
+    _fig_per_dataset_diff(per_dataset, os.path.join(reports_dir, FIG_PER_DATASET_DIFF))
+    _fig_fused_diff(fused_diffs, os.path.join(reports_dir, FIG_FUSED_DIFF))
     _write_evaluate_compare_report(
-        ab_dir,
+        compare_dir,
         baseline_name,
         candidate_name,
         judge_name,
@@ -746,20 +907,16 @@ def evaluate_compare(
         per_dataset_verdict=per_dataset_verdict,
         comparability_findings=comparability_findings,
         cap_sources={"baseline": cap_sources_a, "candidate": cap_sources_b},
-        extra_notes=[f"> ⚠️ **汇总模式**：{note}" for note in notes],
+        extra_notes=notes,
     )
-
-    _check_plt()
-    _fig_per_dataset_diff(per_dataset, os.path.join(ab_dir, "fig_per_dataset_diff.png"))
-    _fig_fused_diff(fused_diffs, os.path.join(ab_dir, "fig_fused_diff.png"))
 
     print(f"[membench] evaluate-compare verdict: {verdict}")
     for gate in gates:
         print(f"[membench]   gate {gate['name']}: {gate['status']} ({gate['detail']})")
-    print(f"[membench] report: {os.path.join(ab_dir, 'compare_report.md')}")
+    print(f"[membench] comparison 报告: {os.path.join(reports_dir, layout.FILE_COMPARISON_MD)}")
 
     return {
-        "compare_dir": ab_dir,
+        "compare_dir": compare_dir,
         "verdict": verdict,
         "gates": gates,
         "fused_diffs": fused_diffs,
@@ -770,7 +927,7 @@ def evaluate_compare(
 
 
 def _write_evaluate_compare_report(
-    ab_dir: str,
+    compare_dir: str,
     baseline_name: str,
     candidate_name: str,
     judge_name: str,
@@ -790,7 +947,7 @@ def _write_evaluate_compare_report(
     extra_notes: list[str] | None = None,
     comparability_findings: list[dict[str, Any]] | None = None,
 ) -> str:
-    """生成 evaluate-compare 的 compare_report.md（中文）。
+    """生成对比实验目录 ``reports/`` 下的 ``comparison.md``（中文）。
 
     ``comparability_findings`` 非空时：抬头给一行汇总，并在「门禁明细」后附
     「两侧可比性（逐数据集）」小节（逐数据集列出关键不一致 / 关键缺失 / 次要差异，
@@ -890,9 +1047,9 @@ def _write_evaluate_compare_report(
     # 检索指标全 0 警示：疑似 evidence 与被检索文本格式不一致（摘要式存储）
     zero_sets: list[str] = []
     for arm in arms:
-        for metrics_dict, run_dir in (
-            (arm.baseline, arm.baseline_run_dir),
-            (arm.candidate, arm.candidate_run_dir),
+        for metrics_dict, dataset_dir in (
+            (arm.baseline, arm.baseline_dataset_dir),
+            (arm.candidate, arm.candidate_dataset_dir),
         ):
             ov = metrics_dict.get("overall", {}) or {}
             if ov.get("evidence_recall") != 0.0 or ov.get("recall_at_5") != 0.0:
@@ -900,7 +1057,7 @@ def _write_evaluate_compare_report(
             has_evidence = metrics_dict.get("has_evidence")
             if not isinstance(has_evidence, bool):
                 has_evidence = _resolve_capabilities(
-                    metrics_dict, run_dir, arm.spec.path
+                    metrics_dict, dataset_dir, arm.spec.path
                 )[0].get("has_evidence", False)
             if has_evidence and arm.spec.name not in zero_sets:
                 zero_sets.append(arm.spec.name)
@@ -913,13 +1070,14 @@ def _write_evaluate_compare_report(
             "`--evidence-match overlap|llm` 调整口径，或让适配器返回原文片段后重跑。</sub>"
         )
         lines.append("")
-    lines.append("![逐数据集准确率差值](fig_per_dataset_diff.png)")
+    lines.append(f"![逐数据集准确率差值]({FIG_PER_DATASET_DIFF})")
     lines.append("")
 
     # 1.5 逐数据集 by_category diff：每个数据集按其实际出现的 raw category
     # 集合分别画 A vs B 准确率与 Δ；不跨数据集合并。
     lines.append("## 逐数据集题型 diff（B - A）")
     lines.append("")
+    # 题型集合与类数都按本报告实际出现的 category 统计（不写死任何数据集的设计类数）
     counts = "、".join(
         f"{arm.spec.name} {len(set(arm.baseline.get('by_category', {})) | set(arm.candidate.get('by_category', {})))} 类"
         for arm in arms
@@ -927,8 +1085,8 @@ def _write_evaluate_compare_report(
     )
     lines.append(
         "<sub>每个数据集按各自的 raw category 列出 A/B 准确率与差值"
-        + (f"（本报告实际出现：{counts}）" if counts else "")
-        + "；题型集合按数据集设计意图保留，不跨数据集强行合并。</sub>"
+        + (f"（本报告实际出现：{counts}）" if counts else "（两侧均无 by_category 数据）")
+        + "；题型集合按各数据集实际出现的 category 保留，不跨数据集强行合并。</sub>"
     )
     lines.append("")
     for arm in arms:
@@ -1181,7 +1339,9 @@ def _write_evaluate_compare_report(
     )
     lines.append("")
 
-    out_path = os.path.join(ab_dir, "compare_report.md")
+    out_path = os.path.join(
+        layout.task_report_dir(compare_dir), layout.FILE_COMPARISON_MD
+    )
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return out_path

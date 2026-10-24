@@ -1,23 +1,28 @@
-"""分片融合：把同一评测的多个分片 run 合并为一个完整 run 目录。
+"""分片融合：把同一评测的多个分片产物按对话粒度合并成一个完整实验目录。
 
-``membench run --shards N --shard-index I`` 产生的各分片 run 可通过
-``membench fuse --runs dir1,dir2,... --out DIR`` 融合：
+``membench run --shards N --shard-index I`` 产生的各分片产物只含本片的对话 / 题目，
+用 ``membench fuse --runs dir1,dir2,... --out DIR`` 融合；入参既可以是实验目录，也可以
+是数据集目录（``<实验目录>/runs/<dataset>``）。
 
-- 校验各 run 的 adapter / dataset / shards / shard_by 一致，且 shard_index 恰好覆盖 0..N-1；
-  判分与可比性元数据（judge / judge_model / driver_llm / adapter_version / adapter_meta /
-  dataset_fingerprint / retrieval_match / schema_version）也必须一致，防止混片；
-- 合并 results.jsonl（按 qid 去重校验，简单拼接保持传入顺序）；
-- 复用 ``metrics.summary.aggregate`` 重新计算指标（能力标注优先按数据集扫描，
-  与 run 口径一致），复用 report 渲染完整报告；
+- 校验各分片的 adapter / dataset / shards / shard_by 一致，且 shard_index 恰好覆盖
+  0..N-1；判分与可比性元数据（judge / judge_model / driver_llm / adapter_version /
+  adapter_meta / dataset_fingerprint / retrieval_match / run_mode / schema_version）
+  也必须一致，防止混片；
+- 在**对话粒度**合并各分片的逐对话 ``report/results.jsonl``：题目级分片下同一对话的
+  记录来自多个分片，对话级分片下同一对话只出现在一片；源数据集可读时按数据集里的
+  对话 / 题目顺序重排，使融合结果与不分片直接跑逐题对齐；
+- 复用 ``metrics.summary.aggregate`` 重新计算数据集级与逐对话指标（能力标注按数据集
+  扫描，与 run 口径一致），复用 report 渲染数据集级报告（md + 两图）与逐对话报告；
 - 门禁判定（stale 一票否决）对融合结果同样生效：存在 knowledge_update 题
   且 stale_rate 超过阈值（与 evaluate 的办公域门禁同阈值）即 FAIL。
 
-输出目录结构与普通 run 一致（results.jsonl + metrics.json + report.md + 图表），
-metadata 标记 ``"fused": true`` 及来源分片列表 ``"fused_from"``，并透传可比性
-元数据（adapter_version / judge_model / driver_llm / dataset_fingerprint /
-retrieval_match / adapter_meta / adapter_describe / schema_version）——融合产物
-可直接参与 ``compare --require-comparable``。各分片的 ``token_usage`` 账本
-逐片相加（任一分片未落账则融合产物不落账，避免"部分求和"被读成全量消耗）。
+``out_dir`` 是**完整实验目录**：``runs/<dataset>/{<对话>/report/...,report/...}`` +
+``reports/``（任务级报告，同 Runner 的 write_task_reports 形态）。metrics 标记
+``"fused": true`` 及来源分片列表 ``"fused_from"``，并透传可比性元数据（adapter_version /
+judge_model / driver_llm / dataset_fingerprint / retrieval_match / adapter_meta /
+adapter_describe / schema_version）——融合产物可直接参与 ``compare --require-comparable``。
+各分片的 ``token_usage`` 账本逐片相加（任一分片未落账则融合产物不落账，避免"部分求和"
+被读成全量消耗）。
 """
 
 from __future__ import annotations
@@ -25,16 +30,14 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
-from typing import Any, Union
+from typing import Any
 
-from membench.evaluate import STALE_GATE_THRESHOLD, scan_capabilities
+from membench import layout
+from membench.compare import _load_metrics, resolve_dataset_dir
+from membench.data.schema import load_dataset, question_capabilities
+from membench.evaluate import STALE_GATE_THRESHOLD
 from membench.metrics import aggregate
-from membench.report import render_run_report
-
-
-def _load_json(path: str) -> dict[str, Any]:
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+from membench.report import copy_report, render_dataset_report, render_dialogue_report
 
 
 def _load_jsonl(path: str) -> list[dict[str, Any]]:
@@ -88,41 +91,133 @@ def fuse_gate(
     }
 
 
+def _read_dialogue_records(dataset_dir: str) -> dict[str, list[dict[str, Any]]]:
+    """读数据集目录下各对话的逐题明细：``<对话目录>/report/results.jsonl``。
+
+    键是对话**目录名**（``layout.tag_dir_name(dialogue_id)``）；没有落明细的对话
+    目录（该片内没有它参与的题）不计入。
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    for name in sorted(os.listdir(dataset_dir)):
+        path = os.path.join(dataset_dir, name, layout.DIR_REPORT, layout.FILE_RESULTS)
+        if os.path.isfile(path):
+            out[name] = _load_jsonl(path)
+    return out
+
+
+def _merge_dialogue_records(dataset_dirs: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """按对话目录名合并各分片的逐题记录（分片内的原始顺序保持不变）。"""
+    merged: dict[str, list[dict[str, Any]]] = {}
+    for dataset_dir in dataset_dirs:
+        for name, records in _read_dialogue_records(dataset_dir).items():
+            merged.setdefault(name, []).extend(records)
+    return merged
+
+
+def _dataset_index(dataset_path: str) -> dict[str, Any] | None:
+    """读源数据集建索引：对话 / 题目顺序、逐对话与整集的能力标注、忽略题数。
+
+    数据集不可读（被移动 / 已清理）时返回 None：融合退化为按分片顺序拼接，能力标注
+    由 :func:`membench.metrics.aggregate` 从记录自行推断。
+    """
+    if not dataset_path or not os.path.isfile(dataset_path):
+        return None
+    try:
+        dialogues = load_dataset(dataset_path)
+    except (OSError, ValueError):
+        return None
+    return {
+        "dialogue_order": {
+            layout.tag_dir_name(str(dialogue.dialogue_id)): i
+            for i, dialogue in enumerate(dialogues)
+        },
+        "qid_order": {
+            str(question.qid): i
+            for dialogue in dialogues
+            for i, question in enumerate(dialogue.questions)
+        },
+        "caps": {
+            str(dialogue.dialogue_id): question_capabilities(dialogue.questions)
+            for dialogue in dialogues
+        },
+        "capabilities": question_capabilities(
+            question for dialogue in dialogues for question in dialogue.questions
+        ),
+        "n_ignored": sum(
+            1
+            for dialogue in dialogues
+            for question in dialogue.questions
+            if getattr(question, "ignore", False)
+        ),
+        "dialogue_n_ignored": {
+            layout.tag_dir_name(str(dialogue.dialogue_id)): sum(
+                1 for question in dialogue.questions if getattr(question, "ignore", False)
+            )
+            for dialogue in dialogues
+        },
+    }
+
+
+def _dialogue_id(records: list[dict[str, Any]], dir_name: str) -> str:
+    """对话 id：取记录里的 ``dialogue_id``；该对话没有题时退回目录名。"""
+    for record in records:
+        dialogue_id = record.get("dialogue_id")
+        if dialogue_id:
+            return str(dialogue_id)
+    return dir_name
+
+
+def _write_report_dir(
+    report_dir: str,
+    records: list[dict[str, Any]],
+    metrics: dict[str, Any],
+    *,
+    figures: bool,
+) -> None:
+    """把逐题明细 / 指标 / 报告写到 ``report_dir``（对话级与数据集级共用）。"""
+    os.makedirs(report_dir, exist_ok=True)
+    with open(os.path.join(report_dir, layout.FILE_RESULTS), "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with open(os.path.join(report_dir, layout.FILE_METRICS), "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+    if figures:
+        render_dataset_report(report_dir, records, metrics)
+    else:
+        render_dialogue_report(report_dir, records, metrics)
+
+
 def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
-    """校验并融合多个分片 run，在 ``out_dir`` 下生成完整 run 目录结构。
+    """校验并融合多个分片产物，在 ``out_dir``（完整实验目录）下写出完整数据集树。
 
     Args:
-        run_dirs: 分片 run 目录列表（每个含 results.jsonl 与 metrics.json）。
-        out_dir: 融合产物输出目录。
+        run_dirs: 分片产物目录列表，每项是实验目录或数据集目录。
+        out_dir: 融合产物输出目录——完整实验目录（``runs/<dataset>/`` + ``reports/``）。
 
     Returns:
-        ``{"out_dir", "metrics", "gate", "n_questions"}``。
+        ``{"out_dir", "dataset_dir", "metrics", "gate", "n_questions"}``。
 
     Raises:
-        ValueError: adapter / dataset / shards 不一致、shard_index 未覆盖
-            0..N-1、qid 重复等校验失败。
-        FileNotFoundError: 缺少 results.jsonl / metrics.json。
+        ValueError: adapter / dataset / shards / shard_by 不一致、shard_index 未覆盖
+            0..N-1、qid 重复，或各分片都没落逐对话明细等校验失败。
+        SystemExit: 入参目录不存在、入参是对话级产物目录、数据集目录缺
+            ``report/metrics.json``（产物不完整），或入参是旧版产物结构
+            （见 :func:`membench.layout.resolve_dataset_dir`）。
     """
     if not run_dirs:
         raise _err("--runs 为空")
 
+    dataset_dirs: list[str] = []
     metas: list[dict[str, Any]] = []
-    records: list[dict[str, Any]] = []
-    for d in run_dirs:
-        metrics_path = os.path.join(d, "metrics.json")
-        results_path = os.path.join(d, "results.jsonl")
-        if not os.path.isfile(metrics_path):
-            raise FileNotFoundError(f"缺少 metrics.json: {metrics_path}")
-        if not os.path.isfile(results_path):
-            raise FileNotFoundError(f"缺少 results.jsonl: {results_path}")
-        metas.append(_load_json(metrics_path))
-        records.extend(_load_jsonl(results_path))
+    for target in run_dirs:
+        dataset_dirs.append(resolve_dataset_dir(target))
+        metas.append(_load_metrics(target))
 
     first = metas[0]
-    for d, m in zip(run_dirs, metas):
+    for target, m in zip(run_dirs, metas):
         for key in ("adapter", "dataset"):
             if m.get(key) != first.get(key):
-                raise _err(f"{key} 不一致: {first.get(key)!r} vs {m.get(key)!r}（{d}）")
+                raise _err(f"{key} 不一致: {first.get(key)!r} vs {m.get(key)!r}（{target}）")
         for key in (
             "judge",
             "judge_model",
@@ -137,13 +232,15 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
             "run_mode",
         ):
             if m.get(key) != first.get(key):
-                raise _err(f"{key} 不一致: {first.get(key)!r} vs {m.get(key)!r}（{d}）")
+                raise _err(f"{key} 不一致: {first.get(key)!r} vs {m.get(key)!r}（{target}）")
         if int(m.get("shards") or 1) != int(first.get("shards") or 1):
-            raise _err(f"shards 不一致: {first.get('shards')!r} vs {m.get('shards')!r}（{d}）")
+            raise _err(
+                f"shards 不一致: {first.get('shards')!r} vs {m.get('shards')!r}（{target}）"
+            )
         if (m.get("shard_by") or "question") != (first.get("shard_by") or "question"):
             raise _err(
                 f"shard_by 不一致: {first.get('shard_by') or 'question'} vs "
-                f"{m.get('shard_by') or 'question'}（{d}）"
+                f"{m.get('shard_by') or 'question'}（{target}）"
             )
 
     shards = int(first.get("shards") or 1)
@@ -153,6 +250,31 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
     if indices != list(range(shards)):
         raise _err(f"shard_index 未完整覆盖 0..{shards - 1}: 实际为 {indices}")
 
+    merged = _merge_dialogue_records(dataset_dirs)
+    if not merged:
+        # 各分片都没有逐对话明细：融合只会产出空数据集，宁可报错也别给"0 题"的假结果
+        raise _err(
+            "各分片产物里都没有逐对话明细（<对话目录>/report/results.jsonl），无法融合"
+        )
+    index = _dataset_index(str(first.get("dataset_path") or ""))
+    if index is not None:
+        # 按源数据集的对话 / 题目顺序重排：融合结果与不分片直接跑逐题对齐
+        merged = dict(
+            sorted(
+                merged.items(),
+                key=lambda item: (
+                    index["dialogue_order"].get(item[0], len(index["dialogue_order"])),
+                    item[0],
+                ),
+            )
+        )
+        unknown = len(index["qid_order"])
+        for dialogue_records in merged.values():
+            dialogue_records.sort(
+                key=lambda r: index["qid_order"].get(str(r.get("qid")), unknown)
+            )
+    records = [record for dialogue_records in merged.values() for record in dialogue_records]
+
     # qid 去重校验：同一题出现在多个分片中说明分片口径被破坏。
     seen: set[str] = set()
     for r in records:
@@ -161,56 +283,64 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
             raise _err(f"qid 重复出现在多个分片中: {qid}")
         seen.add(qid)
 
-    # 能力标注优先按数据集扫描（与 run 口径一致）；数据集不可读时按 records 推断
-    caps = None
-    ds_path = str(first.get("dataset_path") or "")
-    if ds_path and os.path.isfile(ds_path):
-        try:
-            caps = scan_capabilities(ds_path)
-        except (OSError, ValueError):
-            caps = None
-    metrics = dict(aggregate(records, capabilities=caps))
     now = datetime.now()
+    dataset_name = str(first.get("dataset") or "unknown")
+    experiment_dir = os.path.abspath(out_dir)
+    dataset_dir = layout.dataset_dir(experiment_dir, dataset_name)
     run_id = (
-        f"{first.get('adapter', 'unknown')}_{first.get('platform', 'default')}_"
-        f"{first.get('dataset', 'unknown')}_fused_{now.strftime('%Y%m%d_%H%M%S')}"
+        f"{first.get('adapter', 'unknown')}_{first.get('platform', 'default')}"
+        f"_{dataset_name}_{now.strftime('%Y%m%d_%H%M%S')}"
     )
+    # 数据集级与逐对话共用的身份 / 口径元数据；可比性字段透传，融合产物与普通 run
+    # 同等可校验、可对比。
+    base: dict[str, Any] = {
+        "run_id": run_id,
+        "adapter": first.get("adapter"),
+        "dataset": first.get("dataset"),
+        "dataset_path": first.get("dataset_path"),
+        "dataset_source": first.get("dataset_source"),
+        "platform": first.get("platform", "default"),
+        "commit": first.get("commit"),
+        "judge": first.get("judge"),
+        "timestamp": now.isoformat(timespec="seconds"),
+        "limit": None,
+        "shards": shards,
+        "shard_index": None,
+        "shard_by": first.get("shard_by") or "question",
+        "adapter_meta": first.get("adapter_meta"),
+        "adapter_describe": first.get("adapter_describe"),
+        "schema_version": first.get("schema_version"),
+        "driver_llm": first.get("driver_llm"),
+        "judge_model": first.get("judge_model"),
+        "adapter_version": first.get("adapter_version"),
+        "dataset_fingerprint": first.get("dataset_fingerprint"),
+        "retrieval_match": first.get("retrieval_match"),
+        # 运行模式透传（前面已校验各分片一致）
+        "run_mode": first.get("run_mode") or "full",
+        "experiment_dir": experiment_dir,
+        "dataset_dir": dataset_dir,
+    }
+    if first.get("retrieval_match_threshold") is not None:
+        base["retrieval_match_threshold"] = first["retrieval_match_threshold"]
+    match_fallbacks = sum(int(m.get("retrieval_match_fallbacks", 0) or 0) for m in metas)
+    if match_fallbacks:
+        base["retrieval_match_fallbacks"] = match_fallbacks
+
+    caps = index["capabilities"] if index is not None else None
+    n_ignored = (
+        int(index["n_ignored"])
+        if index is not None
+        else sum(int(m.get("n_ignored", 0) or 0) for m in metas)
+    )
+    metrics = dict(aggregate(records, capabilities=caps))
+    metrics.update(base)
     metrics.update(
         {
-            "run_id": run_id,
-            "adapter": first.get("adapter"),
-            "dataset": first.get("dataset"),
-            "dataset_path": first.get("dataset_path"),
-            "dataset_source": first.get("dataset_source"),
-            "platform": first.get("platform", "default"),
-            "commit": first.get("commit"),
-            "judge": first.get("judge"),
-            "n_ignored": sum(int(m.get("n_ignored", 0) or 0) for m in metas),
-            "timestamp": now.isoformat(timespec="seconds"),
-            "limit": None,
-            "shards": shards,
-            "shard_index": None,
-            "shard_by": first.get("shard_by") or "question",
-            # 可比性元数据透传：融合产物与普通 run 同等可校验/可对比
-            "adapter_meta": first.get("adapter_meta"),
-            "adapter_describe": first.get("adapter_describe"),
-            "schema_version": first.get("schema_version"),
-            "driver_llm": first.get("driver_llm"),
-            "judge_model": first.get("judge_model"),
-            "adapter_version": first.get("adapter_version"),
-            "dataset_fingerprint": first.get("dataset_fingerprint"),
-            "retrieval_match": first.get("retrieval_match"),
-            # 运行模式透传（前面已校验各分片一致）
-            "run_mode": first.get("run_mode") or "full",
+            "n_ignored": n_ignored,
             "fused": True,
             "fused_from": [str(m.get("run_id", d)) for m, d in zip(metas, run_dirs)],
         }
     )
-    if first.get("retrieval_match_threshold") is not None:
-        metrics["retrieval_match_threshold"] = first["retrieval_match_threshold"]
-    match_fallbacks = sum(int(m.get("retrieval_match_fallbacks", 0) or 0) for m in metas)
-    if match_fallbacks:
-        metrics["retrieval_match_fallbacks"] = match_fallbacks
     # token 记账：各分片各记各的（question 分片下同一对话可能被多片 ingest，
     # 只有分片自己的计数才是真实成本），故直接相加；任一分片未落账则整体不落账
     # （避免"部分求和"被读成全量消耗）。
@@ -237,16 +367,40 @@ def fuse_runs(run_dirs: list[str], out_dir: str) -> dict[str, Any]:
     gate = fuse_gate(records, metrics)
     metrics["stale_gate"] = gate
 
-    os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "results.jsonl"), "w", encoding="utf-8") as f:
-        for record in records:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=False, indent=2)
-    render_run_report(out_dir, records, metrics)
+    # 逐对话报告：对话级指标由合并后的记录重新聚合（题目级分片下同一对话的记录来自
+    # 多个分片，各片自己的对话级指标都只是子集）。
+    for dir_name, dialogue_records in merged.items():
+        dialogue_id = _dialogue_id(dialogue_records, dir_name)
+        dialogue_metrics = dict(
+            aggregate(
+                dialogue_records,
+                capabilities=index["caps"].get(dialogue_id) if index is not None else None,
+            )
+        )
+        dialogue_metrics.update(base)
+        dialogue_metrics["dialogue_id"] = dialogue_id
+        dialogue_metrics["n_ignored"] = (
+            index["dialogue_n_ignored"].get(dir_name, 0) if index is not None else 0
+        )
+        _write_report_dir(
+            layout.dialogue_report_dir(experiment_dir, dataset_name, dialogue_id),
+            dialogue_records,
+            dialogue_metrics,
+            figures=False,
+        )
+
+    dataset_report = layout.dataset_report_dir(experiment_dir, dataset_name)
+    _write_report_dir(dataset_report, records, metrics, figures=True)
+    copy_report(
+        os.path.join(dataset_report, layout.FILE_REPORT_MD),
+        layout.task_report_dir(experiment_dir),
+        layout.FILE_REPORT_MD,
+        extra_files=[os.path.join(dataset_report, layout.FILE_METRICS)],
+    )
 
     return {
         "out_dir": out_dir,
+        "dataset_dir": dataset_dir,
         "metrics": metrics,
         "gate": gate,
         "n_questions": len(records),

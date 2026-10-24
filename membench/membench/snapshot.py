@@ -4,13 +4,19 @@
 校验），状态的产出与消费全部走适配器接口（``snapshot`` / ``restore`` /
 ``rebuild``）——框架不解析快照内容、不定义记忆应该长什么样。
 
-为什么要按对话存档：runner 每个 dialogue 前都 ``reset()``，评测本身就是
+为什么按对话存档：runner 每个 dialogue 前都 ``reset()``，评测本身就是
 "一个对话一个独立记忆生命周期"，所以"按对话存档 → 按对话恢复"天然等价，
 不需要跨对话的状态连续性。
 
+清单也**每个对话一份**，落在 ``<数据集目录>/<对话目录>/memory_snapshot/manifest.json``，
+自包含（身份 + 数据集指纹 + 能力声明 + 该对话条目）——单个对话目录即可搬到
+别处使用。整场评测的齐备性（对话覆盖 / 数据集指纹 / 格式版本 / 模式协商）
+由 :func:`plan_replay` 扫描各对话清单统一校验，合并指纹见
+:func:`manifests_digest`。
+
 三种模式（``run_mode``）：
 
-- ``full``：正常评测（可选 ``--snapshot-out`` 顺带导出）；
+- ``full``：正常评测（可选 ``--snapshot`` 顺带导出）；
 - ``replay-restore``：快照格式兼容、直接恢复（测**读取/检索/回答**侧改动）；
 - ``replay-rebuild``：格式不兼容或需要重建派生结构，走系统自己的 ``rebuild``。
 
@@ -23,48 +29,48 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 from datetime import datetime
 from typing import Any, Union
+
+from membench import layout
 
 __all__ = [
     "MANIFEST_NAME",
     "RUN_MODES",
     "read_capabilities",
-    "tag_dir_name",
     "dir_sha256",
+    "payload_sha256",
     "new_manifest",
     "save_manifest",
     "load_manifest",
     "write_snapshot",
+    "manifests_digest",
     "plan_replay",
     "replay_dialogue",
     "verify_replay",
 ]
 
-#: 快照根目录下的清单文件名。
+#: 快照清单文件名（落在每个对话的 ``memory_snapshot/`` 目录里）。
 MANIFEST_NAME = "manifest.json"
 
 #: run_mode 取值（``full`` 之外的两种都固定写入侧）。
 RUN_MODES: tuple[str, ...] = ("full", "replay-restore", "replay-rebuild")
 
-_SAFE_TAG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
+def dir_sha256(path: str, exclude: tuple[str, ...] = ()) -> str:
+    """目录内容哈希（相对路径 + 内容，按路径排序）；空目录也能得到稳定值。
 
-def tag_dir_name(tag: str) -> str:
-    """把对话 id 归一成安全的目录名（防路径穿越；空值兜底 ``dialogue``）。"""
-    safe = _SAFE_TAG_RE.sub("_", str(tag)).strip("._-")
-    return (safe or "dialogue")[:120]
-
-
-def dir_sha256(path: str) -> str:
-    """目录内容哈希（相对路径 + 内容，按路径排序）；空目录也能得到稳定值。"""
+    ``exclude`` 里的顶层文件名不计入——快照目录里的 ``manifest.json`` 由框架
+    在算完哈希后才写，排除它才能让哈希只代表适配器产出的内容。
+    """
     digest = hashlib.sha256()
     if not os.path.isdir(path):
         return digest.hexdigest()
     for root, dirs, files in os.walk(path):
         dirs.sort()
         for name in sorted(files):
+            if root == path and name in exclude:
+                continue
             full = os.path.join(root, name)
             rel = os.path.relpath(full, path)
             digest.update(rel.encode("utf-8"))
@@ -74,10 +80,13 @@ def dir_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
-def _dir_bytes(path: str) -> int:
+def _dir_bytes(path: str, exclude: tuple[str, ...] = ()) -> int:
+    """目录内文件字节数合计（``exclude`` 语义同 :func:`dir_sha256`）。"""
     total = 0
     for root, _dirs, files in os.walk(path):
         for name in files:
+            if root == path and name in exclude:
+                continue
             try:
                 total += os.path.getsize(os.path.join(root, name))
             except OSError:
@@ -131,12 +140,10 @@ def new_manifest(
     dataset: str,
     dataset_path: str,
     dataset_fingerprint: dict[str, Any],
-    shard_by: str,
-    shards: int,
-    shard_index: int,
+    dialogue_id: str,
     capabilities: dict[str, Any],
 ) -> dict[str, Any]:
-    """新建（未完成的）快照清单。"""
+    """新建单对话快照清单（``entry`` 与 ``complete`` 由 :func:`write_snapshot` 落定）。"""
     return {
         "schema": 1,
         "run_id": run_id,
@@ -146,20 +153,17 @@ def new_manifest(
         "dataset": dataset,
         "dataset_path": dataset_path,
         "dataset_fingerprint": dataset_fingerprint,
-        "shard_by": shard_by,
-        "shards": shards,
-        "shard_index": shard_index,
-        "capabilities": capabilities,
+        "dialogue_id": str(dialogue_id),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "complete": False,
-        "dialogues": {},
+        "capabilities": capabilities,
     }
 
 
-def save_manifest(root: str, manifest: dict[str, Any]) -> str:
-    """写清单并返回其 sha256（哈希在写入后按文件内容算，回放时可比对）。"""
-    os.makedirs(root, exist_ok=True)
-    path = os.path.join(root, MANIFEST_NAME)
+def save_manifest(snapshot_dir: str, manifest: dict[str, Any]) -> str:
+    """写清单到 ``<snapshot_dir>/manifest.json`` 并返回其 sha256。"""
+    os.makedirs(snapshot_dir, exist_ok=True)
+    path = os.path.join(snapshot_dir, MANIFEST_NAME)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, ensure_ascii=False, indent=2)
     return _file_sha256(path)
@@ -173,26 +177,26 @@ def _file_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
-def load_manifest(root: str) -> dict[str, Any]:
-    """读快照清单；缺失/损坏时抛出带修复建议的 SystemExit。"""
-    path = os.path.join(root, MANIFEST_NAME)
+def load_manifest(snapshot_dir: str) -> dict[str, Any]:
+    """读单对话快照清单；缺失/损坏时抛出带修复建议的 SystemExit。"""
+    path = os.path.join(snapshot_dir, MANIFEST_NAME)
     if not os.path.isfile(path):
         raise SystemExit(
-            f"快照清单不存在: {path}——请确认 --replay 指向的目录是 "
-            "--snapshot-out 导出的快照根目录"
+            f"快照清单不存在: {path}——请确认 --replay 指向的是 --snapshot 导出的"
+            "数据集目录（或含它的实验目录），且该目录覆盖了本次要跑的对话"
         )
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
     except ValueError as exc:
         raise SystemExit(f"快照清单损坏（{path}）：{exc}") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("dialogues"), dict):
-        raise SystemExit(f"快照清单结构非法（{path}）：缺少 dialogues 段")
+    if not isinstance(data, dict) or not isinstance(data.get("entry"), dict):
+        raise SystemExit(f"快照清单结构非法（{path}）：缺少 entry 段")
     return data
 
 
 def write_snapshot(
-    root: str,
+    snapshot_dir: str,
     adapter: Any,
     manifest: dict[str, Any],
     *,
@@ -200,20 +204,21 @@ def write_snapshot(
     sessions: list[list[dict]],
     n_questions: int,
 ) -> dict[str, Any]:
-    """导出单个对话的状态快照并登记到清单。
+    """导出单个对话的状态快照、登记清单并落盘。
+
+    清单在适配器 ``snapshot()`` 成功返回后才写——``complete=true`` 即"该对话
+    快照已完整导出"，导出中途崩溃不会留下会被回放读到的半成品清单。
 
     Returns:
         该对话的清单条目（含目录名、sha256、字节数、条目统计）。
     """
-    dir_name = tag_dir_name(dialogue_id)
-    target = os.path.join(root, dir_name)
-    os.makedirs(target, exist_ok=True)
-    extra = adapter.snapshot(target, dialogue_id)
+    os.makedirs(snapshot_dir, exist_ok=True)
+    extra = adapter.snapshot(snapshot_dir, dialogue_id)
     entry = {
-        "dir": dir_name,
+        "dir": layout.tag_dir_name(dialogue_id),
         "tag": dialogue_id,
-        "sha256": dir_sha256(target),
-        "bytes": _dir_bytes(target),
+        "sha256": dir_sha256(snapshot_dir, exclude=(MANIFEST_NAME,)),
+        "bytes": _dir_bytes(snapshot_dir, exclude=(MANIFEST_NAME,)),
         "n_sessions": len(sessions),
         "n_messages": sum(len(s) for s in sessions),
         "n_questions": n_questions,
@@ -222,8 +227,26 @@ def write_snapshot(
     }
     if isinstance(extra, dict) and extra:
         entry["adapter_report"] = extra
-    manifest["dialogues"][str(dialogue_id)] = entry
+    manifest["entry"] = entry
+    manifest["complete"] = True
+    save_manifest(snapshot_dir, manifest)
     return entry
+
+
+def manifests_digest(snapshot_dirs: dict[str, str]) -> str:
+    """逐对话清单的合并指纹：按对话 id 排序，对 ``id\\tsha256(清单)`` 行求 sha256。
+
+    Args:
+        snapshot_dirs: ``{对话 id: 该对话的 memory_snapshot 目录}``。
+
+    单份清单只覆盖一个对话，装不下"整场评测的快照有没有变过"；合并值让
+    metrics / 报告能用一个字符串表达快照身份。
+    """
+    digest = hashlib.sha256()
+    for dialogue_id in sorted(snapshot_dirs):
+        path = os.path.join(snapshot_dirs[dialogue_id], MANIFEST_NAME)
+        digest.update(f"{dialogue_id}\t{_file_sha256(path)}\n".encode("utf-8"))
+    return digest.hexdigest()
 
 
 def _fingerprint_sha(manifest: dict[str, Any]) -> Union[str, None]:
@@ -231,24 +254,54 @@ def _fingerprint_sha(manifest: dict[str, Any]) -> Union[str, None]:
     return fp.get("sha256") if isinstance(fp, dict) else None
 
 
+def _source_run_id(dataset_dir: str) -> str:
+    """源 run 身份：优先取数据集级 metrics.json 的 run_id，缺失时退回目录名。"""
+    path = os.path.join(dataset_dir, layout.DIR_REPORT, layout.FILE_METRICS)
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                run_id = json.load(handle).get("run_id")
+        except ValueError:
+            run_id = None
+        if run_id:
+            return str(run_id)
+    return os.path.basename(os.path.normpath(dataset_dir))
+
+
 def plan_replay(
-    adapter: Any,
     root: str,
-    *,
-    dataset_fingerprint: dict[str, Any],
+    dataset: str,
+    adapter: Any,
     dialogue_ids: list[str],
+    *,
+    dataset_fingerprint: dict[str, Any] | None = None,
     requested_mode: str = "auto",
 ) -> dict[str, Any]:
-    """跑前校验并决定回放模式（``restore`` / ``rebuild``）。
+    """扫描逐对话清单、跑前校验并决定回放模式（``restore`` / ``rebuild``）。
 
-    校验：清单存在且可读、数据集指纹一致、本 run 要跑的对话都有快照。
+    Args:
+        root: 实验目录（自动在其 ``runs/`` 下定位匹配 ``dataset`` 的数据集目录）
+            或数据集目录（``<实验目录>/runs/<dataset>``）。
+        dataset: 本次评测的数据集名（用于定位与身份校验）。
+        adapter: 当前适配器（读其快照能力声明）。
+        dialogue_ids: 本 run 要跑的对话 id——每一个都必须有完整快照。
+        dataset_fingerprint: 当前数据集的指纹（``dataset_fingerprint()`` 结果）；
+            与快照记录的不一致即拒绝。
+        requested_mode: ``auto`` / ``restore`` / ``rebuild``。
+
+    校验（全部在开跑之前）：清单齐备且 ``complete=true``、清单身份与本次一致
+    （数据集 / 对话 id / 对话目录名）、数据集指纹一致、各对话格式版本一致。
     模式协商：``auto`` 优先 ``restore``（要求格式兼容且适配器声明支持），
     否则退回 ``rebuild``（要求适配器声明支持），都不行则拒绝。
+
+    Returns:
+        ``{"root": 数据集目录, "mode", "run_mode", "format_version",
+        "source_run", "manifest_sha256", "snapshots": {对话 id: 快照目录}}``。
 
     Raises:
         SystemExit: 任一项不满足（宁可跑前拒绝，也不跑完才发现不可比）。
     """
-    manifest = load_manifest(root)
+    dataset_root = layout.resolve_dataset_dir(root, dataset=dataset)
     caps = read_capabilities(adapter)
     if not caps.get("supported"):
         raise SystemExit(
@@ -257,27 +310,79 @@ def plan_replay(
             "snapshot_capabilities() 返回 supported=True；HTTP 桥同理"
         )
 
-    want_fp = dataset_fingerprint.get("sha256") if isinstance(dataset_fingerprint, dict) else None
-    snap_fp = _fingerprint_sha(manifest)
-    if want_fp and snap_fp and want_fp != snap_fp:
-        raise SystemExit(
-            "数据集指纹与快照不一致，拒绝回放："
-            f"当前数据集 sha256={want_fp} vs 快照 {snap_fp}——快照是另一份数据集"
-            "上导出的，回放会得到不可归因的分数（请用同一数据集重新导出快照）"
+    dialogue_ids = [str(d) for d in dialogue_ids]
+    snapshot_dirs = {
+        did: os.path.join(
+            dataset_root, layout.tag_dir_name(did), layout.DIR_SNAPSHOT
         )
-
-    missing = [d for d in dialogue_ids if str(d) not in manifest["dialogues"]]
+        for did in dialogue_ids
+    }
+    missing = [d for d, path in snapshot_dirs.items() if not os.path.isfile(
+        os.path.join(path, MANIFEST_NAME)
+    )]
     if missing:
         raise SystemExit(
             "快照缺少本 run 需要的对话，拒绝回放："
             + "、".join(missing[:5])
             + (f" 等 {len(missing)} 个" if len(missing) > 5 else "")
-            + "——请确认 --snapshot-out 的导出覆盖了这些对话（分片导出时需覆盖同一分片口径）"
+            + "——请确认 --snapshot 的导出覆盖了这些对话（分片导出时需覆盖同一分片口径）"
         )
 
-    snap_version = (manifest.get("capabilities") or {}).get("format_version", 1)
-    compatible = snap_version in (caps.get("compatible_from") or [])
-    same_version = snap_version == caps.get("format_version", 1)
+    want_fp = (
+        dataset_fingerprint.get("sha256")
+        if isinstance(dataset_fingerprint, dict)
+        else None
+    )
+    versions: dict[str, list[str]] = {}
+    raw_versions: dict[str, Any] = {}
+    run_ids: set[str] = set()
+    for did, snapshot_dir in snapshot_dirs.items():
+        path = os.path.join(snapshot_dir, MANIFEST_NAME)
+        manifest = load_manifest(snapshot_dir)
+        if not manifest.get("complete"):
+            raise SystemExit(
+                f"快照清单标记为未完成（complete=false），拒绝回放：{path}"
+                "——快照导出被中断，请重新导出"
+            )
+        if str(manifest.get("dialogue_id")) != did:
+            raise SystemExit(
+                f"快照清单与对话不匹配，拒绝回放：{path} 登记的是 "
+                f"{manifest.get('dialogue_id')!r}，本次需要 {did!r}"
+            )
+        if (manifest.get("entry") or {}).get("dir") != layout.tag_dir_name(did):
+            raise SystemExit(
+                f"快照清单登记的对话目录与所在位置不一致，拒绝回放：{path}"
+                f"（entry.dir={(manifest.get('entry') or {}).get('dir')!r}）"
+                "——快照目录可能被移动或改名，请重新导出"
+            )
+        if str(manifest.get("dataset")) != dataset:
+            raise SystemExit(
+                f"快照来自另一个数据集，拒绝回放：{path} 登记的是 "
+                f"{manifest.get('dataset')!r}，本次评测 {dataset!r}"
+            )
+        snap_fp = _fingerprint_sha(manifest)
+        if want_fp and snap_fp and want_fp != snap_fp:
+            raise SystemExit(
+                "数据集指纹与快照不一致，拒绝回放："
+                f"当前数据集 sha256={want_fp} vs 快照 {snap_fp}——快照是另一份数据集"
+                "上导出的，回放会得到不可归因的分数（请用同一数据集重新导出快照）"
+            )
+        version_raw = (manifest.get("capabilities") or {}).get("format_version", 1)
+        versions.setdefault(str(version_raw), []).append(did)
+        raw_versions.setdefault(str(version_raw), version_raw)
+        run_ids.add(str(manifest.get("run_id") or "n/a"))
+
+    if len(versions) > 1:
+        detail = "；".join(
+            f"v{ver}（{'、'.join(ids[:3])}）" for ver, ids in sorted(versions.items())
+        )
+        raise SystemExit(
+            f"各对话的快照格式版本不一致，拒绝回放：{detail}"
+            "——这些快照不是同一次导出的，请统一重新导出"
+        )
+    snap_version = next(iter(versions))
+    compatible = snap_version in [str(v) for v in caps.get("compatible_from") or []]
+    same_version = snap_version == str(caps.get("format_version", 1))
 
     def _restore_ok() -> bool:
         return same_version or compatible
@@ -308,40 +413,44 @@ def plan_replay(
             "读取侧；派生结构/存储结构变更需要系统提供 rebuild，或重跑）"
         )
     return {
-        "root": root,
+        "root": dataset_root,
         "mode": mode,
         "run_mode": f"replay-{mode}",
-        "format_version": snap_version,
-        "source_run": manifest.get("run_id"),
-        "manifest_sha256": _file_sha256(os.path.join(root, MANIFEST_NAME)),
-        "complete": bool(manifest.get("complete")),
+        "format_version": raw_versions[snap_version],
+        "source_run": "、".join(sorted(run_ids)) if len(run_ids) > 1 else next(iter(run_ids)),
+        "manifest_sha256": manifests_digest(snapshot_dirs),
+        "snapshots": snapshot_dirs,
     }
 
 
 def replay_dialogue(adapter: Any, plan: dict[str, Any], dialogue_id: str) -> None:
     """按计划恢复单个对话的状态（回放模式下替代 reset + ingest）。"""
-    entry = (load_manifest(plan["root"])["dialogues"].get(str(dialogue_id))) or {}
-    dir_name = entry.get("dir") or tag_dir_name(dialogue_id)
-    source = os.path.join(plan["root"], dir_name)
-    if not os.path.isdir(source):
-        raise SystemExit(f"快照目录不存在: {source}（清单里登记了 {dialogue_id}）")
+    source = (plan.get("snapshots") or {}).get(str(dialogue_id))
+    if not source or not os.path.isdir(source):
+        raise SystemExit(f"快照目录不存在: {source}（计划里没有对话 {dialogue_id}）")
     if plan["mode"] == "rebuild":
         adapter.rebuild(source, dialogue_id)
     else:
         adapter.restore(source, dialogue_id)
 
 
-def verify_replay(source_run_dir: str, records: list[dict[str, Any]]) -> dict[str, Any]:
-    """回放保真校验：与源 run 逐题比对（qid 对齐）。
+def verify_replay(source_dataset_dir: str, records: list[dict[str, Any]]) -> dict[str, Any]:
+    """回放保真校验：与源数据集目录的逐题明细比对（qid 对齐）。
+
+    Args:
+        source_dataset_dir: 源评测的数据集目录（``<实验目录>/runs/<dataset>``）。
+        records: 本次回放的逐题记录。
 
     Returns:
         ``{"source_run", "n_source", "n_replay", "n_common", "n_answer_diff",
         "n_retrieved_diff", "n_correct_diff", "answer_match_rate",
-        "mismatch_qids", ...}``；源 results.jsonl 缺失时返回 ``{"error": ...}``。
+        "mismatch_qids", ...}``；源逐题明细缺失时返回 ``{"error": ...}``。
     """
-    source_path = os.path.join(source_run_dir, "results.jsonl")
+    source_path = os.path.join(
+        source_dataset_dir, layout.DIR_REPORT, layout.FILE_RESULTS
+    )
     if not os.path.isfile(source_path):
-        return {"error": f"源 run 缺少 results.jsonl: {source_path}"}
+        return {"error": f"源数据集目录缺少逐题明细: {source_path}"}
     source: dict[str, dict[str, Any]] = {}
     with open(source_path, encoding="utf-8") as handle:
         for line in handle:
@@ -368,7 +477,7 @@ def verify_replay(source_run_dir: str, records: list[dict[str, Any]]) -> dict[st
         if bool((a.get("judge") or {}).get("correct")) != bool((b.get("judge") or {}).get("correct")):
             correct_diff.append(qid)
     return {
-        "source_run": os.path.basename(os.path.normpath(source_run_dir)),
+        "source_run": _source_run_id(source_dataset_dir),
         "n_source": len(source),
         "n_replay": len(replay),
         "n_common": len(common),

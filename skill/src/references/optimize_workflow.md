@@ -18,7 +18,7 @@
 
 ## 阶段 1：诊断——问题出在哪
 
-**输入**：基线 run 的 `report.md`（必要时加 `metrics.json` / `results.jsonl`）。
+**输入**：基线实验目录里数据集级的 `runs/<dataset>/report/report.md`（必要时加同目录的 `metrics.json` / `results.jsonl`；单数据集 run 的任务级 `reports/report.md` 是它的副本）。
 
 **动作**：按顺序读四类信息，形成"短板维度 + 证据"的结论。
 
@@ -84,10 +84,13 @@
 
 ```bash
 cd <skill目录>/membench
-python -m membench.cli run --adapter <adapter> --dataset <同一数据集> --judge <同一判分器> --out runs/
+python -m membench.cli run --adapter <adapter> --dataset <同一数据集> --judge <同一判分器> \
+  --report-out <skill目录>/output
+# 每次 run 新建 <report-out>/eval_<adapter>_<platform>_<ts>/，控制台末行打印数据集产物目录
 ```
 
-- 基线 run 请提前备份（如 `cp -r runs/<run_a> runs/baseline_v1`），防止被覆盖。
+- 基线产物天然留档：每次 run 新建 `eval_<adapter>_<platform>_<ts>/`，不会覆盖旧实验目录
+  （同一秒重复运行会被直接拒绝）；要给某次结果固定名字就整体复制那个实验目录。
 - 改动过程中如顺手改了别处，**回退**——多变量会让 AB 结论失效。
 
 **执行方式（subagent 不是默认动作，按改动性质决定）**：
@@ -114,15 +117,17 @@ python -m membench.cli run --adapter <adapter> --dataset <同一数据集> --jud
 3. **可比性前置校验 + 对比**：
 
 ```bash
-python -m membench.cli compare --baseline runs/<run_a> --candidate runs/<run_b> \
+python -m membench.cli compare \
+  --baseline <基线实验目录或 runs/<dataset> 数据集目录> \
+  --candidate <候选实验目录或 runs/<dataset> 数据集目录> \
   --require-comparable --tag <标签> --report-out output/
 ```
 
 - `--require-comparable`：关键维度（`driver_llm` / `judge_model` / `adapter_version` / `dataset_fingerprint` 等）不一致或无法核验 → 可比性门禁 **FAIL**（整体 verdict=FAIL、退出码 1），即拒绝当 A/B 用；不加该参数时不一致只降级为 WARN。详见 `references/compare_workflows.md`。
-- `--tag <标签>`：决定产物目录 `ab_<tag>_<ts>/`。
+- `--tag <标签>`：决定产物目录 `compare_<name>_<platform>_<ts>/` 的 `<name>` 段（缺省 `<基线 adapter>_vs_<候选 adapter>`）。
 - **`compare` 只测差异，不判定两组是否只差一个变量**——消融靠你自己保证。
 
-**产物**：`ab_<tag>_<ts>/`（A/B 各自报告与 run、`compare_report.md`、`fig_metric_diff.png`）。
+**产物**：`compare_<name>_<platform>_<ts>/{A/,B/,reports/{comparison.md,fig_metric_diff.png,fig_category_diff.png}}`——A/B 各是一个完整 eval 实验形态（自带 `runs/<dataset>/…` 与任务级 `reports/`）。
 
 **判读标准**：
 
@@ -136,14 +141,14 @@ python -m membench.cli compare --baseline runs/<run_a> --candidate runs/<run_b> 
 
 **输入**：诊断结论、plan、AB 产物。
 
-**动作**：写 `optimization_report.md`，落 `ab_<tag>_<ts>/` 根目录，内容至少包含：
+**动作**：写 `optimization_report.md`，落本次对比实验目录的 `reports/`（即 `compare_<name>_<platform>_<ts>/reports/optimization_report.md`，与 `comparison.md` 同目录），内容至少包含：
 
 - **方案**：改了什么（单变量）、为什么、对应哪个短板维度；
 - **可比性声明**：`driver_llm` / `judge_model` / `adapter_version` / `dataset_fingerprint`（证明同尺）；
 - **效果**：门禁结论 + 关键指标 diff（含 `by_category`），明确"涨的是哪个指标、有没有引入回退"；
 - **结论与后续**：是否固化、下一轮优化方向。
 
-**产物**：`ab_<tag>_<ts>/optimization_report.md`。
+**产物**：`compare_<name>_<platform>_<ts>/reports/optimization_report.md`。
 
 **判读标准**：报告要能让人仅凭它复现结论——方案、口径、数字三者齐全；避免只写"效果很好"。
 

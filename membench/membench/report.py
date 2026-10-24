@@ -1,11 +1,12 @@
-"""报告生成：report.md / compare_report.md 与配套图表（matplotlib, Agg 后端）。
+"""报告生成：report.md / comparison.md 与配套图表（matplotlib, Agg 后端）。
 
 图表统一低饱和配色；尽量自动探测中文字体以避免乱码。
 公共入口：
-- :func:`render_run_report`     单个 run 的 report.md + fig_category_accuracy.png + fig_latency_hist.png
-- :func:`render_compare_report` compare_report.md + fig_metric_diff.png（质量+效率）+ fig_category_diff.png（分题型）
-- :func:`fig_dataset_overview`  evaluate 报告用：各数据集质量 + 效率分组条形图
-- :func:`copy_report`           --report-out：把报告连带引用图片复制到指定目录
+- :func:`render_dialogue_report`  对话级 report.md（纯文字，不出图）
+- :func:`render_dataset_report`   数据集级 report.md + fig_category_accuracy.png + fig_latency_hist.png
+- :func:`render_compare_report`   comparison.md + fig_metric_diff.png（质量+效率）+ fig_category_diff.png（分题型）
+- :func:`fig_dataset_overview`    evaluate 报告用：各数据集质量 + 效率分组条形图
+- :func:`copy_report`             把带图报告连同引用图片与附带文件复制到目标目录
 """
 
 from __future__ import annotations
@@ -14,6 +15,15 @@ import os
 import re
 import shutil
 from typing import Any, Iterable
+
+from .layout import (
+    FIG_CATEGORY,
+    FIG_CATEGORY_DIFF,
+    FIG_LATENCY,
+    FIG_METRIC_DIFF,
+    FILE_COMPARISON_MD,
+    FILE_REPORT_MD,
+)
 
 try:
     import matplotlib
@@ -225,6 +235,7 @@ def dim_label(key: str) -> str:
 METADATA_FIELD_ZH: dict[str, str] = {
     "adapter": "adapter",
     "dataset": "数据集",
+    "dialogue_id": "对话 id",
     "dataset_path": "测试集路径",
     "dataset_source": "测试集来源",
     "platform": "平台",
@@ -633,8 +644,25 @@ def _baseline_rows(overall: dict[str, Any]) -> list[list[str]]:
     return rows
 
 
-def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, Any]) -> str:
-    """生成 report.md（章节按 SPEC 第 7 节，中文）。"""
+def write_run_report_md(
+    out_dir: str,
+    records: list[dict],
+    metrics: dict[str, Any],
+    *,
+    with_figures: bool = True,
+) -> str:
+    """生成 report.md（章节按 SPEC 第 7 节，中文）。
+
+    Args:
+        out_dir: 报告目录（对话级 / 数据集级 / 任务级均可）。
+        records: 参与本次报告的评测记录。
+        metrics: ``aggregate`` 结果 + 元信息。
+        with_figures: 是否在正文引用两张分题型 / 延迟图；对话级报告不出图，
+            置 False 以免留下打不开的相对引用。
+
+    Returns:
+        写出的 report.md 路径。
+    """
     overall = metrics.get("overall", {})
     by_category = metrics.get("by_category", {})
 
@@ -659,6 +687,9 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
         [metadata_label("dataset_fingerprint"), _fmt_opt(fp_sha)],
         [metadata_label("retrieval_match"), str(metrics.get("retrieval_match") or "substring")],
     ]
+    if metrics.get("dialogue_id"):
+        # 对话级报告：先声明这份报告只覆盖哪一段对话，避免被读成数据集级结论
+        config_rows.insert(2, [metadata_label("dialogue_id"), f"`{metrics['dialogue_id']}`"])
     lines.append(_md_table(["项目", "值"], config_rows))
     lines.append("")
     # 非默认检索命中口径提示：与 substring 的历史跑分不可直接比较
@@ -780,8 +811,9 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
         )
     )
     lines.append("")
-    lines.append("![分题型准确率](fig_category_accuracy.png)")
-    lines.append("")
+    if with_figures:
+        lines.append(f"![分题型准确率]({FIG_CATEGORY})")
+        lines.append("")
 
     # 3. 效率统计
     lines.append("## 效率统计")
@@ -798,8 +830,9 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
     ]
     lines.append(_md_table(["指标", "值"], eff_rows))
     lines.append("")
-    lines.append("![查询延迟分布](fig_latency_hist.png)")
-    lines.append("")
+    if with_figures:
+        lines.append(f"![查询延迟分布]({FIG_LATENCY})")
+        lines.append("")
 
     # 3.5 全流程 token 消耗（被测系统上报口径，不参与评级/门禁）
     lines.append("## Token 消耗（全流程）")
@@ -856,9 +889,9 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
             ["快照角色", {"replayed": "回放（读取侧口径）", "exported": "导出（本次为全量 run）"}.get(
                 str(state.get("role")), "n/a"
             )],
-            ["快照根目录", f"`{state.get('root', 'n/a')}`"],
+            ["快照根目录（`--replay` 入参）", f"`{state.get('root', 'n/a')}`"],
             ["格式版本", f"v{state.get('format_version', 'n/a')}"],
-            ["清单 sha256", f"`{state.get('manifest_sha256', 'n/a')}`"],
+            ["清单 sha256（逐对话清单合并）", f"`{state.get('manifest_sha256', 'n/a')}`"],
             ["对话数", str(state.get("n_dialogues", "n/a"))],
         ]
         if state.get("role") == "replayed":
@@ -868,8 +901,8 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
         lines.append("")
         if state.get("role") == "exported":
             lines.append(
-                "改**读取侧**代码后可用 `--replay <快照根目录>` 免重跑 ingest；"
-                "改写入侧（抽取 / 更新 / 去重）则必须重新 ingest。"
+                "改**读取侧**代码后可用 `--replay <快照根目录>`（数据集目录，或含它的"
+                "实验目录）免重跑 ingest；改写入侧（抽取 / 更新 / 去重）则必须重新 ingest。"
             )
             lines.append("")
         if verify:
@@ -932,25 +965,39 @@ def write_run_report_md(run_dir: str, records: list[dict], metrics: dict[str, An
     lines.append(_md_table(["指标", "目标", "实际", "评价", "结果"], _baseline_rows(overall)))
     lines.append("")
 
-    out_path = os.path.join(run_dir, "report.md")
+    out_path = os.path.join(out_dir, FILE_REPORT_MD)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return out_path
 
 
-def render_run_report(run_dir: str, records: list[dict], metrics: dict[str, Any]) -> None:
-    """生成 run 目录下的 report.md 与两张图表。"""
-    os.makedirs(run_dir, exist_ok=True)
+def render_dialogue_report(
+    out_dir: str, records: list[dict], metrics: dict[str, Any]
+) -> str:
+    """写对话级 ``report.md``（纯文字，不出图）。
+
+    对话的题目往往只有个位数，出图既没信息量又会把产物撑成两倍；整场评测的
+    图表留给数据集级报告。因此这里也不引用图片，避免留下打不开的相对路径。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    return write_run_report_md(out_dir, records, metrics, with_figures=False)
+
+
+def render_dataset_report(
+    out_dir: str, records: list[dict], metrics: dict[str, Any]
+) -> None:
+    """写数据集级报告：``report.md`` + 分题型准确率图 + 查询延迟分布图。"""
+    os.makedirs(out_dir, exist_ok=True)
     fig_category_accuracy(
-        metrics.get("by_category", {}), os.path.join(run_dir, "fig_category_accuracy.png")
+        metrics.get("by_category", {}), os.path.join(out_dir, FIG_CATEGORY)
     )
     fig_latency_hist(
         [r.get("latency_ms", 0.0) for r in records],
         float(metrics.get("overall", {}).get("latency_p50_ms", 0.0)),
         float(metrics.get("overall", {}).get("latency_p95_ms", 0.0)),
-        os.path.join(run_dir, "fig_latency_hist.png"),
+        os.path.join(out_dir, FIG_LATENCY),
     )
-    write_run_report_md(run_dir, records, metrics)
+    write_run_report_md(out_dir, records, metrics, with_figures=True)
 
 
 def write_compare_report_md(
@@ -962,7 +1009,7 @@ def write_compare_report_md(
     verdict: str,
     comparability: "dict[str, Any] | None" = None,
 ) -> str:
-    """生成 compare_report.md：逐指标 diff 表 + 门禁结论（中文）。
+    """生成 comparison.md：逐指标 diff 表 + 门禁结论（中文）。
 
     ``comparability`` 非 None 时附加「可比性前置校验」小节：逐维度对照表 +
     不可比原因列表，说明 A/B 是否具备结果归因的前提。
@@ -1006,9 +1053,9 @@ def write_compare_report_md(
         )
     lines.append(_md_table(["指标", "A (基线)", "B (候选)", "diff"], rows or [["(无)", "", "", ""]]))
     lines.append("")
-    lines.append("![关键指标对比](fig_metric_diff.png)")
+    lines.append(f"![关键指标对比]({FIG_METRIC_DIFF})")
     lines.append("")
-    lines.append("![分题型准确率对比](fig_category_diff.png)")
+    lines.append(f"![分题型准确率对比]({FIG_CATEGORY_DIFF})")
     lines.append("")
     short_a, short_b = ab_series_labels(metrics_a, metrics_b)
     lines.append(
@@ -1057,7 +1104,7 @@ def write_compare_report_md(
             lines.append("（无可比性问题）")
         lines.append("")
 
-    out_path = os.path.join(out_dir, "compare_report.md")
+    out_path = os.path.join(out_dir, FILE_COMPARISON_MD)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return out_path
@@ -1093,7 +1140,7 @@ def render_compare_report(
     verdict: str,
     comparability: "dict[str, Any] | None" = None,
 ) -> None:
-    """生成 compare 目录下的 compare_report.md 与两张对比图
+    """生成对比报告目录下的 comparison.md 与两张对比图
     （fig_metric_diff.png 质量+效率、fig_category_diff.png 分题型）。
 
     图例用短名（``adapter@commit``）而非 run_id，完整 run_id 见报告正文头部。
@@ -1105,20 +1152,20 @@ def render_compare_report(
         metrics_b.get("overall", {}),
         label_a,
         label_b,
-        os.path.join(out_dir, "fig_metric_diff.png"),
+        os.path.join(out_dir, FIG_METRIC_DIFF),
     )
     fig_category_diff(
         metrics_a.get("by_category", {}),
         metrics_b.get("by_category", {}),
         label_a,
         label_b,
-        os.path.join(out_dir, "fig_category_diff.png"),
+        os.path.join(out_dir, FIG_CATEGORY_DIFF),
     )
     write_compare_report_md(out_dir, metrics_a, metrics_b, diffs, gates, verdict, comparability)
 
 
 # ---------------------------------------------------------------------------
-# 报告导出（--report-out）
+# 报告导出（把报告连同图片与数据复制到目标目录）
 # ---------------------------------------------------------------------------
 
 _IMG_REF_RE = re.compile(r"(!\[[^\]]*\]\()([^)]+)(\))")
@@ -1128,23 +1175,19 @@ def copy_report(
     md_path: str,
     dest_dir: str,
     dest_filename: str,
-    ts_prefix: str,
     extra_files: "Iterable[str] | None" = None,
 ) -> str:
     """把 markdown 报告复制到指定目录，并连带复制其引用的本地图片。
 
-    引用的图片复制到同一目标目录；``ts_prefix`` 非空时图片文件名加前缀
-    避免冲突，为空时保持原文件名（每次评测一个独立子目录的场景）。
-    复制后的 md 中图片引用会被修正为新文件名。非本地引用（http/https）
-    保持不变。
+    图片按原文件名复制到同一目标目录（报告与图片始终同目录同名引用）；
+    非本地引用（http/https）保持不变。
 
     Args:
         md_path: 源报告 markdown 路径。
         dest_dir: 目标目录（不存在则创建）。
-        dest_filename: 目标 md 文件名（如 ``report.md``）。
-        ts_prefix: 图片重命名前缀（空串表示不加前缀、保留原名）。
-        extra_files: 额外一并复制的文件路径（如 run 目录下的
-            ``results.jsonl`` / ``metrics.json``），按原文件名复制；
+        dest_filename: 目标 md 文件名（如 ``report.md`` / ``comparison.md``）。
+        extra_files: 额外一并复制的文件路径（如数据集目录下的
+            ``metrics.json`` / ``results.jsonl``），按原文件名复制；
             不存在的文件跳过。
 
     Returns:
@@ -1160,9 +1203,9 @@ def copy_report(
         if "://" in ref:
             return match.group(0)
         src_img = os.path.join(src_dir, ref)
-        new_name = f"{ts_prefix}_{os.path.basename(ref)}" if ts_prefix else os.path.basename(ref)
+        new_name = os.path.basename(ref)
         dest_img = os.path.join(dest_dir, new_name)
-        # 就地复制（如 A/B 实验把 compare_report 再落一次）时源=目标，跳过以免 SameFileError
+        # 目标目录就是源目录时（报告与图片已在位）跳过，否则 copyfile 抛 SameFileError
         if os.path.isfile(src_img) and os.path.abspath(src_img) != os.path.abspath(dest_img):
             shutil.copyfile(src_img, dest_img)
         return f"{prefix}{new_name}{suffix}"

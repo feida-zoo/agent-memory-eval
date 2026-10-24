@@ -3,36 +3,36 @@ matrix / doctor / adapter / user-data / dataset / list-datasets。
 
 用法（SPEC 第 6 节）：
     python -m membench.cli run --adapter mock-strong \
-        [--dataset membench/data/sample_dataset.jsonl] --judge heuristic [--out runs/] \
+        [--dataset membench/data/sample_dataset.jsonl] --judge heuristic \
         [--platform wx --commit a1b2c3] [--driver-llm gpt-4o] \
         [--adapter-version a1b2c3] [--report-out DIR] \
         [--shards N|max --shard-index I --shard-by question|dialogue] \
         [--evidence-match substring|overlap|llm] \
-        [--snapshot-out DIR]   # 每对话 ingest 后导出状态快照（需适配器支持）
+        [--snapshot]   # 每对话 ingest 后导出状态快照（需适配器支持）
     python -m membench.cli run --adapter mock-strong --dataset ... \
-        --replay <快照根目录> [--replay-mode auto|restore|rebuild] \
-        [--replay-verify-source <源run目录>]   # 快照回放：跳过 ingest，只跑 query
+        --replay <实验目录或数据集目录> [--replay-mode auto|restore|rebuild] \
+        [--replay-verify-source <源产物：实验目录或数据集目录>]   # 快照回放：跳过 ingest，只跑 query
     python -m membench.cli evaluate --adapter mock-strong \
-        [--judge heuristic] [--platform wx --commit a1b2c3] [--out runs/] \
+        [--judge heuristic] [--platform wx --commit a1b2c3] \
         [--driver-llm gpt-4o] [--adapter-version a1b2c3] \
         [--report-out DIR] [--quick | --beam-10m | --no-beam] [--no-lme-s] \
         [--evidence-match substring|overlap|llm] \
         [--dataset KEY|PATH]...   # 显式数据集清单（与预设开关互斥） \
-        [--from-runs KEY=RUN_DIR]...   # 复用已有 run；缺失数据集用 --adapter 补跑
+        [--from-runs KEY=DIR]...   # 复用已有产物；缺失数据集用 --adapter 补跑
     python -m membench.cli evaluate-compare --baseline-adapter A --candidate-adapter B \
-        [--judge heuristic] [--platform wx --commit a1b2c3] [--out runs/] \
+        [--judge heuristic] [--platform wx --commit a1b2c3] \
         [--driver-llm-a gpt-4o] [--adapter-version-a a1b2c3] \
         [--driver-llm-b gpt-4o-mini] [--adapter-version-b d4e5f6] \
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
-        [--report-out DIR] [--tag <label>] [--quick | --beam-10m | --no-beam] \
+        [--report-out DIR] [--tag <name>] [--quick | --beam-10m | --no-beam] \
         [--no-lme-s] [--evidence-match substring|overlap|llm] \
         [--dataset KEY|PATH]...   # 两侧使用同一清单（与预设开关互斥） \
-        [--baseline-run KEY=RUN_DIR]... [--candidate-run KEY=RUN_DIR]...  # 两侧复用+补跑
-    python -m membench.cli fuse --runs runs/<shard0>,runs/<shard1> --out runs/<fused>
-    python -m membench.cli compare --baseline runs/<run_a> --candidate runs/<run_b> \
+        [--baseline-run KEY=DIR]... [--candidate-run KEY=DIR]...  # 两侧复用+补跑
+    python -m membench.cli fuse --runs <分片产物目录>,... --out <完整实验目录>
+    python -m membench.cli compare --baseline <产物目录> --candidate <产物目录> \
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
-        [--require-comparable] [--tag <label>] [--report-out DIR]
-    python -m membench.cli matrix --runs "wx@a1b2c3=runs/dir1" "fs@a1b2c3=runs/dir2" ... \
+        [--require-comparable] [--tag <name>] [--report-out DIR]
+    python -m membench.cli matrix --runs "wx@a1b2c3=<产物目录>" "fs@a1b2c3=<产物目录>" ... \
         [--out DIR] [--report-out DIR]
     python -m membench.cli doctor --target http://127.0.0.1:8787 \
         [--timeout 10.0] [--api-key K]
@@ -41,9 +41,21 @@ matrix / doctor / adapter / user-data / dataset / list-datasets。
     python -m membench.cli dataset info [<key>] | dataset fetch <key> [--out DIR]
     python -m membench.cli list-datasets
 
---report-out 统一语义：实验目录（``eval_*`` / ``ab_*`` / ``matrix_*``）的
+产物一律落「一次实验一个自包含子目录」（见 :mod:`membench.layout`）::
+
+    <report-out>/eval_<name>_<platform>_<ts>/   # 例 eval_mock-strong_default_20261024-193000
+    ├── runs/<dataset>/{report/,<对话>/{report/,runtime/,memory_snapshot/}}
+    └── reports/                                # 任务级（多数据集 evaluate 另含 evaluate_summary.json）
+    <report-out>/compare_<name>_<platform>_<ts>/{A/,B/,reports/comparison.md}
+    <report-out>/matrix_<ts>/{reports/,runs/<label>/}
+
+"产物目录"入参（``--baseline`` / ``--candidate`` / ``--from-runs`` / ``--baseline-run`` /
+``--candidate-run`` / matrix 的 label 右值 / ``--replay``）接受**实验目录**或**数据集目录**
+（``<实验目录>/runs/<dataset>``），统一经 :func:`membench.layout.resolve_dataset_dir` 解析。
+
+--report-out 统一语义：实验目录（``eval_*`` / ``compare_*`` / ``matrix_*``）的
 父目录；缺省时用 paths.output_root()（MEMBENCH_OUTPUT_DIR > skill 的 output/ >
-工程根）。一次实验一个自包含子目录（报告 + 对应 run 副本就近归属）。
+工程根）。
 """
 
 from __future__ import annotations
@@ -53,7 +65,7 @@ import os
 import sys
 from typing import Optional, Sequence
 
-from membench import layout, paths
+from membench import layout
 from membench.adapters import ADAPTERS
 from membench.compare import compare_runs
 from membench.matrix import compare_matrix
@@ -83,12 +95,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "（可用 dataset info 查看全部支持数据集）",
     )
     p_run.add_argument("--judge", default="heuristic", choices=["heuristic", "llm", "client"], help="判分器（默认 heuristic；llm=OpenAI兼容接口；client=agent内置LLM）")
-    p_run.add_argument("--out", default=None, help="run 输出父目录（默认 skill/output/runs/）")
-    p_run.add_argument("--platform", default=None, help="平台标签（如 wx / fs），记入 run_id 与元数据")
+    p_run.add_argument("--platform", default=None, help="平台标签（如 wx / fs），记入元数据与实验目录名")
     p_run.add_argument("--commit", default=None, help="commit 标签（如 a1b2c3），记入元数据")
     p_run.add_argument("--driver-llm", default=None, help="驱动被测系统的 LLM 标识（如 gpt-4o），记入元数据供 compare 可比性校验")
     p_run.add_argument("--adapter-version", default=None, help="适配器实现版本/commit，记入元数据供 compare 可比性校验")
-    p_run.add_argument("--report-out", default=None, help="实验目录父目录：产出 <DIR>/eval_<adapter>_<platform>_<ts>/（报告+metrics+run 副本）")
+    p_run.add_argument("--report-out", default=None, help="实验目录父目录（缺省 output_root()）：产出 <DIR>/eval_<adapter>_<platform>_<ts>/，数据集产物落其 runs/<dataset>/，任务级报告落其 reports/")
     p_run.add_argument("--llm-base-url", default=None, help="judge=llm 时的 OpenAI 兼容 base_url")
     p_run.add_argument("--llm-api-key", default=None, help="judge=llm 时的 API key")
     p_run.add_argument("--llm-model", default=None, help="judge=llm 时的模型名")
@@ -105,14 +116,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--limit", type=int, default=None, help="冒烟模式：只评测（分片后的）前 N 道题，run_id 与 metadata 记录 limit")
     p_run.add_argument("--adapter-meta", default=None, help='适配器配置自由文本（"key=value;..."），原样记入 metadata["adapter_meta"]')
     p_run.add_argument(
-        "--snapshot-out",
-        default=None,
-        help="把每个对话 ingest 完成后的记忆状态导出到该目录（可选能力，需适配器实现 snapshot()）——之后改读取侧代码可用 --replay 免重跑 ingest",
+        "--snapshot",
+        action="store_true",
+        help="对每个对话导出记忆状态快照（可选能力，需适配器实现 snapshot()）——之后改读取侧代码可用 --replay 免重跑 ingest",
     )
     p_run.add_argument(
         "--replay",
         default=None,
-        help="快照根目录：跳过 reset+ingest，按对话恢复快照后只跑 query（写入侧固定，结论只覆盖读取/回答层）",
+        help="回放源（实验目录或 runs/<dataset> 数据集目录）：跳过 reset+ingest，按对话恢复快照后只跑 query（写入侧固定，结论只覆盖读取/回答层）",
     )
     p_run.add_argument(
         "--replay-mode",
@@ -123,7 +134,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--replay-verify-source",
         default=None,
-        help="回放时与源 run 逐题比对（答案/检索/判分），写进 metrics 与报告——回放误差地板",
+        help="回放时与源产物逐题比对（答案/检索/判分），写进 metrics 与报告——回放误差地板；"
+        "入参为实验目录或 runs/<dataset> 数据集目录",
     )
     p_run.add_argument(
         "--shards",
@@ -136,33 +148,33 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.set_defaults(func=_cmd_run)
 
     # --- compare ---
-    p_cmp = sub.add_parser("compare", help="对比两个 run（基线 vs 候选）并输出门禁结论")
-    p_cmp.add_argument("--baseline", required=True, help="基线 run 目录")
-    p_cmp.add_argument("--candidate", required=True, help="候选 run 目录")
+    p_cmp = sub.add_parser("compare", help="对比两个产物目录（基线 vs 候选）并输出门禁结论")
+    p_cmp.add_argument("--baseline", required=True, help="基线产物目录：实验目录或 runs/<dataset> 数据集目录")
+    p_cmp.add_argument("--candidate", required=True, help="候选产物目录：实验目录或 runs/<dataset> 数据集目录")
     p_cmp.add_argument("--acc-threshold", type=float, default=0.02, help="accuracy 允许最大下降（默认 0.02）")
     p_cmp.add_argument("--stale-threshold", type=float, default=0.02, help="stale_rate 允许最大上升（默认 0.02）")
     p_cmp.add_argument("--latency-warn", type=float, default=0.30, help="latency_p95 上升告警比例（默认 0.30）")
     p_cmp.add_argument("--require-comparable", action="store_true", help="strict 可比性：关键维度不一致或无法核验时门禁 FAIL")
-    p_cmp.add_argument("--tag", default=None, help="A/B 实验目录标签（缺省由两个 run_id 拼成 <a>_vs_<b>）")
-    p_cmp.add_argument("--report-out", default=None, help="实验目录父目录：产出 <DIR>/ab_<tag>_<ts>/（A/B 各自带 runs/ 副本 + compare_report.md）")
+    p_cmp.add_argument("--tag", default=None, help="对比实验目录名的 <name> 段（缺省 <基线 adapter>_vs_<候选 adapter>）")
+    p_cmp.add_argument("--report-out", default=None, help="实验目录父目录（缺省 output_root()）：产出 <DIR>/compare_<name>_<platform>_<ts>/，A/ 与 B/ 各为完整评测产物，报告落其 reports/")
     p_cmp.set_defaults(func=_cmd_compare)
 
     # --- fuse ---
-    p_fuse = sub.add_parser("fuse", help="融合同一评测的多个分片 run 为一个完整 run 目录")
-    p_fuse.add_argument("--runs", required=True, help="逗号分隔的分片 run 目录列表（需覆盖全部 shard_index）")
-    p_fuse.add_argument("--out", required=True, help="融合 run 输出目录")
+    p_fuse = sub.add_parser("fuse", help="融合同一评测的多个分片产物为一个完整实验目录")
+    p_fuse.add_argument("--runs", required=True, help="逗号分隔的分片产物目录列表（实验目录或 runs/<dataset> 数据集目录；需覆盖全部 shard_index）")
+    p_fuse.add_argument("--out", required=True, help="融合产物输出的完整实验目录：数据集产物落其 runs/<dataset>/，任务级报告落其 reports/")
     p_fuse.set_defaults(func=_cmd_fuse)
 
     # --- matrix ---
-    p_mtx = sub.add_parser("matrix", help="多 run 矩阵对比（platform × commit 维度）")
+    p_mtx = sub.add_parser("matrix", help="多产物目录矩阵对比（platform × commit 维度）")
     p_mtx.add_argument(
         "--runs",
         required=True,
         nargs="+",
-        help='带标签的 run 目录，形如 "platform@commit=runs/dir"（label 也接受任意字符串）',
+        help='带标签的产物目录，形如 "platform@commit=<实验目录或 runs/<dataset> 数据集目录>"（label 也接受任意字符串）',
     )
-    p_mtx.add_argument("--out", default=None, help="matrix 产物输出目录（缺省 matrix_<时间戳>/）")
-    p_mtx.add_argument("--report-out", default=None, help="实验目录父目录：产出 <DIR>/matrix_<ts>/（--out 优先于本参数）")
+    p_mtx.add_argument("--out", default=None, help="矩阵实验目录（完整实验目录）：报告落其 reports/，各 label 产物落其 runs/<label>/")
+    p_mtx.add_argument("--report-out", default=None, help="实验目录父目录（缺省 output_root()）：产出 <DIR>/matrix_<ts>/（--out 优先于本参数）")
     p_mtx.set_defaults(func=_cmd_matrix)
 
     # --- user-data ---
@@ -180,12 +192,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ev = sub.add_parser("evaluate", help="全量评估：多数据集依次评测 + 宏平均融合综合评分 + 办公域 stale 门禁")
     p_ev.add_argument("--adapter", default=None, help="适配器名（见 list-datasets 提示 / ADAPTERS 注册表）；--from-runs 全复用时可省略")
     p_ev.add_argument("--judge", default=None, choices=["heuristic", "llm", "client"], help="判分器（默认 heuristic；--from-runs 全复用/纯汇总时以已有 run 判分器为准）")
-    p_ev.add_argument("--platform", default=None, help="平台标签（如 wx / fs），记入 run_id 与元数据")
+    p_ev.add_argument("--platform", default=None, help="平台标签（如 wx / fs），记入元数据与实验目录名")
     p_ev.add_argument("--commit", default=None, help="commit 标签（如 a1b2c3），记入元数据")
-    p_ev.add_argument("--out", default=None, help="run 与 evaluate 报告输出父目录（默认 skill/output/runs/）")
     p_ev.add_argument("--driver-llm", default=None, help="驱动被测系统的 LLM 标识（如 gpt-4o），记入每个 run 的元数据")
     p_ev.add_argument("--adapter-version", default=None, help="适配器实现版本/commit，记入每个 run 的元数据")
-    p_ev.add_argument("--report-out", default=None, help="实验目录父目录：产出 <DIR>/eval_<adapter>_<platform>_<ts>/")
+    p_ev.add_argument("--report-out", default=None, help="实验目录父目录（缺省 output_root()）：产出 <DIR>/eval_<adapter>_<platform>_<ts>/，各数据集落其 runs/<dataset>/，任务级报告落其 reports/")
     ev_group = p_ev.add_mutually_exclusive_group()
     ev_group.add_argument("--quick", action="store_true", help="快速模式：跳过 BEAM 与 LongMemEval-S（等价 --no-beam --no-lme-s，分钟级回归）")
     ev_group.add_argument("--beam-10m", action="store_true", help="BEAM 槽位使用 beam_10m.jsonl（默认 beam_1m.jsonl）")
@@ -202,8 +213,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--from-runs",
         action="append",
         default=None,
-        metavar="KEY=RUN_DIR",
-        help="复用已有 run 汇总（可重复，KEY 为数据集 key、RUN_DIR 为 run 目录）；目标清单中缺失的数据集用 --adapter 补跑；与预设开关互斥",
+        metavar="KEY=DIR",
+        help="复用已有产物进行汇总（可重复，KEY 为数据集 key、DIR 为实验目录或 runs/<dataset> 数据集目录）；目标清单中缺失的数据集用 --adapter 补跑；与预设开关互斥",
     )
     p_ev.add_argument("--llm-base-url", default=None, help="judge=llm 时的 OpenAI 兼容 base_url")
     p_ev.add_argument("--llm-api-key", default=None, help="judge=llm 时的 API key")
@@ -223,7 +234,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- evaluate-compare ---
     p_ev_cmp = sub.add_parser(
         "evaluate-compare",
-        help="两组（baseline vs candidate）× 多数据集融合 A/B 对比；产出 ab_<tag>_<ts>/",
+        help="两组（baseline vs candidate）× 多数据集融合 A/B 对比；产出 compare_<name>_<platform>_<ts>/",
     )
     p_ev_cmp.add_argument("--baseline-adapter", default=None, help="基线适配器名；该侧全复用时可省略")
     p_ev_cmp.add_argument("--candidate-adapter", default=None, help="候选适配器名；该侧全复用时可省略")
@@ -231,20 +242,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--baseline-run",
         action="append",
         default=None,
-        metavar="KEY=RUN_DIR",
-        help="复用已有的基线 run（可重复，KEY 为数据集 key）；缺失数据集用 --baseline-adapter 补跑",
+        metavar="KEY=DIR",
+        help="复用已有的基线产物（可重复，KEY 为数据集 key、DIR 为实验目录或 runs/<dataset> 数据集目录）；缺失数据集用 --baseline-adapter 补跑",
     )
     p_ev_cmp.add_argument(
         "--candidate-run",
         action="append",
         default=None,
-        metavar="KEY=RUN_DIR",
-        help="复用已有的候选 run（可重复，KEY 为数据集 key）；缺失数据集用 --candidate-adapter 补跑",
+        metavar="KEY=DIR",
+        help="复用已有的候选产物（可重复，KEY 为数据集 key、DIR 为实验目录或 runs/<dataset> 数据集目录）；缺失数据集用 --candidate-adapter 补跑",
     )
-    p_ev_cmp.add_argument("--judge", default=None, choices=["heuristic", "llm", "client"], help="判分器（默认 heuristic；两侧全复用时以已有 run 判分器为准）")
-    p_ev_cmp.add_argument("--platform", default=None, help="平台标签（如 wx / fs），记入两侧 run 元数据")
-    p_ev_cmp.add_argument("--commit", default=None, help="commit 标签，记入两侧 run 元数据")
-    p_ev_cmp.add_argument("--out", default=None, help="run 输出父目录（默认 paths.runs_dir()）")
+    p_ev_cmp.add_argument("--judge", default=None, choices=["heuristic", "llm", "client"], help="判分器（默认 heuristic；两侧全复用时以已有产物判分器为准）")
+    p_ev_cmp.add_argument("--platform", default=None, help="平台标签（如 wx / fs），记入两侧产物元数据与实验目录名")
+    p_ev_cmp.add_argument("--commit", default=None, help="commit 标签，记入两侧产物元数据")
     p_ev_cmp.add_argument("--driver-llm-a", default=None, help="基线侧的 driver LLM 标识")
     p_ev_cmp.add_argument("--driver-llm-b", default=None, help="候选侧的 driver LLM 标识")
     p_ev_cmp.add_argument("--adapter-version-a", default=None, help="基线侧 adapter 版本/commit")
@@ -252,8 +262,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ev_cmp.add_argument("--acc-threshold", type=float, default=0.02, help="accuracy 允许最大下降（融合维度，默认 0.02）")
     p_ev_cmp.add_argument("--stale-threshold", type=float, default=0.02, help="stale_rate 允许最大上升（融合维度，默认 0.02）")
     p_ev_cmp.add_argument("--latency-warn", type=float, default=0.30, help="latency_p95 相对上升告警比例（融合维度，默认 0.30）")
-    p_ev_cmp.add_argument("--tag", default=None, help="A/B 实验目录标签（缺省由两个 adapter 名拼成）")
-    p_ev_cmp.add_argument("--report-out", default=None, help="实验目录父目录：产出 <DIR>/ab_<tag>_<ts>/")
+    p_ev_cmp.add_argument("--tag", default=None, help="对比实验目录名的 <name> 段（缺省 <基线 adapter>_vs_<候选 adapter>）")
+    p_ev_cmp.add_argument("--report-out", default=None, help="实验目录父目录（缺省 output_root()）：产出 <DIR>/compare_<name>_<platform>_<ts>/，A/ 与 B/ 各为完整评测产物，报告落其 reports/")
     ev_cmp_group = p_ev_cmp.add_mutually_exclusive_group()
     ev_cmp_group.add_argument("--quick", action="store_true", help="快速模式：跳过 BEAM 与 LongMemEval-S（等价 --no-beam --no-lme-s）")
     ev_cmp_group.add_argument("--beam-10m", action="store_true", help="BEAM 槽位使用 beam_10m.jsonl")
@@ -399,39 +409,42 @@ def _cmd_run(args: argparse.Namespace) -> int:
     evidence_matcher = _make_evidence_matcher(args)
     dataset_path, dataset_source = resolve_dataset(args.dataset)
     print(f"[membench] 测试集: {dataset_path} (来源: {dataset_source})")
-    runner = Runner(
-        adapter,
-        dataset_path,
-        judge=judge,
-        out_dir=args.out,
-        platform=args.platform,
-        commit=args.commit,
-        dataset_source=dataset_source,
-        jobs=args.jobs,
-        limit=args.limit,
-        shards=args.shards,
-        shard_index=args.shard_index,
-        shard_by=args.shard_by,
-        adapter_meta=args.adapter_meta,
-        driver_llm=args.driver_llm,
-        adapter_version=args.adapter_version,
-        report_out=args.report_out,
-        evidence_matcher=evidence_matcher,
-        snapshot_out=args.snapshot_out,
-        replay=args.replay,
-        replay_mode=args.replay_mode,
-        replay_verify_source=args.replay_verify_source,
+    adapter_name = str(getattr(adapter, "name", adapter.__class__.__name__))
+    experiment_dir = layout.experiment_path(
+        args.report_out, layout.eval_subdir(adapter_name, args.platform, layout.ts_now())
     )
+    print(f"[membench] 实验目录: {experiment_dir}")
     try:
-        run_dir = runner.run()
+        runner = Runner(
+            adapter,
+            dataset_path,
+            judge=judge,
+            out_dir=experiment_dir,
+            platform=args.platform,
+            commit=args.commit,
+            dataset_source=dataset_source,
+            jobs=args.jobs,
+            limit=args.limit,
+            shards=args.shards,
+            shard_index=args.shard_index,
+            shard_by=args.shard_by,
+            adapter_meta=args.adapter_meta,
+            driver_llm=args.driver_llm,
+            adapter_version=args.adapter_version,
+            evidence_matcher=evidence_matcher,
+            snapshot=args.snapshot,
+            replay=args.replay,
+            replay_mode=args.replay_mode,
+            replay_verify_source=args.replay_verify_source,
+        )
+        dataset_dir = runner.run()
     except ValueError as exc:
-        # 数据集相关参数错误（schema 校验失败等）→ 友好退出
+        # 参数错误（数据集 schema 校验失败、--snapshot 与 --replay 互斥等）→ 友好退出
         raise SystemExit(f"[membench] 参数错误: {exc}")
-    if run_dir is None:
+    if dataset_dir is None:
         # 分片无事可做（索引越界 / 空数据集）：runner 已打印说明，干净退出
         return 0
-    # report_out 时 Runner 已自建 <DIR>/eval_<adapter>_<platform>_<ts>/ 并复制 run 副本
-    print(f"[membench] 完成: {run_dir}")
+    print(f"[membench] 完成: {dataset_dir}")
     return 0
 
 
@@ -444,7 +457,7 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         latency_warn=args.latency_warn,
         require_comparable=args.require_comparable,
         out_dir=args.report_out,
-        tag=args.tag,
+        name=args.tag,
     )
     # compare_runs 已打印 verdict / 逐门禁 / 不可比原因 / 报告路径；此处补实验目录便于脚本消费
     print(f"[membench] verdict: {result['verdict']}")
@@ -454,16 +467,17 @@ def _cmd_compare(args: argparse.Namespace) -> int:
 
 
 def _cmd_fuse(args: argparse.Namespace) -> int:
-    """fuse：融合多个分片 run；stale 门禁 FAIL 时以非零码退出。"""
+    """fuse：融合多个分片产物；stale 门禁 FAIL 时以非零码退出。"""
     from membench.fuse import fuse_runs
 
     run_dirs = [d.strip() for d in args.runs.split(",") if d.strip()]
     try:
         result = fuse_runs(run_dirs, args.out)
-    except (ValueError, FileNotFoundError) as exc:
+    except ValueError as exc:
         raise SystemExit(f"[membench] {exc}")
     gate = result["gate"]
     print(f"[membench] 融合完成: {result['n_questions']} 题 -> {result['out_dir']}")
+    print(f"[membench] 数据集产物: {result['dataset_dir']}")
     print(f"[membench] stale 门禁: {gate['status']} — {gate['detail']}")
     return 1 if gate["status"] == "FAIL" else 0
 
@@ -472,19 +486,14 @@ def _cmd_matrix(args: argparse.Namespace) -> int:
     labeled_runs: list[tuple[str, str]] = []
     for spec in args.runs:
         if "=" not in spec:
-            raise SystemExit(f"--runs 项缺少 '=' 分隔符: {spec}（形如 label=runs/dir）")
+            raise SystemExit(f"--runs 项缺少 '=' 分隔符: {spec}（形如 label=<产物目录>）")
         label, _, run_dir = spec.partition("=")
         if not label or not run_dir:
-            raise SystemExit(f"--runs 项格式非法: {spec}（形如 label=runs/dir）")
+            raise SystemExit(f"--runs 项格式非法: {spec}（形如 label=<产物目录>）")
         labeled_runs.append((label, run_dir))
 
-    if args.out:
-        out_dir = args.out
-    elif args.report_out:
-        # report_out 语义统一为实验目录父目录
-        out_dir = layout.experiment_path(args.report_out, layout.matrix_subdir())
-    else:
-        out_dir = layout.experiment_path(paths.output_root(), layout.matrix_subdir())
+    # --out 优先；否则按 --report-out（缺省 output_root()）建 matrix_<ts>/
+    out_dir = args.out or layout.experiment_path(args.report_out, layout.matrix_subdir())
     result = compare_matrix(labeled_runs, out_dir)
     worst = "PASS"
     for pair in result["pairwise"]:
@@ -493,6 +502,7 @@ def _cmd_matrix(args: argparse.Namespace) -> int:
         elif pair["verdict"] == "WARN" and worst != "FAIL":
             worst = "WARN"
     print(f"[membench] matrix verdict: {worst}")
+    print(f"[membench] 实验目录: {result['out_dir']}")
     print(f"[membench] report: {result['report_path']}")
     return 0
 
@@ -625,7 +635,6 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
     return evaluate(
         adapter,
         judge,
-        out_dir=args.out,
         platform=args.platform,
         commit=args.commit,
         quick=args.quick,
@@ -680,7 +689,6 @@ def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
         baseline_adapter,
         candidate_adapter,
         judge,
-        out_dir=args.out,
         platform=args.platform,
         commit=args.commit,
         quick=args.quick,

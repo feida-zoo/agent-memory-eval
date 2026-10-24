@@ -1,4 +1,9 @@
-"""状态快照与回放测试：导出 → 回放 → 保真校验 → 拒绝与可比性。"""
+"""状态快照与回放测试：导出 → 回放 → 保真校验 → 拒绝与可比性。
+
+产物结构见 :mod:`membench.layout`：``Runner`` 的 ``out_dir`` 是**实验目录**，
+``run()`` 返回数据集目录 ``<实验目录>/runs/<dataset>``，指标与逐题明细都在它的
+``report/`` 下；快照清单**每个对话一份**，落 ``<对话目录>/memory_snapshot/manifest.json``。
+"""
 
 from __future__ import annotations
 
@@ -8,11 +13,23 @@ from pathlib import Path
 
 import pytest
 
+from membench import layout
+from membench import snapshot as snapshot_mod
 from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
 from membench.compare import check_comparability
 from membench.data.schema import dataset_fingerprint
 from membench.runner import Runner
-from membench import snapshot as snapshot_mod
+
+#: 测试数据集文件名 stem —— 即实验目录下数据集目录的名字。
+DATASET = "ds"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_output_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """默认产物根指向 tmp_path：任何走 output_root() 的路径都不落进仓库。"""
+    root = tmp_path / "output-root"
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(root))
+    return root
 
 
 class _FileMemoryAdapter(BaseMemoryAdapter):
@@ -116,89 +133,171 @@ def _dataset(path: Path, marker: str = "") -> Path:
                 ],
             }
         )
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8"
     )
     return path
 
 
-def _full_run(tmp_path: Path, **kwargs) -> str:
+def _dataset_dir_of(experiment: Path) -> Path:
+    """按 layout 契约定位实验目录下的数据集产物目录。"""
+    return Path(layout.resolve_dataset_dir(str(experiment)))
+
+
+def _report_file(dataset_dir: Path, filename: str) -> Path:
+    return Path(dataset_dir) / layout.DIR_REPORT / filename
+
+
+def _metrics(dataset_dir: Path) -> dict:
+    return json.loads(
+        _report_file(dataset_dir, layout.FILE_METRICS).read_text(encoding="utf-8")
+    )
+
+
+def _snapshot_dir(experiment: Path, dialogue_id: str) -> Path:
+    return Path(layout.dialogue_snapshot_dir(str(experiment), DATASET, dialogue_id))
+
+
+def _manifest(experiment: Path, dialogue_id: str) -> dict:
+    path = _snapshot_dir(experiment, dialogue_id) / snapshot_mod.MANIFEST_NAME
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _full_run(tmp_path: Path, *, name: str = "src", **kwargs) -> Path:
+    """全量 run（2 个对话 × 1 题），返回数据集目录。"""
     ds = _dataset(tmp_path / "ds.jsonl")
-    return Runner(
-        _FileMemoryAdapter(tmp_path / "mem"),
+    out = Runner(
+        _FileMemoryAdapter(tmp_path / f"mem-{name}"),
         str(ds),
         judge="heuristic",
-        out_dir=str(tmp_path / "runs"),
+        out_dir=str(tmp_path / name),
         **kwargs,
     ).run()
+    assert out is not None
+    return Path(out)
 
 
-def test_snapshot_export_writes_manifest_and_state(tmp_path: Path) -> None:
-    """全量 run + --snapshot-out：清单落账（complete/指纹/每对话哈希）与指标元数据。"""
-    snap_root = tmp_path / "snap"
-    run_dir = _full_run(tmp_path, snapshot_out=str(snap_root))
-    manifest = json.loads((snap_root / snapshot_mod.MANIFEST_NAME).read_text(encoding="utf-8"))
-    assert manifest["complete"] is True
-    assert set(manifest["dialogues"]) == {"d1", "d2"}
-    assert manifest["dataset_fingerprint"]["sha256"] == dataset_fingerprint(
-        str(tmp_path / "ds.jsonl")
-    )["sha256"]
-    for entry in manifest["dialogues"].values():
+def _replay_run(
+    tmp_path: Path,
+    *,
+    name: str,
+    replay: Path,
+    adapter: BaseMemoryAdapter | None = None,
+    verify_source: Path | None = None,
+) -> Path:
+    """回放 run（新进程空目录：状态只能来自快照），返回数据集目录。"""
+    out = Runner(
+        adapter or _FileMemoryAdapter(tmp_path / f"mem-{name}"),
+        str(tmp_path / "ds.jsonl"),
+        judge="heuristic",
+        out_dir=str(tmp_path / name),
+        replay=str(replay),
+        replay_verify_source=str(verify_source) if verify_source else None,
+    ).run()
+    assert out is not None
+    return Path(out)
+
+
+def test_snapshot_writes_per_dialogue_manifest_and_state(tmp_path: Path) -> None:
+    """全量 run + snapshot=True：逐对话清单落账（complete / 指纹 / 条目哈希）与指标元数据。"""
+    exp = tmp_path / "src"
+    dataset_dir = _full_run(tmp_path, name="src", snapshot=True)
+    fingerprint = dataset_fingerprint(str(tmp_path / "ds.jsonl"))["sha256"]
+    # 实验目录入参经 layout 归一后就是 run() 返回的数据集目录（读取方唯一入口）
+    assert _dataset_dir_of(exp) == dataset_dir
+
+    for dialogue_id in ("d1", "d2"):
+        manifest = _manifest(exp, dialogue_id)
+        assert manifest["complete"] is True
+        assert manifest["dialogue_id"] == dialogue_id
+        assert manifest["dataset"] == DATASET
+        assert manifest["dataset_fingerprint"]["sha256"] == fingerprint
+        assert manifest["capabilities"]["format_version"] == 1
+        # 清单自包含：一份清单只登记自己这一段，不携带其它对话的条目
+        assert "dialogues" not in manifest
+        entry = manifest["entry"]
+        assert entry["dir"] == entry["tag"] == dialogue_id
         assert len(entry["sha256"]) == 64 and entry["bytes"] > 0
         assert entry["ingest_payload_sha256"]
-    metrics = json.loads((Path(run_dir) / "metrics.json").read_text(encoding="utf-8"))
+        assert (entry["n_sessions"], entry["n_messages"], entry["n_questions"]) == (1, 1, 1)
+        # 清单落在它登记的那一层目录里（位置与内容互为凭证）
+        assert _snapshot_dir(exp, dialogue_id).parent.name == entry["dir"]
+
+    metrics = _metrics(dataset_dir)
     assert metrics["run_mode"] == "full"
     assert metrics["state_snapshot"]["role"] == "exported"
     assert metrics["state_snapshot"]["n_dialogues"] == 2
+    assert metrics["state_snapshot"]["root"] == str(dataset_dir)
+    assert metrics["state_snapshot"]["manifest_sha256"] == snapshot_mod.manifests_digest(
+        {d: str(_snapshot_dir(exp, d)) for d in ("d1", "d2")}
+    )
     assert "token_usage" in metrics  # 全量 run 照常记账
+
+    # 对话级 metrics 只登记该对话那一份清单（合并指纹随范围收窄）
+    d1_metrics = json.loads(
+        (
+            Path(layout.dialogue_report_dir(str(exp), DATASET, "d1"))
+            / layout.FILE_METRICS
+        ).read_text(encoding="utf-8")
+    )
+    assert d1_metrics["state_snapshot"]["role"] == "exported"
+    assert d1_metrics["state_snapshot"]["n_dialogues"] == 1
+    assert d1_metrics["state_snapshot"]["manifest_sha256"] == snapshot_mod.manifests_digest(
+        {"d1": str(_snapshot_dir(exp, "d1"))}
+    )
 
 
 def test_replay_same_code_is_faithful(tmp_path: Path) -> None:
     """未改动系统时回放应与源 run 逐题一致；[必跑] ingest 被跳过、口径已标注。"""
-    snap_root = tmp_path / "snap"
-    source_run = _full_run(tmp_path, snapshot_out=str(snap_root))
-
-    replay_run = Runner(
-        _FileMemoryAdapter(tmp_path / "mem2"),  # 新进程/空目录：状态只能来自快照
-        str(tmp_path / "ds.jsonl"),
-        judge="heuristic",
-        out_dir=str(tmp_path / "runs2"),
-        replay=str(snap_root),
-        replay_verify_source=source_run,
-    ).run()
-    metrics = json.loads((Path(replay_run) / "metrics.json").read_text(encoding="utf-8"))
+    exp = tmp_path / "src"
+    source_dataset = _full_run(tmp_path, name="src", snapshot=True)
+    # --replay 传实验目录：自动定位到其中的数据集目录
+    replay_dataset = _replay_run(
+        tmp_path, name="replay", replay=exp, verify_source=source_dataset
+    )
+    metrics = _metrics(replay_dataset)
     assert metrics["run_mode"] == "replay-restore"
     assert metrics["state_snapshot"]["role"] == "replayed"
-    assert metrics["state_snapshot"]["source_run"] == json.loads(
-        (Path(source_run) / "metrics.json").read_text(encoding="utf-8")
-    )["run_id"]
+    assert metrics["state_snapshot"]["root"] == str(source_dataset)
+    assert metrics["state_snapshot"]["source_run"] == _metrics(source_dataset)["run_id"]
+    assert metrics["state_snapshot"]["n_dialogues"] == 2
     assert metrics["token_usage"]["ingest_input_tokens"] == 0
+    assert metrics["token_usage"]["ingest_llm_calls"] == 0
     assert metrics["token_usage"]["ingest_skipped"] == 1
     assert metrics["replay_verify"]["n_answer_diff"] == 0
     assert metrics["replay_verify"]["n_retrieved_diff"] == 0
     assert metrics["replay_verify"]["answer_match_rate"] == 1.0
 
-    md = (Path(replay_run) / "report.md").read_text(encoding="utf-8")
+    md = _report_file(replay_dataset, layout.FILE_REPORT_MD).read_text(encoding="utf-8")
     assert "快照回放（写入侧固定）" in md
     assert "回放保真校验" in md
     assert "ingest 被跳过" in md
 
+    # 逐对话产物同样标注回放口径，不留只按全量读的半成品
+    d1_metrics = json.loads(
+        (
+            Path(layout.dialogue_report_dir(str(tmp_path / "replay"), DATASET, "d1"))
+            / layout.FILE_METRICS
+        ).read_text(encoding="utf-8")
+    )
+    assert d1_metrics["state_snapshot"]["role"] == "replayed"
+    assert d1_metrics["state_snapshot"]["n_dialogues"] == 1
+    assert d1_metrics["token_usage"]["ingest_skipped"] == 1
+
 
 def test_replay_detects_read_side_change(tmp_path: Path) -> None:
     """回放能测出读取侧改动：改答案后保真校验报不一致（A/B 用法的地基）。"""
-    snap_root = tmp_path / "snap"
-    source_run = _full_run(tmp_path, snapshot_out=str(snap_root))
-    replay_run = Runner(
-        _FileMemoryAdapter(tmp_path / "mem2", answer_suffix="（改版）"),
-        str(tmp_path / "ds.jsonl"),
-        judge="heuristic",
-        out_dir=str(tmp_path / "runs2"),
-        replay=str(snap_root),
-        replay_verify_source=source_run,
-    ).run()
-    verify = json.loads((Path(replay_run) / "metrics.json").read_text(encoding="utf-8"))[
-        "replay_verify"
-    ]
+    source_dataset = _full_run(tmp_path, name="src", snapshot=True)
+    # --replay 传数据集目录：直接可用
+    replay_dataset = _replay_run(
+        tmp_path,
+        name="replay",
+        replay=source_dataset,
+        adapter=_FileMemoryAdapter(tmp_path / "mem-replay", answer_suffix="（改版）"),
+        verify_source=source_dataset,
+    )
+    verify = _metrics(replay_dataset)["replay_verify"]
     assert verify["n_answer_diff"] == verify["n_common"] == 2
     assert verify["answer_match_rate"] == 0.0
 
@@ -209,85 +308,142 @@ class _NoSnapshotAdapter(_FileMemoryAdapter):
 
 
 def test_replay_refuses_without_snapshot_support(tmp_path: Path) -> None:
-    snap_root = tmp_path / "snap"
-    _full_run(tmp_path, snapshot_out=str(snap_root))
+    source_dataset = _full_run(tmp_path, name="src", snapshot=True)
     with pytest.raises(SystemExit, match="未声明快照能力"):
         Runner(
-            _NoSnapshotAdapter(tmp_path / "mem2"),
+            _NoSnapshotAdapter(tmp_path / "mem-replay"),
             str(tmp_path / "ds.jsonl"),
             judge="heuristic",
-            out_dir=str(tmp_path / "runs2"),
-            replay=str(snap_root),
+            out_dir=str(tmp_path / "replay"),
+            replay=str(source_dataset),
         ).run()
+    # 跑前拒绝：不为被拒的回放建实验目录
+    assert not (tmp_path / "replay").exists()
 
 
-def test_snapshot_out_refuses_without_capability(tmp_path: Path) -> None:
+def test_snapshot_refuses_without_capability(tmp_path: Path) -> None:
     _dataset(tmp_path / "ds.jsonl")
-    with pytest.raises(SystemExit, match="无法 --snapshot-out"):
+    with pytest.raises(SystemExit, match="无法 --snapshot"):
         Runner(
             _NoSnapshotAdapter(tmp_path / "mem"),
             str(tmp_path / "ds.jsonl"),
             judge="heuristic",
-            out_dir=str(tmp_path / "runs"),
-            snapshot_out=str(tmp_path / "snap"),
+            out_dir=str(tmp_path / "exp"),
+            snapshot=True,
         ).run()
+    assert not (tmp_path / "exp").exists()
 
 
-def test_replay_refuses_on_dataset_fingerprint_mismatch(tmp_path: Path) -> None:
-    snap_root = tmp_path / "snap"
-    _full_run(tmp_path, snapshot_out=str(snap_root))
-    other = _dataset(tmp_path / "other.jsonl", marker="（另一份数据集）")
+def test_replay_refuses_on_other_dataset_or_changed_content(tmp_path: Path) -> None:
+    """回放源的两种"不是同一份数据集"：数据集名不同（另一份数据集）与同名但内容漂移（指纹不符）。"""
+    source_dataset = _full_run(tmp_path, name="src", snapshot=True)
+
+    # 同名（都叫 ds）但内容改过 -> 指纹不一致
+    drifted = _dataset(tmp_path / "drifted" / "ds.jsonl", marker="（另一份数据集）")
     with pytest.raises(SystemExit, match="数据集指纹与快照不一致"):
         Runner(
-            _FileMemoryAdapter(tmp_path / "mem2"),
+            _FileMemoryAdapter(tmp_path / "mem-drifted"),
+            str(drifted),
+            judge="heuristic",
+            out_dir=str(tmp_path / "replay-drifted"),
+            replay=str(source_dataset),
+        ).run()
+
+    # 另一份数据集（文件名不同）-> 清单身份校验先拦下
+    other = _dataset(tmp_path / "other.jsonl", marker="（另一份数据集）")
+    with pytest.raises(SystemExit, match="快照来自另一个数据集"):
+        Runner(
+            _FileMemoryAdapter(tmp_path / "mem-other"),
             str(other),
             judge="heuristic",
-            out_dir=str(tmp_path / "runs2"),
-            replay=str(snap_root),
+            out_dir=str(tmp_path / "replay-other"),
+            replay=str(source_dataset),
         ).run()
+    assert not (tmp_path / "replay-drifted").exists()
+    assert not (tmp_path / "replay-other").exists()
 
 
 def test_replay_refuses_when_dialogue_missing(tmp_path: Path) -> None:
     """快照只覆盖一个对话（limit 冒烟导出）→ 全量回放被拒绝。"""
-    snap_root = tmp_path / "snap"
-    _full_run(tmp_path, snapshot_out=str(snap_root), limit=1)
-    with pytest.raises(SystemExit, match="快照缺少本 run 需要的对话"):
+    exp = tmp_path / "src"
+    source_dataset = _full_run(tmp_path, name="src", snapshot=True, limit=1)
+    # limit=1 只跑了 d1：d2 连快照目录都没有
+    assert (_snapshot_dir(exp, "d1") / snapshot_mod.MANIFEST_NAME).is_file()
+    assert not _snapshot_dir(exp, "d2").exists()
+    with pytest.raises(SystemExit, match="快照缺少本 run 需要的对话") as excinfo:
         Runner(
-            _FileMemoryAdapter(tmp_path / "mem2"),
+            _FileMemoryAdapter(tmp_path / "mem-replay"),
             str(tmp_path / "ds.jsonl"),
             judge="heuristic",
-            out_dir=str(tmp_path / "runs2"),
-            replay=str(snap_root),
+            out_dir=str(tmp_path / "replay"),
+            replay=str(source_dataset),
         ).run()
+    assert "d2" in str(excinfo.value)  # 报错点名缺哪个对话
+    assert not (tmp_path / "replay").exists()
+
+
+def test_replay_refuses_on_incomplete_or_moved_manifest(tmp_path: Path) -> None:
+    """逐对话清单本身是回放门槛：导出被中断（complete=false）或目录被搬动（entry.dir 不符）都拒绝。"""
+    exp = tmp_path / "src"
+    source_dataset = _full_run(tmp_path, name="src", snapshot=True)
+
+    manifest_path = _snapshot_dir(exp, "d1") / snapshot_mod.MANIFEST_NAME
+    original = manifest_path.read_text(encoding="utf-8")
+    moved = json.loads(original)
+    moved["entry"]["dir"] = "moved-elsewhere"
+    manifest_path.write_text(json.dumps(moved, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(SystemExit, match="对话目录与所在位置不一致"):
+        Runner(
+            _FileMemoryAdapter(tmp_path / "mem-moved"),
+            str(tmp_path / "ds.jsonl"),
+            judge="heuristic",
+            out_dir=str(tmp_path / "replay-moved"),
+            replay=str(source_dataset),
+        ).run()
+    manifest_path.write_text(original, encoding="utf-8")
+
+    incomplete_path = _snapshot_dir(exp, "d2") / snapshot_mod.MANIFEST_NAME
+    incomplete = json.loads(incomplete_path.read_text(encoding="utf-8"))
+    incomplete["complete"] = False
+    incomplete_path.write_text(json.dumps(incomplete, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(SystemExit, match="未完成"):
+        Runner(
+            _FileMemoryAdapter(tmp_path / "mem-incomplete"),
+            str(tmp_path / "ds.jsonl"),
+            judge="heuristic",
+            out_dir=str(tmp_path / "replay-incomplete"),
+            replay=str(source_dataset),
+        ).run()
+    assert not (tmp_path / "replay-moved").exists()
+    assert not (tmp_path / "replay-incomplete").exists()
 
 
 def test_replay_incompatible_format_needs_rebuild(tmp_path: Path) -> None:
     """格式不兼容且未声明 rebuild → 拒绝（提示必须重 ingest）。"""
-    snap_root = tmp_path / "snap"
-    _full_run(tmp_path, snapshot_out=str(snap_root))
+    source_dataset = _full_run(tmp_path, name="src", snapshot=True)
     with pytest.raises(SystemExit, match="该改动必须重新 ingest"):
         Runner(
-            _FileMemoryAdapter(tmp_path / "mem2", format_version=2),
+            _FileMemoryAdapter(tmp_path / "mem-replay", format_version=2),
             str(tmp_path / "ds.jsonl"),
             judge="heuristic",
-            out_dir=str(tmp_path / "runs2"),
-            replay=str(snap_root),
+            out_dir=str(tmp_path / "replay"),
+            replay=str(source_dataset),
         ).run()
 
 
 def test_replay_incompatible_format_with_rebuild(tmp_path: Path) -> None:
     """声明了 rebuild → 自动走 replay-rebuild（派生/结构变更的通道）。"""
-    snap_root = tmp_path / "snap"
-    source_run = _full_run(tmp_path, snapshot_out=str(snap_root))
-    replay_run = Runner(
-        _FileMemoryAdapter(tmp_path / "mem2", format_version=2, support_rebuild=True),
-        str(tmp_path / "ds.jsonl"),
-        judge="heuristic",
-        out_dir=str(tmp_path / "runs2"),
-        replay=str(snap_root),
-        replay_verify_source=source_run,
-    ).run()
-    metrics = json.loads((Path(replay_run) / "metrics.json").read_text(encoding="utf-8"))
+    source_dataset = _full_run(tmp_path, name="src", snapshot=True)
+    replay_dataset = _replay_run(
+        tmp_path,
+        name="replay",
+        replay=source_dataset,
+        adapter=_FileMemoryAdapter(
+            tmp_path / "mem-replay", format_version=2, support_rebuild=True
+        ),
+        verify_source=source_dataset,
+    )
+    metrics = _metrics(replay_dataset)
     assert metrics["run_mode"] == "replay-rebuild"
     assert metrics["state_snapshot"]["replay_mode"] == "rebuild"
     assert metrics["replay_verify"]["n_answer_diff"] == 0
@@ -295,17 +451,11 @@ def test_replay_incompatible_format_with_rebuild(tmp_path: Path) -> None:
 
 def test_run_mode_is_critical_for_comparability(tmp_path: Path) -> None:
     """回放 run 与全量 run 不可比；旧 run 缺 run_mode 按 full 归一（不误伤历史）。"""
-    snap_root = tmp_path / "snap"
-    full_run = _full_run(tmp_path, snapshot_out=str(snap_root))
-    replay_run = Runner(
-        _FileMemoryAdapter(tmp_path / "mem2"),
-        str(tmp_path / "ds.jsonl"),
-        judge="heuristic",
-        out_dir=str(tmp_path / "runs2"),
-        replay=str(snap_root),
-    ).run()
-    full = json.loads((Path(full_run) / "metrics.json").read_text(encoding="utf-8"))
-    replay = json.loads((Path(replay_run) / "metrics.json").read_text(encoding="utf-8"))
+    exp = tmp_path / "src"
+    full_dataset = _full_run(tmp_path, name="src", snapshot=True)
+    replay_dataset = _replay_run(tmp_path, name="replay", replay=exp)
+    full = _metrics(full_dataset)
+    replay = _metrics(replay_dataset)
     comp = check_comparability(full, replay)
     dims = {c["dimension"]: c for c in comp["checks"]}
     assert dims["run_mode"]["same"] is False

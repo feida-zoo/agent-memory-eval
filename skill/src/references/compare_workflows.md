@@ -20,7 +20,7 @@
 - `run` 用 `--driver-llm` / `--adapter-version` 显式落账这些字段。
 - `compare --require-comparable` 做**前置校验**（strict）：任一关键维度**不一致**或**无法核验**（元数据缺失）→ 可比性门禁 **FAIL**，整体 verdict=FAIL、退出码 1（即拒绝当 A/B 用）；报告含「可比性前置校验」小节与「不可比原因」清单。
 - 不加 `--require-comparable` 时：关键维度不一致 → 可比性门禁 WARN（verdict 至少 WARN，不会静默 PASS）；关键维度无法核验 → 只在 CLI 输出与报告里提示，不影响 verdict。
-- `compare --tag <标签>` 给本次对比命名，决定产物目录 `ab_<tag>_<ts>/`。
+- `compare --tag <标签>` 给本次对比命名，决定产物目录 `compare_<name>_<platform>_<ts>/` 的 `<name>` 段（缺省 `<基线 adapter>_vs_<候选 adapter>`；`<platform>` 取两臂一致的 platform，不一致则 `p1-p2`、缺省 `default`）。
 
 **不可比时的表现**：报告开头给出"不可比原因"清单（如 `dataset_fingerprint.sha256 不同`、`driver_llm 不同：gpt-4o vs claude-...`），并明确拒绝当 A/B 使用；此时应回到"同尺比较"——固定模型、判分器与数据集后重跑。
 
@@ -48,8 +48,10 @@ PYTHONPATH=/tmp/agent_new:<membench路径> python -m membench.cli run \
   --adapter <adapter模块路径> --commit <SHA_B> --judge llm \
   --driver-llm <驱动模型> --adapter-version <版本> --report-out output/
 
-# 4) 对比（baseline=旧 commit；先做可比性前置校验）
-python -m membench.cli compare --baseline runs/<runA> --candidate runs/<runB> \
+# 4) 对比（baseline=旧 commit；产物落 <report-out>/compare_<name>_<platform>_<ts>/）
+python -m membench.cli compare \
+  --baseline <旧 commit 的实验目录或 runs/<dataset> 数据集目录> \
+  --candidate <新 commit 的实验目录或 runs/<dataset> 数据集目录> \
   --require-comparable --tag <标签> --report-out output/
 
 # 5) 清理
@@ -59,24 +61,39 @@ git -C $AGENT_REPO worktree remove /tmp/agent_new
 
 门禁规则（默认，CLI 可调）：accuracy 降 >0.02 → FAIL；stale_rate 升 >0.02 → FAIL；p95 延迟升 >30% → WARN。
 
-**产物目录（本波落地）**：
+**产物目录（一次实验一个自包含子目录）**：
 
 ```
-<report-out>/ab_<tag>_<ts>/
-├── A/{report.md, metrics.json, fig_*.png, runs/<run_id>/}   # 基线（旧 commit）
-├── B/{report.md, metrics.json, fig_*.png, runs/<run_id>/}   # 候选（新 commit）
-├── compare_report.md / fig_metric_diff.png                   # 对比报告与逐指标 diff 图
-└── optimization_report.md（可选，优化闭环写入）
+<report-out>/eval_<adapter>_<platform>_<ts>/
+├── runs/<dataset>/
+│   ├── report/{report.md, metrics.json, results.jsonl, fig_*.png}   # 数据集级聚合
+│   └── <对话目录>/{runtime/, memory_snapshot/, report/}              # 对话级；report/ 不出图
+└── reports/                                                          # 任务级（单数据集 = 数据集级内容）
+<report-out>/compare_<name>_<platform>_<ts>/
+├── A/  B/                                    # 各一个完整 eval 实验形态（基线 / 候选）
+└── reports/{comparison.md, fig_metric_diff.png, fig_category_diff.png}
+<report-out>/matrix_<ts>/
+├── reports/{report.md, matrix_result.json, fig_matrix_accuracy.png}
+└── runs/<label>/                             # 各 label 的数据集树副本，内部同 runs/<dataset>/
 ```
+
+- `<ts>` = `YYYYMMDD-HHMMSS`；`<platform>` 缺省 `default`，两臂平台不同时 compare 目录用 `p1-p2`。
+- `runtime/` 每个对话都建（接入侧的运行时数据，如桥的 reset 前备份落 `runtime/reset_backup/`）；
+  `memory_snapshot/` 只在 `run --snapshot` 时落（含 `manifest.json`）；对话目录名 = 对话 id
+  归一化（非法字符换 `_`，无 id 时 `dialogue`）。
+- A/B 副本是源实验目录或数据集目录的整理结果：源是实验目录时整树复制并保留其内部相对位置；
+  源是数据集目录时在 `A/runs/<dataset>/` 下重建，缺任务级 `reports/` 时由 compare 从数据集级报告补齐。
 
 ## 工作流 5：平台对比
 
 同一 commit 下，仅切换平台（adapter 构造参数或 Agent 侧配置），其余条件锁死：
 
 ```bash
-python -m membench.cli run --adapter <a> --platform wecom  --commit <SHA> ...
-python -m membench.cli run --adapter <a> --platform feishu --commit <SHA> ...
-python -m membench.cli compare --baseline runs/<wecom run> --candidate runs/<feishu run> \
+python -m membench.cli run --adapter <a> --platform wecom  --commit <SHA> ... --report-out output/
+python -m membench.cli run --adapter <a> --platform feishu --commit <SHA> ... --report-out output/
+python -m membench.cli compare \
+  --baseline <wecom 实验目录或 runs/<dataset> 数据集目录> \
+  --candidate <feishu 实验目录或 runs/<dataset> 数据集目录> \
   --require-comparable --tag wecom-vs-feishu --report-out output/
 ```
 
@@ -89,16 +106,18 @@ python -m membench.cli compare --baseline runs/<wecom run> --candidate runs/<fei
 ```bash
 for p in wecom feishu; do for c in $SHA_A $SHA_B; do
   PYTHONPATH=/tmp/agent_$c:<membench> python -m membench.cli run \
-    --adapter <a> --platform $p --commit $c --judge llm ...
+    --adapter <a> --platform $p --commit $c --judge llm ... --report-out output/
 done; done
 
 python -m membench.cli matrix \
-  --runs "wecom@$SHA_A=runs/<r1>" "feishu@$SHA_A=runs/<r2>" \
-         "wecom@$SHA_B=runs/<r3>" "feishu@$SHA_B=runs/<r4>" \
+  --runs "wecom@$SHA_A=<r1：实验目录或 runs/<dataset> 数据集目录>" \
+         "feishu@$SHA_A=<r2：同上>" \
+         "wecom@$SHA_B=<r3：同上>" \
+         "feishu@$SHA_B=<r4：同上>" \
   --report-out output/
 ```
 
-矩阵报告含：每个核心指标的 平台×commit 透视表、6 组两两门禁、分组条形图；产物落 `matrix_<ts>/`（各组 run 副本在 `runs/<label>/`）。
+矩阵报告含：每个核心指标的 平台×commit 透视表、6 组两两门禁、分组条形图；产物落 `matrix_<ts>/`——`reports/{report.md,matrix_result.json,fig_matrix_accuracy.png}`，各 label 的数据集树副本落 `runs/<label>/`（label 目录名按 slug 归一，`platform@commit` → `platform-commit`）。`--out DIR` 可直接指定完整实验目录（优先于 `--report-out`）。
 **解读顺序**：先看同平台跨 commit（回归），再看同 commit 跨平台（平台差），最后看对角线（交互效应——某平台在某 commit 独差，通常是平台适配代码与新改动的冲突）。
 
 ## 公平性检查清单
@@ -108,4 +127,4 @@ python -m membench.cli matrix \
 - [ ] 同一 LLM 底座与温度（`driver_llm` 一致，建议 temperature=0）
 - [ ] 同一适配器实现版本（`adapter_version` 一致）
 - [ ] 数据集指纹一致（`dataset_fingerprint.sha256` 一致）
-- [ ] runs 目录里 run_id 含 platform 与 commit，混淆时先核对 metrics.json 元数据
+- [ ] 混淆时先核对 `runs/<dataset>/report/metrics.json` 的元数据（`run_id` / `platform` / `commit`）——`run_id` 只记身份，目录名是 `eval_<adapter>_<platform>_<ts>`，不含 commit

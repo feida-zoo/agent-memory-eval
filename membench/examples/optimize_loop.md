@@ -21,8 +21,8 @@
 | 2 优化建议 | 给出可执行方向清单，按预期收益排序 | 建议清单 |
 | 3 优化 plan | 每条拆成**单变量**改动、排优先级、界定验收指标（含门禁阈值） | plan |
 | 4 执行 | 落地单个改动（只改一处；默认当前会话执行，范围明确且独立时才用 subagent） | 代码改动；**⛔ 改完先问是否跑 A/B** |
-| 5 A/B 对比 | 固定模型 / harness / 数据集，只切优化开关；先 `--require-comparable` 校验再 `compare` | `ab_<tag>_<ts>/`；**⛔ 跑前先确认数据集范围、A/B 分组与平台/标签** |
-| 6 优化报告 | 记录方案 + 可归因效果（含门禁结论） | `ab_<tag>_<ts>/optimization_report.md` |
+| 5 A/B 对比 | 固定模型 / harness / 数据集，只切优化开关；先 `--require-comparable` 校验再 `compare` | `compare_<name>_<platform>_<ts>/`；**⛔ 跑前先确认数据集范围、A/B 分组与平台/标签** |
+| 6 优化报告 | 记录方案 + 可归因效果（含门禁结论） | `compare_<name>_<platform>_<ts>/reports/optimization_report.md` |
 
 核心纪律：
 
@@ -44,17 +44,19 @@ python -m membench.cli run --adapter my-system \
     --driver-llm deepseek-v3 --adapter-version v1 \
     --report-out output/
 # 产物: output/eval_my-system_default_<ts>/
-#   ├── report.md / metrics.json / fig_*.png
-#   └── runs/<run_id>/           （run 副本，含 results.jsonl）
+#   ├── runs/sample_dataset/
+#   │   ├── report/{report.md, metrics.json, results.jsonl, fig_*.png}    # 数据集级
+#   │   └── <dialogue_id>/{report/, runtime/}                             # 对话级（report/ 不出图）
+#   └── reports/{report.md, metrics.json, fig_*.png}                      # 任务级
 ```
 
-基线 run 目录里：
+基线读的是数据集级报告目录 `runs/sample_dataset/report/`：
 
 - `results.jsonl`：逐题原始记录（judge 判定、检索命中、延迟、token）。
-- `metrics.json`：六维汇总指标 + 可复现性元数据（`driver_llm` / `judge_model` / `adapter_version` / `dataset_fingerprint` / `schema_version`…）。
+- `metrics.json`：六维汇总指标 + 可复现性元数据（`run_id` / `driver_llm` / `judge_model` / `adapter_version` / `dataset_fingerprint` / `schema_version`…）。
 - `report.md`：含失败样例 Top10 —— **这是排优化优先级的依据**。
 
-> 建议：把基线的实验目录或 `runs/<run_id>/` 改名或备份（如 `cp -r runs/<run_a> runs/baseline_v1`），防止后续被覆盖或混淆。
+> 建议：把基线的**整个实验目录**改名或备份（实验目录自包含，如 `cp -r output/eval_my-system_default_<tsA> output/baseline_v1`），防止后续被覆盖或混淆。
 
 **读报告找短板**：
 
@@ -116,15 +118,19 @@ python -m membench.cli run --adapter my-system --dataset <同一数据集> \
 
 # 对比：先做可比性前置校验，再出门禁结论
 python -m membench.cli compare \
-    --baseline  output/eval_my-system_default_<tsA>/runs/<run_a> \
-    --candidate output/eval_my-system_default_<tsB>/runs/<run_b> \
+    --baseline  output/eval_my-system_default_<tsA> \
+    --candidate output/eval_my-system_default_<tsB> \
     --require-comparable --tag update-on-ingest --report-out output/
+# --baseline / --candidate 也接受数据集目录，如 output/eval_my-system_default_<tsA>/runs/sample_dataset
+# 产物: output/compare_update-on-ingest_default_<ts>/
+#   ├── A/  B/             # 各为完整实验形态（自己的 runs/ 与 reports/）
+#   └── reports/           # comparison.md + fig_metric_diff.png + fig_category_diff.png
 # 自定义门禁阈值：--acc-threshold 0.02 --stale-threshold 0.02 --latency-warn 0.30
 ```
 
 - **消融纪律**：`compare` 只测差异，**不判定**两组是否只差一个变量。你必须自己固定模型 / harness / 数据集，只切优化开关；否则 diff 无法归因。
-- **可比性前置校验**：`--require-comparable` 下，关键维度（adapter / adapter_version / 数据集指纹 / judge / judge_model / driver_llm / platform）不一致或无法核验 → 门禁 FAIL。不可比原因在 CLI 输出与 `ab_<tag>_<ts>/compare_report.md` 的「可比性前置校验」小节可见。
-- 产物落自包含的 `output/ab_<tag>_<ts>/`：`A/`、`B/` 各带 run 副本与报告，`compare_report.md` 是结论；阶段 6 的 `optimization_report.md` 也写在这里。
+- **可比性前置校验**：`--require-comparable` 下，关键维度（adapter / adapter_version / 数据集指纹 / judge / judge_model / driver_llm / platform / run_mode）不一致或无法核验 → 门禁 FAIL。不可比原因在 CLI 输出与 `reports/comparison.md` 的「可比性前置校验」小节可见。
+- 产物落自包含的 `output/compare_<name>_<platform>_<ts>/`：`A/`、`B/` 各是一个完整实验形态（各自的 `runs/` 与 `reports/`），`reports/comparison.md` 是结论；阶段 6 的 `optimization_report.md` 也写在这里。
 
 门禁规则（SPEC 3.6）：
 
@@ -133,11 +139,11 @@ python -m membench.cli compare \
 - latency_p95 上升 > 30% → **WARN**（精度换延迟，人工决策是否接受）
 - 其余指标（token_f1、bleu1、evidence_recall、token 成本等）只报告、不门禁
 
-`compare_report.md` 里有逐指标 diff 表、门禁明细、可比性前置校验表和 `fig_metric_diff.png` 对比图。CI 中可直接用退出码：`FAIL` 时进程退出码为 1。
+`reports/comparison.md` 里有逐指标 diff 表、门禁明细、可比性前置校验表，同目录下的 `fig_metric_diff.png`（关键指标对比）与 `fig_category_diff.png`（分题型准确率对比）是对比图。CI 中可直接用退出码：`FAIL` 时进程退出码为 1。
 
 ## 6. 优化报告
 
-把方案与**可归因**效果写成 `output/ab_<tag>_<ts>/optimization_report.md`：
+把方案与**可归因**效果写成 `output/compare_update-on-ingest_default_<ts>/reports/optimization_report.md`：
 
 - 本次改了什么（单变量）、为什么；
 - A/B 可比性结论（两组只在优化开关上不同）；

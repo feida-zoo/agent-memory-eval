@@ -20,18 +20,23 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 │   ├── data/              # 数据集 schema、JSONL 加载器、fetch（按需下载）、内置集
 │   ├── judges/            # HeuristicJudge / LLMJudge
 │   ├── metrics/           # token_f1 / bleu1 / recall@k + 六维汇总
-│   ├── paths.py           # 产物根 / runs 目录判定（MEMBENCH_OUTPUT_DIR > skill > 工程根）
-│   ├── layout.py          # 实验目录命名与落位（eval_* / ab_* / matrix_* 的公开 helper）
-│   ├── runner.py          # Runner: 执行评测, 写 run 目录
+│   ├── paths.py           # 产物根判定 output_root（MEMBENCH_OUTPUT_DIR > skill 的 output/ > 工程根 output/）
+│   ├── layout.py          # 实验目录命名与落位（eval_* / compare_* / matrix_* 的公开 helper）
+│   ├── runner.py          # Runner: 执行评测，直接写实验目录的 runs/<dataset>/…
+│   ├── snapshot.py        # 状态快照与回放：逐对话 manifest、跑前校验、保真比对
 │   ├── agent_loop.py      # AgentLoopAdapter: 复用 ingest/query 的 tool-call 循环
 │   ├── doctor.py          # check_target: HTTP bridge 三端点契约自检（纯标准库）
-│   ├── fuse.py            # fuse: 分片 run 合并为完整 run（指标重算 + 门禁）
+│   ├── fuse.py            # fuse: 分片产物融合为完整实验目录（指标重算 + 门禁）
 │   ├── compare.py         # compare_runs: 可比性前置校验 + diff + 回归门禁
 │   ├── matrix.py          # compare_matrix: 多 run 矩阵对比（platform × commit）
+│   ├── evaluate.py        # evaluate: 多数据集宏平均融合 + 办公域 stale 门禁
+│   ├── evaluate_compare.py # evaluate_compare: 两组 × 多数据集融合 A/B 对比
+│   ├── ratings.py         # 综合评级阈值表 METRIC_THRESHOLDS
 │   ├── userdata.py        # 用户测试集管理: install / status / delete / resolve
 │   ├── report.py          # report.md + 图表（matplotlib Agg，可选）+ 报告导出
-│   └── cli.py             # CLI: run / evaluate / fuse / compare / matrix / doctor /
-│                          #      adapter / user-data / list-datasets / dataset info|fetch
+│   └── cli.py             # CLI: run / evaluate / evaluate-compare / fuse / compare /
+│                          #      matrix / doctor / adapter / user-data / list-datasets /
+│                          #      dataset info|fetch
 ├── tests/                 # pytest（含 mock-weak vs mock-strong 端到端）
 └── examples/
     ├── quickstart.py      # 最小接入示例
@@ -42,29 +47,33 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 ## 快速开始
 
 ```bash
-# 1. 用内置强 mock 适配器跑内置示例数据集（--report-out 落自包含实验目录）
+# 1. 用内置强 mock 适配器跑内置示例数据集（产物落 <output 根>/eval_mock-strong_default_<ts>/）
 python -m membench.cli run --adapter mock-strong \
-    --dataset membench/data/sample_dataset.jsonl \
-    --judge heuristic --out runs/ --report-out output/
+    --dataset membench/data/sample_dataset.jsonl --judge heuristic
 
 # 2. 再跑弱 mock（模拟“优化前”）
 python -m membench.cli run --adapter mock-weak \
-    --dataset membench/data/sample_dataset.jsonl --out runs/ --report-out output/
+    --dataset membench/data/sample_dataset.jsonl
 
-# 3. 对比两个 run：可比性前置校验 + 门禁结论
-python -m membench.cli compare --baseline runs/<run_weak> --candidate runs/<run_strong> \
-    --require-comparable --tag weak-vs-strong --report-out output/
+# 3. 对比两次评测：可比性前置校验 + 门禁结论
+#    --baseline/--candidate 传实验目录或其中的 runs/<dataset> 数据集目录
+python -m membench.cli compare \
+    --baseline output/eval_mock-weak_default_<ts>/runs/sample_dataset \
+    --candidate output/eval_mock-strong_default_<ts>/runs/sample_dataset \
+    --require-comparable --tag weak-vs-strong
 
 # 4. 改了「读取侧」（检索/排序/回答）代码：用快照回放，免重跑 ingest
 python -m membench.cli run --adapter <你的适配器> --dataset <同一数据集> \
-    --snapshot-out ~/.membench/state_snapshots/<名>     # 先导出（需适配器支持）
+    --snapshot                                        # 先导出（需适配器支持）
 python -m membench.cli run --adapter <你的适配器> --dataset <同一数据集> \
-    --replay ~/.membench/state_snapshots/<名> \
-    --replay-verify-source runs/<源run目录>            # 回放 + 逐题保真校验
+    --replay output/eval_<名>_<平台>_<ts> \
+    --replay-verify-source output/eval_<名>_<平台>_<ts>/runs/<dataset>   # 回放 + 逐题保真校验
 
 # 查看内置数据集
 python -m membench.cli list-datasets
 ```
+
+> 第 3 步的两次 mock 评测没填 `--driver-llm / --adapter-version`，`--require-comparable` 会按「关键维度缺失、无法核验」判 FAIL（这是 strict 模式的既定口径，不是示例坏了）；想看到 PASS 就先在这些维度上补全元数据再跑（见「可复现性元数据」）。
 
 ## 全量评估（多数据集融合总分）
 
@@ -73,7 +82,7 @@ python -m membench.cli list-datasets
 ```bash
 # 默认全量 = 办公域槽位（用户集>内置office）+ locomo + longmemeval_oracle
 #            + gatemem_office + LongMemEval-S + BEAM-1M
-python -m membench.cli evaluate --adapter <你的adapter> --judge llm --report-out <报告父目录>
+python -m membench.cli evaluate --adapter <你的adapter> --judge llm --report-out <实验目录父目录>
 
 python -m membench.cli evaluate --adapter <a> --no-lme-s    # 剔除 LongMemEval-S（~268MB、ingest 成本高）
 python -m membench.cli evaluate --adapter <a> --no-beam     # 不跑 BEAM
@@ -83,15 +92,18 @@ python -m membench.cli evaluate --adapter <a> --quick       # 跳过 BEAM 与 Lo
 python -m membench.cli evaluate --adapter <a> \
     --dataset office --dataset locomo --dataset ~/data/my_set.jsonl
 
-# 汇总模式：复用已跑完的 run（按数据集挨个跑完之后统一出报告）；
-# 目标清单里的缺口自动用 --adapter 补跑（纯复用、无缺口时 --adapter/--judge 可省略）
+# 汇总模式：复用已跑完的产物（按数据集挨个跑完之后统一出报告）；
+# 目标清单里的缺口自动用 --adapter 补跑（纯复用、无缺口时 --adapter/--judge 可省略）。
+# DIR 指向 runs/<数据集目录> 最稳；传实验目录时其下必须只有一个数据集目录（见下）
 python -m membench.cli evaluate --adapter <a> \
     --dataset office --dataset locomo \
-    --from-runs office=output/runs/<run_office> \
-    --from-runs locomo=output/runs/<run_locomo>
+    --from-runs office=output/eval_<名>_<平台>_<ts>/runs/office_dataset \
+    --from-runs locomo=output/eval_<另一个>_<平台>_<ts>/runs/locomo
 ```
 
-**汇总模式（`--from-runs KEY=RUN_DIR`，可重复）**：目标数据集里已有 run 的直接复用、缺失的补跑，最后统一出融合/评级/门禁报告；复用的 run 目录会复制进报告的 `runs/` 保持自包含。**被测对象与评测口径（`adapter / adapter_version / driver_llm / judge / judge_model / 检索口径`）同一侧必须一致**——已有 run 之间混用、或补跑参数与已有 run 不一致，都在**开跑之前**直接拒绝（对比场景同理，每侧固定一个被测对象，差异变量只应发生在两侧之间），避免跑完才发现汇总不可归因。仅跨 run 的 `platform` 差异保留：在控制台与报告顶部**显著标注**。全新评测缺 `--driver-llm / --adapter-version` 时启动即提示——严格可比性（`compare --require-comparable`）会判这些关键维度「无法核验」，且无法事后补记。
+结果落 `--report-out` 父目录下的 `eval_<adapter>_<platform>_<ts>/`：每个数据集一棵 `runs/<dataset>/`（数据集级报告在 `report/`，逐对话产物在 `<对话目录>/`），任务级报告在 `reports/`（含 `evaluate_summary.json`）。
+
+**汇总模式（`--from-runs KEY=DIR`，可重复）**：目标数据集里已有产物的直接复用、缺失的补跑，最后统一出融合/评级/门禁报告；复用的数据集产物会并入本次实验目录的 `runs/<dataset>/`，整个实验目录可搬移。`DIR` 是**实验目录**（其下恰有一个数据集目录时自动选它，多数据集实验目录请直接指向数据集目录）或**数据集目录**（`<实验目录>/runs/<dataset>`，目录名 = 数据集文件名去扩展名，如 `office_dataset`、`locomo`、`beam_1m`）。**被测对象与评测口径（`adapter / adapter_version / driver_llm / judge / judge_model / 检索口径`）同一侧必须一致**——已有产物之间混用、或补跑参数与已有产物不一致，都在**开跑之前**直接拒绝（对比场景同理，每侧固定一个被测对象，差异变量只应发生在两侧之间），避免跑完才发现汇总不可归因。仅跨产物的 `platform` 差异保留：在控制台与报告顶部**显著标注**。全新评测缺 `--driver-llm / --adapter-version` 时启动即提示——严格可比性（`compare --require-comparable`）会判这些关键维度「无法核验」，且无法事后补记。
 
 说明：默认全量**包含** LongMemEval-S（每题约 50 个干扰会话 / ~115k token 的检索压力
 变体，与 oracle 的分差反映检索/精确率损失）；未下载时默认全量会报错提示先
@@ -101,12 +113,12 @@ SKIP）；未显式给出时默认清单的办公域槽位规则不变。
 
 ## A/B 两组多数据集融合对比
 
-`evaluate-compare` 一次跑两套 adapter × 多数据集，直接产出**逐数据集 diff + 跨数据集融合 diff + 门禁 + 对比图**，落 `<报告父目录>/ab_<tag>_<ts>/` 自包含结构（A/B 两侧各自带各数据集 run 副本 + compare_report.md + 两张对比图）：
+`evaluate-compare` 一次跑两套 adapter × 多数据集，直接产出**逐数据集 diff + 跨数据集融合 diff + 门禁 + 对比图**，落 `<实验目录父目录>/compare_<name>_<platform>_<ts>/` 自包含结构（`A/`、`B/` 各为完整评测产物——含自身 `runs/` 与 `reports/`；对比结论 `reports/comparison.md` 与两张对比图 `reports/fig_per_dataset_diff.png`、`reports/fig_fused_diff.png` 落实验目录的 `reports/`）：
 
 ```bash
 python -m membench.cli evaluate-compare \
     --baseline-adapter <adapter_A> --candidate-adapter <adapter_B> \
-    --judge llm --report-out <报告父目录> --tag "优化前vs优化后"
+    --judge llm --report-out <实验目录父目录> --tag "优化前vs优化后"
 
 # 同样支持 --no-lme-s / --no-beam / --beam-10m / --quick 与 --dataset 显式清单；
 # 两侧可分别指定 driver_llm / adapter_version
@@ -116,13 +128,16 @@ python -m membench.cli evaluate-compare \
     --adapter-version-a v1 --adapter-version-b v2 \
     --quick
 
-# 汇总模式：两侧逐数据集复用已跑完的 run、缺口自动补跑（KEY=RUN_DIR 可重复；
+# 汇总模式：两侧逐数据集复用已跑完的产物、缺口自动补跑（KEY=DIR 可重复；
+# DIR 为 runs/<数据集目录>，或"其下只有一个数据集目录"的实验目录；
 # 某侧全部已跑完时可省略该侧 adapter；被测对象与评测口径同一侧一致——
-# 混用或补跑参数与已有 run 不一致 → 开跑之前直接拒绝）
+# 混用或补跑参数与已有产物不一致 → 开跑之前直接拒绝）
 python -m membench.cli evaluate-compare \
-    --baseline-run office=<A_office_run> --candidate-run office=<B_office_run> \
-    --baseline-run locomo=<A_locomo_run> --candidate-run locomo=<B_locomo_run> \
-    --report-out <报告父目录> --tag "优化前vs优化后"
+    --baseline-run office=output/eval_<A>_<平台>_<ts>/runs/office_dataset \
+    --candidate-run office=output/eval_<B>_<平台>_<ts>/runs/office_dataset \
+    --baseline-run locomo=output/eval_<A2>_<平台>_<ts>/runs/locomo \
+    --candidate-run locomo=output/eval_<B2>_<平台>_<ts>/runs/locomo \
+    --report-out <实验目录父目录> --tag "优化前vs优化后"
 ```
 
 门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **逐数据集题型 diff** + **两组融合 diff 表** + **per-dataset 门禁明细**（单数据集 spike 不被融合平均抹平）+ **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）+ **「两侧可比性（逐数据集）」小节**（复用单数据集 `compare` 的维度表：两侧 `dataset_sha256 / judge / judge_model / driver_llm / platform` 不一致记「关键」、两侧都未标注记「关键缺失」、检索命中口径等次要维度记「次要」；两侧 `adapter / adapter_version` 与 `commit` 是被测变量，差异属预期不计入）；比率型指标以百分比呈现（如 `81.5%`），差值为百分点（如 `+2.3pt`）。指标"未计算"统一记 `null`，与真实 0 区分；诊断指标（检索召回率@5 / 过度拒答率）在 diff 与对照表中可见但不参与评级。旧版 run 的 capabilities 未落账时报告会按数据集/逐题记录自动推断并在头部标注来源。可比性问题在**两侧都复用的数据集对上会于开跑前**先打印到控制台——不必等跑完才发现两侧口径对不上。
@@ -132,12 +147,12 @@ python -m membench.cli evaluate-compare \
 - **宏平均**：六项质量指标（accuracy/token_f1/bleu1/evidence_recall/abstention_accuracy/stale_rate）先在各数据集内算分，再跨集等权平均；**指标只在具备对应标注能力的数据集上参与**——无 gold_stale 的集（locomo/longmemeval）不参与 stale_rate，无 evidence 标注的集（longmemeval/beam）不参与 evidence_recall，无 abstention 题的集不参与 abstention_accuracy。绝不用"记 0"稀释。此外**诊断指标**（检索召回率@5 需 has_evidence；过度拒答率全数据集参与）同样跨集融合展示，但不参与综合评级与门禁。
 - **门禁一票否决独立于总分**：办公域槽位 stale_rate > 0.03 → 总评"不达标"，退出码 1（可接 CI），无论综合评级多高。
 - **按需下载的公开集必须先 fetch**：`locomo` / `longmemeval_oracle` / `gatemem_office` / `longmemeval_s` / `beam_1m`（或 `beam_10m`）都没有内置文件，`evaluate` 从 `~/.membench/datasets/` 解析可用路径，缺失时报错提示先 `python -m membench.cli dataset fetch <key>`（`--no-lme-s` 不检查 LongMemEval-S；`--no-beam` / `--quick` 不检查 BEAM 槽位）。judge=heuristic 跑 BEAM 会警告（rubric 型题目规则判分失真，建议 llm/client）。
-- **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**）时落 `DIR/eval_<adapter>_<platform>_<ts>/`，内含 `evaluate_report.md`、`evaluate_summary.json`、`fig_dataset_overview.png` 与 `runs/<各数据集 run_id>/`（自包含）；不传时保持历史位置 `<out_dir>/evaluate_<ts>/`。
+- **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**，缺省 `output_root()`）落 `DIR/eval_<adapter>_<platform>_<ts>/`：各数据集产物在 `runs/<dataset>/`（数据集级报告 `report/{report.md,metrics.json,results.jsonl,fig_*.png}`，逐对话目录 `<对话>/` 内含 `report/`、`runtime/`、`memory_snapshot/`），任务级报告在 `reports/`（`report.md` + `metrics.json` + `evaluate_summary.json` + `fig_dataset_overview.png`）。
 
-run 产物（`runs/<run_id>/`）：`results.jsonl`（逐题原始记录）、`metrics.json`、`report.md`、`fig_category_accuracy.png`、`fig_latency_hist.png`。
+run 产物（`runs/<dataset>/report/`）：`results.jsonl`（逐题原始记录）、`metrics.json`、`report.md`、`fig_category_accuracy.png`、`fig_latency_hist.png`；逐对话产物落 `runs/<dataset>/<对话目录>/report/`（纯文字，不出图）。
 run 报告含 **「Token 消耗（全流程）」** 小节，取自 `metrics.json` 的 `token_usage` 块（被测系统上报口径的累计值：`ingest_input_tokens` / `query_input_tokens` / `query_output_tokens` / `ingest_llm_calls` / `query_llm_calls` + `n_dialogues` / `n_questions`）；`evaluate` 报告给出**分数据集消耗与合计**（`evaluate_summary.json` 的 `token_usage` 同步落账，含 `datasets_reported` 标明合计覆盖范围）。ingest 按每次 reset 后的真实写入累计——题目级分片下同一对话被多个分片各自 ingest 也如实各记一次；分片融合时逐片相加，任一分片未落账则整体不落账。适配器不填 token 时记 0 并显式提示"未上报"，不读成真实零消耗；这不是指标，不参与评级与门禁。
 report.md 中比率型指标以 **"评价（百分比）"** 呈现（如 `优秀（92.3%）`，四级：优秀/良好/中等/较差），开头附 **综合评级**（六项质量指标连续点数均值，1.0~4.0，档内随数值线性变化，阈值 3.5/2.5/1.5）；效率成本指标不参与评级（依赖部署环境）；**诊断指标**（检索召回率@5、过度拒答率）仅展示与归因，不参与评级——前者是前 5 条检索的证据覆盖率，后者是非拒答题的误拒比例，与 `evidence_recall` / `abstention_accuracy` 配合分诊（检索 vs 生成、漏拒 vs 误拒）。评级规则见 `membench/ratings.py` 的 `METRIC_THRESHOLDS` 表，可按团队标准调整。
-compare 产物（`output_root()/ab_<tag>_<ts>/`，见「产物布局」）：A/B 各自带 run 副本 + `compare_report.md` + `fig_metric_diff.png`（质量指标高亮明显变化 + 效率成本）+ `fig_category_diff.png`（分题型准确率对比）。两张图的图例写明 **A（基线）· 短名 / B（候选）· 短名**（短名取 `adapter@commit`，跑 id 见报告头部），B 条的绿/红只表示"明显优化/劣化"，另有独立图例项说明——别把高亮色当身份色。
+compare 产物（`compare_<name>_<platform>_<ts>/`，见「产物布局」）：`A/`、`B/` 各为完整评测产物（自带 `runs/` 与 `reports/`），对比结论 `reports/comparison.md` + `reports/fig_metric_diff.png`（质量指标高亮明显变化 + 效率成本）+ `reports/fig_category_diff.png`（分题型准确率对比）。两张图的图例写明 **A（基线）· 短名 / B（候选）· 短名**（短名取 `adapter@commit`，run_id 见报告头部），B 条的绿/红只表示"明显优化/劣化"，另有独立图例项说明——别把高亮色当身份色。
 
 使用 LLM 判分（可选）：
 
@@ -167,14 +182,22 @@ run_id 带 `_limit{N}` 后缀、metrics.json 记入 `"limit": N`，冒烟结果�
 ```bash
 # 先下载（落 ~/.membench/datasets/beam_1m.jsonl）：
 #   python -m membench.cli dataset fetch beam_1m
-# 按对话分 4 片（整段对话归片 d % 4，分片间不重复 ingest；可在多台机器上并行）
-python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/beam_1m.jsonl --shards 4 --shard-index 0 --shard-by dialogue
+# 按对话分 4 片（整段对话归片 d % 4，分片间不重复 ingest；可在多台机器上并行）。
+# 每个分片各落一个独立实验目录：同机并发时用不同的 --report-out（或错开启动），
+# 实验目录名精确到秒，同一秒内起跑会撞名被拒
+python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/beam_1m.jsonl \
+    --shards 4 --shard-index 0 --shard-by dialogue --report-out output/shard0
 ...
-python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/beam_1m.jsonl --shards 4 --shard-index 3 --shard-by dialogue
+python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/beam_1m.jsonl \
+    --shards 4 --shard-index 3 --shard-by dialogue --report-out output/shard3
 
-# 合并为完整 run（校验分片齐全、adapter/dataset/shard 维度一致、题目无重复；
+# 融合为完整实验目录（校验分片齐全、adapter/dataset/shard 维度一致、题目无重复；
 # 指标重新计算，stale 门禁对融合结果同样生效，FAIL 时退出码 1）
-python -m membench.cli fuse --runs runs/..._dshard0of4,runs/..._dshard1of4,... --out runs/beam_1m_full
+# --runs 每项 = 分片的实验目录，或其中的 runs/<dataset> 数据集目录；
+# --out = 融合产物的完整实验目录（产物落其 runs/<dataset>/ 与 reports/）
+python -m membench.cli fuse \
+    --runs output/shard0/eval_my-sys_<平台>_<ts0>/runs/beam_1m,output/shard1/eval_my-sys_<平台>_<ts1>/runs/beam_1m \
+    --out output/beam_1m_full
 ```
 
 `--shards` 与 `--limit` 可组合（先分片再截断），用于分片链路的廉价验证。
@@ -183,19 +206,20 @@ python -m membench.cli fuse --runs runs/..._dshard0of4,runs/..._dshard1of4,... -
 
 **分片数上限与 `--shards max`**：`--shard-by dialogue` 上限为数据集对话数、`--shard-by question` 上限为题目数。传入超过上限的整数**按上限执行**（不报错，输出中会说明实际分片数）；`--shards max` 直接按上限取最大分片；分片索引越过有效分片数的进程**安全跳过**（不产生空 run——空分片纯浪费进程/内存与桥实例）。
 
-**分片 A/B 官方通路**：两侧分别 `run --shards N --shard-by dialogue` 并行跑 → 每侧每数据集 `fuse` 合并成完整 run → `evaluate-compare --baseline-run <key>=<A完整run> --candidate-run <key>=<B完整run>` 汇总出完整对比报告。融合产物与普通 run 同等可校验：可比性元数据（adapter_version / judge_model / driver_llm / 数据集指纹 / 检索口径）全部透传，可直接用 `compare --require-comparable` 复验。
+**分片 A/B 官方通路**：两侧分别 `run --shards N --shard-by dialogue` 并行跑 → 每侧每数据集 `fuse` 融合成完整实验目录 → `evaluate-compare --baseline-run <key>=<A 融合实验目录> --candidate-run <key>=<B 融合实验目录>` 汇总出完整对比报告。融合产物与普通 run 同等可校验：可比性元数据（adapter_version / judge_model / driver_llm / 数据集指纹 / 检索口径）全部透传，可直接用 `compare --require-comparable` 复验。
 
 **分片维度怎么选（`--shard-by`，重要）**：
 
 - `--shard-by question`（默认）按全局题号 `i % N == shard_index` 分片；不含入选题的对话整段跳过（ingest 也省掉）。适合"少量超长对话承载大量题"、能整块跳过对话的场景。
 - `--shard-by dialogue` 整段选取 `d % N == shard_index` 的对话、保留其全部题目，**分片之间 ingest 互不重复**。"几乎每个对话都有题"的 ingest 密集型数据集（内置 office：20 对话 / 86 题；BEAM-1M：35 对话 × 20 题）必须用它——题目级分片会让每个分片仍对全部对话 ingest，成本 ×N，分片反而更慢。
-- 两种维度的分片都能用 `fuse` 融合回完整 run，但不许混维融合（fuse 会明确报错）。
+- 两种维度的分片都能用 `fuse` 融合回完整产物，但不许混维融合（fuse 会明确报错）。
 
 ## 可复现性元数据
 
-每个 run 目录的 `metrics.json` 除了六维指标，还记一组元数据，回答"这次分数是用什么跑出来的"：
+每个数据集目录的 `report/metrics.json` 除了六维指标，还记一组元数据，回答"这次分数是用什么跑出来的"：
 
 - `schema_version`：元数据 schema 版本（当前 `"0.2"`）；
+- `run_id`：本次评测的身份字符串（形如 `<adapter>_<platform>[_<commit8>]_<dataset>[_shardIofN|_dshardIofN][_limitN]_<%Y%m%d_%H%M%S>`，只作身份标识，不再是目录名）；
 - `adapter` / `platform` / `commit` / `dataset` / `dataset_path` / `dataset_source`；
 - `driver_llm`：驱动被测系统的 LLM 标识（`--driver-llm`，自由文本）；
 - `judge` / `judge_model`：判分器名与判分模型（`judge_model` 缺省时自动取 judge 对象的 `.model`）；
@@ -203,12 +227,14 @@ python -m membench.cli fuse --runs runs/..._dshard0of4,runs/..._dshard1of4,... -
 - `dataset_fingerprint`：`{"sha256": 内容 sha256 前 16 位, "bytes": 字节数, "name": 文件名}`，`compare` 的可比性校验据此机检"数据集是否变了"；
 - `adapter_meta`：`--adapter-meta "model=deepseek-v3;temp=0"` 自由文本，原样记入；
 - `adapter_describe`：adapter 定义了可选 `describe() -> dict` 时自动调用记入（调用失败记 null，不中断评测）；
-- `experiment_dir`：仅当 `--report-out` 给定时有，指向本次实验的自包含目录。
+- `experiment_dir` / `dataset_dir`：本次实验目录与数据集产物目录（读取方据此定位，不必猜层级）；
+- `run_mode`：`full` / `replay-restore` / `replay-rebuild`（见「状态快照与回放」）；
+- `state_snapshot`：`--snapshot` 导出或快照回放时记入；数据集级的 `root` 指向**数据集目录**（即 `--replay` 可传的目录）。
 
 ```bash
 python -m membench.cli run --adapter my-system --dataset membench/data/office_dataset.jsonl \
     --driver-llm deepseek-v3 --adapter-version $(git rev-parse --short HEAD) \
-    --judge llm --llm-model gpt-4o-mini --report-out output/
+    --judge llm --llm-model gpt-4o-mini --report-out output/   # DIR = 实验目录的父目录
 ```
 
 建议至少把驱动模型、判分模型、适配器版本、数据集指纹落全——`compare --require-comparable` 靠这些维度做前置校验，字段缺失会记入"无法核验"。
@@ -234,16 +260,18 @@ python -m membench.cli run --adapter my-system --dataset membench/data/office_da
 - **WARN**：存在关键维度不一致（非 strict）或次要维度不一致——结果可疑但可继续；
 - **FAIL**：strict 下存在关键维度不一致或无法核验。
 
-不可比原因在两处可见：CLI 输出逐条 `[membench] 不可比原因: [关键] <维度>: <说明>`；`ab_<tag>_<ts>/compare_report.md` 的「可比性前置校验」小节给出逐维度对照表（A / B / 是否一致）与「不可比原因」列表。
+不可比原因在两处可见：CLI 输出逐条 `[membench] 不可比原因: [关键] <维度>: <说明>`；`compare_<name>_<platform>_<ts>/reports/comparison.md` 的「可比性前置校验」小节给出逐维度对照表（A / B / 是否一致）与「不可比原因」列表。
 
-**多数据集对比（`evaluate-compare`）同样逐数据集核对**：报告头部有一行汇总，正文附「两侧可比性（逐数据集）」小节（只列不一致与缺失项，级别同上表——「关键缺失」表示两侧都未标注、核验不了）。两点与单数据集 `compare` 不同：两侧 `adapter / adapter_version` 跨侧不同是本实验的设计变量，不进清单；两侧都已复用的数据集对在**跑前**就把问题清单打到控制台，跑完再用最终 run（含本轮补跑的数据集）复核一遍。
+**多数据集对比（`evaluate-compare`）同样逐数据集核对**：报告头部有一行汇总，正文附「两侧可比性（逐数据集）」小节（只列不一致与缺失项，级别同上表——「关键缺失」表示两侧都未标注、核验不了）。两点与单数据集 `compare` 不同：两侧 `adapter / adapter_version` 跨侧不同是本实验的设计变量，不进清单；两侧都已复用的数据集对在**跑前**就把问题清单打到控制台，跑完再用最终产物（含本轮补跑的数据集）复核一遍。
 
 ```bash
-python -m membench.cli compare --baseline runs/<run_a> --candidate runs/<run_b> \
-    --require-comparable --tag my-opt --report-out output/
+python -m membench.cli compare \
+    --baseline output/eval_<A>_<平台>_<ts>/runs/<dataset> \
+    --candidate output/eval_<B>_<平台>_<ts>/runs/<dataset> \
+    --require-comparable --tag my-opt
 ```
 
-`--tag` 决定 `ab_<tag>_<ts>/` 目录名（缺省由两个 run_id 拼）。退出码：verdict=FAIL → 1，否则 0。
+`--tag` 决定实验目录名的 `<name>` 段（缺省 `<基线 adapter>_vs_<候选 adapter>`；`platform` 段缺省取两臂平台，两臂不同则 `p1-p2`）。`--baseline` / `--candidate` 传**实验目录**或 **`runs/<dataset>` 数据集目录**都行。退出码：verdict=FAIL → 1，否则 0。
 
 ## 状态快照与回放（改读取侧免重跑 ingest）
 
@@ -253,19 +281,24 @@ A/B 摆脱"写入漂移"噪声）。
 
 ```bash
 # 1) 全量跑一次并导出快照（需适配器实现 snapshot()；HTTP 桥同款端点见接入章节）
+#    快照固定落各对话的 runs/<dataset>/<对话目录>/memory_snapshot/
 python -m membench.cli run --adapter <你的适配器> --dataset <数据集> \
-    --snapshot-out ~/.membench/state_snapshots/<名> --judge heuristic
+    --snapshot --judge heuristic
 
 # 2) 改了读取侧代码后回放（跳过 reset + ingest，只跑 query）+ 保住真校验地板
+#    --replay 传导过快照的实验目录（或其中的 runs/<数据集目录>）；
+#    --replay-verify-source 传源产物（实验目录或其中 runs/<数据集目录>），
+    按 <数据集目录>/report/results.jsonl 逐题比对）
 python -m membench.cli run --adapter <你的适配器> --dataset <同一个数据集> \
-    --replay ~/.membench/state_snapshots/<名> \
-    --replay-verify-source runs/<源run目录> --judge heuristic
+    --replay output/eval_<名>_<平台>_<ts> \
+    --replay-verify-source output/eval_<名>_<平台>_<ts>/runs/<数据集目录> --judge heuristic
 ```
 
 - **快照时机**：每个对话 ingest 完成后、第一道 query 之前（runner 每对话 `reset()`，
   评测本身是"一个对话一个独立记忆生命周期"，所以按对话切片天然等价）；
-  清单 `manifest.json` 记 run_id / 数据集指纹 / 每对话 sha256、字节数、输入指纹与
-  `complete` 标记；
+  **清单每对话一份**，落 `<对话目录>/memory_snapshot/manifest.json`——自包含
+  （身份 + 数据集指纹 + 能力声明 + 该对话条目 sha256 / 字节数 / 输入指纹与
+  `complete` 标记），单个对话目录即可搬到别处；整场齐备性由跑前扫描各对话清单统一校验；
 - **谁产出快照**：被测系统自己（适配器可选接口 `snapshot_capabilities()` /
   `snapshot()` / `restore()` / `rebuild()`）——框架只给目录与 tag、算哈希、做校验，
   不解析快照内容（HTTP 桥对应 `POST /snapshot-capabilities|/snapshot|/restore`）；
@@ -273,10 +306,10 @@ python -m membench.cli run --adapter <你的适配器> --dataset <同一个数�
   直接恢复）/ `replay-rebuild`（格式不兼容或需重建派生结构，走系统的 `rebuild`）；
   `--replay-mode auto|restore|rebuild` 控制协商，**不兼容且无 rebuild 会在开跑前拒绝**；
 - **跑前校验**：清单缺失/损坏、数据集指纹不符、本 run 需要的对话没快照，一律拒绝，
-  不产生半成品 run 目录；
-- **保真校验**：`--replay-verify-source <源run>` 逐题比对答案 / 检索 / 判分，写进报告
-  与 `metrics.json` 的 `replay_verify`——这就是**回放误差地板**，读取侧 A/B 的差值
-  必须大于它才有意义；未改代码时答案应 100% 一致；
+  不产生半成品产物；
+- **保真校验**：`--replay-verify-source <源产物：实验目录或数据集目录>` 逐题比对答案 / 检索 / 判分，
+  写进报告与 `metrics.json` 的 `replay_verify`——这就是**回放误差地板**，读取侧 A/B
+  的差值必须大于它才有意义；未改代码时答案应 100% 一致；
 - **口径（重要）**：回放固定写入侧，结论只覆盖**读取/检索/回答层**，不得当"完整评测"
   汇报；`run_mode` 是 compare 的**关键维度**，回放分与全量分会被判不可比；融合
   （`fuse`）也拒绝混融两种模式的分片；回放的 token 账里 ingest 记 0 并标
@@ -322,8 +355,8 @@ python -m membench.cli user-data delete
 python -m membench.cli run --adapter mock-strong --platform wx --commit a1b2c3
 ```
 
-- `run_id` 变为 `{adapter}_{platform}_{dataset}_{timestamp}`（缺省 platform 为 `default`）；
-- `metrics.json` 元数据新增 `platform` / `commit` / `dataset_source` 字段；
+- `run_id` 形如 `<adapter>_<platform>[_<commit8>]_<dataset>[_shardIofN|_dshardIofN][_limitN]_<%Y%m%d_%H%M%S>`（缺省 platform 为 `default`）；它只作身份字符串落 `metrics.json`，**不再是目录名**；
+- `metrics.json` 元数据记 `platform` / `commit` / `dataset_source` 字段；
 - `report.md` 开头固定有一张「评测配置」表：测试集路径、测试集来源、平台、commit、判分器。
 
 跨版本（commit）对比时，把两次 run 的 `--driver-llm` / `--adapter-version` 也填上，`compare` 的可比性前置校验才能区分"结果变化来自被测系统"还是"来自换了驱动模型"。
@@ -333,16 +366,19 @@ python -m membench.cli run --adapter mock-strong --platform wx --commit a1b2c3
 `matrix` 子命令对多个带标签的 run 做矩阵对比：
 
 ```bash
+# --runs 每项形如 label=<产物目录>：右值可以是实验目录或 runs/<dataset> 数据集目录
 python -m membench.cli matrix \
-  --runs "wx@a1b2c3=runs/dir1" "fs@a1b2c3=runs/dir2" \
-         "wx@d4e5f6=runs/dir3" "fs@d4e5f6=runs/dir4" \
-  [--out output/matrix_xxx] [--report-out output/]
+  --runs "wx@a1b2c3=output/eval_wx_a1b2c3_<ts>/runs/<dataset>" \
+         "fs@a1b2c3=output/eval_fs_a1b2c3_<ts>/runs/<dataset>" \
+         "wx@d4e5f6=output/eval_wx_d4e5f6_<ts>" \
+         "fs@d4e5f6=output/eval_fs_d4e5f6_<ts>" \
+  [--out output/matrix_from_scratch] [--report-out output/]
 ```
 
-- `--out` 直接指定完整实验目录（优先）；`--report-out DIR` 是实验目录的**父目录**（给出时落 `DIR/matrix_<ts>/`）；都不给时落 `output_root()/matrix_<ts>/`。
+- `--out DIR` 直接指定**完整实验目录**（优先；产物落其 `reports/` 与 `runs/<label>/`）；`--report-out DIR` 是实验目录的**父目录**（给出时落 `DIR/matrix_<ts>/`）；都不给时落 `output_root()/matrix_<ts>/`。
 
-label 推荐 `platform@commit` 格式（也接受任意字符串）。实验目录自包含（各组 run 副本落 `runs/<label>/`），产出 `matrix_report.md` +
-`matrix_result.json` + `fig_matrix_accuracy.png`：
+label 推荐 `platform@commit` 格式（也接受任意字符串）。实验目录自包含（各组产物的数据集树副本落 `runs/<label>/`，内部同 eval 的 `runs/<dataset>/…` 形态），产出 `reports/report.md` +
+`reports/matrix_result.json` + `reports/fig_matrix_accuracy.png`：
 
 1. 若标签恰好覆盖 2 平台 × 2 commit，对 accuracy / stale_rate / evidence_recall /
    abstention_accuracy / latency_p95_ms 各生成一张 platform × commit 透视表；
@@ -352,31 +388,41 @@ label 推荐 `platform@commit` 格式（也接受任意字符串）。实验目�
 
 ## 产物布局（一次实验一个自包含子目录）
 
-报告与其对应的 run 就近归属在同一个实验目录里，不再与全局 run 混放。产物根由 `membench.paths.output_root()` 统一判定：`MEMBENCH_OUTPUT_DIR` > skill 的 `output/` > 工程根 `output/`；run 默认落 `membench.paths.runs_dir()`（开发环境保持历史行为：工程根 `runs/`）。
+报告与其对应的逐题数据就近归属在同一个实验目录里，不再与全局 run 混放。实验目录的**父目录**由 `membench.paths.output_root()` 统一判定：`MEMBENCH_OUTPUT_DIR` > skill 包的 `output/` > 工程根 `output/`；目录名与层级的唯一来源是 `membench/layout.py`。
 
 ```bash
-# 单次评测（run / evaluate --report-out DIR）：DIR 是实验目录的父目录
-DIR/eval_<adapter>_<platform>_<ts>/
-├── report.md / metrics.json / results.jsonl / fig_*.png
-└── runs/<run_id>/                      # 本次评测的 run 副本（含分片）
-# evaluate 特有：evaluate_report.md / evaluate_summary.json + runs/<各数据集 run_id>/
+# 单次评测（run / evaluate --report-out DIR）：DIR 是实验目录的父目录（缺省 output_root()）
+# fuse --out DIR 直接给完整实验目录，形态与本棵树相同（runs/<dataset>/ + reports/）
+DIR/eval_<adapter>_<platform>_<ts>/      # ts = YYYYMMDD-HHMMSS
+├── runs/<dataset>/                      # 每个数据集一棵子树
+│   ├── report/{report.md,metrics.json,results.jsonl,fig_category_accuracy.png,fig_latency_hist.png}
+│   └── <对话目录>/                       # 对话 id 归一成安全目录名（非法字符换 `_`，空值回退 dialogue）
+│       ├── runtime/                     # 运行时数据（桥的 reset 前备份落 runtime/reset_backup/）
+│       ├── memory_snapshot/             # --snapshot 时的对话快照（含 manifest.json）
+│       └── report/{report.md,metrics.json,results.jsonl}   # 对话级，纯文字不出图
+└── reports/                             # 任务级报告：report.md + metrics.json + 报告引用的图
+                                         # run → 数据集级那两图；evaluate → fig_dataset_overview.png
+                                         # 且另有 reports/evaluate_summary.json
 
-# A/B 对比（compare --report-out DIR）
-DIR/ab_<tag>_<ts>/
-├── A/{report.md, metrics.json, fig_*.png, runs/<run_id>/}
-├── B/{report.md, metrics.json, fig_*.png, runs/<run_id>/}
-├── compare_report.md / fig_metric_diff.png
-└── optimization_report.md              # 可选，由你的优化流程写入
+# A/B 对比（compare / evaluate-compare --report-out DIR：同样是实验目录的父目录）
+DIR/compare_<name>_<platform>_<ts>/
+├── A/  B/                               # 各为一个完整 eval 实验形态（含自身 runs/ 与 reports/）
+└── reports/comparison.md                # 结论；另有两张对比图：
+                                         # compare → fig_metric_diff.png / fig_category_diff.png
+                                         # evaluate-compare → fig_per_dataset_diff.png / fig_fused_diff.png
+# 可选：optimization_report.md 由你的优化流程写入 reports/
 
-# 矩阵对比（matrix：--report-out DIR 为父目录，--out 直接指定完整实验目录）
+# 矩阵对比（matrix：--report-out DIR 为父目录，--out 直接指定完整实验目录，--out 优先）
 DIR/matrix_<ts>/
-├── matrix_report.md / matrix_result.json / fig_matrix_accuracy.png
-└── runs/<label>/                       # 各组 run 副本
+├── reports/{report.md,matrix_result.json,fig_matrix_accuracy.png}
+└── runs/<label>/                        # 各 label 的数据集树副本（内部同 eval 的 runs/<dataset>/…）
 ```
 
-- 不传 `--report-out` 时：`run` 只写 `runs/<run_id>/`；`compare` 落 `output_root()/ab_<tag>_<ts>/`；`evaluate` 保持历史位置 `<out_dir>/evaluate_<ts>/`；`matrix` 落 `output_root()/matrix_<ts>/`。
-- 命名与落位 helper 是**公开 API**（不必自己重写约定）：`membench.layout` 的 `subdir_for` / `ab_subdir` / `matrix_subdir` / `experiment_path` / `copy_runs_into` / `materialize_run_experiment` / `materialize_ab_experiment` / `materialize_matrix_experiment`；`membench.paths.output_root()` / `runs_dir()`。
-- Runner API 使用者传 `Runner(..., report_out=DIR)` 即可让 Runner 自己建 `eval_<adapter>_<platform>_<ts>/`、把 run 复制进 `runs/<run_id>/`，并把实验目录写回 `metrics.json.experiment_dir` 且打印出来。
+- 不传 `--report-out` / `--out` 时一律落 `output_root()`：`run` / `evaluate` 落 `output_root()/eval_<adapter>_<platform>_<ts>/`，`compare` / `evaluate-compare` 落 `output_root()/compare_<name>_<platform>_<ts>/`，`matrix` 落 `output_root()/matrix_<ts>/`。
+- 命名与落位 helper 是**公开 API**（不必自己重写约定）：`membench.layout` 的 `eval_subdir` / `compare_subdir` / `matrix_subdir` / `experiment_path` / `runs_root` / `dataset_dir` / `dataset_report_dir` / `dialogue_dir` / `dialogue_report_dir` / `dialogue_runtime_dir` / `dialogue_snapshot_dir` / `task_report_dir` / `resolve_dataset_dir`；产物根 `membench.paths.output_root()`。
+- **读取方的「产物目录」入参**（`compare --baseline/--candidate`、`evaluate --from-runs`、`evaluate-compare --baseline-run/--candidate-run`、`matrix --runs` 右值、`run --replay`、`fuse --runs`）统一经 `layout.resolve_dataset_dir` 解析：传**实验目录**（其下恰有一个数据集目录时自动定位；有多个则要求指向具体数据集目录）或**数据集目录**（`<实验目录>/runs/<dataset>`）都行；指标固定读 `<数据集目录>/report/metrics.json`。
+- Runner API 使用者传 `Runner(..., out_dir=实验目录)`：Runner 直接写 `<实验目录>/runs/<dataset>/…`（数据集级报告 + 逐对话报告 + `runtime/`），任务级报告落 `<实验目录>/reports/`，并把 `experiment_dir` / `dataset_dir` 写回 `metrics.json`。
+- 旧版产物（平铺的 run 目录、缺 `report/` 层级）**不再兼容**：读取时统一报错「产物结构为旧版（缺少 report/ 层级），本版本不再兼容，请重新跑评测」。
 
 ## 如何接入自己的记忆系统
 
@@ -389,6 +435,7 @@ DIR/matrix_<ts>/
 只需实现 `reset / ingest / query` 三个方法：
 
 ```python
+from membench import layout
 from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
 from membench.runner import Runner
 
@@ -405,14 +452,16 @@ class MyAdapter(BaseMemoryAdapter):
                            latency_ms=0.0, input_tokens=0,
                            output_tokens=0, llm_calls=0)
 
-Runner(MyAdapter(), "membench/data/sample_dataset.jsonl").run()
+# out_dir = 实验目录（Runner 直接写它的 runs/<dataset>/…，任务级报告落它的 reports/）
+exp_dir = layout.experiment_path(None, layout.eval_subdir("my-system"))
+Runner(MyAdapter(), "membench/data/sample_dataset.jsonl", out_dir=exp_dir).run()
 ```
 
 可选能力：需要「快照回放」（改读取侧免重跑 ingest，见「状态快照与回放」）时，再实现
 `snapshot_capabilities()`（声明 `supported/restore/rebuild/format_version`）、`snapshot(target_dir, tag)`、
 必要时 `restore(source_dir, tag)` / `rebuild(source_dir, tag)`——框架只传目录与 tag，导出什么由你决定。
 
-完整可运行示例见 `examples/quickstart.py`。token / llm_calls 填不了就填 0（报告中视为 n/a /「未上报」）。`reset()` 里若要实现"清空前快照"这类回溯能力，可读框架给的可选提示环境变量 `MEMBENCH_RUN_DIR` / `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`（框架不读也不写你的存储）。
+完整可运行示例见 `examples/quickstart.py`。token / llm_calls 填不了就填 0（报告中视为 n/a /「未上报」）。`reset()` 里若要实现"清空前快照"这类回溯能力，可读框架给的可选提示环境变量 `MEMBENCH_RUN_DIR`（**本次对话目录**，即 `<实验目录>/runs/<dataset>/<对话目录>`，备份建议落它的 `runtime/reset_backup/`）/ `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`（框架不读也不写你的存储）。
 
 `query` 返回的 `retrieved` 决定 `evidence_recall` / `recall@5` 是否成立，口径 = **注入即口径**：填实际拼进回答 prompt 的**记忆条目原文**，按注入优先级排序，多轮检索先合并去重再返回，报注入的那一份全量（框架不合并、不去重、不截断；空列表 = 静默按 0 召回计）。
 
@@ -420,7 +469,7 @@ Runner(MyAdapter(), "membench/data/sample_dataset.jsonl").run()
 
 如果你的记忆系统已有 HTTP 服务，实现三个端点即可，无需写 Python：
 
-- `POST /reset`：清空全部记忆状态。请求体带**可选**上下文 `{"run_dir", "dialogue_id", "dialogue_index"}`——供服务端在清空前自行快照/归档；不认识就忽略，不影响契约。
+- `POST /reset`：清空全部记忆状态。请求体带**可选**上下文 `{"run_dir", "dialogue_id", "dialogue_index"}`（`run_dir` = 本次**对话目录**，备份建议落它的 `runtime/reset_backup/`）——供服务端在清空前自行快照/归档；不认识就忽略，不影响契约。
 - `POST /ingest`：body `{"messages": [{"role", "content", "timestamp"}]}`
 - `POST /query`：body `{"question": "..."}`，返回 `{"answer": str, "retrieved": [str], ...}`
 
@@ -456,6 +505,7 @@ python -m membench.cli doctor --target http://127.0.0.1:8787 [--timeout 10.0] [-
 > **仅适用 Python 侧**：LLM 客户端与工具 handler 都必须是 Python 可调用对象；非 Python（Node/Electron）系统的 tool-call 循环留在其自身进程内，membench 无法复用，走路径二的 HTTP 接入。
 
 ```python
+from membench import layout
 from membench.agent_loop import AgentLoopAdapter
 from membench.runner import Runner
 
@@ -466,7 +516,8 @@ adapter = AgentLoopAdapter(
     system_prompt="你是一个带长期记忆的办公助手。",
 )
 Runner(adapter, "membench/data/office_dataset.jsonl", judge="heuristic",
-       driver_llm="deepseek-v3").run()
+       driver_llm="deepseek-v3",
+       out_dir=layout.experiment_path(None, layout.eval_subdir("agent-loop"))).run()
 ```
 
 - 确切签名：`run_tool_loop(client, messages, tools, max_rounds=8, system_prompt=None) -> dict`；`AgentLoopAdapter(llm_client, ingest_tools, query_tools=None, system_prompt=None, name="agent-loop", max_rounds=8, retrieved_from=None, ingest_prompt=None, query_prompt=None)`。
@@ -562,13 +613,13 @@ python -m membench.cli list-datasets           # 仅列内置数据集
 **时间戳统一（ISO 8601，精度不变）**：转换器把各原始数据集的时间戳归一成 ISO 8601——LoCoMo `1:56 pm on 8 May, 2023` → `2023-05-08T13:56`、LongMemEval `2023/04/10 (Mon) 17:50` → `2023-04-10T17:50`、BEAM `March-01-2024` → `2024-03-01`、GateMem 与内置集本来就是 ISO（空格分隔会规范成 `T`）。**粒度保持原样**：只到日的不补 `00:00`、只到分的不补秒、原始无时区就不造时区。粒度差异依然存在（LoCoMo / LongMemEval 会话级、GateMem 逐轮、BEAM 每 batch 一条只到日的锚点≈0.6% 消息）；不认识的形态在 `fetch` 阶段报错停下，不静默留混格式。归一实现在 `membench/data/timestamps.py`，解析表按实测形态定（含 LoCoMo 12 小时制边界与 LongMemEval 星期一致性校验）。
 
 ```bash
-python -m membench.cli dataset fetch locomo            # 逐个下载；幂等，--force 可重下
+python -m membench.cli dataset fetch locomo            # 逐个下载；幂等（产物已存在且可解析即直接返回）
 python -m membench.cli dataset fetch longmemeval_oracle
 python -m membench.cli dataset fetch beam_1m
 # 全部可下载 key：locomo / longmemeval_oracle / longmemeval_s / gatemem_office / beam_1m / beam_10m
 ```
 
-`dataset fetch` 幂等：产物已存在且能被 `load_dataset` 解析时直接返回；未知 key → 退出码 2（并列出可下载的 key）；下载失败 → 打印消息、退出码 1。`evaluate` 全量评估会从下载目录解析这些集，缺失时报错提示先 `dataset fetch <key>`。
+`dataset fetch` 幂等：产物已存在且能被 `load_dataset` 解析时直接返回；未知 key → 退出码 2（并列出可下载的 key）；下载失败 → 打印消息、退出码 1。CLI 未暴露 `--force`，要强制重下请删掉 `~/.membench/datasets/<key>.jsonl` 与同名 raw 缓存目录后重跑（或调 `membench.data.fetch.fetch_dataset(key, force=True)`）。`evaluate` 全量评估会从下载目录解析这些集，缺失时报错提示先 `dataset fetch <key>`。
 
 手动转换（自选数据源时）：
 
@@ -591,8 +642,8 @@ python -m membench.data.convert_longmemeval /tmp/longmemeval_oracle.json -o ~/.m
 python -m membench.data.convert_beam <chats根目录> --scale 1m -o ~/.membench/datasets/beam_1m.jsonl
 python -m membench.data.convert_gatemem episodes.jsonl checkpoints.jsonl --ignore-privacy-refuse -o ~/.membench/datasets/gatemem_office.jsonl
 
-# 评测（LoCoMo 为英文长对话，建议先用 --max-dialogues 1 冒烟）
-python -m membench.cli run --adapter mock-strong --dataset ~/.membench/datasets/locomo.jsonl --out runs/
+# 评测（LoCoMo 为英文长对话，建议先用 --limit 5 冒烟）
+python -m membench.cli run --adapter mock-strong --dataset ~/.membench/datasets/locomo.jsonl --limit 5
 ```
 
 题型映射与已知限制：
@@ -609,7 +660,7 @@ python -m membench.cli run --adapter mock-strong --dataset ~/.membench/datasets/
 ## FAQ
 
 **Q: compare 的两次 run 有什么前提？**
-A: 同一数据集（指纹一致）、同一判分器与判分模型、同一驱动 LLM 与适配器实现，只变被测系统；否则 diff 无法归因。`compare` 会做可比性前置校验，关键维度不一致时给出 WARN/FAIL；要强制拦截用 `--require-comparable`（不可比原因见 CLI 输出与 `compare_report.md` 的「可比性前置校验」小节）。
+A: 同一数据集（指纹一致）、同一判分器与判分模型、同一驱动 LLM 与适配器实现，只变被测系统；否则 diff 无法归因。`compare` 会做可比性前置校验，关键维度不一致时给出 WARN/FAIL；要强制拦截用 `--require-comparable`（不可比原因见 CLI 输出与 `compare_<name>_<platform>_<ts>/reports/comparison.md` 的「可比性前置校验」小节）。
 
 **Q: heuristic 判分把我的正确答案判错了怎么办？**
 A: 启发式是 token 包含匹配，表述差异大时会误判。先跑 `--judge llm` 复核；长期方案是优化黄金集答案表述或改用 LLM 判分（注意对基线重跑保持同尺比较）。
@@ -618,7 +669,7 @@ A: 启发式是 token 包含匹配，表述差异大时会误判。先跑 `--jud
 A: 填 0 即可，报告中对应项视为 n/a /「未上报」，不影响 accuracy 等核心指标。注意这与"真实消耗为 0"是两回事：`token_usage` 块全为 0 时报告会显式标注"适配器未上报该字段"。适配器（或 HTTP 桥的 `/ingest`、`/query` 响应）能填多少填多少——填了才有"这次评测烧了多少 token"的账。
 
 **Q: 每个对话都 `reset()`，怎么回溯"清空前记忆里存了什么"？**
-A: 框架不读不写你的记忆存储（黑盒契约），但会把 reset 上下文（run 目录 / 对话 id 与序号）作为可选提示给出：Python 适配器读环境变量 `MEMBENCH_RUN_DIR` / `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`；HTTP 桥收 `POST /reset` 请求体里的 `run_dir` / `dialogue_id` / `dialogue_index`。要不要在清空前快照、落到哪里，由接入侧决定——参考模板的实现：`BRIDGE_RESET_BACKUP=run` 时快照到本次 run 的 `run_snapshots/reset_<序号>_<dialogue_id>/`（`examples/http_bridge_node/README.md`）。逐题 `retrieved` 已在 `results.jsonl` 里，快照只用于查内部存储状态；reset 每对话一次，长跑请谨慎常开。
+A: 框架不读不写你的记忆存储（黑盒契约），但会把 reset 上下文（本次对话目录 / 对话 id 与序号）作为可选提示给出：Python 适配器读环境变量 `MEMBENCH_RUN_DIR`（= `<实验目录>/runs/<dataset>/<对话目录>`）/ `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`；HTTP 桥收 `POST /reset` 请求体里的 `run_dir` / `dialogue_id` / `dialogue_index`。要不要在清空前快照、落到哪里，由接入侧决定——约定是落该对话目录的 `runtime/reset_backup/`（参考模板的实现：`BRIDGE_RESET_BACKUP=run` 时即如此，见 `examples/http_bridge_node/README.md`）。逐题 `retrieved` 已在数据集级 `report/results.jsonl` 里，快照只用于查内部存储状态；reset 每对话一次，长跑请谨慎常开。
 
 **Q: 如何把门禁接入 CI？**
 A: `compare` 子命令在 verdict=FAIL 时以退出码 1 退出，直接放进流水线即可。
@@ -631,7 +682,7 @@ A: 当前 Runner 按题目级并发执行（记忆系统有状态，ingest 顺�
 针对通用办公助手类 Agent 内置的领域数据集：20 个对话、86 题，覆盖二十类办公场景——项目截止日变更、会议决议追溯、写作风格偏好、日程与联系人变动、敏感信息拒答（红线题）、跨周待办跟踪、自动化流程偏好、长跨度谈判时间线、供应商合同、招聘面试、事故复盘、客户投诉升级、年度预算、流程偏好回滚、差旅报销规则、同名项目干扰、凭证保密、远程办公制度、发布计划、OKR 协作。
 
 ```bash
-python -m membench.cli run --adapter my-system --dataset membench/data/office_dataset.jsonl --out runs/
+python -m membench.cli run --adapter my-system --dataset membench/data/office_dataset.jsonl
 ```
 
 办公场景的指标优先级建议：**stale_rate（陈旧召回）是一票否决项**——过期的截止日和联系人会直接造成办公事故；其次是 abstention_accuracy（涉密信息拒答）与 preference 题准确率（决定产出物是否"像你写的"）。建议将此数据集作为最小验收集，再按你的实际业务对话扩充到 50–100 题。

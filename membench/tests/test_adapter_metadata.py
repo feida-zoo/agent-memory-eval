@@ -1,4 +1,8 @@
-"""adapter 配置元数据测试：--adapter-meta 透传与 adapter.describe() 自动记录。"""
+"""adapter 配置元数据测试：--adapter-meta 透传与 adapter.describe() 自动记录。
+
+metrics 读自数据集级 ``<实验目录>/runs/<dataset>/report/metrics.json``
+（见 :mod:`membench.layout`）。
+"""
 
 from __future__ import annotations
 
@@ -29,15 +33,19 @@ class _BrokenDescribeAdapter(MockStrongAdapter):
 
 
 def _run(tmp_path: Path, adapter, **kwargs) -> dict:
+    """把 ``tmp_path/exp`` 当实验目录跑一次，返回数据集级 metrics。"""
     runner = Runner(
         adapter,
         str(SAMPLE_DATASET_PATH),
         judge="heuristic",
-        out_dir=str(tmp_path / "runs"),
+        out_dir=str(tmp_path / "exp"),
         **kwargs,
     )
-    run_dir = Path(runner.run())
-    return json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    dataset_dir = runner.run()
+    assert dataset_dir is not None
+    return json.loads(
+        (Path(dataset_dir) / "report" / "metrics.json").read_text(encoding="utf-8")
+    )
 
 
 def test_adapter_meta_passthrough(tmp_path: Path) -> None:

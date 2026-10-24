@@ -1,19 +1,49 @@
-"""--limit 冒烟模式与 --shards/--shard-index 分片的 Runner 测试。"""
+"""--limit 冒烟模式与 --shards/--shard-index 分片的 Runner 测试。
+
+产物结构见 :mod:`membench.layout`：``out_dir`` 是实验目录，``run()`` 返回数据集目录
+``<实验目录>/runs/<dataset>``；分片只影响本分片的对话/题目，树形与元数据一致。
+"""
 
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
+from membench import layout
 from membench.adapters import MockStrongAdapter
 from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
 from membench.data import SAMPLE_DATASET_PATH
 from membench.runner import Runner
 
+#: 测试数据集目录名（= 数据集文件名 stem）。
+DATASET = "sample_dataset"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_output_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """默认产物根指向 tmp_path：任何走 output_root() 的路径都不落进仓库。"""
+    root = tmp_path / "output-root"
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(root))
+    return root
+
+
+def _dataset_artifacts(dataset_dir: Path) -> tuple[dict, list[dict]]:
+    """读数据集级 metrics 与逐题明细（都在 ``<数据集目录>/report/`` 下）。"""
+    report_dir = Path(dataset_dir) / layout.DIR_REPORT
+    metrics = json.loads((report_dir / layout.FILE_METRICS).read_text(encoding="utf-8"))
+    records = [
+        json.loads(line)
+        for line in (report_dir / layout.FILE_RESULTS).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return metrics, records
+
 
 def _run(tmp_path: Path, name: str, **kwargs) -> tuple[Path, dict, list[dict]]:
+    """跑一次评测，返回（数据集目录, 数据集级 metrics, 数据集级逐题明细）。"""
     runner = Runner(
         MockStrongAdapter(),
         str(SAMPLE_DATASET_PATH),
@@ -21,23 +51,21 @@ def _run(tmp_path: Path, name: str, **kwargs) -> tuple[Path, dict, list[dict]]:
         out_dir=str(tmp_path / name),
         **kwargs,
     )
-    run_dir = Path(runner.run())
-    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
-    records = [
-        json.loads(line)
-        for line in (run_dir / "results.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    return run_dir, metrics, records
+    dataset_dir = Path(runner.run())
+    metrics, records = _dataset_artifacts(dataset_dir)
+    return dataset_dir, metrics, records
 
 
 def test_limit_truncates_questions(tmp_path: Path) -> None:
     """limit=3 时只评测前 3 道题，metrics 与 run_id 均体现 limit。"""
-    _, metrics, records = _run(tmp_path, "limited", limit=3)
+    dataset_dir, metrics, records = _run(tmp_path, "limited", limit=3)
     assert len(records) == 3
     assert metrics["overall"]["n_questions"] == 3
     assert metrics["limit"] == 3
     assert "_limit3_" in metrics["run_id"]
+    # 产物归属写进 metrics：数据集目录与实验目录不必靠猜层级
+    assert metrics["dataset_dir"] == str(dataset_dir)
+    assert Path(metrics["experiment_dir"]) == tmp_path / "limited"
 
 
 def test_limit_none_is_full_run(tmp_path: Path) -> None:
@@ -56,19 +84,25 @@ def test_limit_validation(tmp_path: Path) -> None:
 
 
 def test_shards_partition_dataset(tmp_path: Path) -> None:
-    """2 分片的 qid 集合不相交且并集等于全量 qid 集合。"""
-    _, m0, r0 = _run(tmp_path, "s0", shards=2, shard_index=0)
+    """2 分片的 qid 集合不相交且并集等于全量 qid 集合（分片 run 照常产全树）。"""
+    s0_dir, m0, r0 = _run(tmp_path, "s0", shards=2, shard_index=0)
     _, m1, r1 = _run(tmp_path, "s1", shards=2, shard_index=1)
-    _, _, full = _run(tmp_path, "full")
+    _, full_metrics, full = _run(tmp_path, "full")
 
     q0 = [r["qid"] for r in r0]
     q1 = [r["qid"] for r in r1]
     assert set(q0).isdisjoint(q1)
     assert set(q0) | set(q1) == {r["qid"] for r in full}
+    assert len(q0) + len(q1) == full_metrics["overall"]["n_questions"]
     assert m0["shards"] == 2 and m0["shard_index"] == 0
     assert m1["shards"] == 2 and m1["shard_index"] == 1
     assert "_shard0of2_" in m0["run_id"]
     assert "_shard1of2_" in m1["run_id"]
+    # 分片写的仍是同一套树：数据集报告 + 任务级 reports/ 都在位
+    assert (s0_dir / layout.DIR_REPORT / layout.FILE_METRICS).is_file()
+    assert (
+        s0_dir.parent.parent / layout.DIR_REPORTS / layout.FILE_REPORT_MD
+    ).is_file()
 
 
 def test_shards_deterministic_order(tmp_path: Path) -> None:
@@ -161,7 +195,7 @@ def _dense_dataset(tmp_path: Path, n_dialogues: int = 4, per: int = 3) -> Path:
 
 def test_shards_by_dialogue_partition_dataset(tmp_path: Path) -> None:
     """dialogue 分片整段选取对话：分片间对话不相交，对话与题目并集均覆盖全量。"""
-    _, m0, r0 = _run(tmp_path, "d0", shards=2, shard_index=0, shard_by="dialogue")
+    d0_dir, m0, r0 = _run(tmp_path, "d0", shards=2, shard_index=0, shard_by="dialogue")
     _, m1, r1 = _run(tmp_path, "d1", shards=2, shard_index=1, shard_by="dialogue")
     _, _, full = _run(tmp_path, "full")
 
@@ -177,6 +211,13 @@ def test_shards_by_dialogue_partition_dataset(tmp_path: Path) -> None:
     assert {r["qid"] for r in r0} | {r["qid"] for r in r1} == {
         r["qid"] for r in full
     }
+    # 本分片只落自己的对话目录（不为其它的对话留空目录）
+    laid_out = {
+        p.name
+        for p in d0_dir.iterdir()
+        if p.is_dir() and p.name != layout.DIR_REPORT
+    }
+    assert laid_out == {layout.tag_dir_name(d) for d in d0}
 
 
 def test_shards_by_dialogue_avoid_repeated_ingest(tmp_path: Path) -> None:
@@ -223,8 +264,13 @@ def test_shard_by_invalid(tmp_path: Path) -> None:
         )
 
 
+def _cli_experiment_dirs(root: Path) -> list[Path]:
+    """CLI 产物：``--report-out`` 下的实验目录（``eval_<adapter>_<platform>_<ts>``）。"""
+    return sorted(p for p in root.glob("eval_*") if p.is_dir())
+
+
 def test_cli_shard_by_dialogue(tmp_path: Path) -> None:
-    """CLI 透传 --shard-by dialogue，metrics.json 记录 shard_by。"""
+    """CLI 透传 --shard-by dialogue；实验目录与数据集目录按新结构落位。"""
     from membench import cli
 
     rc = cli.main(
@@ -236,8 +282,8 @@ def test_cli_shard_by_dialogue(tmp_path: Path) -> None:
             str(SAMPLE_DATASET_PATH),
             "--judge",
             "heuristic",
-            "--out",
-            str(tmp_path / "runs"),
+            "--report-out",
+            str(tmp_path),
             "--shards",
             "2",
             "--shard-index",
@@ -247,16 +293,23 @@ def test_cli_shard_by_dialogue(tmp_path: Path) -> None:
         ]
     )
     assert rc == 0
-    run_dir = next((tmp_path / "runs").iterdir())
-    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    experiments = _cli_experiment_dirs(tmp_path)
+    assert len(experiments) == 1
+    assert experiments[0].name.startswith("eval_mock-strong_default_")
+    # 目录名末段是 TS_FORMAT 秒级时间戳（格式不符时 strptime 抛错即失败）
+    datetime.strptime(experiments[0].name.rsplit("_", 1)[-1], layout.TS_FORMAT)
+
+    dataset_dir = experiments[0] / layout.DIR_RUNS / DATASET
+    metrics, records = _dataset_artifacts(dataset_dir)
     assert metrics["shard_by"] == "dialogue"
-    assert metrics["overall"]["n_questions"] > 0
+    assert metrics["overall"]["n_questions"] == len(records) > 0
+    assert (experiments[0] / layout.DIR_REPORTS / layout.FILE_REPORT_MD).is_file()
 
 
 def test_shards_over_dialogue_count_clamped(tmp_path: Path) -> None:
     """--shards 超过对话数 -> 按上限执行（不报错），标签与元数据用有效分片数。"""
     ds = _dense_dataset(tmp_path, n_dialogues=2, per=2)
-    run_dir = Runner(
+    dataset_dir = Runner(
         MockStrongAdapter(),
         str(ds),
         judge="heuristic",
@@ -265,16 +318,17 @@ def test_shards_over_dialogue_count_clamped(tmp_path: Path) -> None:
         shard_index=1,
         shard_by="dialogue",
     ).run()
-    assert run_dir is not None
-    assert "_dshard1of2_" in Path(run_dir).name
-    metrics = json.loads((Path(run_dir) / "metrics.json").read_text(encoding="utf-8"))
+    assert dataset_dir is not None
+    metrics, records = _dataset_artifacts(Path(dataset_dir))
+    assert "_dshard1of2_" in metrics["run_id"]
     assert metrics["shards"] == 2
+    assert metrics["overall"]["n_questions"] == len(records) == 2
 
 
 def test_shards_over_question_count_clamped(tmp_path: Path) -> None:
     """question 维度超过题目数 -> 同样按上限执行。"""
     ds = _dense_dataset(tmp_path, n_dialogues=1, per=3)
-    run_dir = Runner(
+    dataset_dir = Runner(
         MockStrongAdapter(),
         str(ds),
         judge="heuristic",
@@ -282,15 +336,17 @@ def test_shards_over_question_count_clamped(tmp_path: Path) -> None:
         shards=9,
         shard_index=2,
     ).run()
-    assert run_dir is not None
-    metrics = json.loads((Path(run_dir) / "metrics.json").read_text(encoding="utf-8"))
+    assert dataset_dir is not None
+    metrics, records = _dataset_artifacts(Path(dataset_dir))
     assert metrics["shards"] == 3
+    assert "_shard2of3_" in metrics["run_id"]
+    assert len(records) == 1
 
 
 def test_shards_at_limit_ok(tmp_path: Path) -> None:
     """分片数等于上限可用（每个分片恰有归属）。"""
     ds = _dense_dataset(tmp_path, n_dialogues=2, per=1)
-    run_dir = Runner(
+    dataset_dir = Runner(
         MockStrongAdapter(),
         str(ds),
         judge="heuristic",
@@ -299,7 +355,7 @@ def test_shards_at_limit_ok(tmp_path: Path) -> None:
         shard_index=1,
         shard_by="dialogue",
     ).run()
-    assert (Path(run_dir) / "metrics.json").is_file()
+    assert (Path(dataset_dir) / layout.DIR_REPORT / layout.FILE_METRICS).is_file()
 
 
 def test_shards_index_beyond_effective_skips(tmp_path: Path) -> None:
@@ -323,7 +379,7 @@ def test_shards_max_auto_and_skip(tmp_path: Path) -> None:
     """--shards max 按上限自动取最大；越界索引同样安全跳过。"""
     ds = _dense_dataset(tmp_path, n_dialogues=2, per=1)
     out_dir = tmp_path / "mx"
-    run_dir = Runner(
+    dataset_dir = Runner(
         MockStrongAdapter(),
         str(ds),
         judge="heuristic",
@@ -332,9 +388,12 @@ def test_shards_max_auto_and_skip(tmp_path: Path) -> None:
         shard_index=0,
         shard_by="dialogue",
     ).run()
-    assert run_dir is not None and "_dshard0of2_" in Path(run_dir).name
-    metrics = json.loads((Path(run_dir) / "metrics.json").read_text(encoding="utf-8"))
+    assert dataset_dir is not None
+    metrics, records = _dataset_artifacts(Path(dataset_dir))
     assert metrics["shards"] == 2
+    assert "_dshard0of2_" in metrics["run_id"]
+    assert len(records) == 1
+
     skipped = Runner(
         MockStrongAdapter(),
         str(ds),
@@ -345,6 +404,8 @@ def test_shards_max_auto_and_skip(tmp_path: Path) -> None:
         shard_by="dialogue",
     ).run()
     assert skipped is None
+    # 跳过的分片不动已有产物（同一实验目录里的数据集报告保持原样）
+    assert _dataset_artifacts(Path(dataset_dir))[0]["run_id"] == metrics["run_id"]
 
 
 def test_cli_shards_max_and_clamp(tmp_path: Path) -> None:
@@ -360,8 +421,13 @@ def test_cli_shards_max_and_clamp(tmp_path: Path) -> None:
             "--shards", "max",
             "--shard-index", "0",
             "--shard-by", "dialogue",
-            "--out", str(tmp_path / "runs"),
+            "--report-out", str(tmp_path),
         ]
     )
     assert rc == 0
-    assert list((tmp_path / "runs").glob("*_dshard0of2_*"))
+    experiments = _cli_experiment_dirs(tmp_path)
+    assert len(experiments) == 1
+    metrics, records = _dataset_artifacts(experiments[0] / layout.DIR_RUNS / "dense")
+    assert metrics["shards"] == 2
+    assert "_dshard0of2_" in metrics["run_id"]
+    assert len(records) == 1

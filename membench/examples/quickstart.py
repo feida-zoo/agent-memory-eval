@@ -13,6 +13,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))  # 便于直接运行
 
+from membench import layout
 from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
 from membench.runner import Runner
 
@@ -61,5 +62,8 @@ if __name__ == "__main__":
     dataset = os.path.join(
         os.path.dirname(__file__), "..", "membench", "data", "sample_dataset.jsonl"
     )
-    run_dir = Runner(MyAdapter(), dataset, judge="heuristic", out_dir="runs").run()
-    print(f"评测完成，报告见: {run_dir}/report.md")
+    # 实验目录自包含：Runner 把数据集产物写到它的 runs/<dataset>/，任务级报告写到 reports/
+    experiment_dir = layout.experiment_path(None, layout.eval_subdir(MyAdapter.name))
+    dataset_dir = Runner(MyAdapter(), dataset, judge="heuristic", out_dir=experiment_dir).run()
+    print(f"评测完成，实验目录: {experiment_dir}")
+    print(f"数据集报告目录: {os.path.join(dataset_dir, layout.DIR_REPORT)}")

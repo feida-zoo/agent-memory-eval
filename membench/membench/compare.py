@@ -1,4 +1,4 @@
-"""compare：对比两个 run（基线 vs 候选），产出逐指标 diff 与回归门禁判定。
+"""compare：对比两份评测产物（基线 vs 候选），产出逐指标 diff 与回归门禁判定。
 
 门禁规则（SPEC 3.6，阈值可由 CLI 覆盖）：
 - accuracy 下降 > acc_threshold（默认 0.02） -> FAIL
@@ -6,9 +6,21 @@
 - latency_p95 上升 > latency_warn（默认 30%） -> WARN
 - 其余指标变动仅报告，不门禁。
 
-产物布局：``<root>/ab_<tag>_<ts>/``（自包含，A/B 各自带 run 副本），由
-:func:`membench.layout.materialize_ab_experiment` 落地；``<root>`` 取 ``out_dir``
-或 :func:`membench.paths.output_root`。
+入参（``--baseline`` / ``--candidate``）是「产物目录」：既可以是**实验目录**（含
+``runs/``，其下恰好一个数据集目录），也可以是**数据集目录**
+（``<实验目录>/runs/<dataset>``）；指标一律读 ``<数据集目录>/report/metrics.json``。
+旧版产物（没有 ``report/`` 层级，或旧的 ``ab_`` 实验目录）不再兼容，直接报错要求重跑
+（见 :func:`membench.layout.resolve_dataset_dir`）。
+
+产物布局（见 :mod:`membench.layout`）::
+
+    <out_dir>/compare_<name>_<platform>_<ts>/
+    ├── A/  B/                   # 各为一个完整 eval 实验形态（runs/ + reports/）
+    └── reports/{comparison.md, fig_metric_diff.png, fig_category_diff.png}
+
+``out_dir`` 是实验目录的**父目录**（缺省 :func:`membench.paths.output_root`）。A/ B/
+在入参解析、产物齐备校验与可比性核对完成之后才落地——入参有问题或产物不完整时不留
+半个实验目录。
 
 可比性前置校验：比较前先核对驱动/判分模型、适配器实现与数据集
 指纹等维度；关键维度缺失或不一致时给出 ``comparability`` 门禁，避免结果不可归因
@@ -19,11 +31,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from typing import Any
 
 from membench import layout
+from membench.layout import resolve_dataset_dir
 from membench.paths import output_root
-from membench.report import render_compare_report
+from membench.report import _md_table, copy_report, render_compare_report
 
 # 参与逐指标 diff 的 overall 指标（排除计数项）
 _DIFF_KEYS: list[str] = [
@@ -90,11 +104,20 @@ _COMPARABILITY_DIMS: tuple[str, ...] = (
 )
 
 
-def _load_metrics(run_dir: str) -> dict[str, Any]:
-    """读取 run 目录下的 metrics.json。"""
-    path = os.path.join(run_dir, "metrics.json")
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"metrics.json 不存在: {path}")
+#: A/B 两臂的目录名——compare 实验目录下固定为这两棵完整的 eval 树。
+_DIR_A = "A"
+_DIR_B = "B"
+
+
+def _load_metrics(target: str) -> dict[str, Any]:
+    """读取「产物目录」（实验目录或数据集目录）的数据集级指标。
+
+    入参是对话级产物目录、旧版产物结构或半成品（缺 ``report/metrics.json``）时，
+    :func:`membench.layout.resolve_dataset_dir` 直接 SystemExit 并给出可操作提示；
+    本函数只负责把已确认存在的指标读出来。
+    """
+    dataset_dir = resolve_dataset_dir(target)
+    path = os.path.join(dataset_dir, layout.DIR_REPORT, layout.FILE_METRICS)
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
@@ -347,6 +370,106 @@ def _comparability_gate(
     return {"name": "comparability", "status": status, "detail": detail}
 
 
+def _run_id(metrics: dict[str, Any], target: str) -> str:
+    """run 身份：优先 metrics 的 run_id，缺失时退回入参目录名。"""
+    return str(metrics.get("run_id") or os.path.basename(os.path.normpath(target)))
+
+
+def _series_name(metrics: dict[str, Any]) -> str:
+    """实验目录名里的被测系统片段（adapter，缺失时退回 run_id）。"""
+    return str(metrics.get("adapter") or metrics.get("run_id") or "unknown")
+
+
+def _platform_tag(metrics_a: dict[str, Any], metrics_b: dict[str, Any]) -> str:
+    """实验目录名里的平台片段：两臂同平台取该平台，不同平台拼 ``p1-p2``。"""
+    platform_a = str(metrics_a.get("platform") or "default")
+    platform_b = str(metrics_b.get("platform") or "default")
+    return platform_a if platform_a == platform_b else f"{platform_a}-{platform_b}"
+
+
+def _dataset_name(metrics: dict[str, Any], target: str) -> str:
+    """数据集名：优先 metrics 记的名字，退回入参目录名（都按 layout 规则 slug 化）。"""
+    return layout.slug(str(metrics.get("dataset") or os.path.basename(os.path.normpath(target))))
+
+
+#: 数据集产物里支撑 A/B 副本的必需文件（缺任一即视为产物不完整）。
+_REQUIRED_PRODUCT_FILES: tuple[str, ...] = (layout.FILE_METRICS, layout.FILE_REPORT_MD)
+
+
+def _require_dataset_product(dataset_dir: str) -> None:
+    """校验数据集产物齐备（在复制 A/B 副本之前调用）。
+
+    缺文件要在这里就拦下：复制之后再炸会留下半个实验目录（A/ 已落地、
+    ``reports/`` 未生成）。措辞与 :func:`membench.layout._require_metrics` 一致。
+
+    Raises:
+        SystemExit: ``report/`` 下缺 :data:`_REQUIRED_PRODUCT_FILES` 中的任一文件。
+    """
+    for name in _REQUIRED_PRODUCT_FILES:
+        path = os.path.join(dataset_dir, layout.DIR_REPORT, name)
+        if not os.path.isfile(path):
+            raise SystemExit(f"数据集目录缺少 {name}（产物不完整）: {dataset_dir}")
+
+
+def _ensure_task_reports(arm_dir: str, dataset_dir: str) -> None:
+    """补齐 A/B 副本的任务级 ``reports/``（形态与 Runner 的 write_task_reports 一致）。"""
+    task_dir = layout.task_report_dir(arm_dir)
+    if os.path.isfile(os.path.join(task_dir, layout.FILE_REPORT_MD)):
+        return
+    report_dir = os.path.join(dataset_dir, layout.DIR_REPORT)
+    copy_report(
+        os.path.join(report_dir, layout.FILE_REPORT_MD),
+        task_dir,
+        layout.FILE_REPORT_MD,
+        extra_files=[os.path.join(report_dir, layout.FILE_METRICS)],
+    )
+
+
+def _copy_arm(compare_dir: str, arm: str, target: str, metrics: dict[str, Any]) -> str:
+    """把一侧产物整理成 ``<compare_dir>/<arm>/``——一个完整的 eval 实验形态。
+
+    入参是实验目录时整树复制（连同 ``runs/`` 与 ``reports/``）；入参是数据集目录时
+    构造成 ``runs/<dataset>/`` 并从数据集报告生成任务级 ``reports/``，与
+    :class:`membench.runner.Runner` 的产物形态一致。
+    """
+    src = os.path.abspath(target)
+    arm_dir = os.path.join(compare_dir, arm)
+    if os.path.isdir(layout.runs_root(src)):
+        shutil.copytree(src, arm_dir)
+        # 副本里的数据集目录：源实验目录内的相对位置原样保留
+        in_arm = os.path.join(arm_dir, os.path.relpath(resolve_dataset_dir(src), src))
+    else:
+        in_arm = layout.dataset_dir(arm_dir, _dataset_name(metrics, src))
+        shutil.copytree(src, in_arm)
+    _ensure_task_reports(arm_dir, in_arm)
+    return arm_dir
+
+
+def _append_sources_section(md_path: str, sources: dict[str, dict[str, str]]) -> None:
+    """在 comparison.md 末尾追加「来源与产物」小节（两侧源目录路径与 run_id）。"""
+    rows = [
+        [
+            role,
+            f"`{src['target']}`",
+            f"`{src['dataset_dir']}`",
+            f"`{src['run_id']}`",
+            f"`{os.path.basename(src['arm_dir'])}/`",
+        ]
+        for role, src in sources.items()
+    ]
+    block = "\n".join(
+        [
+            "",
+            "## 来源与产物",
+            "",
+            _md_table(["侧", "源产物目录", "数据集目录", "run_id", "本实验副本"], rows),
+            "",
+        ]
+    )
+    with open(md_path, "a", encoding="utf-8") as f:
+        f.write(block)
+
+
 def compare_runs(
     dir_a: str,
     dir_b: str,
@@ -355,25 +478,33 @@ def compare_runs(
     latency_warn: float = 0.30,
     require_comparable: bool = False,
     out_dir: str | None = None,
-    tag: str | None = None,
+    name: str | None = None,
+    platform: str | None = None,
 ) -> dict[str, Any]:
-    """对比两个 run 目录。
+    """对比两侧的产物目录（实验目录或数据集目录）。
 
     Args:
-        dir_a: 基线 run 目录（含 metrics.json）。
-        dir_b: 候选 run 目录（含 metrics.json）。
+        dir_a: 基线产物目录。
+        dir_b: 候选产物目录。
         acc_threshold: accuracy 允许的最大下降幅度。
         stale_threshold: stale_rate 允许的最大上升幅度。
         latency_warn: latency_p95 相对上升的告警比例（0.30 = 30%）。
         require_comparable: strict 模式；关键维度不一致或缺失 -> 门禁 FAIL。
-        out_dir: A/B 实验目录的父目录；缺省 :func:`membench.paths.output_root`。
-        tag: A/B 实验目录标签；缺省 ``{run_a}_vs_{run_b}``。
+        out_dir: compare 实验目录的**父目录**；缺省 :func:`membench.paths.output_root`。
+        name: 实验目录名里的标签；缺省 ``<A 的 adapter>_vs_<B 的 adapter>``。
+        platform: 实验目录名里的平台；缺省按两臂的 platform 取（不同则 ``p1-p2``）。
 
     Returns:
         ``{"verdict", "diffs", "gates", "run_a", "run_b", "compare_dir",
-        "comparability"}``；``gates`` 首位为 ``comparability`` 门禁，
-        ``compare_dir`` 指向落地的 ``ab_*`` 实验目录。
+        "report_path", "arm_a", "arm_b", "sources", "comparability"}``；``gates``
+        首位为 ``comparability`` 门禁，``compare_dir`` 指向落地的
+        ``compare_<name>_<platform>_<ts>`` 实验目录。
     """
+    dataset_a = resolve_dataset_dir(dir_a)
+    dataset_b = resolve_dataset_dir(dir_b)
+    # 产物齐备校验与指标读取都在建目录 / 复制之前完成：A/B 副本只从完整产物复制。
+    _require_dataset_product(dataset_a)
+    _require_dataset_product(dataset_b)
     metrics_a = _load_metrics(dir_a)
     metrics_b = _load_metrics(dir_b)
     overall_a = metrics_a.get("overall", {})
@@ -393,14 +524,38 @@ def compare_runs(
     else:
         verdict = "PASS"
 
-    id_a = str(metrics_a.get("run_id") or os.path.basename(os.path.normpath(dir_a)))
-    id_b = str(metrics_b.get("run_id") or os.path.basename(os.path.normpath(dir_b)))
-    base = out_dir or output_root()
-    ab_dir = layout.experiment_path(base, layout.ab_subdir(tag or f"{id_a}_vs_{id_b}"))
-    render_compare_report(
-        ab_dir, metrics_a, metrics_b, diffs, gates, verdict, comparability=comparability
+    id_a = _run_id(metrics_a, dir_a)
+    id_b = _run_id(metrics_b, dir_b)
+    # 入参解析、产物齐备校验与可比性核对都已完成，此后才建实验目录并复制 A/B。
+    compare_dir = layout.experiment_path(
+        out_dir or output_root(),
+        layout.compare_subdir(
+            name or f"{_series_name(metrics_a)}_vs_{_series_name(metrics_b)}",
+            platform or _platform_tag(metrics_a, metrics_b),
+        ),
     )
-    layout.materialize_ab_experiment(ab_dir, dir_a, dir_b, ab_dir)
+    reports_dir = layout.task_report_dir(compare_dir)
+    render_compare_report(
+        reports_dir, metrics_a, metrics_b, diffs, gates, verdict, comparability=comparability
+    )
+    arm_a = _copy_arm(compare_dir, _DIR_A, dir_a, metrics_a)
+    arm_b = _copy_arm(compare_dir, _DIR_B, dir_b, metrics_b)
+    report_path = os.path.join(reports_dir, layout.FILE_COMPARISON_MD)
+    sources = {
+        "A（基线）": {
+            "target": dir_a,
+            "dataset_dir": dataset_a,
+            "run_id": id_a,
+            "arm_dir": arm_a,
+        },
+        "B（候选）": {
+            "target": dir_b,
+            "dataset_dir": dataset_b,
+            "run_id": id_b,
+            "arm_dir": arm_b,
+        },
+    }
+    _append_sources_section(report_path, sources)
 
     # 逐条打印不可比原因（含"关键维度无法核验"），默认模式也不静默
     for reason in comparability["reasons"]:
@@ -409,7 +564,9 @@ def compare_runs(
     print(f"[membench] compare {id_a} -> {id_b}: {verdict}")
     for gate in gates:
         print(f"[membench]   gate {gate['name']}: {gate['status']} ({gate['detail']})")
-    print(f"[membench] report: {os.path.join(ab_dir, 'compare_report.md')}")
+    print(f"[membench] report: {report_path}")
+    print(f"[membench] A 副本: {arm_a}")
+    print(f"[membench] B 副本: {arm_b}")
 
     return {
         "verdict": verdict,
@@ -417,6 +574,10 @@ def compare_runs(
         "gates": gates,
         "run_a": id_a,
         "run_b": id_b,
-        "compare_dir": ab_dir,
+        "compare_dir": compare_dir,
+        "report_path": report_path,
+        "arm_a": arm_a,
+        "arm_b": arm_b,
+        "sources": sources,
         "comparability": comparability,
     }

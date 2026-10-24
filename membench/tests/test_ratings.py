@@ -22,7 +22,7 @@ from membench.ratings import (
     rate_metric,
     rating_points,
 )
-from membench.report import write_run_report_md
+from membench.report import render_dialogue_report, write_run_report_md
 
 # ---------------------------------------------------------------------------
 # rate_metric：各指标阈值边界
@@ -386,24 +386,30 @@ def test_write_run_report_md_contains_ratings(tmp_path) -> None:
 
 def test_run_report_warns_all_zero_retrieval(tmp_path) -> None:
     """标注了 evidence 但两项检索指标全 0 -> 报告给出"格式不一致"警示；
-    非默认检索口径在配置表与提示中可见。"""
+    非默认检索口径在配置表与提示中可见。
+
+    经对话级报告入口（``render_dialogue_report``）落盘：它负责建目录，
+    两份口径各写自己的 ``report/``，后一次不覆盖前一次的产物。
+    """
     records = [{"qid": "q1", "category": "single_hop", "judge": {"correct": True}}]
 
     metrics = _minimal_metrics()
     metrics.update({"has_evidence": True, "retrieval_match": "substring"})
     metrics["overall"]["evidence_recall"] = 0.0
     metrics["overall"]["recall_at_5"] = 0.0
-    out_path = write_run_report_md(str(tmp_path), records, metrics)
+    out_path = render_dialogue_report(str(tmp_path / "ds1" / "report"), records, metrics)
     content = open(out_path, encoding="utf-8").read()
     assert "疑似 evidence 与被检索文本格式不一致" in content
     assert "| 检索匹配口径 | substring |" in content
 
     metrics2 = _minimal_metrics()
     metrics2.update({"retrieval_match": "overlap", "retrieval_match_threshold": 0.6})
-    out_path2 = write_run_report_md(str(tmp_path), records, metrics2)
+    out_path2 = render_dialogue_report(str(tmp_path / "ds2" / "report"), records, metrics2)
     content2 = open(out_path2, encoding="utf-8").read()
     assert "检索命中口径：**overlap**（阈值 0.6）" in content2
     assert "| 检索匹配口径 | overlap |" in content2
+    # 第一份报告未被第二份覆盖
+    assert os.path.isfile(out_path) and out_path != out_path2
 
 
 def test_write_run_report_md_no_overall_rating(tmp_path) -> None:

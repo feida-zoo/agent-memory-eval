@@ -15,8 +15,8 @@ membench/                 # 评测工程（Python 包工程根）
 │   ├── data/             # schema / 加载器 / 转换器 / fetch（按需下载）/ info（数据集注册表）
 │   ├── judges/           # heuristic / llm（OpenAI 兼容）/ client（复用 agent 的 LLM）
 │   ├── metrics/          # token_f1 / bleu1 / recall@k + 六维汇总
-│   ├── paths.py          # 【唯一】默认产物目录判定（output_root / runs_dir）
-│   ├── layout.py         # 【唯一】实验目录命名与 materialize（eval_* / ab_* / matrix_*）
+│   ├── paths.py          # 【唯一】默认产物根目录判定（output_root）
+│   ├── layout.py         # 【唯一】实验目录命名与路径 helper（eval_* / compare_* / matrix_* / resolve_dataset_dir）
 │   ├── agent_loop.py     # tool-call 循环复用（run_tool_loop / AgentLoopAdapter）
 │   ├── doctor.py         # 三端点连通性与契约校验
 │   ├── runner.py / evaluate.py / compare.py / matrix.py / fuse.py / report.py
@@ -49,18 +49,22 @@ docs/                     # 深度研究报告 + 配图
   ```
 
   改动涉及面较广时不要只跑子集。
-- **坑**：macOS 自带 `/usr/bin/python3` 可能低于 3.10 且缺 matplotlib，会让 report/图表相关测试大面积失败（`RuntimeError: 报告图表需要 matplotlib`）。这类失败先确认解释器与依赖，再怀疑代码。
+- **坑**：macOS 自带 `/usr/bin/python3` 可能低于 3.10 且缺 matplotlib，会让 report/图表相关测试大面积失败（`RuntimeError: 报告图表需要 matplotlib`）。这类失败先确认解释器与依赖，再怀疑代码。本仓库开发机上验证过的解释器是 `/opt/homebrew/bin/python3.13`（已装 matplotlib），可直接用它替换上面的 `python`。
 - 测试不得在仓库内写产物：涉及默认目录的测试用 `monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(tmp_path / ...))`。
 
 ## 核心约定（改代码前必读）
 
-1. **一次实验一个自包含子目录**（报告与对应 run 就近归属，不再全局扁平化）：
-   - `output/eval_<adapter>_<platform>_<ts>/`：`report.md`、`metrics.json`、`fig_*.png` + `runs/<run_id>/`
-   - `output/ab_<tag>_<ts>/`：`A/`、`B/`（各含 `report.md`/`metrics.json`/`fig_*.png`/`runs/<run_id>/`）+ `compare_report.md`
-   - `output/matrix_<ts>/`：报告 + `runs/<label>/`
-   - CLI `--report-out DIR` 一律指**实验目录的父目录**。
-   - 命名与落位**只走** `membench/layout.py`，不要在业务代码里手写目录名或手抄复制逻辑。
-2. **默认目录只由 `membench/paths.py` 判定**（`output_root()` / `runs_dir()`；`MEMBENCH_OUTPUT_DIR` > skill 的 `output/` > 工程根）。历史上的多处 SKILL.md 探测已收敛到这里，不要再复制一份。
+1. **一次实验一个自包含子目录**（报告与对应数据就近归属）：
+   - `output/eval_<name>_<platform>_<ts>/`（`ts` = `YYYYMMDD-HHMMSS`）：
+     - `runs/<dataset>/report/`：数据集级 `report.md`、`metrics.json`、`results.jsonl`、`fig_*.png`
+     - `runs/<dataset>/<dialogue_id>/`：对话级 `runtime/`（桥的 reset 前备份落 `runtime/reset_backup/`；`MEMBENCH_RUN_DIR` 指本对话目录）、`memory_snapshot/`（`--snapshot` 时含 `manifest.json`）、`report/`（`report.md`、`metrics.json`、`results.jsonl`，不出图）
+     - `reports/`：任务级报告（多数据集 `evaluate` 另含 `evaluate_summary.json`）
+   - `output/compare_<name>_<platform>_<ts>/`：`A/`、`B/`（各为完整 eval 实验形态，含自己的 `runs/` 与 `reports/`）+ `reports/{comparison.md,fig_*.png}`
+   - `output/matrix_<ts>/`：`reports/{report.md,matrix_result.json,fig_matrix_accuracy.png}` + `runs/<label>/`
+   - CLI `--report-out DIR` 一律指**实验目录的父目录**（缺省 `output_root()`）；`fuse --out` / `matrix --out` 指**完整实验目录**。
+   - 「产物目录」入参（`--baseline` / `--candidate` / `--from-runs` / `--baseline-run` / `--candidate-run` / `fuse --runs` 各项 / `matrix --runs` 的 `=` 右值 / `--replay`）统一接受**实验目录**或 `runs/<dataset>` 数据集目录，经 `layout.resolve_dataset_dir` 解析。
+   - 旧版产物（平铺 run 目录、缺 `report/` 层级、旧版对比实验目录）一律报错拒绝，不留兼容层。命名与落位**只走** `membench/layout.py`，不要在业务代码里手写目录名或手抄复制逻辑。
+2. **默认根目录只由 `membench/paths.py` 判定**（`output_root()`；`MEMBENCH_OUTPUT_DIR` > skill 的 `output/` > 工程根）。历史上的多处 SKILL.md 探测已收敛到这里，不要再复制一份。
 3. **可比性前置校验**：`compare` 按 `membench/compare.py` 的维度表核对 A/B 元数据（关键维度不一致 → 不可比）。新增关键维度要同步三处：维度表、`Runner` 的元数据写入、文档。**`commit` 不同是 A/B 的被测变量，不得判为不可比。** 纪律：compare 只测量差异，不判定两组是否只差一个变量。
 4. **数据集政策**：仓库**不内置**开源大数据集。`office_dataset.jsonl` / `sample_dataset.jsonl` 是自造演示集；`locomo` / `longmemeval_*` / `gatemem_office` / `beam_*` 一律 `dataset fetch` 到 `~/.membench/datasets/`。
    - `membench/.gitignore` 已忽略这些文件：**绝不**加入 git，也绝不让它们进入 skill 包（`skill/build_skill.py` 自带自检，混入即报错）。

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -188,18 +189,23 @@ def _run_evaluate(
     script: dict[str, tuple[str, list[str]]],
     office_key: str = "A",
 ) -> dict:
-    """执行全量评估并返回解析后的 evaluate_summary.json（附带 _rc 与 _eval_dir）。"""
+    """执行全量评估并返回解析后的 evaluate_summary.json（附带 _rc 与 _eval_dir）。
+
+    ``report_out`` 是实验目录（``eval_<adapter>_<platform>_<ts>``）的父目录：各数据集
+    产物落实验目录的 ``runs/<dataset>/``，任务级报告落 ``reports/``。
+    """
+    report_out = tmp_path / "out"
     rc = evaluate(
         ScriptedAdapter(script),
         "heuristic",
-        out_dir=str(tmp_path / "runs"),
+        report_out=str(report_out),
         specs=_specs(mini, office_key=office_key),
     )
-    eval_dirs = sorted((tmp_path / "runs").glob("evaluate_*"))
-    assert eval_dirs, "缺少 evaluate_<时间戳> 目录"
+    eval_dirs = sorted(report_out.glob("eval_*"))
+    assert eval_dirs, "缺少 eval_<adapter>_<platform>_<时间戳> 目录"
     eval_dir = eval_dirs[-1]
-    summary_path = eval_dir / "evaluate_summary.json"
-    assert summary_path.is_file(), "缺少 evaluate_summary.json"
+    summary_path = eval_dir / "reports" / "evaluate_summary.json"
+    assert summary_path.is_file(), "缺少 reports/evaluate_summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     summary["_rc"] = rc
     summary["_eval_dir"] = str(eval_dir)
@@ -290,7 +296,9 @@ def test_gate_fail_exit_code(
     assert summary["gate"]["status"] == "FAIL"
     assert summary["_rc"] == 1
 
-    report = (Path(summary["_eval_dir"]) / "evaluate_report.md").read_text(encoding="utf-8")
+    report = (Path(summary["_eval_dir"]) / "reports" / "report.md").read_text(
+        encoding="utf-8"
+    )
     assert "门禁结论： FAIL" in report
     assert "总评结论： 不达标" in report
 
@@ -314,7 +322,9 @@ def test_report_contents(
 ) -> None:
     """报告含综合评级、"评价（百分比）"样式与"参与数据集"列。"""
     summary = _run_evaluate(tmp_path, mini_datasets, script)
-    report = (Path(summary["_eval_dir"]) / "evaluate_report.md").read_text(encoding="utf-8")
+    eval_dir = Path(summary["_eval_dir"])
+    reports_dir = eval_dir / "reports"
+    report = (reports_dir / "report.md").read_text(encoding="utf-8")
 
     assert "**综合评级：" in report
     assert "/4.0）**" in report
@@ -328,27 +338,35 @@ def test_report_contents(
     assert "参与数据集" in report
     assert "## 分数据集明细" in report
     assert "## 诊断指标（不参与评级）" in report
-    # 效率成本段 + 报告配图
+    # 效率成本段 + 报告配图（图与报告同在 reports/ 下）
     assert "## 效率成本（分数据集）" in report
     assert "avg_output_tokens" in report
     assert "avg_ingest_latency_ms" in report
-    assert (Path(summary["_eval_dir"]) / "fig_dataset_overview.png").is_file()
+    assert (reports_dir / "fig_dataset_overview.png").is_file()
     assert "](fig_dataset_overview.png)" in report
     # 综合评级保留两位小数（不强行截断到一位）
-    import re
-
     m = re.search(r"综合评级：\S+（(\d+\.\d+)/4.0）", report)
     assert m is not None and len(m.group(1).split(".")[1]) == 2
     # 数据集范围行：先确认本次实际评测的数据集 key 与来源
     assert "数据集范围" in report
     assert "a（user-specified）" in report
-    # 报告目录下复制了各数据集 run 副本，链接指向相对路径 runs/<run_id>/report.md
-    report_dir = Path(summary["_eval_dir"])
-    assert summary["experiment_dir"] == str(report_dir)
-    for rel in summary["runs"].values():
-        assert rel.startswith("runs/")
-        assert (report_dir / rel / "report.md").is_file()
-    assert "(runs/" in report
+    # 任务级报告在实验目录的 reports/ 下；各数据集产物在 runs/<dataset>/ 下，
+    # 报告内链接按实验目录相对路径给出（runs/<dataset>/report/report.md）
+    assert Path(summary["experiment_dir"]).resolve() == eval_dir.resolve()
+    assert summary["runs"]["a"] == "runs/a"
+    for key, rel in summary["runs"].items():
+        assert rel == f"runs/{key}"
+        assert (eval_dir / rel / "report" / "report.md").is_file()
+        assert (eval_dir / rel / "report" / "metrics.json").is_file()
+    assert "[runs/a/report/report.md](../runs/a/report/report.md)" in report
+    assert (reports_dir / "metrics.json").is_file()
+    assert (reports_dir / "evaluate_summary.json").is_file()
+    # 报告内相对链接必须全部指向真实文件（无死链、无绝对路径）
+    links = re.findall(r"\]\(([^)]+)\)", report)
+    assert links, "报告缺少相对链接"
+    for target in links:
+        assert "://" not in target and not target.startswith("/")
+        assert (reports_dir / target).is_file(), f"死链: {target}"
     # B 不参与 stale_rate，明细表中应显示 "未定义"（避免业务方把 "未定义"
     # 误读为 "0% 召回"，统一用 "未定义" 取代 "—" 占位）。
     detail_section = report.split("## 分数据集明细")[1]
@@ -501,16 +519,21 @@ def test_run_datasets_forwards_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPa
             captured.update(kwargs)
 
         def run(self) -> str:
-            run_dir = tmp_path / "fake_run"
-            run_dir.mkdir(exist_ok=True)
-            (run_dir / "metrics.json").write_text("{}", encoding="utf-8")
-            return str(run_dir)
+            # Runner 落盘位置：<实验目录>/runs/<dataset>/report/metrics.json
+            dataset_dir = tmp_path / "exp" / "runs" / "d"
+            (dataset_dir / "report").mkdir(parents=True, exist_ok=True)
+            (dataset_dir / "report" / "metrics.json").write_text("{}", encoding="utf-8")
+            return str(dataset_dir)
 
     monkeypatch.setattr(ev_mod, "Runner", _FakeRunner)
     specs = [DatasetSpec(key="k", name="K", path=str(dataset), source="user-specified")]
-    results = ev_mod.run_datasets(object(), "heuristic", specs, str(tmp_path / "runs"), jobs=7)
+    results = ev_mod.run_datasets(object(), "heuristic", specs, str(tmp_path / "exp"), jobs=7)
     assert captured["jobs"] == 7
+    # 各数据集写同一个实验目录；任务级 reports/ 由 evaluate 统一写，避免逐数据集覆盖
+    assert captured["out_dir"] == str(tmp_path / "exp")
+    assert captured["write_task_reports"] is False
     assert results and results[0].metrics == {}
+    assert results[0].run_dir == str(tmp_path / "exp" / "runs" / "d")
 
 
 def test_cli_run_forwards_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -527,17 +550,22 @@ def test_cli_run_forwards_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
             return str(tmp_path)
 
     monkeypatch.setattr(cli, "Runner", _FakeRunner)
+    report_out = tmp_path / "out"
     rc = cli.main(
         [
             "run",
             "--adapter", "mock-weak",
             "--dataset", str(SAMPLE_DATASET_PATH),
             "--jobs", "5",
-            "--out", str(tmp_path / "runs"),
+            "--report-out", str(report_out),
         ]
     )
     assert rc == 0
     assert captured["jobs"] == 5
+    # CLI 自己建实验目录（<report-out>/eval_<adapter>_<platform>_<ts>）并交给 Runner
+    out_dir = Path(str(captured["out_dir"]))
+    assert out_dir.parent == report_out
+    assert out_dir.name.startswith("eval_mock-weak_default_")
 
 
 def test_dataset_specs_parsing_rules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

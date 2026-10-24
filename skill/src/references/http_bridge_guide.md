@@ -12,11 +12,11 @@
 
 | 端点 | 请求体 | 响应（最少） | 说明 |
 |---|---|---|---|
-| `POST /reset` | `{}` 或 `{"run_dir","dialogue_id","dialogue_index"}`（可选提示） | 2xx 即可（体可空） | 真清空记忆库（向量 collection / 事实表 / 情景缓冲 / 图谱），测试库与生产库隔离；上下文只用于"清空前快照"等回溯能力，可忽略 |
+| `POST /reset` | `{}` 或 `{"run_dir","dialogue_id","dialogue_index"}`（可选提示；`run_dir` = **该对话的目录** `<实验目录>/runs/<dataset>/<对话目录>`） | 2xx 即可（体可空） | 真清空记忆库（向量 collection / 事实表 / 情景缓冲 / 图谱），测试库与生产库隔离；上下文只用于"清空前快照"等回溯能力，可忽略 |
 | `POST /ingest` | `{"messages":[{"role","content","timestamp"}]}` | `{"input_tokens":int,"llm_calls":int,"latency_ms":float}` | 走**记忆写入路径**；拿不到 token/调用数填 `0`（报告标「未上报」） |
 | `POST /query` | `{"question":str}` | `{"answer":str,"retrieved":[str],...}` | 走**记忆读取+回答**；`retrieved` 填实际注入 prompt 的**记忆原文**，注入即口径（优先级顺序、多轮检索先合并去重、报全量，见下方常见坑）；`input_tokens`/`output_tokens` 填了才会进「Token 消耗」账 |
 | `POST /snapshot-capabilities`（可选） | `{}` | `{"supported":true,"restore":true,"rebuild":false,"format_version":1}` | 声明快照能力；老桥缺该端点 → 框架按不支持处理 |
-| `POST /snapshot`（可选） | `{"target_dir","tag"}` | `{"items":int}` | 把当前记忆整体导出到 target_dir（**内容与布局由桥决定**；模板 = `memory/` + 标记文件） |
+| `POST /snapshot`（可选） | `{"target_dir","tag"}` | `{"items":int}` | 把当前记忆整体导出到 target_dir（框架传的是该对话的 `memory_snapshot/`；**内容与布局由桥决定**，模板 = `memory/` + 标记文件） |
 | `POST /restore`（可选） | `{"source_dir","tag"}` | `{"restored":true}` | 从快照恢复；**只认带标记文件的快照**，并重建进程内实例（只换磁盘不重建缓存等于没恢复） |
 
 - `Content-Type: application/json`；如果服务要求鉴权，客户端用 `api_key` 时发
@@ -111,4 +111,4 @@ result = check_target("http://127.0.0.1:8787", timeout=10.0, api_key=None)
   （stub 掉 `ipcMain`/`BrowserWindow` 即可），否则会因缺窗口上下文而失败。
 - 评测用独立数据目录（`BRIDGE_DATA_DIR`）与独立实例：`reset` 必须真清空，且**绝不能碰生产数据**。
 - **并行分片 = 每分片一个桥实例**：评测对每个 dialogue 调 `reset()`，两个分片共享一个实例会互相清库（跨片串扰）。N 分片并行就起 N 个桥（各自 `BRIDGE_PORT` + `BRIDGE_DATA_DIR`）；只有一个实例时请串行跑分片。被测系统若自带多命名空间隔离，可自行在桥上按命名空间路由——那是系统能力增强，不是本模板的默认行为。
-- **清空前快照（可选，回溯用）**：框架在每次 `reset` 前把上下文放进请求体（`run_dir` / `dialogue_id` / `dialogue_index`），**不读不写**你的记忆存储。要"清空前留一份"就在桥里自己做：模板实现为 `BRIDGE_RESET_BACKUP`——`run` 落本次 run 的 `run_snapshots/reset_<序号>_<dialogue_id>/`，设目录则落该目录，**默认关闭**。逐题 `retrieved` 已在 `results.jsonl`，快照只用于查"内部存储为什么长这样"（stale / 误改记忆 / 该记没记）；reset 每对话一次，长跑常开等于每对话复制一份记忆目录。
+- **清空前快照（可选，回溯用）**：框架在每次 `reset` 前把上下文放进请求体（`run_dir` / `dialogue_id` / `dialogue_index`），**不读不写**你的记忆存储。`run_dir` 现在指向**该对话的目录**（`<实验目录>/runs/<dataset>/<对话目录>`，框架已把它的 `runtime/` 建好）：要"清空前留一份"就在桥里自己做，约定落 `runtime/reset_backup/reset_<序号>_<dialogue_id>/`，**默认关闭**。逐题 `retrieved` 已在 `results.jsonl`，快照只用于查"内部存储为什么长这样"（stale / 误改记忆 / 该记没记）；reset 每对话一次，长跑常开等于每对话复制一份记忆目录。

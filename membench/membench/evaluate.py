@@ -2,14 +2,15 @@
 
 流程：
     plan_datasets 规划数据集清单（办公域槽位 + 按需下载公开集 + BEAM 槽位）
-    -> 每个数据集用 Runner 各跑一次（adapter 实例复用，reset 由 Runner 内部负责）
-    -> 读取各 run_dir 的 metrics.json
+    -> 建一个实验目录 ``<report_out>/eval_<adapter>_<platform>_<ts>/``
+    -> 每个数据集用 Runner 各跑一次写进它的 ``runs/<dataset>/``
+       （adapter 实例复用，reset 由 Runner 内部负责；write_task_reports=False）
+    -> 读取各数据集 ``report/metrics.json``
     -> 宏平均融合六项质量指标（按能力标注决定参与集）
     -> 办公域 stale 门禁（一票否决）
-    -> 报告目录（report_out 缺省时 <out_dir>/evaluate_<ts>/，
-       指定时 <report_out>/eval_<adapter>_<platform>_<ts>/）内写
-       evaluate_report.md + evaluate_summary.json，并把各数据集 run 目录
-       复制进该目录的 runs/ 下，使报告与 run 数据就近归属、自包含。
+    -> 任务级报告写实验目录的 ``reports/``：report.md（全量评估报告）、
+       metrics.json（任务级汇总）、evaluate_summary.json（机器可消费的清单）、
+       fig_dataset_overview.png；报告内链接指向 ``runs/<dataset>/report/report.md``。
 
 融合口径（宏平均）：
     - accuracy / token_f1 / bleu1：所有数据集参与；
@@ -18,23 +19,28 @@
     - abstention_accuracy：仅 has_abstention（任一题目为拒答题：category 为
       abstention 或 gold 为拒答哨兵值）的数据集参与；
     融合值 = 参与集该指标 overall 值的算术平均。
+
+"产物目录"（``--from-runs`` 的 ``KEY=DIR``）统一经 :func:`membench.layout.resolve_dataset_dir`
+解析：入参可以是实验目录（含 ``runs/``）或数据集目录（``runs/<dataset>``），
+解析结果落数据集目录，指标固定读 ``<数据集目录>/report/metrics.json``。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Union
 
-from membench import layout, paths
+from membench import layout
 from membench.data.info import resolve_available_path
 from membench.data.schema import load_dataset, question_capabilities
+from membench.layout import resolve_dataset_dir
 from membench.ratings import format_metric, overall_rating
 from membench.report import (
-    TOKEN_USAGE_FIELD_ZH,
     _md_table,
     _fmt_opt,
     fig_dataset_overview,
@@ -101,8 +107,8 @@ class DatasetResult:
 
     Attributes:
         spec: 数据集槽位。
-        run_dir: Runner 产出的 run 目录。
-        metrics: 该 run 的 metrics.json 内容。
+        run_dir: 该数据集产物目录（``<实验目录>/runs/<dataset>``）。
+        metrics: 该数据集 ``report/metrics.json`` 的内容。
         capabilities: 能力标注（has_evidence / has_stale / has_abstention）。
     """
 
@@ -238,12 +244,47 @@ def _capabilities_from_metrics(metrics: dict[str, Any], dataset_path: str) -> di
     return {k: False for k in keys}
 
 
-def load_provided_result(key: str, run_dir: str) -> DatasetResult:
-    """从现成 run 目录加载 DatasetResult（汇总模式复用已有评测结果）。"""
-    metrics_path = os.path.join(run_dir, "metrics.json")
-    if not os.path.isfile(metrics_path):
-        raise SystemExit(f"run 目录缺少 metrics.json: {run_dir}（{key}）")
-    with open(metrics_path, encoding="utf-8") as f:
+def _dataset_path_of(dataset_dir: str) -> Union[str, None]:
+    """数据集产物记录的数据集路径（判断两份产物是否同源，缺失返 None）。"""
+    path = os.path.join(dataset_dir, layout.DIR_REPORT, layout.FILE_METRICS)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            metrics = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return str(metrics.get("dataset_path") or "") or None
+
+
+def adopt_dataset_dir(experiment_dir: str, dataset_dir: str) -> str:
+    """把复用的数据集产物并入本次实验目录（已在位时原样返回）。
+
+    汇总模式（``--from-runs``）复用的产物可能来自别的实验目录；并入后本次实验
+    目录自包含（报告内相对链接全部落在目录内），可整体搬移。目标目录名沿用来源
+    数据集目录名（已是安全名）；同名但数据集不同的产物直接拒绝，避免互相串味。
+    """
+    source = os.path.abspath(dataset_dir)
+    target = layout.dataset_dir(experiment_dir, os.path.basename(os.path.normpath(source)))
+    if os.path.abspath(target) == source:
+        return source
+    existing = _dataset_path_of(target)
+    if existing is not None and existing != _dataset_path_of(source):
+        raise SystemExit(
+            f"数据集目录名冲突：{target} 已是另一个数据集（{existing}），"
+            f"无法并入 {source}——请用一个实验目录承载全部数据集"
+        )
+    shutil.copytree(source, target, dirs_exist_ok=True)
+    print(f"[membench] 复用产物已并入本次实验目录: {source} -> {target}")
+    return os.path.abspath(target)
+
+
+def load_provided_result(key: str, product_dir: str) -> DatasetResult:
+    """从现成产物目录（实验目录或数据集目录）加载 DatasetResult（汇总模式复用）。"""
+    dataset_dir = resolve_dataset_dir(product_dir, key)
+    with open(
+        os.path.join(dataset_dir, layout.DIR_REPORT, layout.FILE_METRICS), encoding="utf-8"
+    ) as f:
         metrics = json.load(f)
     dataset_path = str(metrics.get("dataset_path") or "")
     source = str(metrics.get("dataset_source") or "user-specified")
@@ -254,7 +295,7 @@ def load_provided_result(key: str, run_dir: str) -> DatasetResult:
     spec = DatasetSpec(key=key, name=name, path=dataset_path, source=source)
     return DatasetResult(
         spec=spec,
-        run_dir=run_dir,
+        run_dir=dataset_dir,
         metrics=metrics,
         capabilities=_capabilities_from_metrics(metrics, dataset_path),
     )
@@ -581,7 +622,7 @@ def run_datasets(
     adapter: Any,
     judge: Any,
     specs: list[DatasetSpec],
-    out_dir: str,
+    experiment_dir: str,
     platform: Union[str, None] = None,
     commit: Union[str, None] = None,
     jobs: int = 1,
@@ -589,12 +630,15 @@ def run_datasets(
     adapter_version: Union[str, None] = None,
     evidence_matcher: Any = None,
 ) -> list[DatasetResult]:
-    """对每个数据集用 Runner 各跑一次，收集 metrics.json。
+    """对每个数据集用 Runner 各跑一次写进同一个实验目录，收集 metrics。
 
-    adapter 实例跨数据集复用同一个（reset 由 Runner 内部负责）；
-    每个数据集新建 Runner。jobs 透传给 Runner 的题目级并发参数。
-    driver_llm / adapter_version 透传给 Runner，记入每个 run 的元数据。
-    evidence_matcher 为检索命中口径匹配器（默认 substring）。
+    每个数据集落 ``<experiment_dir>/runs/<dataset>/``（Runner 按数据集文件名词干
+    命名并写自己的数据集目录）；adapter 实例跨数据集复用同一个（reset 由 Runner
+    内部负责），每个数据集新建 Runner。任务级 reports/ 由调用方（evaluate）统一写，
+    故 Runner 传 ``write_task_reports=False``。
+    jobs 透传给 Runner 的题目级并发参数。driver_llm / adapter_version 透传给
+    Runner，记入每个 run 的元数据。evidence_matcher 为检索命中口径匹配器
+    （默认 substring）。
     """
     results: list[DatasetResult] = []
     for spec in specs:
@@ -603,26 +647,30 @@ def run_datasets(
             adapter,
             spec.path,
             judge=judge,
-            out_dir=out_dir,
-            platform=platform,
-            commit=commit,
+            out_dir=experiment_dir,
             dataset_source=spec.source,
             jobs=jobs,
+            platform=platform,
+            commit=commit,
             driver_llm=driver_llm,
             adapter_version=adapter_version,
             evidence_matcher=evidence_matcher,
+            write_task_reports=False,
         )
         run_dir = runner.run()
         if run_dir is None:
             raise SystemExit(f"数据集 {spec.name} 无可评测内容（空数据集），终止评估")
-        with open(os.path.join(run_dir, "metrics.json"), encoding="utf-8") as f:
+        with open(
+            os.path.join(run_dir, layout.DIR_REPORT, layout.FILE_METRICS), encoding="utf-8"
+        ) as f:
             metrics = json.load(f)
         results.append(
             DatasetResult(
                 spec=spec,
-                run_dir=run_dir,
+                run_dir=os.path.abspath(run_dir),
                 metrics=metrics,
-                capabilities=scan_capabilities(spec.path),
+                # 能力标注优先用 run 落账值（Runner 已按同一口径扫描），缺失才重扫数据集
+                capabilities=_capabilities_from_metrics(metrics, spec.path),
             )
         )
     return results
@@ -663,8 +711,9 @@ def _token_usage_summary(results: list[DatasetResult]) -> dict[str, Any]:
     }
 
 
-def write_evaluate_report(
-    eval_dir: str,
+def _render_task_report_md(
+    experiment_dir: str,
+    reports_dir: str,
     adapter_name: str,
     judge_name: str,
     platform: Union[str, None],
@@ -675,14 +724,13 @@ def write_evaluate_report(
     gate: dict[str, Any],
     extra_notes: Union[list[str], None] = None,
 ) -> str:
-    """生成 evaluate_report.md（中文），写入报告目录并返回报告路径。
+    """生成任务级 ``report.md``（中文，全量评估报告），返回报告路径。
 
     Args:
+        experiment_dir: 实验目录——各数据集产物在其 ``runs/<dataset>/`` 下，报告内
+            链接用相对它算出的 ``runs/<dataset>/report/report.md``。
+        reports_dir: 任务级报告目录（``<实验目录>/reports``）。
         extra_notes: 报告顶部追加的提示行（Markdown，如汇总模式的元数据不一致告警）。
-
-    Args:
-        eval_dir: 报告目录。各数据集 run 副本已复制到其 ``runs/<run_id>/`` 下，
-            故报告中的 run 链接使用相对该目录的 ``runs/<run_id>/report.md``。
         results: 各数据集评测结果（spec 提供数据集范围、来源与路径）。
     """
     gate_status = str(gate["status"])
@@ -693,7 +741,7 @@ def write_evaluate_report(
     verdict = "不达标" if gate_status == "FAIL" else "达标"
 
     lines: list[str] = []
-    lines.append(f"# membench 全量评估报告 — evaluate_{timestamp.strftime('%Y%m%d_%H%M%S')}")
+    lines.append(f"# membench 全量评估报告 — {os.path.basename(os.path.normpath(experiment_dir))}")
     lines.append("")
 
     # 门禁结论（报告顶部显著呈现）
@@ -953,30 +1001,105 @@ def write_evaluate_report(
         lines.append("（本次评测各 run 均未落账 `token_usage`：适配器未上报或产物来自旧版本）")
     lines.append("")
 
-    # 各数据集 run 目录链接（指向报告目录下复制后的 runs/<run_id>/）
+    # 各数据集产物链接：显示实验目录内的规范路径；链接目标相对报告所在目录
+    # （报告在 <实验目录>/reports/ 下，故目标带 ../——否则点开是死链）
     lines.append("## 各数据集 run 目录")
     lines.append("")
     for r in results:
-        rel = f"runs/{os.path.basename(os.path.normpath(r.run_dir))}"
-        lines.append(f"- {r.spec.name}: [{rel}]({rel}/report.md)")
+        label = os.path.relpath(r.run_dir, experiment_dir).replace(os.sep, "/")
+        target = "/".join(
+            (
+                os.path.relpath(r.run_dir, reports_dir).replace(os.sep, "/"),
+                layout.DIR_REPORT,
+                layout.FILE_REPORT_MD,
+            )
+        )
+        lines.append(
+            f"- {r.spec.name}: [{label}/{layout.DIR_REPORT}/{layout.FILE_REPORT_MD}]({target})"
+        )
     lines.append("")
 
-    out_path = os.path.join(eval_dir, "evaluate_report.md")
+    out_path = os.path.join(reports_dir, layout.FILE_REPORT_MD)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+    return out_path
 
-    # 报告配图：各数据集质量 + 效率分组条形图
+
+def write_task_reports(
+    experiment_dir: str,
+    *,
+    adapter_name: str,
+    judge_name: str,
+    platform: Union[str, None],
+    commit: Union[str, None],
+    timestamp: datetime,
+    results: list[DatasetResult],
+    fused: dict[str, dict[str, Any]],
+    gate: dict[str, Any],
+    extra_notes: Union[list[str], None] = None,
+) -> dict[str, Any]:
+    """写任务级报告到 ``<实验目录>/reports/``，返回 evaluate_summary.json 的内容。
+
+    产物：``report.md``（全量评估报告，内链指向各数据集
+    ``runs/<dataset>/report/report.md``）、``metrics.json``（任务级汇总：融合值 +
+    门禁 + 身份 + token 消耗）、``evaluate_summary.json``（机器可消费的清单，额外
+    带各数据集相对路径）、``fig_dataset_overview.png``。
+    """
+    reports_dir = layout.task_report_dir(experiment_dir)
+    os.makedirs(reports_dir, exist_ok=True)
+    # 先出图再写 md：md 引用了这张图，图先到位就不会留下打不开的相对引用
     fig_dataset_overview(
         [(r.spec.name, r.metrics.get("overall", {})) for r in results],
-        os.path.join(eval_dir, "fig_dataset_overview.png"),
+        os.path.join(reports_dir, layout.FIG_DATASET_OVERVIEW),
     )
-    return out_path
+    _render_task_report_md(
+        experiment_dir,
+        reports_dir,
+        adapter_name,
+        judge_name,
+        platform,
+        commit,
+        timestamp,
+        results,
+        fused,
+        gate,
+        extra_notes=extra_notes,
+    )
+
+    metrics = {
+        "experiment_dir": experiment_dir,
+        "reports_dir": reports_dir,
+        "adapter": adapter_name,
+        "judge": judge_name,
+        "platform": platform or "default",
+        "commit": commit,
+        "timestamp": timestamp.isoformat(timespec="seconds"),
+        "n_datasets": len(results),
+        "datasets": [r.spec.key for r in results],
+        "overall": {k: v["value"] for k, v in fused.items() if v["value"] is not None},
+        "fused": fused,
+        "gate": gate,
+        "token_usage": _token_usage_summary(results),
+    }
+    with open(os.path.join(reports_dir, layout.FILE_METRICS), "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+    summary = {
+        **metrics,
+        "runs": {
+            r.spec.key: os.path.relpath(r.run_dir, experiment_dir).replace(os.sep, "/")
+            for r in results
+        },
+    }
+    with open(os.path.join(reports_dir, layout.FILE_SUMMARY), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"[membench] 任务级报告: {reports_dir}")
+    return summary
 
 
 def evaluate(
     adapter: Any = None,
     judge: Any = None,
-    out_dir: Union[str, None] = None,
     platform: Union[str, None] = None,
     commit: Union[str, None] = None,
     quick: bool = False,
@@ -991,28 +1114,27 @@ def evaluate(
     adapter_version: Union[str, None] = None,
     evidence_matcher: Any = None,
 ) -> int:
-    """执行全量评估：多数据集依次评测 + 宏平均融合 + 门禁 + 报告。
+    """执行全量评估：一个实验目录承载全部数据集 + 宏平均融合 + 门禁 + 报告。
 
     Args:
         adapter: 适配器实例（跨数据集复用，Runner 内部负责 reset）；汇总模式下
             仅当存在需要补跑的数据集时必需，纯复用可为 None。
         judge: judge 名字符串或 Judge 实例（与 Runner 约定一致）；纯复用可为
-            None，此时报告头以已有 run 的元数据为准。
-        from_runs: 汇总模式：``{数据集 key: 已有 run 目录}``。目标清单（``specs``）
-            中有对应 run 的复用其结果、缺失的**补跑**（要求 adapter/judge 可用）；
-            未给 ``specs`` 时目标清单即这些 key（纯汇总）。被测对象与评测口径
-            （:data:`_IDENTITY_KEYS`）在**开跑之前**校验：已有 run 之间混用、或
-            补跑参数与已有 run 不一致，直接拒绝（避免结果不可归因）；全新 run 缺
+            None，此时报告头以已有产物的元数据为准。
+        from_runs: 汇总模式：``{数据集 key: 产物目录}``（实验目录或数据集目录）。
+            目标清单（``specs``）中有对应产物的复用其结果、缺失的**补跑**（要求
+            adapter/judge 可用）；未给 ``specs`` 时目标清单即这些 key（纯汇总）。
+            复用的产物会并入本次实验目录（自包含、可整体搬移）。被测对象与评测
+            口径（:data:`_IDENTITY_KEYS`）在**开跑之前**校验：已有产物之间混用、或
+            补跑参数与已有产物不一致，直接拒绝（避免结果不可归因）；全新 run 缺
             ``driver_llm / adapter_version`` 只在启动时提示（严格可比性会判无法核验）。
-        out_dir: run 数据与缺省报告目录的父目录；None 时默认 paths.runs_dir()。
         platform: 平台标签。commit: commit 标签。
         quick: 跳过 BEAM 与 LongMemEval-S 槽位（等价 no_beam + no_lme_s）。
         beam_10m: BEAM 槽位用 10m 集。no_beam: 不评测 BEAM 槽位。
         no_lme_s: 剔除 LongMemEval-S 变体（默认包含）。
-        report_out: 报告根目录。给定后报告落
-            ``<report_out>/eval_<adapter>_<platform>_<ts>/``；None 时落
-            ``<out_dir>/evaluate_<ts>/``。两种情况都把各数据集 run 目录复制进
-            报告目录的 ``runs/`` 下（自包含，便于就近归属与搬移）。
+        report_out: 实验目录的父目录（缺省 :func:`membench.paths.output_root`）；
+            实验目录名 ``eval_<adapter>_<platform>_<ts>``，各数据集落它的
+            ``runs/<dataset>/``，任务级报告落它的 ``reports/``。
         specs: 显式数据集清单（默认 None 时按 quick/beam_10m/no_beam/no_lme_s 调 plan_datasets）。
         driver_llm: 驱动被测系统的 LLM 标识，透传给每个 run 的元数据（默认 None）。
         adapter_version: 适配器实现版本标识，透传给每个 run 的元数据（默认 None）。
@@ -1022,15 +1144,12 @@ def evaluate(
     Returns:
         进程退出码：门禁 FAIL 为 1，否则 0（与 compare 一致）。
     """
-    if out_dir is None:
-        out_dir = paths.runs_dir()
-
     if from_runs and specs is None and (quick or beam_10m or no_beam or no_lme_s):
         raise SystemExit("--from-runs 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）互斥")
 
     provided: dict[str, DatasetResult] = {}
-    for key, run_dir in (from_runs or {}).items():
-        provided[key] = load_provided_result(key, run_dir)
+    for key, product_dir in (from_runs or {}).items():
+        provided[key] = load_provided_result(key, product_dir)
 
     if specs is None:
         if provided:
@@ -1103,17 +1222,20 @@ def evaluate(
         )
 
     now = datetime.now()
-    # 报告目录：显式 report_out 时用自包含的 eval_<adapter>_<platform>_<ts>/；
-    # 否则保持历史位置 <out_dir>/evaluate_<ts>/（不引入新的测试副作用）。
-    if report_out:
-        report_dir = layout.experiment_path(
-            report_out, layout.subdir_for(adapter_name, platform, layout.ts_now(now))
-        )
-    else:
-        report_dir = os.path.join(out_dir, f"evaluate_{now.strftime('%Y%m%d_%H%M%S')}")
-        os.makedirs(report_dir, exist_ok=True)
+    experiment_dir = layout.experiment_path(
+        report_out, layout.eval_subdir(adapter_name, platform, layout.ts_now(now))
+    )
+    print(f"[membench] 实验目录: {experiment_dir}")
 
-    provided_by_key = dict(provided)
+    # 复用的产物并入本次实验目录：报告与 run 数据就近归属，实验目录可整体搬移
+    provided_by_key: dict[str, DatasetResult] = {}
+    for key, res in provided.items():
+        provided_by_key[key] = DatasetResult(
+            spec=res.spec,
+            run_dir=adopt_dataset_dir(experiment_dir, res.run_dir),
+            metrics=res.metrics,
+            capabilities=res.capabilities,
+        )
     missing_specs: list[DatasetSpec] = []
     for spec in specs:
         if spec.key in provided_by_key:
@@ -1125,7 +1247,7 @@ def evaluate(
             adapter,
             judge,
             missing_specs,
-            out_dir,
+            experiment_dir,
             platform=platform,
             commit=commit,
             jobs=jobs,
@@ -1155,47 +1277,20 @@ def evaluate(
     fused = fuse_metrics(results)
     gate = evaluate_gate(results)
 
-    # 把各数据集 run 目录复制进报告目录的 runs/ 下，使报告与 run 数据就近归属、可整体搬移；
-    # 报告里的链接据此指向 runs/<run_id>/report.md。
-    copied_runs = layout.copy_runs_into(
-        os.path.join(report_dir, "runs"), [r.run_dir for r in results]
+    write_task_reports(
+        experiment_dir,
+        adapter_name=adapter_name,
+        judge_name=judge_name,
+        platform=platform,
+        commit=commit,
+        timestamp=now,
+        results=results,
+        fused=fused,
+        gate=gate,
+        extra_notes=[f"> ⚠️ **汇总模式**：{note}" for note in notes],
     )
-
-    report_path = write_evaluate_report(
-        report_dir,
-        adapter_name,
-        judge_name,
-        platform,
-        commit,
-        now,
-        results,
-        fused,
-        gate,
-        extra_notes=[f"> ⚠️ **汇总模式**：跨数据集元数据不一致 —— {note}" for note in notes],
-    )
-
-    # 汇总 JSON，便于程序化消费。
-    summary = {
-        "eval_dir": report_dir,
-        "experiment_dir": report_dir,
-        "adapter": adapter_name,
-        "judge": judge_name,
-        "platform": platform or "default",
-        "commit": commit,
-        "timestamp": now.isoformat(timespec="seconds"),
-        "datasets": [r.spec.key for r in results],
-        "runs": {
-            r.spec.key: os.path.relpath(d, report_dir)
-            for r, d in zip(results, copied_runs)
-        },
-        "fused": fused,
-        "gate": gate,
-        "token_usage": _token_usage_summary(results),
-    }
-    with open(os.path.join(report_dir, "evaluate_summary.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
 
     print(f"[membench] 门禁结论: {gate['status']} — {gate['detail']}")
-    print(f"[membench] 报告: {report_path}")
+    print(f"[membench] 报告: {os.path.join(layout.task_report_dir(experiment_dir), layout.FILE_REPORT_MD)}")
 
     return 1 if gate["status"] == "FAIL" else 0

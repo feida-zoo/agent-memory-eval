@@ -143,13 +143,22 @@ def restore(self, source_dir: str, tag: str) -> None:    # 同版本恢复
 def rebuild(self, source_dir: str, tag: str) -> None:    # 跨版本/重建派生结构（可选）
 ```
 
-- **时机**：runner 在每个对话 ingest 完成后、第一道 query 之前调用 `snapshot()`——回放
-  就是"恢复这个状态，然后跑该对话的题"；runner 每对话 `reset()`，所以按对话切片天然等价；
+- **时机与落位**：runner 在每个对话 ingest 完成后、第一道 query 之前调用 `snapshot()`——回放
+  就是"恢复这个状态，然后跑该对话的题"；runner 每对话 `reset()`，所以按对话切片天然等价。
+  快照落该对话目录的 `memory_snapshot/`（框架另写一份 `manifest.json` 清单），整棵产物树见
+  `references/compare_workflows.md` 的"产物目录"；
+- **命令**：导出用 `run --snapshot`（布尔开关，目录固定，不用指定）；回放用
+  `run --replay <实验目录或 runs/<dataset> 数据集目录>`——跳过 reset+ingest 只跑 query，
+  清单齐备性 / 数据集指纹 / 对话覆盖 / 能力 / 模式都在开跑前校验，失败即停不留半成品；
 - **模式**：`full` / `replay-restore`（格式兼容）/ `replay-rebuild`（格式不兼容或需重建
   派生结构）——不兼容且没声明 `rebuild` 会被**拒绝**，提示必须重新 ingest；
 - **口径**：回放固定写入侧，结论只覆盖读取/回答层；`run_mode` 是 compare 的关键维度，
-  回放分与全量分判不可比；`--replay-verify-source` 给出**回放误差地板**（未改代码时答案
-  应逐题一致，不一致说明恢复不保真——先修这个再谈 A/B）；
+  回放分与全量分判不可比；
+- **`replay_verify_source` / `--replay-verify-source`**：回放时与源产物逐题比对，写进
+  `metrics["replay_verify"]` 与报告——这就是"回放误差地板"（未改代码时答案应逐题一致，
+  不一致说明恢复不保真，先修这个再谈 A/B）。**入参为源评测的实验目录或数据集目录**
+  （`<实验目录>` 或 `<实验目录>/runs/<dataset>`，实现按 `<数据集目录>/report/results.jsonl`
+  取源明细）；
 - **必须重跑的场景**：改动落在写入侧（抽取/更新/去重/写入成本）或逻辑 schema 变更且系统
   没有 `rebuild`；
 - **HTTP 桥**：同款端点 `POST /snapshot-capabilities|/snapshot|/restore|/rebuild`（见
@@ -229,10 +238,16 @@ python -m membench.cli doctor --target http://127.0.0.1:8787 [--timeout 10.0] [-
 ```bash
 cd <skill目录>/membench
 # 1) 冒烟：迷你集跑通链路
-python -m membench.cli run --adapter <你的adapter> --dataset membench/data/sample_dataset.jsonl --judge heuristic
+python -m membench.cli run --adapter <你的adapter> --dataset membench/data/sample_dataset.jsonl --judge heuristic \
+  --report-out <skill目录>/output
 # 2) 业务验收：办公黄金集
-python -m membench.cli run --adapter <你的adapter> --dataset membench/data/office_dataset.jsonl --judge heuristic
+python -m membench.cli run --adapter <你的adapter> --dataset membench/data/office_dataset.jsonl --judge heuristic \
+  --report-out <skill目录>/output
 ```
+
+不传 `--report-out` 时实验目录落 `output_root()`（skill 环境 = `<skill目录>/output`，可用
+`MEMBENCH_OUTPUT_DIR` 覆盖）；报告在 `<实验目录>/runs/<dataset>/report/report.md`，任务级副本在
+`<实验目录>/reports/report.md`，逐题明细（含 `retrieved`）在同目录 `results.jsonl`。
 
 **验收判据**：
 

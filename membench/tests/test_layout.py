@@ -1,13 +1,19 @@
-"""产物布局（membench.layout）测试：命名 helper 与实验目录 materialize。
+"""产物布局（membench.layout）测试：命名常量、路径 helper、实验目录冲突与产物目录解析。
 
-覆盖一次实验一个自包含子目录——报告与图表落目录根，
-对应 run 副本落 ``runs/<run_id>/``，不再与全局 run 混放。
-另覆盖 ``copy_runs_into`` 的目标目录冲突检测（同名会静默合并）。
+覆盖终态布局的唯一路径来源：``eval_<name>_<platform>_<ts>`` / ``compare_...`` /
+``matrix_<ts>`` 的命名、``runs/<dataset>/<对话>/{report,runtime,memory_snapshot}``
+与实验根层 ``reports/`` 的路径拼接、``experiment_path`` 拒绝复用非空实验目录，以及
+``resolve_dataset_dir`` 对「数据集目录 / 实验目录 / 对话目录（拒绝）/ 旧版产物」几态的处理。
+
+另断言旧版 API（``subdir_for`` / ``ab_subdir`` / ``copy_runs_into`` / ``materialize_*``）
+已随布局重构删除：它们若被恢复，目录命名与落位就出现了第二个来源。
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
 
 import pytest
@@ -15,123 +21,291 @@ import pytest
 from membench import layout
 
 
-def _fake_run(root: Path, name: str) -> Path:
-    """构造一个最小 run 目录：报告（引用两张图）+ metrics + results + 图。"""
-    run_dir = root / name
-    run_dir.mkdir(parents=True)
-    (run_dir / "results.jsonl").write_text('{"qid": "q1"}\n', encoding="utf-8")
-    (run_dir / "metrics.json").write_text(
-        json.dumps({"run_id": name, "overall": {"accuracy": 1.0}}, ensure_ascii=False),
+def _fake_dataset_dir(exp_dir: Path, dataset: str, *, metrics: bool = True) -> Path:
+    """造一个数据集形状的产物目录：``<exp>/runs/<dataset>/report/{metrics.json,report.md}``。
+
+    ``metrics=False`` 时只建报告目录、不落 ``metrics.json``，用于验证半成品被拦下。
+    """
+    report_dir = exp_dir / "runs" / layout.slug(dataset) / layout.DIR_REPORT
+    report_dir.mkdir(parents=True)
+    (report_dir / layout.FILE_REPORT_MD).write_text("# r\n", encoding="utf-8")
+    if metrics:
+        (report_dir / layout.FILE_METRICS).write_text(
+            json.dumps({"run_id": dataset, "dataset": dataset}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    return report_dir.parent
+
+
+def _fake_dialogue_dir(exp_dir: Path, dataset: str, dialogue_id: str) -> Path:
+    """造一个对话形状的产物目录：``<exp>/runs/<dataset>/<对话>/report/{metrics.json,report.md}``。
+
+    对话目录与数据集目录一样带 ``report/`` 层级，只有 ``metrics.json`` 里的
+    ``dialogue_id`` 能把两者分开——这正是 resolve 必须识别的形状。
+    """
+    report_dir = Path(layout.dialogue_report_dir(str(exp_dir), dataset, dialogue_id))
+    report_dir.mkdir(parents=True)
+    (report_dir / layout.FILE_REPORT_MD).write_text("# d\n", encoding="utf-8")
+    (report_dir / layout.FILE_METRICS).write_text(
+        json.dumps({"run_id": f"run_{dialogue_id}", "dialogue_id": dialogue_id}),
         encoding="utf-8",
     )
-    (run_dir / "fig_category_accuracy.png").write_bytes(b"png-cat")
-    (run_dir / "fig_latency_hist.png").write_bytes(b"png-lat")
-    (run_dir / "report.md").write_text(
-        "# r\n\n![a](fig_category_accuracy.png)\n\n![b](fig_latency_hist.png)\n",
-        encoding="utf-8",
+    return report_dir.parent
+
+
+# ---------------------------------------------------------------------------
+# 命名与常量
+# ---------------------------------------------------------------------------
+
+
+def test_layout_constants_are_single_source() -> None:
+    """目录名 / 报告文件名 / 图名常量：其它模块拼路径一律引用它们。"""
+    assert layout.TS_FORMAT == "%Y%m%d-%H%M%S"
+    assert (
+        layout.DIR_RUNS,
+        layout.DIR_REPORT,
+        layout.DIR_REPORTS,
+        layout.DIR_RUNTIME,
+        layout.DIR_SNAPSHOT,
+    ) == ("runs", "report", "reports", "runtime", "memory_snapshot")
+    assert (
+        layout.FILE_REPORT_MD,
+        layout.FILE_COMPARISON_MD,
+        layout.FILE_METRICS,
+        layout.FILE_RESULTS,
+        layout.FILE_SUMMARY,
+        layout.FILE_MATRIX_RESULT,
+    ) == (
+        "report.md",
+        "comparison.md",
+        "metrics.json",
+        "results.jsonl",
+        "evaluate_summary.json",
+        "matrix_result.json",
     )
-    return run_dir
+    assert (
+        layout.FIG_CATEGORY,
+        layout.FIG_LATENCY,
+        layout.FIG_METRIC_DIFF,
+        layout.FIG_CATEGORY_DIFF,
+        layout.FIG_DATASET_OVERVIEW,
+        layout.FIG_MATRIX_ACCURACY,
+    ) == (
+        "fig_category_accuracy.png",
+        "fig_latency_hist.png",
+        "fig_metric_diff.png",
+        "fig_category_diff.png",
+        "fig_dataset_overview.png",
+        "fig_matrix_accuracy.png",
+    )
 
 
 def test_naming_helpers() -> None:
-    """subdir_for / ab_subdir / slug 的命名约定（含缺省 platform 与空标签回退）。"""
+    """eval_subdir / compare_subdir / matrix_subdir / slug 的命名约定。"""
     assert layout.slug("mock strong/a") == "mock-strong-a"
     assert layout.slug("") == "default"
-    assert layout.subdir_for("mock-strong", "wx", ts="261014_120000") == (
-        "eval_mock-strong_wx_261014_120000"
+    assert layout.slug("my set/v2") == "my-set-v2"
+    assert layout.eval_subdir("mock-strong", "wx", ts="20260101-120000") == (
+        "eval_mock-strong_wx_20260101-120000"
     )
-    assert layout.subdir_for("mock-strong", None, ts="261014_120000") == (
-        "eval_mock-strong_default_261014_120000"
+    assert layout.eval_subdir("mock-strong", None, ts="20260101-120000") == (
+        "eval_mock-strong_default_20260101-120000"
     )
-    assert layout.ab_subdir("a1_vs_b1", ts="261014_120000") == "ab_a1_vs_b1_261014_120000"
-
-
-def test_materialize_run_experiment(tmp_path: Path) -> None:
-    """单次评测：报告/metrics/结果/图落实验目录根，run 副本落 runs/<run_id>/。"""
-    run_dir = _fake_run(tmp_path / "runs", "run-1")
-    exp_dir = layout.materialize_run_experiment(str(tmp_path / "eval_x"), str(run_dir))
-
-    exp = Path(exp_dir)
-    for fname in (
-        "report.md",
-        "metrics.json",
-        "results.jsonl",
-        "fig_category_accuracy.png",
-        "fig_latency_hist.png",
-    ):
-        assert (exp / fname).is_file(), f"缺少 {fname}"
-    assert (exp / "runs" / "run-1" / "metrics.json").is_file()
-    assert (exp / "runs" / "run-1" / "results.jsonl").is_file()
-
-
-def test_materialize_ab_experiment(tmp_path: Path) -> None:
-    """A/B：A、B 各带 runs/<run_id>/ 与自身报告，对比报告落实验目录根。"""
-    run_a = _fake_run(tmp_path / "runs", "run-a")
-    run_b = _fake_run(tmp_path / "runs", "run-b")
-    compare_dir = tmp_path / "staging"
-    compare_dir.mkdir()
-    (compare_dir / "fig_metric_diff.png").write_bytes(b"png-diff")
-    (compare_dir / "compare_report.md").write_text(
-        "# c\n\n![d](fig_metric_diff.png)\n", encoding="utf-8"
+    assert layout.compare_subdir("a1_vs_b1", "wx", ts="20260101-120000") == (
+        "compare_a1_vs_b1_wx_20260101-120000"
     )
-
-    ab_dir = layout.materialize_ab_experiment(
-        str(tmp_path / "ab_x"), str(run_a), str(run_b), str(compare_dir)
+    # platform 缺省（两臂同平台时也走这里）固定为 default
+    assert layout.compare_subdir("a1_vs_b1", ts="20260101-120000") == (
+        "compare_a1_vs_b1_default_20260101-120000"
     )
-    ab = Path(ab_dir)
-    assert (ab / "compare_report.md").is_file()
-    assert (ab / "fig_metric_diff.png").is_file()
-    for arm, run_id in (("A", "run-a"), ("B", "run-b")):
-        assert (ab / arm / "report.md").is_file(), f"{arm} 缺少 report.md"
-        assert (ab / arm / "metrics.json").is_file(), f"{arm} 缺少 metrics.json"
-        assert (ab / arm / "runs" / run_id / "metrics.json").is_file()
+    assert layout.matrix_subdir(ts="20260101-120000") == "matrix_20260101-120000"
 
 
-def test_copy_runs_into_rejects_basename_conflict(tmp_path: Path) -> None:
-    """labels 缺省且两个不同源目录 basename 相同：抛 ValueError，不静默合并。"""
-    a = _fake_run(tmp_path / "left", "run-1")
-    b = _fake_run(tmp_path / "right", "run-1")
-
-    with pytest.raises(ValueError, match="目标目录冲突"):
-        layout.copy_runs_into(str(tmp_path / "dest"), [str(a), str(b)])
-
-    # 冲突时先整体校验再复制：不留下半个目标目录
-    assert not (tmp_path / "dest" / "run-1").exists()
+def test_ts_now_follows_ts_format() -> None:
+    """ts_now() 的产物是 TS_FORMAT 形状，实验目录名可被按 ts 解析出来。"""
+    assert re.fullmatch(r"\d{8}-\d{6}", layout.ts_now())
+    assert layout.eval_subdir("a", "b").startswith("eval_a_b_")
 
 
-def test_copy_runs_into_rejects_slug_colliding_labels(tmp_path: Path) -> None:
-    """label 互不相同但 slug() 归一成同名：同样抛 ValueError。"""
-    a = _fake_run(tmp_path / "runs", "run-a")
-    b = _fake_run(tmp_path / "runs", "run-b")
+def test_tag_dir_name_normalizes_dialogue_ids() -> None:
+    """对话目录名归一：非法字符换 ``_``、防路径穿越、超长截断、空值兜底。"""
+    assert layout.tag_dir_name("d 001") == "d_001"
+    assert layout.tag_dir_name("../../etc/passwd") == "etc_passwd"
+    assert layout.tag_dir_name("") == "dialogue"
+    assert layout.tag_dir_name("   ") == "dialogue"
+    assert layout.tag_dir_name("x" * 200) == "x" * 120
 
-    with pytest.raises(ValueError, match="目标目录冲突"):
-        layout.copy_runs_into(
-            str(tmp_path / "dest"), [str(a), str(b)], labels=["a b", "a/b"]
+
+def test_legacy_layout_api_is_gone() -> None:
+    """旧版 API 不得复活：命名与落位只能走本模块的 helper。"""
+    for name in ("subdir_for", "ab_subdir", "copy_runs_into", "_plan_run_targets", "copy_report_into"):
+        assert not hasattr(layout, name), f"旧 API {name} 不应存在"
+    assert [n for n in dir(layout) if n.startswith("materialize_")] == []
+
+
+# ---------------------------------------------------------------------------
+# 实验目录内的路径
+# ---------------------------------------------------------------------------
+
+
+def test_path_helpers_build_expected_tree(tmp_path: Path) -> None:
+    """runs_root / dataset_dir / *_report_dir / task_report_dir 的逐层拼接。"""
+    exp = tmp_path / "eval_mock-strong_wx_20260101-120000"
+    assert layout.runs_root(str(exp)) == str(exp / "runs")
+    assert layout.dataset_dir(str(exp), "office") == str(exp / "runs" / "office")
+    # 数据集目录名按 layout.slug 归一（含空格 / 斜杠的 key 也安全）
+    assert layout.dataset_dir(str(exp), "my set/v2") == str(exp / "runs" / "my-set-v2")
+    assert layout.dataset_report_dir(str(exp), "office") == str(
+        exp / "runs" / "office" / "report"
+    )
+    assert layout.dialogue_dir(str(exp), "office", "d 001") == str(
+        exp / "runs" / "office" / "d_001"
+    )
+    assert layout.dialogue_report_dir(str(exp), "office", "d 001") == str(
+        exp / "runs" / "office" / "d_001" / "report"
+    )
+    assert layout.dialogue_runtime_dir(str(exp), "office", "d 001") == str(
+        exp / "runs" / "office" / "d_001" / "runtime"
+    )
+    assert layout.dialogue_snapshot_dir(str(exp), "office", "d 001") == str(
+        exp / "runs" / "office" / "d_001" / "memory_snapshot"
+    )
+    assert layout.task_report_dir(str(exp)) == str(exp / "reports")
+
+
+# ---------------------------------------------------------------------------
+# experiment_path：建目录与冲突拒绝
+# ---------------------------------------------------------------------------
+
+
+def test_experiment_path_creates_and_rejects_non_empty(tmp_path: Path) -> None:
+    """同秒同名实验目录：首次建出、空目录可复用、非空即拒绝（不静默覆盖）。"""
+    base = tmp_path / "output"
+    name = layout.eval_subdir("mock-strong", "wx", ts="20260101-120000")
+
+    exp = Path(layout.experiment_path(str(base), name))
+    assert exp.is_dir() and exp.name == name
+    # 上一次跑在校验阶段失败留下的空目录可以复用
+    assert layout.experiment_path(str(base), name) == str(exp)
+
+    (exp / "runs").mkdir()
+    (exp / "runs" / "office").mkdir()
+    with pytest.raises(SystemExit) as excinfo:
+        layout.experiment_path(str(base), name)
+    message = str(excinfo.value)
+    assert str(exp) in message
+    assert "非空" in message
+
+
+def test_experiment_path_defaults_to_output_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """base 缺省时落 MEMBENCH_OUTPUT_DIR（默认产物根的唯一入口）。"""
+    root = tmp_path / "custom-root"
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(root))
+    exp = Path(layout.experiment_path(None, layout.matrix_subdir(ts="20260101-120000")))
+    assert exp.parent == root
+    assert exp.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# resolve_dataset_dir：产物目录归一
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_dataset_dir_accepts_dataset_and_experiment_dirs(tmp_path: Path) -> None:
+    """数据集目录原样返回；实验目录按唯一数据集子目录或 dataset 提示命中。"""
+    exp = tmp_path / "eval_x_wx_20260101-120000"
+    dataset_dir = _fake_dataset_dir(exp, "office")
+
+    assert layout.resolve_dataset_dir(str(dataset_dir)) == str(dataset_dir)
+    assert layout.resolve_dataset_dir(str(exp)) == str(dataset_dir)
+    assert layout.resolve_dataset_dir(str(exp), dataset="office") == str(dataset_dir)
+    # dataset 提示不命中（另一次评测的数据集名）时退回唯一的数据集子目录
+    assert layout.resolve_dataset_dir(str(exp), dataset="locomo") == str(dataset_dir)
+
+
+def test_resolve_dataset_dir_requires_hint_when_multiple_datasets(tmp_path: Path) -> None:
+    """实验目录下有多个数据集产物：给 dataset 提示能定位，不给则报错要求指具体目录。"""
+    exp = tmp_path / "eval_x_wx_20260101-120000"
+    office = _fake_dataset_dir(exp, "office")
+    locomo = _fake_dataset_dir(exp, "locomo")
+
+    assert layout.resolve_dataset_dir(str(exp), dataset="locomo") == str(locomo)
+    with pytest.raises(SystemExit) as excinfo:
+        layout.resolve_dataset_dir(str(exp))
+    message = str(excinfo.value)
+    assert "多个数据集目录" in message
+    assert "office" in message and "locomo" in message
+    assert str(exp / "runs") in message
+
+
+def test_resolve_dataset_dir_rejects_missing_and_incomplete(tmp_path: Path) -> None:
+    """入参不存在 / 数据集产物缺 metrics.json（半成品）都在读取前被拦下。"""
+    with pytest.raises(SystemExit) as missing:
+        layout.resolve_dataset_dir(str(tmp_path / "nope"))
+    assert "产物目录不存在" in str(missing.value)
+
+    exp = tmp_path / "eval_x_wx_20260101-120000"
+    dataset_dir = _fake_dataset_dir(exp, "office", metrics=False)
+    with pytest.raises(SystemExit) as incomplete:
+        layout.resolve_dataset_dir(str(dataset_dir))
+    assert "metrics.json" in str(incomplete.value)
+    assert "产物不完整" in str(incomplete.value)
+
+
+def test_resolve_dataset_dir_rejects_dialogue_dir(tmp_path: Path) -> None:
+    """对话级产物目录被拒：一段对话的指标不是数据集汇总，也不能当数据集用。"""
+    exp = tmp_path / "eval_x_wx_20260101-120000"
+    dataset_dir = _fake_dataset_dir(exp, "office")
+    dialogue_dir = _fake_dialogue_dir(exp, "office", "d 001")
+
+    with pytest.raises(SystemExit) as excinfo:
+        layout.resolve_dataset_dir(str(dialogue_dir))
+    message = str(excinfo.value)
+    assert "对话级产物目录" in message
+    assert "d 001" in message
+    assert "请传实验目录或数据集目录" in message
+
+    # 实验目录入参仍定位到真正的数据集目录：对话目录不会被当成数据集目录
+    assert layout.resolve_dataset_dir(str(exp)) == str(dataset_dir)
+
+    # runs/ 下混进对话形状目录（非合法布局）同样不当作数据集目录
+    stray_report = exp / "runs" / "stray_dialogue" / layout.DIR_REPORT
+    stray_report.mkdir(parents=True)
+    (stray_report / layout.FILE_METRICS).write_text(
+        json.dumps({"run_id": "stray", "dialogue_id": "stray_dialogue"}),
+        encoding="utf-8",
+    )
+    assert layout.resolve_dataset_dir(str(exp)) == str(dataset_dir)
+
+
+def test_resolve_dataset_dir_rejects_legacy_layout(tmp_path: Path) -> None:
+    """旧版产物（平铺 run 目录 / 缺 report/ 层级 / ab_ 实验目录）统一报不兼容。"""
+    # 1) 平铺 run 目录：报告与数据在目录根
+    legacy_run = tmp_path / "runs" / "mock-weak_wx_dg_20250101_000000"
+    legacy_run.mkdir(parents=True)
+    (legacy_run / layout.FILE_METRICS).write_text('{"run_id": "legacy"}', encoding="utf-8")
+
+    with pytest.raises(SystemExit) as excinfo:
+        layout.resolve_dataset_dir(str(legacy_run))
+    assert layout.LEGACY_LAYOUT_MSG in str(excinfo.value)
+
+    # 2) 旧版 A/B 实验目录：A/ B/ 各是一份平铺 run，根层没有 runs/
+    legacy_ab = tmp_path / "ab_a1_vs_b1_20250101_000000"
+    for arm in ("A", "B"):
+        (legacy_ab / arm).mkdir(parents=True)
+        (legacy_ab / arm / layout.FILE_METRICS).write_text(
+            json.dumps({"run_id": arm}), encoding="utf-8"
         )
+    with pytest.raises(SystemExit) as excinfo_ab:
+        layout.resolve_dataset_dir(str(legacy_ab))
+    assert layout.LEGACY_LAYOUT_MSG in str(excinfo_ab.value)
 
-
-def test_copy_runs_into_allows_distinct_targets(tmp_path: Path) -> None:
-    """不冲突路径不受影响：basename 互异 / label 互异时各复制到自己的目录。"""
-    a = _fake_run(tmp_path / "runs", "run-a")
-    b = _fake_run(tmp_path / "runs", "run-b")
-
-    dests = layout.copy_runs_into(str(tmp_path / "dest"), [str(a), str(b)])
-    assert [Path(d).name for d in dests] == ["run-a", "run-b"]
-    assert (tmp_path / "dest" / "run-a" / "metrics.json").is_file()
-    assert (tmp_path / "dest" / "run-b" / "metrics.json").is_file()
-
-    labeled = layout.copy_runs_into(
-        str(tmp_path / "dest2"), [str(a), str(b)], labels=["L1", "L2"]
+    # 3) 实验目录里有 runs/<dataset>，但该层缺 report/（旧结构或跑到一半）
+    half_baked = tmp_path / "eval_x_wx_20250101-000000"
+    (half_baked / "runs" / "office").mkdir(parents=True)
+    (half_baked / "runs" / "office" / layout.FILE_METRICS).write_text(
+        '{"run_id": "flat"}', encoding="utf-8"
     )
-    assert [Path(d).name for d in labeled] == ["L1", "L2"]
-    assert (tmp_path / "dest2" / "L1" / "metrics.json").is_file()
-
-
-def test_copy_runs_into_same_source_repeated_is_not_conflict(tmp_path: Path) -> None:
-    """同一源目录重复出现（dest == 源）不算冲突，也不会自我复制。"""
-    run_dir = _fake_run(tmp_path / "runs", "run-1")
-
-    dests = layout.copy_runs_into(str(tmp_path / "runs"), [str(run_dir), str(run_dir)])
-
-    assert dests == [str(run_dir), str(run_dir)]
-    assert (run_dir / "metrics.json").is_file()
+    with pytest.raises(SystemExit) as excinfo_half:
+        layout.resolve_dataset_dir(str(half_baked))
+    assert layout.LEGACY_LAYOUT_MSG in str(excinfo_half.value)

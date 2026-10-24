@@ -7,9 +7,10 @@ from pathlib import Path
 
 import pytest
 
+from membench import layout
 from membench.adapters import MockStrongAdapter
 from membench.evaluate import scan_capabilities
-from membench.report import write_run_report_md
+from membench.report import render_dialogue_report
 from membench.runner import Runner
 
 
@@ -69,39 +70,68 @@ def test_runner_skips_ignored_questions(tmp_path: Path, capsys: pytest.CaptureFi
         MockStrongAdapter(),
         str(ds_path),
         judge="heuristic",
-        out_dir=str(tmp_path / "runs"),
+        out_dir=str(tmp_path / "eval_ignore"),
     )
-    run_dir = Path(runner.run())
+    dataset_dir = Path(runner.run())
+    report_dir = dataset_dir / layout.DIR_REPORT
 
     results = [
         json.loads(line)
-        for line in (run_dir / "results.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (report_dir / layout.FILE_RESULTS).read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     qids = {r["qid"] for r in results}
     assert qids == {"d1_q1", "d1_q2"}  # 被忽略题完全不产生记录
 
-    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    metrics = json.loads((report_dir / layout.FILE_METRICS).read_text(encoding="utf-8"))
     assert metrics["overall"]["n_questions"] == 2  # 分母不含被忽略题
     assert metrics["n_ignored"] == 2
     assert "abstention" not in metrics["by_category"]  # 忽略题不进分类聚合
 
-    report = (run_dir / "report.md").read_text(encoding="utf-8")
+    report = (report_dir / layout.FILE_REPORT_MD).read_text(encoding="utf-8")
     assert "- 忽略题数: 2（ignore=true，未参与评分）" in report
+
+    # 对话级产物：同一套忽略口径（分母与忽略数都按该对话统计）
+    dialogue_report_dir = dataset_dir / "d1" / layout.DIR_REPORT
+    assert (dataset_dir / "d1" / layout.DIR_RUNTIME).is_dir()
+    dialogue_metrics = json.loads(
+        (dialogue_report_dir / layout.FILE_METRICS).read_text(encoding="utf-8")
+    )
+    assert dialogue_metrics["dialogue_id"] == "d1"
+    assert dialogue_metrics["overall"]["n_questions"] == 2
+    assert dialogue_metrics["n_ignored"] == 2
+    dialogue_qids = {
+        json.loads(line)["qid"]
+        for line in (dialogue_report_dir / layout.FILE_RESULTS)
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    }
+    assert dialogue_qids == {"d1_q1", "d1_q2"}
+    assert "- 忽略题数: 2（ignore=true，未参与评分）" in (
+        dialogue_report_dir / layout.FILE_REPORT_MD
+    ).read_text(encoding="utf-8")
 
     out = capsys.readouterr().out
     assert "[membench] 已忽略 2 道标记题（ignore=true）" in out
 
 
 def test_report_omits_ignore_line_when_zero(tmp_path: Path) -> None:
-    """n_ignored 为 0 / 缺失时，报告不输出忽略题数行。"""
-    out_path = write_run_report_md(
-        str(tmp_path),
+    """n_ignored 为 0 / 缺失时报告不输出忽略题数行；对话级报告不引用图片。"""
+    out_path = render_dialogue_report(
+        str(tmp_path / "d1" / layout.DIR_REPORT),
         records=[],
-        metrics={"run_id": "t", "overall": {"n_questions": 0}, "by_category": {}},
+        metrics={
+            "run_id": "t",
+            "dialogue_id": "d1",
+            "overall": {"n_questions": 0},
+            "by_category": {},
+        },
     )
+    assert Path(out_path).name == layout.FILE_REPORT_MD
     report = Path(out_path).read_text(encoding="utf-8")
     assert "忽略题数" not in report
+    assert "![" not in report  # 对话级不出图，也不留打不开的相对引用
 
 
 def test_scan_capabilities_excludes_ignored(tmp_path: Path) -> None:

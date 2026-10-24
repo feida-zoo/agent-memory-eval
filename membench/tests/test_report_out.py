@@ -1,15 +1,20 @@
-"""报告中文化与 --report-out 自包含实验目录测试（冻结契约）。
+"""报告中文化与自包含实验目录（--report-out）测试（冻结契约）。
 
 - category / 效率统计指标名的中文显示映射（未知 category 原样显示）；
-- run --report-out DIR -> DIR/eval_<adapter>_<platform>_<ts>/：报告+图表+run 副本；
-- compare --report-out DIR -> DIR/ab_<tag>_<ts>/：A/B 各自 runs/ 副本 + 对比报告；
-- evaluate(report_out=DIR) -> DIR/eval_<adapter>_<platform>_<ts>/：报告+summary+run 副本；
-- 不传 --report-out 时 run 只在 run 目录内产出、runs/ 父目录无散落文件。
+- ``run --report-out DIR`` -> ``DIR/eval_<adapter>_<platform>_<ts>/``：数据集级报告落
+  ``runs/<dataset>/report/``（md + metrics + 逐题明细 + 两张图），任务级报告落同实验
+  目录的 ``reports/``；
+- ``compare --report-out DIR`` -> ``DIR/compare_<name>_<platform>_<ts>/``：``A/``、``B/``
+  各为完整评测实验形态，对比报告落 ``reports/comparison.md``；
+- ``evaluate(report_out=DIR)`` -> ``DIR/eval_<adapter>_<platform>_<ts>/``：任务级
+  ``reports/`` 含 report.md / metrics.json / evaluate_summary.json / 数据集总览图；
+- 不传 ``--report-out`` 时实验目录落 ``output_root()``，父目录无散落文件。
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -22,20 +27,30 @@ from membench.evaluate import DatasetSpec, evaluate
 from membench.report import write_run_report_md
 from membench.runner import Runner
 
-#: 拒答话术（与 heuristic judge 的拒答信号词对齐）。
-REFUSAL = "我不知道，相关信息不在我的记忆中。"
 
-
-def _run(tmp_path: Path, **kwargs) -> Path:
-    """用 MockStrongAdapter 在内置 sample 数据集上跑一次，返回 run 目录。"""
+def _run(exp_dir: Path) -> Path:
+    """把 ``exp_dir`` 当实验目录跑一次内置 sample 数据集，返回数据集产物目录。"""
     runner = Runner(
         MockStrongAdapter(),
         str(SAMPLE_DATASET_PATH),
         judge="heuristic",
-        out_dir=str(tmp_path / "runs"),
-        **kwargs,
+        out_dir=str(exp_dir),
     )
-    return Path(runner.run())
+    dataset_dir = runner.run()
+    assert dataset_dir is not None
+    return Path(dataset_dir)
+
+
+def _only_subdir(parent: Path) -> Path:
+    """返回 parent 下唯一的子目录（多于/少于一个即失败）。"""
+    subs = [p for p in parent.iterdir() if p.is_dir()]
+    assert len(subs) == 1, f"期望唯一子目录，实际 {[p.name for p in subs]}"
+    return subs[0]
+
+
+def _local_links(md: str) -> list[str]:
+    """报告里的本地引用（相对文件名 / 相对路径），跳过 http(s) 外链。"""
+    return [ref for ref in re.findall(r"\]\(([^)]+)\)", md) if "://" not in ref]
 
 
 # ---------------------------------------------------------------------------
@@ -45,8 +60,8 @@ def _run(tmp_path: Path, **kwargs) -> Path:
 
 def test_report_category_and_efficiency_zh(tmp_path: Path) -> None:
     """分题型表 category 列与效率统计指标名均为中文（保留英文原词）。"""
-    run_dir = _run(tmp_path)
-    report = (run_dir / "report.md").read_text(encoding="utf-8")
+    dataset_dir = _run(tmp_path / "exp")
+    report = (dataset_dir / "report" / "report.md").read_text(encoding="utf-8")
 
     assert "单跳（single_hop）" in report
     assert "查询延迟均值（ms）" in report
@@ -67,7 +82,11 @@ def test_report_unknown_category_passthrough(tmp_path: Path) -> None:
         "by_category": {"custom_type": {"accuracy": 1.0, "n": 1}},
     }
     records = [{"latency_ms": 1.0, "judge": {"correct": True}}]
-    md = Path(write_run_report_md(str(tmp_path), records, metrics)).read_text(encoding="utf-8")
+    report_dir = tmp_path / "report"
+    report_dir.mkdir()
+    md = Path(
+        write_run_report_md(str(report_dir), records, metrics, with_figures=False)
+    ).read_text(encoding="utf-8")
     assert "custom_type" in md
     assert "单跳" not in md
 
@@ -89,7 +108,11 @@ def test_report_known_category_mapping(tmp_path: Path) -> None:
         "by_category": {c: {"accuracy": 1.0, "n": 1} for c in cats},
     }
     records = [{"latency_ms": 1.0, "judge": {"correct": True}}]
-    md = Path(write_run_report_md(str(tmp_path), records, metrics)).read_text(encoding="utf-8")
+    report_dir = tmp_path / "report"
+    report_dir.mkdir()
+    md = Path(
+        write_run_report_md(str(report_dir), records, metrics, with_figures=False)
+    ).read_text(encoding="utf-8")
     for zh in (
         "单跳（single_hop）",
         "多跳（multi_hop）",
@@ -112,15 +135,8 @@ def test_report_known_category_mapping(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _latest_subdir(parent: Path) -> Path:
-    """返回 parent 下唯一的子目录（多于/少于一个即失败）。"""
-    subs = [p for p in parent.iterdir() if p.is_dir()]
-    assert len(subs) == 1, f"期望唯一子目录，实际 {[p.name for p in subs]}"
-    return subs[0]
-
-
 def test_cli_run_report_out_subdir(tmp_path: Path) -> None:
-    """run --report-out：DIR/eval_mock-strong_default_<ts>/ 含报告、图表与 run 副本。"""
+    """run --report-out：DIR/eval_mock-strong_default_<ts>/ 含数据集级与任务级报告。"""
     out = tmp_path / "out"
     rc = cli.main(
         [
@@ -131,61 +147,108 @@ def test_cli_run_report_out_subdir(tmp_path: Path) -> None:
             str(SAMPLE_DATASET_PATH),
             "--judge",
             "heuristic",
-            "--out",
-            str(tmp_path / "runs"),
             "--report-out",
             str(out),
         ]
     )
     assert rc == 0
-    exp_dir = _latest_subdir(out)
+    exp_dir = _only_subdir(out)
     assert exp_dir.name.startswith("eval_mock-strong_default_")
+    # 实验目录根层只有 runs/ 与 reports/ 两个子目录，不散落任何文件
+    assert sorted(p.name for p in exp_dir.iterdir()) == ["reports", "runs"]
+
+    dataset_dir = exp_dir / "runs" / "sample_dataset"
+    for fname in (
+        "report.md",
+        "metrics.json",
+        "results.jsonl",
+        "fig_category_accuracy.png",
+        "fig_latency_hist.png",
+    ):
+        assert (dataset_dir / "report" / fname).is_file(), f"缺少 {fname}"
+    # 数据集级 report.md 的图片引用为同目录相对文件名
+    report = (dataset_dir / "report" / "report.md").read_text(encoding="utf-8")
+    assert "](fig_category_accuracy.png)" in report
+    assert "](fig_latency_hist.png)" in report
+
+    # 每个对话一个目录：runtime/ 始终建出，report/ 落该对话的产物
+    dlg_dirs = sorted(p for p in dataset_dir.iterdir() if p.is_dir() and p.name != "report")
+    assert dlg_dirs, "缺少对话级目录"
+    for dlg_dir in dlg_dirs:
+        assert (dlg_dir / "runtime").is_dir(), f"{dlg_dir.name} 缺少 runtime/"
+        for fname in ("report.md", "metrics.json", "results.jsonl"):
+            assert (dlg_dir / "report" / fname).is_file(), f"{dlg_dir.name} 缺少 {fname}"
+
+    # 任务级报告 = 数据集级报告内容（md + 两图 + metrics）；逐题明细不重复落一份
+    task_dir = exp_dir / "reports"
     for fname in (
         "report.md",
         "metrics.json",
         "fig_category_accuracy.png",
         "fig_latency_hist.png",
     ):
-        assert (exp_dir / fname).is_file(), f"缺少 {fname}"
-    # 子目录内的 report.md 图片引用为原文件名（同目录）
-    report = (exp_dir / "report.md").read_text(encoding="utf-8")
-    assert "](fig_category_accuracy.png)" in report
-    assert "](fig_latency_hist.png)" in report
-    # run 副本自包含：runs/<run_id>/ 里有自己的报告/指标/逐题结果
-    run_copies = [p for p in (exp_dir / "runs").iterdir() if p.is_dir()]
-    assert len(run_copies) == 1, "缺少 runs/<run_id>/ 副本"
-    for fname in ("report.md", "metrics.json", "results.jsonl"):
-        assert (run_copies[0] / fname).is_file(), f"run 副本缺少 {fname}"
+        assert (task_dir / fname).is_file(), f"任务级报告缺少 {fname}"
+    assert not (task_dir / "results.jsonl").exists()
+    assert (task_dir / "report.md").read_text(
+        encoding="utf-8"
+    ) == (dataset_dir / "report" / "report.md").read_text(encoding="utf-8")
 
 
 def test_cli_compare_report_out_subdir(tmp_path: Path) -> None:
-    """compare --report-out：DIR/ab_<tag>_<ts>/ 含 A/B run 副本与对比报告。"""
-    run_a = _run(tmp_path / "a")
-    run_b = _run(tmp_path / "b")
+    """compare --report-out：DIR/compare_<name>_<platform>_<ts>/ 含 A/B 完整产物与对比报告。
+
+    A 臂传实验目录、B 臂传数据集目录——两种「产物目录」入参形态都要能解析。
+    """
+    exp_a = tmp_path / "exp_a"
+    _run(exp_a)
+    dataset_b = _run(tmp_path / "exp_b")
     out = tmp_path / "out"
     rc = cli.main(
         [
             "compare",
             "--baseline",
-            str(run_a),
+            str(exp_a),
             "--candidate",
-            str(run_b),
+            str(dataset_b),
             "--report-out",
             str(out),
         ]
     )
     assert rc == 0
-    ab_dir = _latest_subdir(out)
-    assert ab_dir.name.startswith("ab_")
-    assert (ab_dir / "compare_report.md").is_file()
-    assert (ab_dir / "fig_metric_diff.png").is_file()
-    assert (ab_dir / "fig_category_diff.png").is_file()
-    # A / B 各自带自包含的 runs/<run_id>/ 副本
+    cmp_dir = _only_subdir(out)
+    assert cmp_dir.name.startswith("compare_mock-strong_vs_mock-strong_default_")
+    assert sorted(p.name for p in cmp_dir.iterdir()) == ["A", "B", "reports"]
+
+    reports_dir = cmp_dir / "reports"
+    for fname in ("comparison.md", "fig_metric_diff.png", "fig_category_diff.png"):
+        assert (reports_dir / fname).is_file(), f"缺少 {fname}"
+    comparison = (reports_dir / "comparison.md").read_text(encoding="utf-8")
+    # 门禁结论与逐指标 diff 表都在对比报告里；两张对比图为同目录相对引用
+    assert "门禁结论： PASS" in comparison
+    assert "## 逐指标 diff（B - A）" in comparison
+    assert "](fig_metric_diff.png)" in comparison
+    assert "](fig_category_diff.png)" in comparison
+
+    # A / B 各为完整评测实验形态：runs/<dataset>/report/... + 任务级 reports/
     for arm in ("A", "B"):
-        run_copies = [p for p in (ab_dir / arm / "runs").iterdir() if p.is_dir()]
-        assert len(run_copies) == 1, f"{arm} 缺少 run 副本"
-        assert (run_copies[0] / "report.md").is_file()
-        assert (run_copies[0] / "metrics.json").is_file()
+        arm_dir = cmp_dir / arm
+        assert sorted(p.name for p in arm_dir.iterdir()) == ["reports", "runs"]
+        for fname in ("report.md", "metrics.json", "fig_category_accuracy.png"):
+            assert (arm_dir / "reports" / fname).is_file(), f"{arm} 任务级报告缺少 {fname}"
+        dataset_dir = arm_dir / "runs" / "sample_dataset"
+        for fname in ("report.md", "metrics.json", "results.jsonl"):
+            assert (dataset_dir / "report" / fname).is_file(), f"{arm} 数据集报告缺少 {fname}"
+        # 对话级产物随副本整体搬运
+        assert (dataset_dir / "d001" / "report" / "metrics.json").is_file()
+
+    # A 臂是实验目录入参：整树原样复制
+    assert (cmp_dir / "A" / "reports" / "report.md").read_text(
+        encoding="utf-8"
+    ) == (exp_a / "reports" / "report.md").read_text(encoding="utf-8")
+    # B 臂是数据集目录入参：先构造 runs/<dataset>/，再据数据集报告补任务级 reports/
+    assert (cmp_dir / "B" / "reports" / "metrics.json").read_text(
+        encoding="utf-8"
+    ) == (dataset_b / "report" / "metrics.json").read_text(encoding="utf-8")
 
 
 class _StubAdapter(BaseMemoryAdapter):
@@ -231,38 +294,102 @@ def _mini_dataset(tmp_path: Path) -> Path:
 
 
 def test_evaluate_report_out_subdir(tmp_path: Path) -> None:
-    """evaluate(report_out=...)：DIR/eval_<adapter>_<platform>_<ts>/ 含报告、summary 与 run 副本。"""
+    """evaluate(report_out=...)：DIR/eval_stub_default_<ts>/ 含数据集树与任务级 reports/。"""
     ds = _mini_dataset(tmp_path)
     out = tmp_path / "out"
     rc = evaluate(
         _StubAdapter(),
         "heuristic",
-        out_dir=str(tmp_path / "runs"),
         specs=[
             DatasetSpec(key="mini", name="mini", path=str(ds), source="user-specified")
         ],
         report_out=str(out),
     )
     assert rc == 0
-    exp_dir = _latest_subdir(out)
+    exp_dir = _only_subdir(out)
     assert exp_dir.name.startswith("eval_stub_default_")
-    assert (exp_dir / "evaluate_report.md").is_file()
-    assert (exp_dir / "evaluate_summary.json").is_file()
-    run_copies = [p for p in (exp_dir / "runs").iterdir() if p.is_dir()]
-    assert len(run_copies) == 1, "缺少 runs/<run_id>/ 副本"
+    assert sorted(p.name for p in exp_dir.iterdir()) == ["reports", "runs"]
+
+    reports_dir = exp_dir / "reports"
+    for fname in (
+        "report.md",
+        "metrics.json",
+        "evaluate_summary.json",
+        "fig_dataset_overview.png",
+    ):
+        assert (reports_dir / fname).is_file(), f"任务级报告缺少 {fname}"
+
+    dataset_dir = exp_dir / "runs" / "mini"
+    for fname in (
+        "report.md",
+        "metrics.json",
+        "results.jsonl",
+        "fig_category_accuracy.png",
+        "fig_latency_hist.png",
+    ):
+        assert (dataset_dir / "report" / fname).is_file(), f"数据集报告缺少 {fname}"
     for fname in ("report.md", "metrics.json", "results.jsonl"):
-        assert (run_copies[0] / fname).is_file(), f"run 副本缺少 {fname}"
+        assert (dataset_dir / "d1" / "report" / fname).is_file(), f"对话报告缺少 {fname}"
+
+    # 任务级清单记下各数据集的相对路径与门禁结论
+    summary = json.loads((reports_dir / "evaluate_summary.json").read_text(encoding="utf-8"))
+    assert summary["datasets"] == ["mini"]
+    assert summary["n_datasets"] == 1
+    assert summary["runs"] == {"mini": "runs/mini"}
+    assert "gate" in summary and "fused" in summary
+    # 任务级 report.md 的内链与同目录图片引用都能解析到真实文件
+    links = _local_links((reports_dir / "report.md").read_text(encoding="utf-8"))
+    assert "fig_dataset_overview.png" in links
+    assert any(link.endswith("report/report.md") for link in links), "应内链到数据集报告"
+    for link in links:
+        assert (reports_dir / link).is_file(), f"引用指向不存在的文件: {link}"
 
 
-def test_no_report_out_behavior_unchanged(tmp_path: Path) -> None:
-    """不传 --report-out：只在 run_dir 下生成产物，runs 父目录无散落文件。"""
-    run_dir = _run(tmp_path)
-    assert (run_dir / "report.md").is_file()
-    assert (run_dir / "results.jsonl").is_file()
-    assert (run_dir / "metrics.json").is_file()
-    # runs 父目录下只有 run 目录，无散落的报告/图片
-    stray = [p for p in (tmp_path / "runs").iterdir() if p.is_file()]
-    assert stray == []
+def test_default_report_out_uses_output_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """不传 --report-out：实验目录落 output_root()（MEMBENCH_OUTPUT_DIR），父目录无散落文件。"""
+    root = tmp_path / "output"
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(root))
+    rc = cli.main(
+        [
+            "run",
+            "--adapter",
+            "mock-strong",
+            "--dataset",
+            str(SAMPLE_DATASET_PATH),
+            "--judge",
+            "heuristic",
+        ]
+    )
+    assert rc == 0
+    exp_dir = _only_subdir(root)
+    assert exp_dir.name.startswith("eval_mock-strong_default_")
+    assert (exp_dir / "runs" / "sample_dataset" / "report" / "report.md").is_file()
+    assert (exp_dir / "reports" / "report.md").is_file()
+    # 产物根目录下没有散落的报告/图片/指标
+    assert [p for p in root.iterdir() if p.is_file()] == []
+
+
+def test_removed_flags_rejected(tmp_path: Path) -> None:
+    """旧参数 --out / --snapshot-out 已删除：传入即被 argparse 拒绝（退出码 2）。"""
+    run_prefix = [
+        "run",
+        "--adapter",
+        "mock-strong",
+        "--dataset",
+        str(SAMPLE_DATASET_PATH),
+        "--judge",
+        "heuristic",
+    ]
+    for command in (
+        run_prefix + ["--out", str(tmp_path)],
+        run_prefix + ["--snapshot-out", str(tmp_path)],
+        ["evaluate", "--out", str(tmp_path)],
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main(command)
+        assert excinfo.value.code == 2, f"{command} 应被 argparse 拒绝（参数已删除）"
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1,6 +1,7 @@
 """matrix：多 run 矩阵对比（platform × commit 维度）。
 
-:func:`compare_matrix` 读取若干带标签 run 的 metrics.json，产出：
+:func:`compare_matrix` 读取若干带标签的**产物目录**（实验目录或数据集目录）的
+``<数据集目录>/report/metrics.json``，产出：
 
 1. 若标签均可解析为 ``platform@commit`` 且恰好覆盖 2 平台 × 2 commit，
    对 accuracy / stale_rate / evidence_recall / abstention_accuracy /
@@ -10,8 +11,10 @@
 4. 分组条形图 ``fig_matrix_accuracy.png``（x=commit，hue=platform，
    或反之取合理者；标签不可解析时退化为按 label 单系列）。
 
-产物写到 ``out_dir``：``matrix_report.md``、``matrix_result.json``、
-``fig_matrix_accuracy.png``。
+产物写到 ``out_dir``（完整实验目录，见 :mod:`membench.layout`）::
+
+    <out_dir>/reports/{report.md, matrix_result.json, fig_matrix_accuracy.png}
+    <out_dir>/runs/<label>/          # 各 label 的数据集树副本（report/ + 对话目录）
 """
 
 from __future__ import annotations
@@ -19,10 +22,11 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import shutil
 from typing import Any
 
 from membench import layout
-from membench.compare import _eval_gates, _load_metrics
+from membench.compare import _eval_gates, _load_metrics, resolve_dataset_dir
 from membench.report import PALETTE, _md_table, _setup_fonts, metric_label
 from membench.ratings import format_metric_value
 
@@ -165,18 +169,54 @@ def _verdict_of(gates: list[dict[str, Any]]) -> str:
     return "PASS"
 
 
+def _copy_label_trees(
+    out_dir: str, labels: list[str], dataset_dirs: dict[str, str]
+) -> dict[str, str]:
+    """把各 label 的数据集树复制到 ``<out_dir>/runs/<label>/``。
+
+    label 目录名按 :func:`membench.layout.slug` 归一（``platform@commit`` →
+    ``platform-commit``）；两个不同源的 label 归一成同一目录名即报错，避免一份副本
+    被另一份覆盖。
+
+    Raises:
+        ValueError: 目标目录冲突。
+    """
+    planned: list[tuple[str, str, str]] = []
+    seen: dict[str, str] = {}
+    for label in labels:
+        source = dataset_dirs[label]
+        dest = os.path.join(layout.runs_root(out_dir), layout.slug(label))
+        prev = seen.get(dest)
+        if prev is not None and os.path.abspath(prev) != os.path.abspath(source):
+            raise ValueError(
+                f"matrix 标签目录冲突：{prev} 与 {source} 都会写入 {dest}；"
+                "请改用归一化后互不相同的 label"
+            )
+        seen.setdefault(dest, source)
+        planned.append((label, source, dest))
+
+    os.makedirs(layout.runs_root(out_dir), exist_ok=True)
+    label_dirs: dict[str, str] = {}
+    for label, source, dest in planned:
+        if not os.path.isdir(dest):
+            shutil.copytree(source, dest)
+        label_dirs[label] = dest
+    return label_dirs
+
+
 def compare_matrix(labeled_runs: list[tuple[str, str]], out_dir: str) -> dict[str, Any]:
-    """多 run 矩阵对比。
+    """多 run 矩阵对比，产物落 ``out_dir``（完整实验目录）。
 
     Args:
-        labeled_runs: ``[(label, run_dir), ...]``，label 推荐格式
-            ``"platform@commit"``（也接受任意字符串）。
-        out_dir: 产物输出目录（写 matrix_report.md / matrix_result.json /
-            fig_matrix_accuracy.png）。
+        labeled_runs: ``[(label, target), ...]``，label 推荐格式
+            ``"platform@commit"``（也接受任意字符串）；target 是实验目录或数据集目录。
+        out_dir: 矩阵实验目录——报告落其 ``reports/``（report.md /
+            matrix_result.json / fig_matrix_accuracy.png），各 label 的数据集树副本落
+            ``runs/<label>/``。
 
     Returns:
-        结果 dict：``{"labels", "summary", "pivot_tables", "pairwise",
-        "out_dir", "report_path", "result_path", "fig_path"}``。
+        结果 dict：``{"labels", "summary", "pivot_tables", "pairwise", "out_dir",
+        "fig_path", "label_dirs", "report_path", "result_path"}``。
     """
     if len(labeled_runs) < 2:
         raise ValueError("matrix 至少需要 2 个 labeled run")
@@ -184,10 +224,12 @@ def compare_matrix(labeled_runs: list[tuple[str, str]], out_dir: str) -> dict[st
     labels: list[str] = []
     overalls: dict[str, dict[str, Any]] = {}
     metrics_by_label: dict[str, dict[str, Any]] = {}
-    for label, run_dir in labeled_runs:
+    dataset_dirs: dict[str, str] = {}
+    for label, target in labeled_runs:
         if label in overalls:
             raise ValueError(f"重复的 label: {label}")
-        metrics = _load_metrics(run_dir)
+        dataset_dirs[label] = resolve_dataset_dir(target)
+        metrics = _load_metrics(target)
         metrics_by_label[label] = metrics
         overalls[label] = metrics.get("overall", {})
         labels.append(label)
@@ -226,9 +268,13 @@ def compare_matrix(labeled_runs: list[tuple[str, str]], out_dir: str) -> dict[st
             }
         )
 
-    # 4. 分组条形图
-    os.makedirs(out_dir, exist_ok=True)
-    fig_path = os.path.join(out_dir, "fig_matrix_accuracy.png")
+    # 4. 各 label 的数据集树副本：先复制再写报告，目标冲突 / 源缺失都在落报告前暴露
+    label_dirs = _copy_label_trees(out_dir, labels, dataset_dirs)
+
+    # 5. 报告与图表落 <exp>/reports/
+    reports_dir = layout.task_report_dir(out_dir)
+    os.makedirs(reports_dir, exist_ok=True)
+    fig_path = os.path.join(reports_dir, layout.FIG_MATRIX_ACCURACY)
     fig_matrix_accuracy(summary, parsed or None, fig_path)
 
     result: dict[str, Any] = {
@@ -238,19 +284,17 @@ def compare_matrix(labeled_runs: list[tuple[str, str]], out_dir: str) -> dict[st
         "pairwise": pairwise,
         "out_dir": out_dir,
         "fig_path": fig_path,
+        "label_dirs": label_dirs,
     }
 
     report_path = _write_matrix_report_md(
-        out_dir, labels, metrics_by_label, summary, pivots, pairwise
+        reports_dir, labels, metrics_by_label, summary, pivots, pairwise, label_dirs
     )
     result["report_path"] = report_path
-    result_path = os.path.join(out_dir, "matrix_result.json")
+    result_path = os.path.join(reports_dir, layout.FILE_MATRIX_RESULT)
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     result["result_path"] = result_path
-
-    # 各组 run 副本落 out_dir/runs/<label>/，使矩阵实验目录自包含
-    layout.materialize_matrix_experiment(out_dir, labeled_runs)
 
     print(f"[membench] matrix: {len(labels)} runs -> {out_dir}")
     return result
@@ -263,8 +307,9 @@ def _write_matrix_report_md(
     summary: dict[str, dict[str, float]],
     pivots: dict[str, dict[str, dict[str, float]]] | None,
     pairwise: list[dict[str, Any]],
+    label_dirs: dict[str, str],
 ) -> str:
-    """生成 matrix_report.md（中文）。"""
+    """生成矩阵报告 ``report.md``（中文，图片引用同目录相对文件名）。"""
     lines: list[str] = []
     lines.append("# membench 矩阵对比报告")
     lines.append("")
@@ -273,7 +318,8 @@ def _write_matrix_report_md(
         m = metrics_by_label[label]
         lines.append(
             f"- `{label}`: adapter={m.get('adapter', 'n/a')}, "
-            f"dataset={m.get('dataset', 'n/a')}, run_id={m.get('run_id', 'n/a')}"
+            f"dataset={m.get('dataset', 'n/a')}, run_id={m.get('run_id', 'n/a')}, "
+            f"副本={label_dirs[label]}"
         )
     lines.append("")
 
@@ -320,7 +366,7 @@ def _write_matrix_report_md(
     ]
     lines.append(_md_table(["指标", *labels], rows))
     lines.append("")
-    lines.append("![矩阵 accuracy](fig_matrix_accuracy.png)")
+    lines.append(f"![矩阵 accuracy]({layout.FIG_MATRIX_ACCURACY})")
     lines.append("")
 
     # 3. 两两门禁判定
@@ -335,7 +381,7 @@ def _write_matrix_report_md(
     lines.append(_md_table(["A", "B", "结论", "", "说明"], pair_rows))
     lines.append("")
 
-    out_path = os.path.join(out_dir, "matrix_report.md")
+    out_path = os.path.join(out_dir, layout.FILE_REPORT_MD)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return out_path

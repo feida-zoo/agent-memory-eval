@@ -2,28 +2,32 @@
 
 覆盖：
 - 两组融合 diff 计算；
-- 逐数据集 diff 表 + 融合 diff 表 + 门禁结论写入 compare_report.md；
-- 产物布局：A/B 两侧各数据集 run 副本 + compare_report.md + 两张图；
-- CLI：_cmd_evaluate_compare 参数透传 + 系统退出码映射；
+- 逐数据集 diff 表 + 融合 diff 表 + 门禁结论写入 ``reports/comparison.md``；
+- 产物布局：``compare_<name>_<platform>_<ts>/{A,B}/`` 各为完整 eval 实验形态
+  （``runs/<dataset>/`` + ``reports/``），对比报告与两张对比图落 ``reports/``；
+- CLI：_cmd_evaluate_compare 参数透传 + 系统退出码映射（``--out`` 已删除）；
 - 缺失融合指标时的兜底（未定义 / 跳过）。
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
-from membench import cli
+from membench import cli, layout
 from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
-from membench.evaluate import DatasetSpec, fuse_metrics
+from membench.evaluate import DatasetResult, DatasetSpec, fuse_metrics
 from membench.evaluate_compare import (
+    FIG_FUSED_DIFF,
+    FIG_PER_DATASET_DIFF,
     ArmDatasetResult,
-    _arm_fuse,
     _fused_diff,
     _fused_gates,
     _per_dataset_diff,
+    _side_fuse,
     evaluate_compare,
 )
 
@@ -193,15 +197,45 @@ def _specs(mini: dict[str, Path]) -> list[DatasetSpec]:
     ]
 
 
+def _arm_results(arms: list[ArmDatasetResult], side: str) -> list[DatasetResult]:
+    """把双臂结果拆成某一侧的 DatasetResult 列表（``_side_fuse`` 的入参形态）。"""
+    out: list[DatasetResult] = []
+    for arm in arms:
+        if side == "baseline":
+            out.append(
+                DatasetResult(
+                    spec=arm.spec,
+                    run_dir=arm.baseline_dataset_dir,
+                    metrics=arm.baseline,
+                    capabilities=arm.capabilities,
+                )
+            )
+        else:
+            out.append(
+                DatasetResult(
+                    spec=arm.spec,
+                    run_dir=arm.candidate_dataset_dir,
+                    metrics=arm.candidate,
+                    capabilities=arm.capabilities,
+                )
+            )
+    return out
+
+
 def _build_arms(mini: dict[str, Path], scripts: dict[str, dict[str, tuple[str, list[str]]]]) -> list[ArmDatasetResult]:
-    """直接构造 ArmDatasetResult，避开真实 run（轻量、确定性高）。"""
+    """跑两侧真实 run 构造 ArmDatasetResult；两侧各占一个实验目录。"""
     base = ScriptedAdapter(scripts["baseline"], name="base")
     cand = ScriptedAdapter(scripts["candidate"], name="cand")
     from membench.evaluate import run_datasets
 
+    root = mini["A"].parent
     specs = _specs(mini)
-    base_results = run_datasets(base, "heuristic", specs=specs, out_dir=str(mini["A"].parent))
-    cand_results = run_datasets(cand, "heuristic", specs=specs, out_dir=str(mini["A"].parent))
+    base_results = run_datasets(
+        base, "heuristic", specs=specs, experiment_dir=str(root / "arm_base")
+    )
+    cand_results = run_datasets(
+        cand, "heuristic", specs=specs, experiment_dir=str(root / "arm_cand")
+    )
     arms: list[ArmDatasetResult] = []
     for b, c in zip(base_results, cand_results):
         arms.append(
@@ -209,19 +243,25 @@ def _build_arms(mini: dict[str, Path], scripts: dict[str, dict[str, tuple[str, l
                 spec=b.spec,
                 baseline=b.metrics,
                 candidate=c.metrics,
-                baseline_run_dir=b.run_dir,
-                candidate_run_dir=c.run_dir,
+                baseline_dataset_dir=b.run_dir,
+                candidate_dataset_dir=c.run_dir,
                 capabilities=b.capabilities,
             )
         )
     return arms
 
 
-def test_arm_fuse_matches_per_arm_fuse_metrics(mini_datasets, scripts) -> None:
-    """_arm_fuse 与 evaluate.fuse_metrics 在两侧应分别得到一致的融合值。"""
+def test_side_fuse_matches_side_metrics(mini_datasets, scripts) -> None:
+    """_side_fuse 与 evaluate.fuse_metrics 在两侧应分别得到一致的融合值。"""
     arms = _build_arms(mini_datasets, scripts)
-    fused_base, sources_base = _arm_fuse(arms, "baseline")
-    fused_cand, _ = _arm_fuse(arms, "candidate")
+    base_results = _arm_results(arms, "baseline")
+    cand_results = _arm_results(arms, "candidate")
+    fused_base, sources_base = _side_fuse(base_results)
+    fused_cand, _ = _side_fuse(cand_results)
+
+    # capabilities 已落账时，两侧融合值与直接对同一批 DatasetResult 融合一致
+    assert fused_base == fuse_metrics(base_results)
+    assert fused_cand == fuse_metrics(cand_results)
 
     # 手工比对：baseline 侧 accuracy
     assert fused_base["accuracy"]["value"] is not None
@@ -272,30 +312,50 @@ def test_per_dataset_diff_returns_one_row_per_dataset(mini_datasets, scripts) ->
         assert diff >= -1e-9
 
 
-def test_evaluate_compare_writes_ab_layout(mini_datasets, scripts, tmp_path) -> None:
-    """evaluate_compare 端到端：ab_<tag>_<ts>/ 落地，含 A/B 两侧 runs/ + compare_report.md + 两张图。"""
+def test_evaluate_compare_writes_compare_layout(mini_datasets, scripts, tmp_path, monkeypatch) -> None:
+    """evaluate_compare 端到端：compare_<name>_<platform>_<ts>/ 落地，
+    A/B 各为完整 eval 实验形态，对比报告与两张对比图落其 reports/。"""
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(tmp_path / "output"))
     base = ScriptedAdapter(scripts["baseline"], name="base")
     cand = ScriptedAdapter(scripts["candidate"], name="cand")
+    report_out = tmp_path / "out"
     result = evaluate_compare(
         base,
         cand,
         "heuristic",
-        out_dir=str(tmp_path / "runs"),
-        report_out=str(tmp_path),
+        report_out=str(report_out),
         tag="base_vs_cand",
         specs=_specs(mini_datasets),
         adapter_version_baseline="v1",
         adapter_version_candidate="v2",
     )
     compare_dir = Path(result["compare_dir"])
-    assert compare_dir.name.startswith("ab_base_vs_cand_")
-    assert (compare_dir / "A" / "runs").is_dir()
-    assert (compare_dir / "B" / "runs").is_dir()
-    assert (compare_dir / "compare_report.md").is_file()
-    assert (compare_dir / "fig_per_dataset_diff.png").is_file()
-    assert (compare_dir / "fig_fused_diff.png").is_file()
+    assert compare_dir.parent == report_out
+    assert compare_dir.name.startswith("compare_base_vs_cand_")
+    # 实验目录父目录下只有这一个实验目录，报告不再散落在父目录根层
+    assert [p.name for p in report_out.iterdir()] == [compare_dir.name]
 
-    md = (compare_dir / "compare_report.md").read_text(encoding="utf-8")
+    reports = compare_dir / layout.DIR_REPORTS
+    assert (reports / layout.FILE_COMPARISON_MD).is_file()
+    assert (reports / FIG_PER_DATASET_DIFF).is_file()
+    assert (reports / FIG_FUSED_DIFF).is_file()
+
+    # A/B 两侧各是完整 eval 形态：runs/<dataset>/report/... + 任务级 reports/
+    for arm in ("A", "B"):
+        for key in ("a", "b", "c"):
+            dataset_report = compare_dir / arm / layout.DIR_RUNS / key / layout.DIR_REPORT
+            assert (dataset_report / layout.FILE_METRICS).is_file()
+            assert (dataset_report / layout.FILE_RESULTS).is_file()
+        task_dir = compare_dir / arm / layout.DIR_REPORTS
+        for name in (
+            layout.FILE_REPORT_MD,
+            layout.FILE_METRICS,
+            layout.FILE_SUMMARY,
+            layout.FIG_DATASET_OVERVIEW,
+        ):
+            assert (task_dir / name).is_file(), f"{arm} 缺少 reports/{name}"
+
+    md = (reports / layout.FILE_COMPARISON_MD).read_text(encoding="utf-8")
     assert "**门禁结论：" in md
     assert "跨数据集融合 diff" in md
     assert "逐数据集关键指标 diff" in md
@@ -307,18 +367,24 @@ def test_evaluate_compare_writes_ab_layout(mini_datasets, scripts, tmp_path) -> 
     # 中文化指标名出现在报告中
     assert "正确率（accuracy）" in md
     assert "证据召回率（evidence_recall）" in md
+    # 图片引用一律同目录相对文件名（报告与图同在 reports/，可整体搬移）
+    refs = re.findall(r"!\[[^\]]*\]\(([^)]+)\)", md)
+    assert refs, "对比报告应引用对比图"
+    for ref in refs:
+        assert "://" not in ref and "/" not in ref, ref
+        assert (reports / ref).is_file(), ref
 
 
-def test_evaluate_compare_verdict_pass_when_candidate_better(mini_datasets, scripts, tmp_path) -> None:
-    """candidate 全面优于 baseline -> verdict PASS。"""
+def test_evaluate_compare_verdict_pass_when_candidate_better(mini_datasets, scripts, tmp_path, monkeypatch) -> None:
+    """candidate 全面优于 baseline -> verdict 与门禁明细仍齐全。"""
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(tmp_path / "output"))
     base = ScriptedAdapter(scripts["baseline"], name="base")
     cand = ScriptedAdapter(scripts["candidate"], name="cand")
     result = evaluate_compare(
         base,
         cand,
         "heuristic",
-        out_dir=str(tmp_path / "runs"),
-        report_out=str(tmp_path),
+        report_out=str(tmp_path / "out"),
         tag="base_vs_cand",
         specs=_specs(mini_datasets),
     )
@@ -326,6 +392,35 @@ def test_evaluate_compare_verdict_pass_when_candidate_better(mini_datasets, scri
     # 至少 gates 包含 accuracy_regression
     gate_names = {g["name"] for g in result["gates"]}
     assert "accuracy_regression" in gate_names
+
+
+def test_evaluate_compare_precheck_failure_leaves_no_experiment_dir(
+    mini_datasets, scripts, tmp_path, monkeypatch
+) -> None:
+    """预检失败（补跑参数与已有产物不一致）在建目录 / 复制产物之前拦下：
+
+    ``report_out`` 下不留任何实验目录——连父目录都不建，更没有 A/B 半成品树。
+    """
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(tmp_path / "output"))
+    arms = _build_arms(mini_datasets, scripts)
+    report_out = tmp_path / "out_precheck"
+
+    with pytest.raises(SystemExit, match="补跑参数与已有 run 不一致"):
+        evaluate_compare(
+            ScriptedAdapter(scripts["baseline"], name="base"),
+            ScriptedAdapter(scripts["candidate"], name="cand"),
+            "heuristic",
+            report_out=str(report_out),
+            tag="base_vs_cand",
+            specs=_specs(mini_datasets),
+            # 基线侧只复用 a：b / c 需补跑，补跑标注与已有产物不一致即拒绝
+            baseline_runs={arms[0].spec.key: arms[0].baseline_dataset_dir},
+            candidate_runs={arm.spec.key: arm.candidate_dataset_dir for arm in arms},
+            adapter_version_baseline="v9",
+        )
+
+    assert not report_out.exists()
+    assert not list(report_out.glob("compare_*"))
 
 
 def test_cli_evaluate_compare_quick_and_beam10m_exclusive() -> None:
@@ -344,12 +439,16 @@ def test_cli_evaluate_compare_quick_and_beam10m_exclusive() -> None:
 
 
 def test_cli_evaluate_compare_pass_through(tmp_path, monkeypatch) -> None:
-    """_cmd_evaluate_compare 透传到 evaluate_compare；失败时退出码 1。"""
+    """_cmd_evaluate_compare 透传到 evaluate_compare；失败时退出码 1。
+
+    ``--out`` 已删除：CLI 只透传 ``--report-out``（实验目录父目录），不再传 out_dir。
+    """
     captured: dict[str, object] = {}
+    report_out = tmp_path / "out"
 
     def _stub(baseline_adapter, candidate_adapter, judge, **kwargs):  # type: ignore[no-untyped-def]
         captured.update(kwargs)
-        return {"verdict": "FAIL", "gates": [], "fused_diffs": {}, "fused_baseline": {}, "fused_candidate": {}, "per_dataset": [], "compare_dir": str(tmp_path / "ab")}
+        return {"verdict": "FAIL", "gates": [], "fused_diffs": {}, "fused_baseline": {}, "fused_candidate": {}, "per_dataset": [], "compare_dir": str(tmp_path / "compare_x")}
 
     import membench.evaluate_compare as ec_mod
 
@@ -364,6 +463,7 @@ def test_cli_evaluate_compare_pass_through(tmp_path, monkeypatch) -> None:
             "--stale-threshold", "0.01",
             "--latency-warn", "0.2",
             "--tag", "my_tag",
+            "--report-out", str(report_out),
         ]
     )
     assert rc == 1
@@ -371,6 +471,8 @@ def test_cli_evaluate_compare_pass_through(tmp_path, monkeypatch) -> None:
     assert captured["stale_threshold"] == 0.01
     assert captured["latency_warn"] == 0.2
     assert captured["tag"] == "my_tag"
+    assert captured["report_out"] == str(report_out)
+    assert "out_dir" not in captured
     assert captured["quick"] is True
     assert captured["beam_10m"] is False
 
@@ -381,7 +483,7 @@ def test_cli_evidence_match_pass_through(tmp_path, monkeypatch) -> None:
 
     def _stub(baseline_adapter, candidate_adapter, judge, **kwargs):  # type: ignore[no-untyped-def]
         captured.update(kwargs)
-        return {"verdict": "PASS", "gates": [], "fused_diffs": {}, "fused_baseline": {}, "fused_candidate": {}, "per_dataset": [], "compare_dir": str(tmp_path / "ab")}
+        return {"verdict": "PASS", "gates": [], "fused_diffs": {}, "fused_baseline": {}, "fused_candidate": {}, "per_dataset": [], "compare_dir": str(tmp_path / "compare_x")}
 
     import membench.evaluate_compare as ec_mod
 
@@ -422,7 +524,7 @@ def test_cli_evidence_match_llm_requires_config(monkeypatch) -> None:
 def test_cli_evaluate_compare_pass_returns_zero(tmp_path, monkeypatch) -> None:
     """verdict=PASS 时退出码 0。"""
     def _stub(baseline_adapter, candidate_adapter, judge, **kwargs):  # type: ignore[no-untyped-def]
-        return {"verdict": "PASS", "gates": [], "fused_diffs": {}, "fused_baseline": {}, "fused_candidate": {}, "per_dataset": [], "compare_dir": str(tmp_path / "ab")}
+        return {"verdict": "PASS", "gates": [], "fused_diffs": {}, "fused_baseline": {}, "fused_candidate": {}, "per_dataset": [], "compare_dir": str(tmp_path / "compare_x")}
 
     import membench.evaluate_compare as ec_mod
 
@@ -451,8 +553,8 @@ def test_per_dataset_gates_flags_single_dataset_spike() -> None:
             spec=DatasetSpec(key="a", name="A", path="x", source="builtin"),
             baseline={"overall": {"accuracy": 0.9, "stale_rate": 0.01, "latency_p95_ms": 100.0}},
             candidate={"overall": {"accuracy": 0.9, "stale_rate": 0.10, "latency_p95_ms": 100.0}},
-            baseline_run_dir="x",
-            candidate_run_dir="y",
+            baseline_dataset_dir="x",
+            candidate_dataset_dir="y",
         )
     ]
     rows = _per_dataset_gates(arms, acc_threshold=0.02, stale_threshold=0.02, latency_warn=0.30)
@@ -468,7 +570,7 @@ def test_resolve_capabilities_reads_top_level_and_falls_back(tmp_path) -> None:
     # 顶层已落账（任一 True）→ 直读，来源 metrics
     caps, src = _resolve_capabilities(
         {"has_evidence": True, "has_stale": False, "has_abstention": True},
-        run_dir=str(tmp_path),
+        dataset_dir=str(tmp_path),
         spec_path=str(tmp_path / "missing.jsonl"),
     )
     assert src == "metrics"
@@ -495,21 +597,25 @@ def test_resolve_capabilities_reads_top_level_and_falls_back(tmp_path) -> None:
     )
     caps, src = _resolve_capabilities(
         {"has_evidence": False, "has_stale": False, "has_abstention": False},
-        run_dir=str(tmp_path),
+        dataset_dir=str(tmp_path),
         spec_path=str(ds),
     )
     assert src == "dataset"
     assert caps["has_abstention"] is True
 
     # 顶层缺失、数据集与 results.jsonl 均不可得 → missing 全 False
-    caps, src = _resolve_capabilities({}, run_dir=str(tmp_path), spec_path=str(tmp_path / "nope.jsonl"))
+    caps, src = _resolve_capabilities(
+        {}, dataset_dir=str(tmp_path), spec_path=str(tmp_path / "nope.jsonl")
+    )
     assert src == "missing"
     assert caps == {"has_evidence": False, "has_stale": False, "has_abstention": False}
 
-    # 数据集不可得时回退按 results.jsonl 反推（evidence_hit / KU / 拒答哨兵）
-    run_dir = tmp_path / "run1"
-    run_dir.mkdir()
-    (run_dir / "results.jsonl").write_text(
+    # 数据集不可得时回退按 results.jsonl 反推（evidence_hit / KU / 拒答哨兵）；
+    # 逐题明细固定读 <数据集目录>/report/results.jsonl
+    dataset_dir = tmp_path / "run1"
+    report_dir = dataset_dir / layout.DIR_REPORT
+    report_dir.mkdir(parents=True)
+    (report_dir / layout.FILE_RESULTS).write_text(
         "\n".join(
             json.dumps(r)
             for r in [
@@ -521,7 +627,7 @@ def test_resolve_capabilities_reads_top_level_and_falls_back(tmp_path) -> None:
     )
     caps, src = _resolve_capabilities(
         {},
-        run_dir=str(run_dir),
+        dataset_dir=str(dataset_dir),
         spec_path=str(tmp_path / "nope2.jsonl"),
     )
     assert src == "results_jsonl"
@@ -556,7 +662,7 @@ def test_cli_evaluate_compare_dataset_flag(tmp_path, monkeypatch) -> None:
             "fused_baseline": {},
             "fused_candidate": {},
             "per_dataset": [],
-            "compare_dir": str(tmp_path / "ab"),
+            "compare_dir": str(tmp_path / "compare_x"),
         }
 
     monkeypatch.setattr(ec_mod, "evaluate_compare", _stub)
@@ -571,6 +677,9 @@ def test_cli_evaluate_compare_dataset_flag(tmp_path, monkeypatch) -> None:
     assert rc == 0
     specs = captured["specs"]
     assert specs is not None and specs[0].path == str(ds.resolve())
+    # 未传 --report-out 时交给缺省 output_root()；--out 已删除，不再有 out_dir 参数
+    assert captured["report_out"] is None
+    assert "out_dir" not in captured
 
     with pytest.raises(SystemExit, match="互斥"):
         cli.main(

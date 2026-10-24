@@ -13,7 +13,7 @@ description: >
 # agent-memory-eval：Agent 记忆系统评测技能
 
 本技能封装 membench 评测工程（`membench/`，自带 README 与测试），覆盖**接入 → 评测 → 对比 → 优化闭环**的完整工作流。
-**所有评测报告必须输出到本 skill 的 `output/` 目录，文件名带 `_YYMMDD_hhmmss` 时间戳后缀，报告开头注明所用测试集（membench 自动生成，勿删）。**
+**所有评测报告必须输出到本 skill 的 `output/` 目录（`--report-out <skill目录>/output`；不传时缺省 `output_root()` 同样是它）。产物一次实验一个自包含子目录（`eval_*` / `compare_*` / `matrix_*`，目录名自带 `YYYYMMDD-HHMMSS` 时间戳），报告开头注明所用测试集（membench 自动生成，勿删）。**
 
 ## ⛔ 两个强制检查点（不得跳过）
 
@@ -39,7 +39,7 @@ description: >
 | `membench/membench/data/sample_dataset.jsonl` | **内置**冒烟迷你集（仅验证管线连通，不作评估结论） |
 | `~/.membench/datasets/` | **按需下载**数据集的落盘目录（`locomo` / `longmemeval_oracle` / `longmemeval_s` / `gatemem_office` / `beam_1m` / `beam_10m`） |
 | `user_dataset/` | 用户专属测试集存放目录（与内置集物理隔离） |
-| `output/` | 所有评估/对比报告的输出目录（实验子目录：`eval_*` / `ab_*` / `matrix_*`） |
+| `output/` | 所有评估/对比报告的输出目录（实验子目录：`eval_*` / `compare_*` / `matrix_*`；可用 `MEMBENCH_OUTPUT_DIR` 覆盖） |
 | `docs/` | 《Agent 记忆系统深度研究报告》及配图，供随时查阅背景知识 |
 | `references/adapter_guide.md` | 接入指南详解（三挂点、真实性红线与降级口径流程、验收 checklist、判分器） |
 | `references/compare_workflows.md` | commit / 平台 / 矩阵对比详解 + 可比性前置校验 |
@@ -141,16 +141,19 @@ python -m membench.cli run --adapter <adapter> --dataset ~/.membench/datasets/lo
 > - 用户不确定时不要干问：给判断依据（记忆系统存原文→`substring`/`overlap`；存摘要/改写→`llm`），仍不确定就先 `--limit 20` 小样本冒烟看命中情况，再定完整评测口径；
 > - 口径选错只能重跑（无自动补救）——这一步是整晚评测成本的关键闸门，必须落实。
 
-**产物目录约定（本波已落地的布局，报告与 run 就近归属）：**
+**产物目录约定（一次实验一个自包含子目录，报告与数据就近归属）：**
 
-| 命令 | 产物目录 | 内含 |
+| 命令 | 实验目录（`--report-out DIR` 的产出） | 内含 |
 |---|---|---|
-| `run --report-out DIR` | `DIR/eval_<adapter>_<platform>_<ts>/` | `report.md`、`metrics.json`、`fig_*.png`、`runs/<run_id>/`（自包含） |
-| `evaluate --report-out DIR` | `DIR/eval_<adapter>_<platform>_<ts>/` | `evaluate_report.md`、`evaluate_summary.json`、`fig_dataset_overview.png`、`runs/<各数据集 run_id>/` |
-| `compare --report-out DIR` | `DIR/ab_<tag>_<ts>/` | `A/{report.md,metrics.json,fig_*.png,runs/}`、`B/{...}`、`compare_report.md`（+`fig_metric_diff.png`、`fig_category_diff.png`）、可选 `optimization_report.md` |
-| `matrix --report-out DIR` | `DIR/matrix_<ts>/` | 矩阵报告、`matrix_result.json`、配图、`runs/<label>/` |
+| `run --report-out DIR` | `DIR/eval_<adapter>_<platform>_<ts>/` | `runs/<dataset>/{report/{report.md,metrics.json,results.jsonl,fig_*.png},<对话目录>/{runtime/,memory_snapshot/,report/}}` + 任务级 `reports/` |
+| `evaluate --report-out DIR` | `DIR/eval_<adapter>_<platform>_<ts>/` | 各数据集落 `runs/<dataset>/…`；任务级 `reports/{report.md,metrics.json,evaluate_summary.json,fig_dataset_overview.png}` |
+| `compare` / `evaluate-compare` `--report-out DIR` | `DIR/compare_<name>_<platform>_<ts>/` | `A/`、`B/`（各一个完整 eval 实验形态，自带 `runs/` 与 `reports/`）+ `reports/{comparison.md,fig_metric_diff.png,fig_category_diff.png}`（evaluate-compare 为 `fig_per_dataset_diff.png`、`fig_fused_diff.png`） |
+| `matrix --report-out DIR` | `DIR/matrix_<ts>/` | `reports/{report.md,matrix_result.json,fig_matrix_accuracy.png}` + `runs/<label>/`（各 label 的数据集树副本） |
+| `fuse --out DIR` | `DIR`（必填，就是实验目录本身） | `runs/<dataset>/…` + `reports/` |
 
-不传 `--report-out` 时，runs 默认落到 `<skill目录>/output/runs/`（skill 环境）或工程根 `runs/`（开发环境）。命名 helper（`membench.layout.subdir_for` / `ab_subdir` / `matrix_subdir`）是公开可复用 API，不必自己重写约定。
+- `<ts>` = `YYYYMMDD-HHMMSS`；`<platform>` 缺省 `default`；目录名精确到秒，同名且非空会被直接拒绝（不会静默覆盖）。
+- **读产物的入参**统一接受**实验目录**或**数据集目录**（`<实验目录>/runs/<dataset>`）：`compare --baseline/--candidate`、`evaluate --from-runs KEY=DIR`、`evaluate-compare --baseline-run/--candidate-run`、`matrix --runs`、`fuse --runs`、`run --replay`，都经 `membench.layout.resolve_dataset_dir` 解析；旧版平铺 run 产物（缺 `report/` 层级）一律报错，要求重跑。
+- 不传 `--report-out` 时用 `output_root()`：`MEMBENCH_OUTPUT_DIR` > skill 包 `output/` > 工程根 `membench/output/`。目录命名只走 `membench/layout.py`（`eval_subdir` / `compare_subdir` / `matrix_subdir`），不要自己拼目录名。
 
 ### 工作流 2.5：全量评估（多数据集融合总分）
 
@@ -172,7 +175,7 @@ python -m membench.cli evaluate --from-runs office=<run目录> --from-runs locom
 # 默认清单含 LongMemEval-S 与 BEAM-1M（用 --no-lme-s / --no-beam 剔除）
 ```
 
-用户问"两版系统 A/B 对比一下、跨数据集一次出结论"时用 `evaluate-compare`：两套 adapter × 同一组数据集，分别跑完后产出**逐数据集 diff + 逐数据集题型 diff + 跨数据集融合 diff + 融合/per-dataset 两层门禁 + 对比图**，落 `<报告父目录>/ab_<tag>_<ts>/` 自包含结构（旧版 run 的 capabilities 未落账时自动推断并在报告头标注来源；**启动前先做「评测前置确认」，两侧同口径**，见工作流 2）：
+用户问"两版系统 A/B 对比一下、跨数据集一次出结论"时用 `evaluate-compare`：两套 adapter × 同一组数据集，分别跑完后产出**逐数据集 diff + 逐数据集题型 diff + 跨数据集融合 diff + 融合/per-dataset 两层门禁 + 对比图**，落 `<报告父目录>/compare_<name>_<platform>_<ts>/` 自包含结构——`A/`、`B/` 各为完整 eval 实验形态，结论在 `reports/comparison.md`、两图（`fig_per_dataset_diff.png` / `fig_fused_diff.png`）同目录（两侧 capabilities 未落账时自动推断并在报告头标注来源；**启动前先做「评测前置确认」，两侧同口径**，见工作流 2）：
 
 ```bash
 python -m membench.cli evaluate-compare \
@@ -183,12 +186,13 @@ python -m membench.cli evaluate-compare \
 # （口径不同不可与历史 substring 跑分直接比较，两侧需同口径重跑）
 # llm 口径为逐题 chat 调用（单题可达 10s+），大规模评测配 --jobs 8~16 并发跑
 
-# 汇总模式：两侧各自复用+补跑（KEY=RUN_DIR 可重复；某侧全部已跑完时可省略该侧 adapter；
+# 汇总模式：两侧各自复用+补跑（KEY=DIR 可重复，DIR = 实验目录或 runs/<dataset> 数据集目录；
+# 某侧全部已跑完时可省略该侧 adapter；
 # 每侧 adapter / adapter_version / driver_llm / judge / judge_model / 检索口径 必须一致，
-# 混用或补跑参数与已有 run 不一致 → 开跑之前直接拒绝）
+# 混用或补跑参数与已有产物不一致 → 开跑之前直接拒绝）
 python -m membench.cli evaluate-compare \
-    --baseline-run office=<A_run> --candidate-run office=<B_run> \
-    --baseline-run locomo=<A_run> --candidate-run locomo=<B_run> \
+    --baseline-run office=<A 侧产物> --candidate-run office=<B 侧产物> \
+    --baseline-run locomo=<A 侧产物> --candidate-run locomo=<B 侧产物> \
     --report-out ../output/ --tag "优化前vs优化后"
 # 报告附「两侧可比性（逐数据集）」：dataset_sha256 / judge / judge_model / driver_llm / platform
 # 不一致或两侧都未标注逐项列出（两侧都复用的数据集对在跑前先打印一份——别等跑完才发现）
@@ -215,13 +219,15 @@ python -m membench.cli evaluate-compare \
 详见 `references/compare_workflows.md`。要点：用 `git worktree add` 分别检出两个 commit，各自构建并以 `--commit <sha>` 标签跑同一测试集，然后：
 
 ```bash
-python -m membench.cli compare --baseline runs/<旧commit的run> --candidate runs/<新commit的run> \
+python -m membench.cli compare \
+  --baseline <旧 commit 的实验目录或 runs/<dataset> 数据集目录> \
+  --candidate <新 commit 的实验目录或 runs/<dataset> 数据集目录> \
   --require-comparable --tag <标签> --report-out ../output/
 ```
 
 - **`--require-comparable`**：对比前做**前置校验**——驱动/判分模型、适配器实现版本、数据集指纹等关键维度不一致即判"不可比"，禁止当 A/B 用（避免"变量变了还照给 PASS"）。
 - **召回口径一致性**：两次 run 必须同一 `--evidence-match` 口径（默认 substring；口径不同对比无意义，可比性校验会给 WARN）——启动评测前按「评测前置确认」（见工作流 2）先与用户敲定。
-- **`--tag`**：给本次对比命名，决定 `ab_<tag>_<ts>/` 目录名。
+- **`--tag`**：给本次对比命名，决定实验目录 `compare_<name>_<platform>_<ts>/` 的 `<name>` 段（缺省 `<基线 adapter>_vs_<候选 adapter>`）。
 - 其余 commit 对比模板见 `scripts/eval_two_commits.sh`。
 
 门禁：accuracy 降 >0.02 或 stale_rate 升 >0.02 → FAIL（退出码 1，可接 CI）。
@@ -236,7 +242,7 @@ python -m membench.cli compare --baseline runs/<旧commit的run> --candidate run
   → 优化 plan（拆成单变量改动、排优先级、界定验收指标）
   → 执行（落地单个改动；范围明确且独立时才交 subagent，默认当前会话执行）
   → AB 对比（消融 + 可比性前置校验）
-  → 优化报告（方案 + 可归因效果，落 ab_<tag>_<ts>/optimization_report.md）
+  → 优化报告（方案 + 可归因效果，落对比实验目录的 reports/optimization_report.md）
 ```
 
 | 阶段 | 动作与命令 | 产物 | 检查点 |
@@ -245,8 +251,8 @@ python -m membench.cli compare --baseline runs/<旧commit的run> --candidate run
 | 2 优化建议 | 给出可执行方向清单，按预期收益排序 | 建议清单 | — |
 | 3 优化 plan | 每条拆成**单变量**改动、排优先级、界定验收指标（含门禁阈值） | plan（一人一步） | — |
 | 4 执行 | 落地单个改动（只改一处；默认当前会话执行，范围明确且独立时才用 subagent） | 代码改动 | **⛔ 检查点①：改完后先问用户是否跑 A/B** |
-| 5 AB 对比 | 固定模型/harness、只切优化开关；先 `--require-comparable` 校验再 `compare` | `ab_<tag>_<ts>/` | **⛔ 检查点②：跑前先确认数据集范围、A/B 分组与平台/标签** |
-| 6 优化报告 | 记录方案 + 可归因效果（含门禁结论） | `ab_<tag>_<ts>/optimization_report.md` | — |
+| 5 AB 对比 | 固定模型/harness、只切优化开关；先 `--require-comparable` 校验再 `compare` | `compare_<name>_<platform>_<ts>/` | **⛔ 检查点②：跑前先确认数据集范围、A/B 分组与平台/标签** |
+| 6 优化报告 | 记录方案 + 可归因效果（含门禁结论） | `compare_<name>_<platform>_<ts>/reports/optimization_report.md` | — |
 
 - 每次只改一个变量；数据集与判分器在两次 run 之间保持不变（见工作流 2 / 3）。
 - 失败/回退样例里若出现大量"答案其实对但判 False"，先切 `--judge llm` 再定胜负（见 `references/optimize_workflow.md`）。
@@ -262,8 +268,8 @@ python -m membench.cli compare --baseline runs/<旧commit的run> --candidate run
 
 ```bash
 python -m membench.cli matrix \
-  --runs "wx@<shaA>=runs/<run1>" "fs@<shaA>=runs/<run2>" \
-         "wx@<shaB>=runs/<run3>" "fs@<shaB>=runs/<run4>" \
+  --runs "wx@<shaA>=<实验目录1 或 runs/<dataset>>" "fs@<shaA>=<实验目录2 或 runs/<dataset>>" \
+         "wx@<shaB>=<实验目录3 或 runs/<dataset>>" "fs@<shaB>=<实验目录4 或 runs/<dataset>>" \
   --report-out ../output/
 ```
 
@@ -304,12 +310,12 @@ python -m membench.cli doctor --target <url>     # 连通性 + 三端点契约�
 
 - 校验 `/reset` 2xx、`/ingest` 2xx（含 `input_tokens`/`llm_calls` 数值校验）、`/query` 2xx + JSON + 字符串 `answer`（`retrieved` 若出现须为字符串列表）。
 - 底层实现为 `membench.doctor.check_target(base_url, timeout=10.0, api_key=None)`，只依赖标准库。
-- **清空前快照（可选，回溯用）**：框架在每次 `reset()` 前给出上下文（HTTP：`POST /reset` 请求体的 `run_dir` / `dialogue_id` / `dialogue_index`；Python 适配器：同名环境变量 `MEMBENCH_*`），框架**不读不写**记忆存储——要不要快照由桥决定。模板支持 `BRIDGE_RESET_BACKUP=run`（快照进本次 run 的 `run_snapshots/reset_<序号>_<dialogue_id>/`）或指定固定目录；默认关闭（reset 每对话一次，长跑常开会把磁盘翻倍）。逐题 `retrieved` 已在 `results.jsonl` 里，快照只用于查内部存储状态。
+- **清空前快照（可选，回溯用）**：框架在每次 `reset()` 前给出上下文（HTTP：`POST /reset` 请求体的 `run_dir` / `dialogue_id` / `dialogue_index`；Python 适配器：同名环境变量 `MEMBENCH_*`），框架**不读不写**记忆存储——要不要快照由接入侧决定。`MEMBENCH_RUN_DIR` / `run_dir` 现在指**该对话的目录**（`<实验目录>/runs/<dataset>/<对话目录>`，其 `runtime/` 框架已建好），约定把清空前的备份落 `<对话目录>/runtime/reset_backup/`；默认关闭（reset 每对话一次，长跑常开会把磁盘翻倍）。逐题 `retrieved` 已在 `results.jsonl` 里，快照只用于查内部存储状态。
 
 ### run 元数据与可比性
 
 - `run` 新增 `--driver-llm` / `--adapter-version`；`metrics.json` 记 `driver_llm` / `judge_model` / `adapter_version` / `dataset_fingerprint` / `schema_version`，用于回溯"这次分数是用什么跑出来的"。
-- `compare` 新增 `--require-comparable` / `--tag`：前者做可比性前置校验（关键维度不一致 → 不可比，禁止当 A/B），后者决定 `ab_<tag>_<ts>/` 目录名。
+- `compare` 新增 `--require-comparable` / `--tag`：前者做可比性前置校验（关键维度不一致 → 不可比，禁止当 A/B），后者决定实验目录 `compare_<name>_<platform>_<ts>/` 的 `<name>` 段。
 - 数据集指纹 `membench.data.schema.dataset_fingerprint(path) -> {"sha256", "bytes", "name"}`；可用 `membench.data.info.resolve_available_path(key)` 解析某数据集当前可用路径（内置优先，其次 `datasets_dir()`）。
 - **token 消耗记账**：`metrics.json` 的 `token_usage` 块记全流程累计（`ingest_input_tokens` / `query_input_tokens` / `query_output_tokens` / `ingest_llm_calls` / `query_llm_calls` + `n_dialogues` / `n_questions`）；run 结束控制台直接打印一行摘要，run 报告有「Token 消耗（全流程）」表，`evaluate` 报告给分数据集消耗 + 合计（`evaluate_summary.json` 的 `token_usage`）。适配器不填 = 0 且标注「未上报」，不是真实零消耗；该块不参与评级 / 门禁 / 可比性校验。
 
@@ -321,7 +327,7 @@ python -m membench.cli doctor --target <url>     # 连通性 + 三端点契约�
 - 两种维度都能用 `fuse` 融合，但**不许混维融合**（fuse 会明确报错）。
 - **并行分片要实例隔离**：分片是"进程级"并行——每个分片必须独占一个记忆实例（HTTP 桥 = 每分片独立桥进程，`BRIDGE_PORT` / `BRIDGE_DATA_DIR` 各自隔离；Python 适配器 = 每分片独立进程）。runner 对每个 dialogue 调 `reset()`，共享同一实例并行会互相清库（跨片串扰）；只有一个实例时请串行跑分片。
 - **分片数上限与 `--shards max`**：dialogue 模式上限=数据集对话数、question 模式上限=题目数；传超过上限的整数会**按上限执行**（不报错）；`--shards max` 自动按上限取最大；索引越过有效分片数的进程安全跳过（不产生空 run）。
-- **分片 A/B（大数据集对比）官方通路**：两侧分别 `run --shards N --shard-by dialogue`（每分片独立实例并行）→ 每侧每数据集 `fuse` 合并成完整 run → `evaluate-compare --baseline-run <key>=<A完整run> --candidate-run <key>=<B完整run>` 汇总出完整对比报告；融合产物透传全部可比性元数据，可直接参与 `compare --require-comparable` 复验。
+- **分片 A/B（大数据集对比）官方通路**：两侧分别 `run --shards N --shard-by dialogue`（每分片独立实例并行）→ 每侧每数据集用 `fuse --out <完整实验目录>` 合并成完整实验目录 → `evaluate-compare --baseline-run <key>=<A 侧完整实验目录或 runs/<dataset>> --candidate-run <key>=<B 侧同上>` 汇总出完整对比报告；融合产物透传全部可比性元数据，可直接参与 `compare --require-comparable` 复验。
 - **多数据集对比的可比性**：报告附「两侧可比性（逐数据集）」（两侧 `dataset_sha256 / judge / judge_model / driver_llm / platform` 不一致记「关键」、两侧都未标注记「关键缺失」、检索口径等记「次要」；`adapter / adapter_version` 与 `commit` 是被测变量，差异属预期）；两侧都复用的数据集对在**开跑前**先打印问题清单。要做成"能归因的 A/B"，两侧就都带上 `--driver-llm-a/-b` 与 `--adapter-version-a/-b`——缺了只能在报告里记「无法核验」，事后无法补记。
 
 ## 结果解读准则

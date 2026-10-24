@@ -36,8 +36,9 @@ import { createMemorySystem } from "./memory-entry.mjs";
 const PORT = Number(process.env.BRIDGE_PORT || 8787);
 const HOST = process.env.BRIDGE_HOST || "127.0.0.1";
 const DATA_DIR = process.env.BRIDGE_DATA_DIR || "./.bridge-data";
-// 清空前快照（默认关闭）："" = 不做；"run" = 落到本次评测 run 目录的
-// run_snapshots/（run_dir 由 membench 通过 /reset 请求体带过来）；其它值 = 固定目录。
+// 清空前快照（默认关闭）："" = 不做；"run" = 落到本次对话目录的
+// runtime/reset_backup/（对话目录由 membench 经 /reset 请求体的 run_dir 带过来）；
+// 其它值 = 固定目录。
 // 注意成本：reset 每个对话调一次，开启后等于每对话复制一份记忆目录——调试/复现时开，
 // 长跑批量评测建议关。
 const RESET_BACKUP = process.env.BRIDGE_RESET_BACKUP || "";
@@ -47,14 +48,15 @@ let memory = createMemorySystem({ dataDir: DATA_DIR });
 /**
  * 清空前快照（BRIDGE_RESET_BACKUP，默认关闭，人类可读布局）：把当前记忆目录
  * 复制一份，便于评测后回溯"这一刻记忆里有什么"。目录名带 reset 序号与对话 id，
- * 与 results.jsonl 的 dialogue_id 直接对得上。
+ * 与 results.jsonl 的 dialogue_id 直接对得上；`run` 模式落对话目录的
+ * `runtime/reset_backup/`（请求体里 run_dir 就是该对话目录）。
  */
 function snapshotBeforeReset(body) {
   if (!RESET_BACKUP) return null;
   const base =
     RESET_BACKUP === "run"
       ? body.run_dir
-        ? path.join(String(body.run_dir), "run_snapshots")
+        ? path.join(String(body.run_dir), "runtime", "reset_backup")
         : null
       : RESET_BACKUP;
   if (!base) return null;

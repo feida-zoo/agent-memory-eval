@@ -1,4 +1,9 @@
-"""fuse 子命令测试：分片融合校验、指标重算、stale 门禁。"""
+"""fuse 子命令测试：分片融合校验、指标重算、stale 门禁、产物树。
+
+产物结构（见 :mod:`membench.layout`）：``out_dir`` 是**完整实验目录**——
+融合结果落 ``<out_dir>/runs/<dataset>/{report/,<对话>/report/}``，
+任务级报告落 ``<out_dir>/reports/``。
+"""
 
 from __future__ import annotations
 
@@ -7,11 +12,20 @@ from pathlib import Path
 
 import pytest
 
+from membench import layout
 from membench.adapters import MockStrongAdapter, MockWeakAdapter
 from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
 from membench.data import SAMPLE_DATASET_PATH
 from membench.fuse import fuse_runs
 from membench.runner import Runner
+
+_DATASET = "sample_dataset"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_output_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """兜底：任何走默认产物目录的调用都落 tmp，不往仓库写产物。"""
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(tmp_path / "output"))
 
 
 class _StaleAdapter(BaseMemoryAdapter):
@@ -51,9 +65,26 @@ def _stale_dataset(path: Path) -> Path:
     return path
 
 
+def _read_jsonl(path: Path) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _metrics_path(dataset_dir: str) -> Path:
+    return Path(dataset_dir) / layout.DIR_REPORT / layout.FILE_METRICS
+
+
+def _read_metrics(dataset_dir: str) -> dict:
+    return json.loads(_metrics_path(dataset_dir).read_text(encoding="utf-8"))
+
+
 def _shard_run(
     tmp_path: Path, name: str, adapter, shards: int, shard_index: int, shard_by: str = "question"
 ) -> str:
+    """跑一个分片 run，返回其**数据集目录**（``<实验目录>/runs/<dataset>``）。"""
     runner = Runner(
         adapter,
         str(SAMPLE_DATASET_PATH),
@@ -67,48 +98,73 @@ def _shard_run(
 
 
 def _full_run(tmp_path: Path, name: str, adapter) -> tuple[str, dict, list[dict]]:
+    """跑全量 run，返回 ``(数据集目录, 数据集级 metrics, 全量逐题记录)``。"""
     runner = Runner(
         adapter,
         str(SAMPLE_DATASET_PATH),
         judge="heuristic",
         out_dir=str(tmp_path / name),
     )
-    run_dir = runner.run()
-    metrics = json.loads((Path(run_dir) / "metrics.json").read_text(encoding="utf-8"))
-    records = [
-        json.loads(line)
-        for line in (Path(run_dir) / "results.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    return run_dir, metrics, records
+    dataset_dir = runner.run()
+    report_dir = Path(dataset_dir) / layout.DIR_REPORT
+    return (
+        dataset_dir,
+        _read_metrics(dataset_dir),
+        _read_jsonl(report_dir / layout.FILE_RESULTS),
+    )
 
 
 def test_fuse_two_shards_matches_full_run(tmp_path: Path) -> None:
-    """两个分片融合后的题集与指标等同于全量 run。"""
+    """两个分片融合后的题集与指标等同于全量 run，产物落完整实验树。"""
     s0 = _shard_run(tmp_path, "s0", MockStrongAdapter(), 2, 0)
     s1 = _shard_run(tmp_path, "s1", MockStrongAdapter(), 2, 1)
     _, full_metrics, full_records = _full_run(tmp_path, "full", MockStrongAdapter())
 
-    out_dir = str(tmp_path / "fused")
-    result = fuse_runs([s0, s1], out_dir)
+    out_dir = tmp_path / "fused"
+    result = fuse_runs([s0, s1], str(out_dir))
 
-    out = Path(out_dir)
-    assert (out / "results.jsonl").is_file()
-    assert (out / "metrics.json").is_file()
-    assert (out / "report.md").is_file()
+    dataset_dir = Path(result["dataset_dir"])
+    assert result["out_dir"] == str(out_dir)
+    assert dataset_dir == out_dir / layout.DIR_RUNS / _DATASET
+    report_dir = dataset_dir / layout.DIR_REPORT
+    for name in (
+        layout.FILE_RESULTS,
+        layout.FILE_METRICS,
+        layout.FILE_REPORT_MD,
+        layout.FIG_CATEGORY,
+        layout.FIG_LATENCY,
+    ):
+        assert (report_dir / name).is_file(), f"缺少 {layout.DIR_REPORT}/{name}"
+    # 任务级 reports/：与 Runner 的 write_task_reports 同形态（md + metrics）
+    task_dir = out_dir / layout.DIR_REPORTS
+    assert (task_dir / layout.FILE_REPORT_MD).is_file()
+    assert (task_dir / layout.FILE_METRICS).is_file()
 
-    fused_records = [
-        json.loads(line)
-        for line in (out / "results.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    fused_records = _read_jsonl(report_dir / layout.FILE_RESULTS)
     assert {r["qid"] for r in fused_records} == {r["qid"] for r in full_records}
+    # 顺序与不分片直接跑逐题对齐（对话顺序 + 对话内题目顺序）
+    assert [r["qid"] for r in fused_records] == [r["qid"] for r in full_records]
     assert result["n_questions"] == len(full_records)
+
+    # 逐对话报告：融合时按对话粒度重建（每条只含自己的题，且不出图）
+    dialogue_dirs = sorted(
+        p for p in dataset_dir.iterdir() if p.is_dir() and p.name != layout.DIR_REPORT
+    )
+    fused_qids: list[str] = []
+    for dialogue_dir in dialogue_dirs:
+        dialogue_report = dialogue_dir / layout.DIR_REPORT
+        assert (dialogue_report / layout.FILE_METRICS).is_file()
+        assert (dialogue_report / layout.FILE_REPORT_MD).is_file()
+        assert not list(dialogue_report.glob("fig_*.png"))
+        fused_qids.extend(r["qid"] for r in _read_jsonl(dialogue_report / layout.FILE_RESULTS))
+    assert sorted(fused_qids) == sorted(r["qid"] for r in full_records)
 
     metrics = result["metrics"]
     assert metrics["overall"]["accuracy"] == pytest.approx(full_metrics["overall"]["accuracy"])
     assert metrics["overall"]["stale_rate"] == pytest.approx(full_metrics["overall"]["stale_rate"])
     assert metrics["overall"]["n_questions"] == full_metrics["overall"]["n_questions"]
+    # 落盘的数据集级 metrics 与返回值一致
+    assert _read_metrics(result["dataset_dir"]) == metrics
     # metadata 标记 fused 及来源分片列表
     assert metrics["fused"] is True
     assert len(metrics["fused_from"]) == 2
@@ -134,9 +190,9 @@ def test_fuse_rejects_duplicate_shards(tmp_path: Path) -> None:
 
 
 def test_fuse_rejects_unsharded_runs(tmp_path: Path) -> None:
-    run_dir, _, _ = _full_run(tmp_path, "full", MockStrongAdapter())
+    dataset_dir, _, _ = _full_run(tmp_path, "full", MockStrongAdapter())
     with pytest.raises(ValueError, match="未分片"):
-        fuse_runs([run_dir], str(tmp_path / "fused"))
+        fuse_runs([dataset_dir], str(tmp_path / "fused"))
 
 
 def test_fuse_rejects_adapter_mismatch(tmp_path: Path) -> None:
@@ -157,11 +213,20 @@ def test_fuse_stale_gate_fail(tmp_path: Path) -> None:
     assert result["metrics"]["overall"]["stale_rate"] == pytest.approx(1.0)
     assert result["gate"]["status"] == "FAIL"
     assert result["metrics"]["stale_gate"]["status"] == "FAIL"
+    # 门禁结论落盘：数据集级 metrics.json 里同样标 FAIL（读产物即可复核结论）
+    assert _read_metrics(result["dataset_dir"])["stale_gate"]["status"] == "FAIL"
 
 
-def test_fuse_missing_metrics_file(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
+def test_fuse_missing_input_or_incomplete_product_rejected(tmp_path: Path) -> None:
+    """入参不存在 -> SystemExit；产物有 report/ 层级但缺 metrics.json -> SystemExit。"""
+    with pytest.raises(SystemExit, match="产物目录不存在"):
         fuse_runs([str(tmp_path / "nonexistent")], str(tmp_path / "fused"))
+
+    # 有 report/ 层级但没落 metrics.json：产物不完整，宁可报错也别拿半成品融合
+    incomplete = Path(layout.dataset_report_dir(str(tmp_path / "exp"), _DATASET))
+    incomplete.mkdir(parents=True)
+    with pytest.raises(SystemExit, match="metrics.json"):
+        fuse_runs([str(incomplete.parent)], str(tmp_path / "fused2"))
 
 
 def test_fuse_dialogue_shards_matches_full_run(tmp_path: Path) -> None:
@@ -177,6 +242,11 @@ def test_fuse_dialogue_shards_matches_full_run(tmp_path: Path) -> None:
     assert result["metrics"]["overall"]["accuracy"] == pytest.approx(
         full_metrics["overall"]["accuracy"]
     )
+    # dialogue 分片间不重复 ingest，融合后与全量 run 的题集一致
+    fused_records = _read_jsonl(
+        Path(result["dataset_dir"]) / layout.DIR_REPORT / layout.FILE_RESULTS
+    )
+    assert [r["qid"] for r in fused_records] == [r["qid"] for r in full_records]
 
 
 def test_fuse_rejects_mixed_shard_by(tmp_path: Path) -> None:
@@ -207,10 +277,10 @@ def test_fuse_passes_through_comparability_metadata(tmp_path: Path) -> None:
 
     s0 = _shard("m0", 0)
     s1 = _shard("m1", 1)
-    fused = fuse_runs([s0, s1], str(tmp_path / "fused_meta"))["out_dir"]
+    fused = fuse_runs([s0, s1], str(tmp_path / "fused_meta"))["dataset_dir"]
 
-    src = json.loads((Path(s0) / "metrics.json").read_text(encoding="utf-8"))
-    dst = json.loads((Path(fused) / "metrics.json").read_text(encoding="utf-8"))
+    src = _read_metrics(s0)
+    dst = _read_metrics(fused)
     for key in (
         "adapter_version",
         "judge_model",
@@ -222,6 +292,10 @@ def test_fuse_passes_through_comparability_metadata(tmp_path: Path) -> None:
     ):
         assert dst.get(key) == src.get(key), key
     assert dst["fused"] is True and dst["fused_from"]
+
+    # 产物归属字段指向融合实验目录内的真实路径
+    assert dst["experiment_dir"] == str(tmp_path / "fused_meta")
+    assert dst["dataset_dir"] == fused
 
     # 回归：此前关键维度全缺失，require_comparable 必然 FAIL
     result = compare_runs(
@@ -236,10 +310,11 @@ def test_fuse_rejects_mixed_metadata(tmp_path: Path) -> None:
     """判分/驱动等元数据不一致的分片拒绝融合（防止混片）。"""
     s0 = _shard_run(tmp_path, "x0", MockStrongAdapter(), 2, 0)
     s1 = _shard_run(tmp_path, "x1", MockStrongAdapter(), 2, 1)
-    metrics_path = Path(s1) / "metrics.json"
-    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics = _read_metrics(s1)
     metrics["driver_llm"] = "different-model"
-    metrics_path.write_text(json.dumps(metrics, ensure_ascii=False), encoding="utf-8")
+    _metrics_path(s1).write_text(
+        json.dumps(metrics, ensure_ascii=False), encoding="utf-8"
+    )
 
     with pytest.raises(ValueError, match="driver_llm 不一致"):
         fuse_runs([s0, s1], str(tmp_path / "bad"))

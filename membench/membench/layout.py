@@ -1,52 +1,71 @@
-"""一次实验一个自包含子目录的产物布局。
+"""实验产物布局的唯一入口：目录名 / 报告文件名常量与路径 helper。
 
-约定（报告与其 run 就近归属，不再与全局 run 混放）：
+终态结构（报告与数据就近归属，一次实验一个自包含子目录）::
 
-单次评测（run / evaluate）::
+    <root>/eval_<name>_<platform>_<ts>/
+    ├── runs/<dataset>/
+    │   ├── report/                      # 数据集级聚合报告（md + metrics + 逐题明细 + 图）
+    │   └── <dialogue_id>/
+    │       ├── runtime/                 # 运行时数据（如桥的 reset 前备份）
+    │       ├── memory_snapshot/         # --snapshot 导出的对话快照（含 manifest.json）
+    │       └── report/                  # 对话级报告（纯文字，不出图）
+    └── reports/                         # 任务级报告（单数据集 run = 数据集级报告内容）
 
-    <root>/eval_<adapter>_<platform>_<ts>/
-    ├── report.md / metrics.json / fig_*.png     # 报告与图表
-    └── runs/<run_id>/                            # 本次评测的 run（含分片）
+    <root>/compare_<name>_<platform>_<ts>/   A/ B/（各为完整 eval 实验形态）+ reports/
+    <root>/matrix_<ts>/                      reports/ + runs/<label>/（内部同 eval 树）
 
-A/B 对比（compare）::
+``<root>`` 由 :func:`membench.paths.output_root` 解析（CLI ``--report-out DIR`` 即指它）。
 
-    <root>/ab_<tag>_<ts>/
-    ├── A/{report.md,metrics.json,fig_*.png,runs/<run_id>/}
-    ├── B/{report.md,metrics.json,fig_*.png,runs/<run_id>/}
-    ├── compare_report.md / fig_metric_diff.png
-    └── optimization_report.md（可选，由调用方写入）
-
-矩阵对比（matrix）::
-
-    <root>/matrix_<ts>/
-    ├── matrix_report.md / matrix_result.json / fig_matrix_accuracy.png
-    └── runs/<label>/                             # 各组 run 副本
-
-``<root>`` 由 :func:`membench.paths.output_root` 解析（或 CLI ``--report-out DIR``）。
-命名 helper（:func:`subdir_for` / :func:`ab_subdir` / :func:`matrix_subdir`）是
-Runner API 使用者可复用的公开接口，不必自己重写约定。
+本模块是这些目录名与报告文件名的**唯一来源**：其它模块拼路径一律调用这里的常量与
+helper，不要手写字面量。helper 只计算路径、不建目录——需要落盘时调用方自行
+``os.makedirs(..., exist_ok=True)``。读取侧把「产物目录」（实验目录或数据集目录）归一成
+数据集目录也只走这里的 :func:`resolve_dataset_dir`。
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
-import shutil
 from datetime import datetime
-from typing import Iterable, Sequence
 
 from membench.paths import output_root
-from membench.report import copy_report
 
-#: 时间戳后缀格式（与 CLI 一致）。
-TS_FORMAT = "%y%m%d_%H%M%S"
+#: 实验目录时间戳格式。
+TS_FORMAT = "%Y%m%d-%H%M%S"
 
-#: 目录名安全化：非字母数字与 ``._-`` 的字符替换为 ``-``。
+#: 实验目录下的各层目录名。
+DIR_RUNS = "runs"
+DIR_REPORT = "report"  # 对话级 / 数据集级报告目录
+DIR_REPORTS = "reports"  # 实验根层的任务级报告目录（与 runs/ 平级）
+DIR_RUNTIME = "runtime"
+DIR_SNAPSHOT = "memory_snapshot"
+
+#: 报告与数据文件名。
+FILE_REPORT_MD = "report.md"
+FILE_COMPARISON_MD = "comparison.md"
+FILE_METRICS = "metrics.json"
+FILE_RESULTS = "results.jsonl"
+FILE_SUMMARY = "evaluate_summary.json"
+FILE_MATRIX_RESULT = "matrix_result.json"
+
+#: 图表文件名（报告内引用一律同目录相对文件名）。
+FIG_CATEGORY = "fig_category_accuracy.png"
+FIG_LATENCY = "fig_latency_hist.png"
+FIG_METRIC_DIFF = "fig_metric_diff.png"
+FIG_CATEGORY_DIFF = "fig_category_diff.png"
+FIG_DATASET_OVERVIEW = "fig_dataset_overview.png"
+FIG_MATRIX_ACCURACY = "fig_matrix_accuracy.png"
+
+#: 实验目录名安全化：非字母数字与 ``._-`` 的字符替换为 ``-``。
 _UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+#: 对话目录名安全化：非字母数字与 ``._-`` 的字符替换为 ``_``。
+_SAFE_TAG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def ts_now(now: datetime | None = None) -> str:
-    """当前时间戳字符串（``%y%m%d_%H%M%S``）。"""
+    """当前时间戳字符串（:data:`TS_FORMAT`）。"""
     return (now or datetime.now()).strftime(TS_FORMAT)
 
 
@@ -56,14 +75,20 @@ def slug(text: str) -> str:
     return cleaned or "default"
 
 
-def subdir_for(adapter: str, platform: str | None = None, ts: str | None = None) -> str:
-    """单次评测实验目录名：``eval_<adapter>_<platform>_<ts>``。"""
-    return f"eval_{slug(adapter)}_{slug(platform or 'default')}_{ts or ts_now()}"
+def tag_dir_name(tag: str) -> str:
+    """把对话 id 归一成安全的目录名（防路径穿越；空值兜底 ``dialogue``）。"""
+    safe = _SAFE_TAG_RE.sub("_", str(tag)).strip("._-")
+    return (safe or "dialogue")[:120]
 
 
-def ab_subdir(tag: str, ts: str | None = None) -> str:
-    """A/B 对比实验目录名：``ab_<tag>_<ts>``。"""
-    return f"ab_{slug(tag)}_{ts or ts_now()}"
+def eval_subdir(name: str, platform: str | None = None, ts: str | None = None) -> str:
+    """单次评测实验目录名：``eval_<name>_<platform>_<ts>``。"""
+    return f"eval_{slug(name)}_{slug(platform or 'default')}_{ts or ts_now()}"
+
+
+def compare_subdir(name: str, platform: str | None = None, ts: str | None = None) -> str:
+    """A/B 对比实验目录名：``compare_<name>_<platform>_<ts>``。"""
+    return f"compare_{slug(name)}_{slug(platform or 'default')}_{ts or ts_now()}"
 
 
 def matrix_subdir(ts: str | None = None) -> str:
@@ -72,140 +97,168 @@ def matrix_subdir(ts: str | None = None) -> str:
 
 
 def experiment_path(base: str | None, name: str) -> str:
-    """在 ``base``（默认 :func:`membench.paths.output_root`）下建实验目录并返回。"""
+    """在 ``base``（默认 :func:`membench.paths.output_root`）下建实验目录并返回。
+
+    目标已存在且**非空**时拒绝新建：实验目录名只精确到秒，同一秒内的两次评测若落到
+    同一目录，后一次会静默覆盖前一次的数据集级报告。上一次跑在校验阶段就失败留下的
+    空目录可以复用，不算冲突。
+    """
     path = os.path.join(base or output_root(), name)
+    if os.path.isdir(path) and os.listdir(path):
+        raise SystemExit(
+            f"实验目录已存在且非空: {path}；"
+            "同一秒内重复运行请换 --report-out，或稍后重试"
+        )
     os.makedirs(path, exist_ok=True)
     return path
 
 
-def copy_report_into(md_path: str, dest_dir: str, dest_filename: str = "report.md") -> str:
-    """把 markdown 报告连同其引用的本地图片复制到 ``dest_dir``（保持原文件名）。"""
-    return copy_report(md_path, dest_dir, dest_filename, "")
+# ---------------------------------------------------------------------------
+# 实验目录内的路径
+# ---------------------------------------------------------------------------
+
+def runs_root(experiment_dir: str) -> str:
+    """实验目录下的 ``runs/``。"""
+    return os.path.join(experiment_dir, DIR_RUNS)
 
 
-def _plan_run_targets(
-    dest_runs_dir: str, run_dirs: Sequence[str], labels: Sequence[str] | None
-) -> list[tuple[str, str]]:
-    """计算每个源 run 的目标目录，先整体校验再复制。
+def dataset_dir(experiment_dir: str, dataset: str) -> str:
+    """数据集产物目录：``<exp>/runs/<slug(dataset)>``。"""
+    return os.path.join(runs_root(experiment_dir), slug(dataset))
 
-    先算完再复制，避免发现冲突时已写入半个目录。
+
+def dataset_report_dir(experiment_dir: str, dataset: str) -> str:
+    """数据集级报告目录：``<exp>/runs/<dataset>/report``。"""
+    return os.path.join(dataset_dir(experiment_dir, dataset), DIR_REPORT)
+
+
+def dialogue_dir(experiment_dir: str, dataset: str, dialogue_id: str) -> str:
+    """对话目录：``<exp>/runs/<dataset>/<tag_dir_name(dialogue_id)>``。"""
+    return os.path.join(dataset_dir(experiment_dir, dataset), tag_dir_name(dialogue_id))
+
+
+def dialogue_report_dir(experiment_dir: str, dataset: str, dialogue_id: str) -> str:
+    """对话级报告目录。"""
+    return os.path.join(dialogue_dir(experiment_dir, dataset, dialogue_id), DIR_REPORT)
+
+
+def dialogue_runtime_dir(experiment_dir: str, dataset: str, dialogue_id: str) -> str:
+    """对话级运行时数据目录（如桥的 reset 前备份落 ``runtime/reset_backup/``）。"""
+    return os.path.join(dialogue_dir(experiment_dir, dataset, dialogue_id), DIR_RUNTIME)
+
+
+def dialogue_snapshot_dir(experiment_dir: str, dataset: str, dialogue_id: str) -> str:
+    """对话级快照目录（``--snapshot`` 时含 ``manifest.json``）。"""
+    return os.path.join(dialogue_dir(experiment_dir, dataset, dialogue_id), DIR_SNAPSHOT)
+
+
+def task_report_dir(experiment_dir: str) -> str:
+    """实验根层的任务级报告目录：``<exp>/reports``。"""
+    return os.path.join(experiment_dir, DIR_REPORTS)
+
+
+# ---------------------------------------------------------------------------
+# 产物目录解析（读取方的唯一入口）
+# ---------------------------------------------------------------------------
+
+#: 旧版产物（平铺 run 目录、缺 ``report/`` 层级，或旧的 ``ab_`` 实验目录）的统一报错文案。
+LEGACY_LAYOUT_MSG = "产物结构为旧版（缺少 report/ 层级），本版本不再兼容，请重新跑评测"
+
+
+def _dialogue_id_of_report(path: str) -> str | None:
+    """读 ``<dir>/report/metrics.json`` 落账的 ``dialogue_id``（没有 / 读不出返 None）。
+
+    对话目录与数据集目录都带 ``report/`` 层级，只有 ``dialogue_id`` 能把两者分开：
+    数据集级 metrics 不写该字段，对话级聚合写。读不出 / 解析失败按"不是对话目录"
+    处理——文件本身的问题由 :func:`_require_metrics` 报错。
+    """
+    metrics_path = os.path.join(path, DIR_REPORT, FILE_METRICS)
+    try:
+        with open(metrics_path, encoding="utf-8") as handle:
+            metrics = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(metrics, dict):
+        return None
+    dialogue_id = metrics.get("dialogue_id")
+    return str(dialogue_id) if dialogue_id else None
+
+
+def _is_dialogue_dir(path: str) -> bool:
+    """对话级产物目录的判定：``report/metrics.json`` 里落账了 ``dialogue_id``。"""
+    return _dialogue_id_of_report(path) is not None
+
+
+def _is_dataset_dir(path: str) -> bool:
+    """数据集目录的判定：带 ``report/`` 层级且不是对话级产物目录。
+
+    ``report/`` 下文件是否齐备由 :func:`_require_metrics` 校验。
+    """
+    return os.path.isdir(os.path.join(path, DIR_REPORT)) and not _is_dialogue_dir(path)
+
+
+def _require_metrics(dataset_dir: str) -> str:
+    """数据集目录必须落账 ``report/metrics.json``。
+
+    半成品产物（跑到一半被中断）要在这里就被拦下，不能等读取方打开文件时才抛错。
+    """
+    if not os.path.isfile(os.path.join(dataset_dir, DIR_REPORT, FILE_METRICS)):
+        raise SystemExit(f"数据集目录缺少 {FILE_METRICS}（产物不完整）: {dataset_dir}")
+    return dataset_dir
+
+
+def resolve_dataset_dir(target: str, dataset: str | None = None) -> str:
+    """把「产物目录」入参归一成数据集目录（``<实验目录>/runs/<dataset>``）。
+
+    读取侧（compare / fuse / matrix / evaluate 汇总）统一用本函数解析入参：
+
+    - **数据集目录**（自带 ``report/`` 层级）原样返回；
+    - **实验目录**按 ``dataset``（数据集 key，目录名经 :func:`slug` 归一后比对）命中，
+      否则取唯一的数据集子目录；有多个而无法定位时报错，要求直接传数据集目录；
+    - **对话目录**（``report/metrics.json`` 里落账了 ``dialogue_id``）一律拒绝：
+      一段对话的指标不是数据集汇总，拿它当数据集会得到以偏概全的结论；
+    - 两者都不是（缺 ``report/`` 层级）→ 按旧版产物报错（:data:`LEGACY_LAYOUT_MSG`）。
+
+    Args:
+        target: 数据集目录或实验目录。
+        dataset: 数据集 key，用于在实验目录下优先定位（默认 None）。
 
     Returns:
-        ``[(dest, run_dir), ...]``。
+        数据集目录的绝对路径。
 
     Raises:
-        ValueError: 两个**不同**源目录映射到同一目标目录（``labels`` 缺省时是
-            basename 相同，给了 labels 时是 ``slug()`` 把不同标签归一成同名），
-            否则 ``copytree`` 会把两份 run 静默混进同一目录。
+        SystemExit: 入参目录不存在、入参是对话级产物目录、数据集目录缺
+            ``report/metrics.json``（产物不完整）、实验目录下有多个数据集目录而
+            调用方未指定，或入参是旧版产物结构。
     """
-    targets: list[tuple[str, str]] = []
-    seen: dict[str, tuple[str, str | None]] = {}
-    for i, run_dir in enumerate(run_dirs):
-        label = labels[i] if labels is not None else None
-        if label is not None:
-            name = slug(label)
-        else:
-            name = os.path.basename(os.path.normpath(run_dir))
-        dest = os.path.join(dest_runs_dir, name)
-        prev = seen.get(os.path.abspath(dest))
-        if prev is not None and os.path.abspath(prev[0]) != os.path.abspath(run_dir):
-            raise ValueError(
-                "copy_runs_into: 目标目录冲突——"
-                f"{_src_desc(prev[0], prev[1])} 与 {_src_desc(run_dir, label)} "
-                f"都会写入 {dest}；请改用互不相同的 run_id / labels"
+    if not os.path.isdir(target):
+        raise SystemExit(f"产物目录不存在: {target}")
+    abspath = os.path.abspath(target)
+    dialogue_id = _dialogue_id_of_report(abspath)
+    if dialogue_id is not None:
+        raise SystemExit(
+            f"入参是对话级产物目录（对话 {dialogue_id}），请传实验目录或数据集目录: {abspath}"
+        )
+    if _is_dataset_dir(abspath):
+        return _require_metrics(abspath)
+
+    runs = runs_root(abspath)
+    if os.path.isdir(runs):
+        if dataset:
+            candidate = dataset_dir(abspath, dataset)
+            if _is_dataset_dir(candidate):
+                return _require_metrics(candidate)
+        found = sorted(
+            os.path.join(runs, name)
+            for name in os.listdir(runs)
+            if _is_dataset_dir(os.path.join(runs, name))
+        )
+        if len(found) == 1:
+            return _require_metrics(found[0])
+        if len(found) > 1:
+            names = "、".join(os.path.basename(path) for path in found)
+            raise SystemExit(
+                f"实验目录 {abspath} 下有多个数据集目录（{names}），无法确定读哪一个；"
+                f"请把入参指向具体的数据集目录 {runs}/<dataset>"
             )
-        seen.setdefault(os.path.abspath(dest), (run_dir, label))
-        targets.append((dest, run_dir))
-    return targets
-
-
-def _src_desc(run_dir: str, label: str | None) -> str:
-    """冲突消息里的来源描述：带标签时一并给出。"""
-    return f"{run_dir}（标签 {label!r}）" if label is not None else run_dir
-
-
-def copy_runs_into(
-    dest_runs_dir: str,
-    run_dirs: Sequence[str],
-    labels: Sequence[str] | None = None,
-) -> list[str]:
-    """把若干 run 目录复制到 ``dest_runs_dir`` 下，返回目标目录列表。
-
-    Args:
-        dest_runs_dir: 目标 ``runs/`` 目录（不存在则创建）。
-        run_dirs: 源 run 目录列表。
-        labels: 可选，与 ``run_dirs`` 一一对应的目录名；缺省用源目录 basename。
-
-    Raises:
-        ValueError: 同一次调用内两个**不同**源目录映射到同一目标目录（同源目录
-            重复出现不算冲突）。
-    """
-    os.makedirs(dest_runs_dir, exist_ok=True)
-    out: list[str] = []
-    for dest, run_dir in _plan_run_targets(dest_runs_dir, run_dirs, labels):
-        if os.path.abspath(dest) == os.path.abspath(run_dir):
-            out.append(dest)  # 已是同一目录，避免 copytree 自我复制
-            continue
-        shutil.copytree(run_dir, dest, dirs_exist_ok=True)
-        out.append(dest)
-    return out
-
-
-def materialize_run_experiment(exp_dir: str, run_dir: str) -> str:
-    """单次评测：报告 + 图表落实验目录根，run 副本落 ``<exp_dir>/runs/``。"""
-    os.makedirs(exp_dir, exist_ok=True)
-    report_md = os.path.join(run_dir, "report.md")
-    if os.path.isfile(report_md):
-        copy_report_into(report_md, exp_dir, "report.md")
-    for extra in ("metrics.json", "results.jsonl"):
-        src = os.path.join(run_dir, extra)
-        if os.path.isfile(src):
-            shutil.copyfile(src, os.path.join(exp_dir, extra))
-    copy_runs_into(os.path.join(exp_dir, "runs"), [run_dir])
-    return exp_dir
-
-
-def materialize_ab_experiment(
-    ab_dir: str,
-    run_a: str,
-    run_b: str,
-    compare_dir: str,
-) -> str:
-    """A/B 对比：A/B 各自带 ``runs/``，对比报告落实验目录根。
-
-    Args:
-        ab_dir: A/B 实验目录（``<root>/ab_<tag>_<ts>``）。
-        run_a: 基线 run 目录；run_b: 候选 run 目录。
-        compare_dir: compare 生成的目录（含 compare_report.md 与配图）。
-    """
-    for arm, run_dir in (("A", run_a), ("B", run_b)):
-        arm_dir = os.path.join(ab_dir, arm)
-        os.makedirs(arm_dir, exist_ok=True)
-        report_md = os.path.join(run_dir, "report.md")
-        if os.path.isfile(report_md):
-            copy_report_into(report_md, arm_dir, "report.md")
-        for extra in ("metrics.json", "results.jsonl"):
-            src = os.path.join(run_dir, extra)
-            if os.path.isfile(src):
-                shutil.copyfile(src, os.path.join(arm_dir, extra))
-        copy_runs_into(os.path.join(arm_dir, "runs"), [run_dir])
-
-    compare_md = os.path.join(compare_dir, "compare_report.md")
-    if os.path.isfile(compare_md):
-        copy_report_into(compare_md, ab_dir, "compare_report.md")
-    return ab_dir
-
-
-def materialize_matrix_experiment(
-    exp_dir: str,
-    labeled_runs: Iterable[tuple[str, str]],
-) -> str:
-    """矩阵对比：各组 run 副本落 ``<exp_dir>/runs/<label>/``。"""
-    os.makedirs(exp_dir, exist_ok=True)
-    labels: list[str] = []
-    run_dirs: list[str] = []
-    for label, run_dir in labeled_runs:
-        labels.append(label)
-        run_dirs.append(run_dir)
-    copy_runs_into(os.path.join(exp_dir, "runs"), run_dirs, labels=labels)
-    return exp_dir
+    raise SystemExit(f"{LEGACY_LAYOUT_MSG}：{abspath}")

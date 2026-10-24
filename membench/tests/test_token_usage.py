@@ -1,12 +1,20 @@
-"""token 记账测试：run 落账 token_usage、分片求和、run / evaluate 报告展示。"""
+"""token 记账测试：run 落账 token_usage、分片求和、run / evaluate 报告展示。
+
+产物结构（见 :mod:`membench.layout`）：``Runner(out_dir=实验目录)`` 落
+``<实验目录>/runs/<dataset>/report/``（数据集级）与
+``<实验目录>/runs/<dataset>/<对话>/report/``（对话级），任务级报告在
+``<实验目录>/reports/``。
+"""
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
+from membench import layout
 from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
 from membench.evaluate import DatasetSpec, evaluate
 from membench.fuse import fuse_gate, fuse_runs
@@ -51,17 +59,23 @@ def _dataset(path: Path, dialogue_id: str, qids: tuple[str, ...], sessions: int 
     return path
 
 
-def _metrics(run_dir: str) -> dict:
-    return json.loads((Path(run_dir) / "metrics.json").read_text(encoding="utf-8"))
+def _report_metrics(report_owner: str) -> dict:
+    """某层级的 ``report/metrics.json``（数据集目录或对话目录均可）。"""
+    return json.loads(
+        (Path(report_owner) / "report" / "metrics.json").read_text(encoding="utf-8")
+    )
 
 
 def test_run_accounts_ingest_and_query_tokens(tmp_path: Path) -> None:
     """ingest 按对话真实计一次、query 逐题累计；报告与控制台同步可见。"""
     ds = _dataset(tmp_path / "d.jsonl", "d1", ("q1", "q2"))
-    run_dir = Runner(
-        _TokenAdapter(), str(ds), judge="heuristic", out_dir=str(tmp_path / "runs")
+    out_dir = tmp_path / "exp"
+    dataset_dir = Runner(
+        _TokenAdapter(), str(ds), judge="heuristic", out_dir=str(out_dir)
     ).run()
-    usage = _metrics(run_dir)["token_usage"]
+    # run() 返回数据集目录（<实验目录>/runs/<dataset>），数据集级报告在其 report/ 下
+    assert dataset_dir == str(out_dir / "runs" / "d")
+    usage = _report_metrics(dataset_dir)["token_usage"]
     assert usage == {
         "ingest_input_tokens": 20,  # 2 session × 10
         "ingest_llm_calls": 2,
@@ -73,16 +87,25 @@ def test_run_accounts_ingest_and_query_tokens(tmp_path: Path) -> None:
     }
     records = [
         json.loads(line)
-        for line in (Path(run_dir) / "results.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (Path(dataset_dir) / "report" / "results.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
     assert [r["ingest_input_tokens"] for r in records] == [20, 20]
 
-    md = (Path(run_dir) / "report.md").read_text(encoding="utf-8")
+    md = (Path(dataset_dir) / "report" / "report.md").read_text(encoding="utf-8")
     assert "## Token 消耗（全流程）" in md
     assert "260" in md  # ingest 20 + query 输入 200 + 输出 40
 
-    metrics_two = _metrics(run_dir)
-    assert metrics_two["token_usage"]["query_input_tokens"] == 200
+    # 对话级与数据集级同一套记账口径（单对话时两者逐字段相等）
+    dialogue_metrics = _report_metrics(str(Path(dataset_dir) / "d1"))
+    assert dialogue_metrics["dialogue_id"] == "d1"
+    assert dialogue_metrics["token_usage"] == usage
+
+    # 单数据集 run 的任务级报告 = 数据集级报告内容（write_task_reports 默认 True）
+    task_dir = out_dir / "reports"
+    assert (task_dir / "report.md").read_text(encoding="utf-8") == md
+    assert (task_dir / "metrics.json").is_file()
 
 
 class _SilentAdapter(BaseMemoryAdapter):
@@ -122,12 +145,18 @@ def test_fuse_sums_token_usage_across_shards(tmp_path: Path) -> None:
         ).run()
         for i in (0, 1)
     ]
-    fused = fuse_runs(shard_dirs, str(tmp_path / "fused"))["out_dir"]
-    usage = _metrics(fused)["token_usage"]
+    fused = fuse_runs(shard_dirs, str(tmp_path / "fused"))
+    # fuse 的 out_dir 是完整实验目录：数据集产物在其 runs/<dataset>/，任务级报告在其 reports/
+    assert fused["dataset_dir"] == str(tmp_path / "fused" / "runs" / "d")
+    assert (tmp_path / "fused" / "reports" / "report.md").is_file()
+    usage = _report_metrics(fused["dataset_dir"])["token_usage"]
     assert usage["ingest_input_tokens"] == 40  # 两片各 ingest 一次该对话
     assert usage["query_input_tokens"] == 200  # 题目不重复，2 题 × 100
     assert usage["query_output_tokens"] == 40
     assert usage["n_questions"] == 2
+    # 融合产物的逐题明细与指标同在数据集 report/ 目录
+    assert (tmp_path / "fused" / "runs" / "d" / "report" / "results.jsonl").is_file()
+    assert (tmp_path / "fused" / "runs" / "d" / "d1" / "report" / "metrics.json").is_file()
 
 
 def test_fuse_omits_token_usage_when_a_shard_lacks_it(tmp_path: Path) -> None:
@@ -144,13 +173,13 @@ def test_fuse_omits_token_usage_when_a_shard_lacks_it(tmp_path: Path) -> None:
         ).run()
         for i in (0, 1)
     ]
-    old = Path(shard_dirs[1]) / "metrics.json"
+    old = Path(shard_dirs[1]) / "report" / "metrics.json"
     metrics = json.loads(old.read_text(encoding="utf-8"))
     del metrics["token_usage"]
     old.write_text(json.dumps(metrics, ensure_ascii=False), encoding="utf-8")
 
-    fused = fuse_runs(shard_dirs, str(tmp_path / "fused"))["out_dir"]
-    assert "token_usage" not in _metrics(fused)
+    fused = fuse_runs(shard_dirs, str(tmp_path / "fused"))
+    assert "token_usage" not in _report_metrics(fused["dataset_dir"])
 
 
 def test_fuse_gate_skips_when_stale_rate_none() -> None:
@@ -168,7 +197,6 @@ def test_evaluate_report_shows_token_totals(tmp_path: Path) -> None:
     rc = evaluate(
         _TokenAdapter(),
         "heuristic",
-        out_dir=str(tmp_path / "runs"),
         report_out=str(tmp_path / "out"),
         specs=[
             DatasetSpec(key="a", name="a", path=str(a), source="user-specified"),
@@ -177,10 +205,12 @@ def test_evaluate_report_shows_token_totals(tmp_path: Path) -> None:
     )
     assert rc == 0
     eval_dir = next((tmp_path / "out").glob("eval_*"))
-    md = (eval_dir / "evaluate_report.md").read_text(encoding="utf-8")
+    md = (eval_dir / "reports" / "report.md").read_text(encoding="utf-8")
     assert "## Token 消耗（全流程）" in md
     assert "合计（2/2 个数据集上报）" in md
-    summary = json.loads((eval_dir / "evaluate_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads(
+        (eval_dir / "reports" / "evaluate_summary.json").read_text(encoding="utf-8")
+    )
     assert summary["token_usage"]["datasets_reported"] == 2
     total = summary["token_usage"]["total"]
     assert total["ingest_input_tokens"] == 40  # 两个数据集各 1 对话 × 2 session × 10
@@ -194,7 +224,6 @@ def test_evaluate_report_marks_missing_token_usage(tmp_path: Path) -> None:
     rc = evaluate(
         _TokenAdapter(),
         "heuristic",
-        out_dir=str(tmp_path / "runs"),
         report_out=str(tmp_path / "out"),
         specs=[
             DatasetSpec(key="a", name="a", path=str(a), source="user-specified"),
@@ -203,9 +232,11 @@ def test_evaluate_report_marks_missing_token_usage(tmp_path: Path) -> None:
     )
     assert rc == 0
     eval_dir = next((tmp_path / "out").glob("eval_*"))
-    summary = json.loads((eval_dir / "evaluate_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads(
+        (eval_dir / "reports" / "evaluate_summary.json").read_text(encoding="utf-8")
+    )
     for rel in summary["runs"].values():
-        metrics_path = eval_dir / rel / "metrics.json"
+        metrics_path = eval_dir / rel / "report" / "metrics.json"
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         del metrics["token_usage"]
         metrics_path.write_text(json.dumps(metrics, ensure_ascii=False), encoding="utf-8")
@@ -216,13 +247,12 @@ def test_evaluate_report_marks_missing_token_usage(tmp_path: Path) -> None:
     rc = _evaluate(
         None,
         None,
-        out_dir=str(tmp_path / "runs2"),
         report_out=str(tmp_path / "out2"),
         from_runs=from_runs,
     )
     assert rc == 0
     eval_dir2 = next((tmp_path / "out2").glob("eval_*"))
-    md = (eval_dir2 / "evaluate_report.md").read_text(encoding="utf-8")
+    md = (eval_dir2 / "reports" / "report.md").read_text(encoding="utf-8")
     assert "均未落账 `token_usage`" in md
 
 
@@ -251,10 +281,20 @@ def test_runner_exports_reset_context(tmp_path: Path) -> None:
             return QueryResult(answer="周五", retrieved=["项目截止日是周五"])
 
     ds = _dataset(tmp_path / "d.jsonl", "d1", ("q1",))
-    run_dir = Runner(
-        _RecordingAdapter(), str(ds), judge="heuristic", out_dir=str(tmp_path / "runs")
+    out_dir = tmp_path / "exp"
+    dataset_dir = Runner(
+        _RecordingAdapter(), str(ds), judge="heuristic", out_dir=str(out_dir)
     ).run()
-    assert seen == [{"run_dir": run_dir, "dialogue_id": "d1", "dialogue_index": "1"}]
+    assert dataset_dir == str(out_dir / "runs" / "d")
+    # MEMBENCH_RUN_DIR 指本对话目录（适配器把运行时数据就近落它的 runtime/ 下）
+    assert seen == [
+        {
+            "run_dir": layout.dialogue_dir(str(out_dir), "d", "d1"),
+            "dialogue_id": "d1",
+            "dialogue_index": "1",
+        }
+    ]
+    assert (out_dir / "runs" / "d" / "d1" / "runtime").is_dir()
     assert "MEMBENCH_RUN_DIR" not in os.environ
     assert "MEMBENCH_DIALOGUE_ID" not in os.environ
 

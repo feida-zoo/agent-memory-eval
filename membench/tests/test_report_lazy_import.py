@@ -10,6 +10,7 @@ matplotlib 是可选依赖（``pip install membench[report]``）。纯查询命�
 from __future__ import annotations
 
 import importlib
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -47,18 +48,45 @@ def test_report_importable_without_matplotlib(no_matplotlib) -> None:
 
 
 def test_copy_report_works_without_matplotlib(no_matplotlib, tmp_path: Path) -> None:
-    """copy_report 不依赖 matplotlib，无 matplotlib 时仍应正常工作。"""
+    """copy_report 不依赖 matplotlib：图片按原名复制到同目录并改写引用。"""
     src = tmp_path / "src"
     src.mkdir()
-    (src / "fig.png").write_bytes(b"fake-png")
+    (src / "fig_category_accuracy.png").write_bytes(b"fake-png")
     md = src / "report.md"
-    md.write_text("# 报告\n\n![图](fig.png)\n", encoding="utf-8")
+    md.write_text("# 报告\n\n![图](fig_category_accuracy.png)\n", encoding="utf-8")
+    metrics = src / "metrics.json"
+    metrics.write_text('{"run_id": "t"}\n', encoding="utf-8")
 
     dest = tmp_path / "dest"
-    out = report.copy_report(str(md), str(dest), "eval_report_x_260918.md", "260918")
+    out = report.copy_report(
+        str(md),
+        str(dest),
+        "report.md",
+        extra_files=[str(metrics), str(src / "missing.jsonl")],
+    )
 
-    assert Path(out).read_text(encoding="utf-8").count("260918_fig.png") == 1
-    assert (dest / "260918_fig.png").is_file()
+    assert Path(out).name == "report.md"
+    content = Path(out).read_text(encoding="utf-8")
+    # 引用保持同目录相对文件名（layout 契约：报告内的图片引用不写绝对路径）
+    assert content.count("](fig_category_accuracy.png)") == 1
+    assert (dest / "fig_category_accuracy.png").is_file()
+    # extra_files 按原文件名复制；不存在的文件跳过而不报错
+    assert json.loads((dest / "metrics.json").read_text(encoding="utf-8")) == {"run_id": "t"}
+    assert not (dest / "missing.jsonl").exists()
+
+
+def test_copy_report_keeps_remote_image_refs(tmp_path: Path) -> None:
+    """非本地引用（http/https）原样保留，不当成本地文件去复制。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    md = src / "report.md"
+    md.write_text("![远程](https://example.invalid/a.png)\n", encoding="utf-8")
+
+    dest = tmp_path / "dest"
+    out = report.copy_report(str(md), str(dest), "report.md")
+
+    assert "https://example.invalid/a.png" in Path(out).read_text(encoding="utf-8")
+    assert sorted(p.name for p in dest.iterdir()) == ["report.md"]
 
 
 def test_fig_functions_raise_friendly_error_without_matplotlib(
