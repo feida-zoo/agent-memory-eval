@@ -22,6 +22,12 @@
 在入参解析、产物齐备校验与可比性核对完成之后才落地——入参有问题或产物不完整时不留
 半个实验目录。
 
+**就地模式**（``task_dir``）：一次 A/B 本来就是**一个任务目录**，两臂已在
+``<task_dir>/A`` 与 ``<task_dir>/B``（``task init --arms 2`` 建的骨架，各臂各自跑过
+``run`` / ``fuse``）。此时不新建 ``compare_*`` 目录、也不复制两臂——只把
+``comparison.md`` 与两张对比图写进 ``<task_dir>/reports/``，两臂产物原样留在原位；
+两臂缺省就是该任务目录的 A/ B/，也可显式给 ``dir_a`` / ``dir_b``。
+
 可比性前置校验：比较前先核对驱动/判分模型、适配器实现与数据集
 指纹等维度；关键维度缺失或不一致时给出 ``comparability`` 门禁，避免结果不可归因
 却照给 PASS。
@@ -405,7 +411,7 @@ _REQUIRED_PRODUCT_FILES: tuple[str, ...] = (layout.FILE_METRICS, layout.FILE_REP
 
 
 def _require_dataset_product(dataset_dir: str) -> None:
-    """校验数据集产物齐备（在复制 A/B 副本之前调用）。
+    """校验数据集产物齐备（在复制 A/B 副本 / 就地写报告之前调用）。
 
     缺文件要在这里就拦下：复制之后再炸会留下半个实验目录（A/ 已落地、
     ``reports/`` 未生成）。措辞与 :func:`membench.layout._require_metrics` 一致。
@@ -479,8 +485,8 @@ def _append_sources_section(md_path: str, sources: dict[str, dict[str, str]]) ->
 
 
 def compare_runs(
-    dir_a: str,
-    dir_b: str,
+    dir_a: str | None = None,
+    dir_b: str | None = None,
     acc_threshold: float = 0.02,
     stale_threshold: float = 0.02,
     latency_warn: float = 0.30,
@@ -488,12 +494,13 @@ def compare_runs(
     out_dir: str | None = None,
     name: str | None = None,
     platform: str | None = None,
+    task_dir: str | None = None,
 ) -> dict[str, Any]:
     """对比两侧的产物目录（实验目录或数据集目录）。
 
     Args:
-        dir_a: 基线产物目录。
-        dir_b: 候选产物目录。
+        dir_a: 基线产物目录；``task_dir`` 给定时缺省为该任务目录的 ``A/``。
+        dir_b: 候选产物目录；``task_dir`` 给定时缺省为该任务目录的 ``B/``。
         acc_threshold: accuracy 允许的最大下降幅度。
         stale_threshold: stale_rate 允许的最大上升幅度。
         latency_warn: latency_p95 相对上升的告警比例（0.30 = 30%）。
@@ -501,16 +508,39 @@ def compare_runs(
         out_dir: compare 实验目录的**父目录**；缺省 :func:`membench.paths.output_root`。
         name: 实验目录名里的标签；缺省 ``<A 的 adapter>_vs_<B 的 adapter>``。
         platform: 实验目录名里的平台；缺省按两臂的 platform 取（不同则 ``p1-p2``）。
+        task_dir: **就地模式**：输出容器即这个已存在的任务目录——两臂已在
+            ``<task_dir>/A`` ``<task_dir>/B``（缺省从这里读，也可用 ``dir_a`` /
+            ``dir_b`` 显式指定），报告与两张对比图写 ``<task_dir>/reports/``，
+            不新建 ``compare_*`` 目录、不复制两臂。与 ``out_dir`` 互斥。
 
     Returns:
         ``{"verdict", "diffs", "gates", "run_a", "run_b", "compare_dir",
         "report_path", "arm_a", "arm_b", "sources", "comparability"}``；``gates``
-        首位为 ``comparability`` 门禁，``compare_dir`` 指向落地的
-        ``compare_<name>_<platform>_<ts>`` 实验目录。
+        首位为 ``comparability`` 门禁，``compare_dir`` 指向本次输出容器
+        （新建的 ``compare_<name>_<platform>_<ts>`` 实验目录，或就地模式下的
+        ``task_dir``）。
     """
+    if task_dir is not None:
+        if out_dir is not None:
+            raise SystemExit("compare 的 task_dir 与 out_dir 互斥：就地对比只给任务目录")
+        if not os.path.isdir(task_dir):
+            raise SystemExit(
+                f"任务目录不存在: {task_dir}；"
+                "请先运行 python -m membench.cli task init --name <NAME> --arms 2"
+            )
+        # 就地：两臂就在任务目录里，缺省读 <task_dir>/A 与 <task_dir>/B
+        container = os.path.abspath(task_dir)
+        dir_a = os.path.abspath(dir_a) if dir_a else layout.arm_dir(container, layout.DIR_ARM_A)
+        dir_b = os.path.abspath(dir_b) if dir_b else layout.arm_dir(container, layout.DIR_ARM_B)
+    else:
+        if not dir_a or not dir_b:
+            raise SystemExit(
+                "compare 需要两侧产物目录（dir_a / dir_b），或就地模式的任务目录 task_dir"
+            )
+        container = ""
     dataset_a = resolve_dataset_dir(dir_a)
     dataset_b = resolve_dataset_dir(dir_b)
-    # 产物齐备校验与指标读取都在建目录 / 复制之前完成：A/B 副本只从完整产物复制。
+    # 产物齐备校验与指标读取都在写报告 / 复制之前完成：两侧都必须是完整产物。
     _require_dataset_product(dataset_a)
     _require_dataset_product(dataset_b)
     metrics_a = _load_metrics(dir_a)
@@ -534,20 +564,26 @@ def compare_runs(
 
     id_a = _run_id(metrics_a, dir_a)
     id_b = _run_id(metrics_b, dir_b)
-    # 入参解析、产物齐备校验与可比性核对都已完成，此后才建实验目录并复制 A/B。
-    compare_dir = layout.experiment_path(
-        out_dir or output_root(),
-        layout.compare_subdir(
-            name or f"{_series_name(metrics_a)}_vs_{_series_name(metrics_b)}",
-            platform or _platform_tag(metrics_a, metrics_b),
-        ),
-    )
+    # 入参解析、产物齐备校验与可比性核对都已完成，此后才落地报告与 A/B 副本。
+    if task_dir is not None:
+        # 就地：容器就是任务目录，两臂已在位——只写 reports/，不新建目录也不复制
+        compare_dir = container
+        arm_a = layout.arm_dir(container, layout.DIR_ARM_A)
+        arm_b = layout.arm_dir(container, layout.DIR_ARM_B)
+    else:
+        compare_dir = layout.experiment_path(
+            out_dir or output_root(),
+            layout.compare_subdir(
+                name or f"{_series_name(metrics_a)}_vs_{_series_name(metrics_b)}",
+                platform or _platform_tag(metrics_a, metrics_b),
+            ),
+        )
+        arm_a = _copy_arm(compare_dir, layout.DIR_ARM_A, dir_a, metrics_a)
+        arm_b = _copy_arm(compare_dir, layout.DIR_ARM_B, dir_b, metrics_b)
     reports_dir = layout.task_report_dir(compare_dir)
     render_compare_report(
         reports_dir, metrics_a, metrics_b, diffs, gates, verdict, comparability=comparability
     )
-    arm_a = _copy_arm(compare_dir, layout.DIR_ARM_A, dir_a, metrics_a)
-    arm_b = _copy_arm(compare_dir, layout.DIR_ARM_B, dir_b, metrics_b)
     report_path = os.path.join(reports_dir, layout.FILE_COMPARISON_MD)
     sources = {
         "A（基线）": {
@@ -573,8 +609,9 @@ def compare_runs(
     for gate in gates:
         print(f"[membench]   gate {gate['name']}: {gate['status']} ({gate['detail']})")
     print(f"[membench] report: {report_path}")
-    print(f"[membench] A 副本: {arm_a}")
-    print(f"[membench] B 副本: {arm_b}")
+    arm_role = "臂（就地）" if task_dir is not None else "副本"
+    print(f"[membench] A {arm_role}: {arm_a}")
+    print(f"[membench] B {arm_role}: {arm_b}")
 
     return {
         "verdict": verdict,

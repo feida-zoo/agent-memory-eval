@@ -118,6 +118,10 @@ def _normalize_metrics(metrics: dict) -> dict:
         normalized.pop(key, None)
     for key in ("latency_p50_ms", "latency_p95_ms"):
         normalized.get("overall", {}).pop(key, None)
+    # state_snapshot 的根目录指向本次 run 自己的数据集目录（逐 run 不同，属路径口径）
+    snapshot = normalized.get("state_snapshot")
+    if isinstance(snapshot, dict):
+        snapshot.pop("root", None)
     return normalized
 
 

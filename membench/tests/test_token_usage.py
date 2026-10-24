@@ -173,13 +173,19 @@ def test_fuse_omits_token_usage_when_a_shard_lacks_it(tmp_path: Path) -> None:
         ).run()
         for i in (0, 1)
     ]
-    old = Path(shard_dirs[1]) / "report" / "metrics.json"
+    # 分片不再落数据集级产物：去掉第二片对话级 report/ 的 token_usage 账目
+    old = Path(shard_dirs[1]) / "d1" / layout.DIR_REPORT / layout.FILE_METRICS
     metrics = json.loads(old.read_text(encoding="utf-8"))
     del metrics["token_usage"]
     old.write_text(json.dumps(metrics, ensure_ascii=False), encoding="utf-8")
 
     fused = fuse_runs(shard_dirs, str(tmp_path / "fused"))
     assert "token_usage" not in _report_metrics(fused["dataset_dir"])
+    # 对话级同样不落账（该对话的副本不全）
+    for dialogue_dir in Path(fused["dataset_dir"]).glob("*/"):
+        if dialogue_dir.name == layout.DIR_REPORT:
+            continue
+        assert "token_usage" not in _report_metrics(str(dialogue_dir))
 
 
 def test_fuse_gate_skips_when_stale_rate_none() -> None:

@@ -3,10 +3,15 @@
 产物结构见 :mod:`membench.layout`：``Runner`` 的 ``out_dir`` 是**实验目录**，
 ``run()`` 返回数据集目录 ``<实验目录>/runs/<dataset>``，指标与逐题明细都在它的
 ``report/`` 下；快照清单**每个对话一份**，落 ``<对话目录>/memory_snapshot/manifest.json``。
+
+快照**默认导出**（``snapshot=True``）；适配器未声明快照能力时只打印一次警告并跳过
+（metrics 记 ``state_snapshot.role="unsupported"``），``replay`` 模式下自动不导出。
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import shutil
 from pathlib import Path
@@ -321,17 +326,75 @@ def test_replay_refuses_without_snapshot_support(tmp_path: Path) -> None:
     assert not (tmp_path / "replay").exists()
 
 
-def test_snapshot_refuses_without_capability(tmp_path: Path) -> None:
+def test_snapshot_defaults_on(tmp_path: Path) -> None:
+    """快照默认导出：不传 snapshot 也逐对话落清单，metrics 记 exported。"""
+    exp = tmp_path / "src"
+    dataset_dir = _full_run(tmp_path, name="src")
+    for dialogue_id in ("d1", "d2"):
+        assert (_snapshot_dir(exp, dialogue_id) / snapshot_mod.MANIFEST_NAME).is_file()
+    state = _metrics(dataset_dir)["state_snapshot"]
+    assert state["role"] == "exported" and state["n_dialogues"] == 2
+
+
+def test_snapshot_oversize_warns_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """单份快照超过阈值时只告警一次，并提示可用 --no-snapshot 关闭。"""
+    monkeypatch.setattr("membench.runner.SNAPSHOT_WARN_BYTES", 1)
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        _full_run(tmp_path, name="src")
+    out = buffer.getvalue()
+    assert out.count("--no-snapshot 关闭") == 1
+    # 告警不改变产物：两份清单照旧写完
+    for dialogue_id in ("d1", "d2"):
+        assert (_snapshot_dir(tmp_path / "src", dialogue_id) / snapshot_mod.MANIFEST_NAME).is_file()
+
+
+def test_snapshot_unsupported_adapter_warns_and_skips(tmp_path: Path) -> None:
+    """适配器不支持快照：只警告一次、跳过导出、metrics 记 unsupported，评测照常完成。"""
     _dataset(tmp_path / "ds.jsonl")
-    with pytest.raises(SystemExit, match="无法 --snapshot"):
-        Runner(
-            _NoSnapshotAdapter(tmp_path / "mem"),
-            str(tmp_path / "ds.jsonl"),
-            judge="heuristic",
-            out_dir=str(tmp_path / "exp"),
-            snapshot=True,
-        ).run()
-    assert not (tmp_path / "exp").exists()
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        dataset_dir = Path(
+            Runner(
+                _NoSnapshotAdapter(tmp_path / "mem"),
+                str(tmp_path / "ds.jsonl"),
+                judge="heuristic",
+                out_dir=str(tmp_path / "exp"),
+            ).run()
+        )
+    assert buffer.getvalue().count("未声明快照能力") == 1
+    metrics = _metrics(dataset_dir)
+    state = metrics["state_snapshot"]
+    assert state["role"] == "unsupported"
+    assert state["root"] == str(dataset_dir)
+    assert state["n_dialogues"] == 2
+    assert state["manifest_sha256"] is None and state["format_version"] is None
+    # 跳过的只是快照：指标与逐对话产物照常，也不留空的 memory_snapshot/ 目录
+    assert metrics["overall"]["n_questions"] == 2
+    assert not list(dataset_dir.glob(f"*/{layout.DIR_SNAPSHOT}"))
+
+
+def test_replay_does_not_export_snapshots(tmp_path: Path) -> None:
+    """回放模式自动不导出快照：snapshot=True 也不再报互斥，回放目录不落 memory_snapshot/。"""
+    exp = tmp_path / "src"
+    source_dataset = _full_run(tmp_path, name="src", snapshot=True)
+
+    replay_dataset = _replay_run(tmp_path, name="replay", replay=exp)
+    assert _metrics(replay_dataset)["state_snapshot"]["role"] == "replayed"
+    assert not list(Path(replay_dataset).glob(f"*/{layout.DIR_SNAPSHOT}"))
+
+    # 显式 snapshot=True + replay：构造期不再报错，同样不导出
+    explicit = Runner(
+        _FileMemoryAdapter(tmp_path / "mem-explicit"),
+        str(tmp_path / "ds.jsonl"),
+        judge="heuristic",
+        out_dir=str(tmp_path / "replay-explicit"),
+        replay=str(source_dataset),
+        snapshot=True,
+    )
+    explicit_dir = Path(explicit.run())
+    assert _metrics(explicit_dir)["state_snapshot"]["role"] == "replayed"
+    assert not list(explicit_dir.glob(f"*/{layout.DIR_SNAPSHOT}"))
 
 
 def test_replay_refuses_on_other_dataset_or_changed_content(tmp_path: Path) -> None:

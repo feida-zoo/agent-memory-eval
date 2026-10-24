@@ -16,7 +16,7 @@
 
 三种模式（``run_mode``）：
 
-- ``full``：正常评测（可选 ``--snapshot`` 顺带导出）；
+- ``full``：正常评测（默认导出对话状态快照，``--no-snapshot`` 关闭）；
 - ``replay-restore``：快照格式兼容、直接恢复（测**读取/检索/回答**侧改动）；
 - ``replay-rebuild``：格式不兼容或需要重建派生结构，走系统自己的 ``rebuild``。
 
@@ -182,7 +182,7 @@ def load_manifest(snapshot_dir: str) -> dict[str, Any]:
     path = os.path.join(snapshot_dir, MANIFEST_NAME)
     if not os.path.isfile(path):
         raise SystemExit(
-            f"快照清单不存在: {path}——请确认 --replay 指向的是 --snapshot 导出的"
+            f"快照清单不存在: {path}——请确认 --replay 指向的是导出了快照的"
             "数据集目录（或含它的实验目录），且该目录覆盖了本次要跑的对话"
         )
     try:
@@ -325,7 +325,7 @@ def plan_replay(
             "快照缺少本 run 需要的对话，拒绝回放："
             + "、".join(missing[:5])
             + (f" 等 {len(missing)} 个" if len(missing) > 5 else "")
-            + "——请确认 --snapshot 的导出覆盖了这些对话（分片导出时需覆盖同一分片口径）"
+            + "——请确认快照导出覆盖了这些对话（分片导出时需覆盖同一分片口径）"
         )
 
     want_fp = (

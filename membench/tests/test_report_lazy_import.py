@@ -5,12 +5,22 @@ matplotlib 是可选依赖（``pip install membench[report]``）。纯查询命�
 不依赖 matplotlib 的工具函数（copy_report / _md_table / PALETTE），必须在
 无 matplotlib 环境下可用；画图函数则应抛出带安装提示的 RuntimeError，
 而不是 ImportError 堆栈。
+
+另外覆盖报告渲染的三条硬约束（都在报告文本层面断言）：
+
+- 对话级报告给出该对话记忆快照的**可点击相对链接**（``../memory_snapshot/``）
+  与清单 ``entry`` 的条目数 / 字节数；
+- 适配器不支持快照（``state_snapshot.role="unsupported"``）时渲染成一句可读
+  文案，不留 ``n/a`` / ``vNone`` / ``None`` 这类空值，也不给打不开的链接；
+- 分片产物（``shards > 1``）在报告顶部标注"仅覆盖部分题目"，题目数写成带
+  分母的形式；fuse 的整体融合产物（``shard_index=None``）不标。
 """
 
 from __future__ import annotations
 
 import importlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +28,9 @@ from pathlib import Path
 import pytest
 
 import membench.report as report
+from membench.adapters import MockStrongAdapter
+from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
+from membench.runner import Runner
 
 
 @pytest.fixture()
@@ -217,3 +230,172 @@ class TestCompareFigureLegend:
             {"adapter": "mock-a", "run_id": "r1"}, {"adapter": "mock-a", "run_id": "r2"}
         )
         assert (same_a, same_b) == ("r1", "r2")
+
+
+# ---------------------------------------------------------------------------
+# 对话级报告：记忆快照链接 / 不支持快照的文案 / 分片标注
+# ---------------------------------------------------------------------------
+
+class _SnapshotAdapter(BaseMemoryAdapter):
+    """最小可快照适配器：记忆收在内存里，``snapshot()`` 把它写成快照目录下的一个文件。"""
+
+    name = "snap-min"
+
+    def __init__(self) -> None:
+        self.memories: list[dict] = []
+
+    def reset(self) -> None:
+        self.memories = []
+
+    def ingest(self, messages: list[dict]) -> IngestStats:
+        self.memories.extend(messages)
+        return IngestStats(input_tokens=5, llm_calls=1)
+
+    def query(self, question: str) -> QueryResult:
+        return QueryResult(
+            answer="周五",
+            retrieved=["项目截止日是周五"],
+            input_tokens=3,
+            output_tokens=1,
+        )
+
+    def snapshot_capabilities(self) -> dict:
+        return {"supported": True, "restore": True, "format_version": 1}
+
+    def snapshot(self, target_dir: str, tag: str) -> dict:
+        with open(Path(target_dir) / "memory.jsonl", "w", encoding="utf-8") as handle:
+            for message in self.memories:
+                handle.write(json.dumps(message, ensure_ascii=False) + "\n")
+        return {"items": len(self.memories)}
+
+
+def _write_dataset(path: Path, n_dialogues: int = 1) -> Path:
+    """写一个「n 对话 × 1 题」的小数据集，每题都带 evidence。"""
+    rows = [
+        {
+            "dialogue_id": f"d{i}",
+            "sessions": [
+                [
+                    {
+                        "role": "user",
+                        "content": f"第{i}次记录：项目截止日是周五。",
+                        "timestamp": None,
+                    }
+                ]
+            ],
+            "questions": [
+                {
+                    "qid": f"d{i}_q1",
+                    "question": "项目截止日是哪天？",
+                    "gold_answer": "周五",
+                    "category": "single_hop",
+                    "evidence": ["项目截止日是周五"],
+                }
+            ],
+        }
+        for i in range(1, n_dialogues + 1)
+    ]
+    path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _run_small(
+    tmp_path: Path, adapter: BaseMemoryAdapter, *, n_dialogues: int = 1, **kwargs
+) -> Path:
+    """跑一次迷你评测，返回数据集产物目录 ``<实验目录>/runs/mini``。"""
+    dataset = _write_dataset(tmp_path / "mini.jsonl", n_dialogues)
+    out = Runner(
+        adapter, str(dataset), judge="heuristic", out_dir=str(tmp_path / "exp"), **kwargs
+    ).run()
+    assert out is not None
+    return Path(out)
+
+
+def test_dialogue_report_links_memory_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """对话级报告给快照目录的同目录相对链接，并给出清单 entry 的条目数与字节数。
+
+    「跑完 ingest 就能翻记忆文件」：链接必须能点开（指向真实存在的目录），
+    条目数与体积必须取自 ``manifest.json`` 的 ``entry``，不是渲染时编的数字。
+    """
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(tmp_path / "output-root"))
+    dataset_dir = _run_small(tmp_path, _SnapshotAdapter())
+    report_dir = dataset_dir / "d1" / "report"
+    md = (report_dir / "report.md").read_text(encoding="utf-8")
+
+    manifest = json.loads(
+        (dataset_dir / "d1" / "memory_snapshot" / "manifest.json").read_text(encoding="utf-8")
+    )
+    entry = manifest["entry"]
+
+    # 报告里的本地链接逐个解析：每一个都要指向真实存在的路径
+    links = [ref for ref in re.findall(r"\]\(([^)]+)\)", md) if "://" not in ref]
+    assert "../memory_snapshot/" in links
+    for ref in links:
+        assert (report_dir / ref).exists(), f"报告里的相对链接打不开: {ref}"
+
+    assert f"{entry['n_sessions']} session" in md
+    assert f"{entry['n_messages']} 消息" in md
+    assert f"{entry['n_questions']} 题" in md
+    assert f"{entry['bytes']} 字节" in md
+
+
+def test_dialogue_report_renders_unsupported_snapshot_readably(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """适配器不支持快照：角色写成可读文案，不留空的格式版本 / 清单 sha256 与死链接。"""
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(tmp_path / "output-root"))
+    dataset_dir = _run_small(tmp_path, MockStrongAdapter())
+    md = (dataset_dir / "d1" / "report" / "report.md").read_text(encoding="utf-8")
+
+    assert "| 快照角色 | 不支持（适配器未声明快照能力） |" in md
+    # 没有快照就没有格式版本与清单指纹可给：这两行整体消失，而不是渲染成空值
+    assert "格式版本" not in md
+    assert "清单 sha256（逐对话清单合并）" not in md
+    assert "vNone" not in md
+    assert "`None`" not in md
+    # 没导出快照就不给链接（报告里不留打不开的相对路径）
+    assert "memory_snapshot" not in md
+
+
+def test_shard_run_report_marks_partial_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """分片产物：报告顶部标注分片范围，题目数写成带分母的形式。"""
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(tmp_path / "output-root"))
+    dataset_dir = _run_small(
+        tmp_path,
+        MockStrongAdapter(),
+        n_dialogues=2,
+        shards=2,
+        shard_index=0,
+        shard_by="dialogue",
+    )
+    md = (dataset_dir / "d1" / "report" / "report.md").read_text(encoding="utf-8")
+
+    # 顶部：标注必须在正文（评测配置）之前
+    note = "分片 0/2（按 dialogue）——仅覆盖部分题目"
+    assert note in md
+    assert md.index(note) < md.index("## 评测配置")
+    # 题目数是**本片**的：写清分母与完整结果的去向，避免被读成整场题数
+    assert "- 题目数: 1（分片 0/2，总量见融合报告）" in md
+
+
+def test_fused_metrics_are_not_marked_as_partial(tmp_path: Path) -> None:
+    """fuse 的整体融合产物（``shards>1`` 但 ``shard_index=None``）覆盖全部题目，不标分片。"""
+    metrics = {
+        "run_id": "r1",
+        "shards": 2,
+        "shard_index": None,
+        "shard_by": "dialogue",
+        "fused": True,
+        "overall": {"n_questions": 2},
+    }
+    out = report.write_run_report_md(str(tmp_path), [], metrics, with_figures=False)
+    md = Path(out).read_text(encoding="utf-8")
+    assert "仅覆盖部分题目" not in md
+    assert "总量见融合报告" not in md

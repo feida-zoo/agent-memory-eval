@@ -320,3 +320,109 @@ def test_n_questions_mismatch_is_critical(tmp_path: Path) -> None:
     assert strict["verdict"] == "FAIL"
     assert strict["gates"][0]["name"] == "comparability"
     assert strict["gates"][0]["status"] == "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# 就地模式：一次 A/B 就是一个任务目录，两臂已在 task_dir/A|B
+# ---------------------------------------------------------------------------
+
+
+def _tree_snapshot(root: Path) -> dict[str, str]:
+    """目录内容快照（相对路径 -> 文件内容），用来断言这棵树没被复制 / 改写。"""
+    return {
+        str(path.relative_to(root)): path.read_text(encoding="utf-8")
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _two_arm_task(tmp_path: Path, metrics_b: dict | None = None) -> tuple[Path, Path]:
+    """建一个双臂任务目录并在两臂各写一份完整数据集产物，返回 (任务目录, 父目录)。"""
+    base = tmp_path / "out"
+    task = Path(layout.init_task_dir(str(base), "ab", platform="t"))
+    _write_dataset(task / layout.DIR_ARM_A, "sample_dataset", _metrics("run_a"))
+    _write_dataset(task / layout.DIR_ARM_B, "sample_dataset", metrics_b or _metrics("run_b"))
+    return task, base
+
+
+def test_in_place_compare_writes_report_into_task_dir(tmp_path: Path) -> None:
+    """就地对比：两臂缺省读 task_dir/A|B，报告落 task_dir/reports/，不新建目录、不复制两臂。"""
+    task, base = _two_arm_task(tmp_path)
+    # 两臂各留一个哨兵文件：就地模式不得复制 / 重建这两棵树
+    (task / layout.DIR_ARM_A / "keep.txt").write_text("哨兵", encoding="utf-8")
+    before_a = _tree_snapshot(task / layout.DIR_ARM_A)
+    before_b = _tree_snapshot(task / layout.DIR_ARM_B)
+
+    result = compare_runs(task_dir=str(task))
+
+    assert result["verdict"] == "PASS"
+    assert result["compare_dir"] == str(task)
+    assert result["report_path"] == str(task / layout.DIR_REPORTS / layout.FILE_COMPARISON_MD)
+    assert result["arm_a"] == str(task / layout.DIR_ARM_A)
+    assert result["arm_b"] == str(task / layout.DIR_ARM_B)
+    for name in (layout.FILE_COMPARISON_MD, layout.FIG_METRIC_DIFF, layout.FIG_CATEGORY_DIFF):
+        assert (task / layout.DIR_REPORTS / name).is_file(), f"缺少 reports/{name}"
+    md = result["report_path"]
+    assert "**门禁结论： PASS" in Path(md).read_text(encoding="utf-8")
+    # 「来源与产物」小节回指两臂（就地模式下"副本"就是 A/ 与 B/ 本身）
+    assert str(task / layout.DIR_ARM_A) in Path(md).read_text(encoding="utf-8")
+
+    # 只有一个任务目录、没有复制两臂：两臂内容逐字节不变
+    assert [p.name for p in base.iterdir()] == [task.name]
+    assert _tree_snapshot(task / layout.DIR_ARM_A) == before_a
+    assert _tree_snapshot(task / layout.DIR_ARM_B) == before_b
+
+
+def test_in_place_compare_accepts_explicit_arm_dirs(tmp_path: Path) -> None:
+    """就地模式也接受显式两臂（CLI 用 --baseline/--candidate 覆盖缺省），输出仍落任务目录。"""
+    task, base = _two_arm_task(tmp_path)
+
+    result = compare_runs(
+        str(task / layout.DIR_ARM_A), str(task / layout.DIR_ARM_B), task_dir=str(task)
+    )
+
+    assert result["verdict"] == "PASS"
+    assert result["compare_dir"] == str(task)
+    assert (task / layout.DIR_REPORTS / layout.FILE_COMPARISON_MD).is_file()
+    assert [p.name for p in base.iterdir()] == [task.name]
+
+
+def test_in_place_compare_reports_regression_verdict(tmp_path: Path) -> None:
+    """就地模式的回归门禁照样生效：B 的 accuracy 掉 > 阈值 -> FAIL，报告同步。"""
+    b_metrics = _metrics("run_b")
+    b_metrics["overall"] = {**_metrics()["overall"], "accuracy": 0.8}
+    task, _base = _two_arm_task(tmp_path, metrics_b=b_metrics)
+
+    result = compare_runs(task_dir=str(task))
+
+    assert result["verdict"] == "FAIL"
+    acc_gate = next(g for g in result["gates"] if g["name"] == "accuracy_regression")
+    assert acc_gate["status"] == "FAIL"
+    md = (task / layout.DIR_REPORTS / layout.FILE_COMPARISON_MD).read_text(encoding="utf-8")
+    assert "**门禁结论： FAIL" in md
+
+
+def test_in_place_compare_rejects_incomplete_arm(tmp_path: Path) -> None:
+    """某一臂产物不完整 -> 当场拒绝，且不写 reports/comparison.md（就地也不留半成品报告）。"""
+    task = Path(layout.init_task_dir(str(tmp_path / "out"), "ab", platform="t"))
+    _write_dataset(task / layout.DIR_ARM_A, "sample_dataset", _metrics("run_a"))
+    dataset_b = Path(
+        _write_dataset(task / layout.DIR_ARM_B, "sample_dataset", _metrics("run_b"))
+    )
+    (dataset_b / layout.DIR_REPORT / layout.FILE_REPORT_MD).unlink()
+
+    with pytest.raises(SystemExit) as excinfo:
+        compare_runs(task_dir=str(task))
+
+    assert "产物不完整" in str(excinfo.value)
+    assert str(dataset_b) in str(excinfo.value)
+    assert not (task / layout.DIR_REPORTS / layout.FILE_COMPARISON_MD).exists()
+
+
+def test_in_place_compare_requires_existing_task_dir(tmp_path: Path) -> None:
+    """task_dir 不存在 / 与 out_dir 同时给 -> 报错（不建目录、不猜路径）。"""
+    with pytest.raises(SystemExit, match="任务目录不存在"):
+        compare_runs(task_dir=str(tmp_path / "nope"))
+    task, _base = _two_arm_task(tmp_path)
+    with pytest.raises(SystemExit, match="互斥"):
+        compare_runs(task_dir=str(task), out_dir=str(tmp_path / "elsewhere"))

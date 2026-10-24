@@ -55,6 +55,10 @@ python -m membench.cli compare \
   --candidate <新 commit 的实验目录或 runs/<dataset> 数据集目录> \
   --require-comparable --tag <标签> --report-out output/
 
+# 4b) 两臂本来就写在同一个任务目录里（如分片 A/B 通路，见下）时可就地出报告：
+python -m membench.cli compare --task-dir <任务目录> --require-comparable
+#     comparison.md 落该任务目录的 reports/，不新建 compare_*、不复制两臂
+
 # 5) 清理
 git -C $AGENT_REPO worktree remove /tmp/agent_old
 git -C $AGENT_REPO worktree remove /tmp/agent_new
@@ -62,12 +66,22 @@ git -C $AGENT_REPO worktree remove /tmp/agent_new
 
 门禁规则（默认，CLI 可调）：accuracy 降 >0.02 → FAIL；stale_rate 升 >0.02 → FAIL；p95 延迟升 >30% → WARN。
 
-**产物目录（一次实验一个自包含子目录）**：
+**多分片 A/B（任务目录通路）**：大数据集上分片跑 A/B 时，`task init --name <名> --arms 2` 建一棵
+双臂任务目录，两侧各片 `run --task-dir <任务目录>/A|B --shards N --shard-by dialogue`（每片独占
+一个记忆实例）→ 各自 `fuse --task-dir <任务目录>/A|B` 就地补齐数据集级与任务级产物 →
+`compare --task-dir <任务目录> --require-comparable` 就地出 `reports/comparison.md`。多数据集汇总
+仍走 `evaluate-compare --baseline-run/--candidate-run`。纪律：共享任务目录只允许**对话级**分片
+（题目级分片会让多片写同一对话目录互相覆盖），分片产物只写各片负责的对话目录 + 账本
+`runs/<dataset>/shards.json`（各片的 `status` / 对话 / 题数 / `run_id`），数据集级与任务级产品由
+`fuse` 补齐；账本口径不一致（`shards` / `shard_by` / `limit` / 数据集指纹）或同片重复跑都会被拒绝。
+
+**产物目录（一次实验一个自包含任务目录）**：
 
 ```
 <report-out>/eval_<adapter>_<platform>_<ts>/
 ├── runs/<dataset>/
 │   ├── report/{report.md, metrics.json, results.jsonl, fig_*.png}   # 数据集级聚合
+│   ├── shards.json                                                  # 分片账本（分片评测才有）
 │   └── <对话目录>/{runtime/, memory_snapshot/, report/}              # 对话级；report/ 不出图
 └── reports/                                                          # 任务级（单数据集 = 数据集级内容）
 <report-out>/compare_<name>_<platform>_<ts>/
@@ -80,8 +94,16 @@ git -C $AGENT_REPO worktree remove /tmp/agent_new
 
 - `<ts>` = `YYYYMMDD-HHMMSS`；`<platform>` 缺省 `default`，两臂平台不同时 compare 目录用 `p1-p2`。
 - `runtime/` 每个对话都建（接入侧的运行时数据，如桥的 reset 前备份落 `runtime/reset_backup/`）；
-  `memory_snapshot/` 只在 `run --snapshot` 时落（含 `manifest.json`）；对话目录名 = 对话 id
-  归一化（非法字符换 `_`，无 id 时 `dialogue`）。
+  `memory_snapshot/` **默认导出**（每对话 ingest 完成后、第一道 query 之前一份，含框架写的
+  `manifest.json`；`--no-snapshot` 关闭，`--snapshot` 已删）；对话目录名 = 对话 id
+  归一化（非法字符换 `_`，无 id 时 `dialogue`）。对话级 `report.md` 给出 `../memory_snapshot/`
+  的可点击链接与清单条目数 / 体积——跑完 ingest 就能翻记忆文件。
+- **任务目录与就地产出**：`task init --name NAME [--platform P] [--arms 1|2]` 先建骨架
+  （arms=1 → `runs/` + `reports/`；arms=2 → `A/` `B/` + `reports/`，stdout 只打印绝对路径），
+  之后 `run --task-dir <任务目录|它的臂>` 写进它、`fuse --task-dir <臂>` 就地补齐数据集级/任务级、
+  `compare --task-dir <任务目录>` 就地读 `A/` 与 `B/` 出报告（不新建 `compare_*`、不复制两臂）；
+  `task status <任务目录>` 看进度。多片共享一个任务目录时只允许 `--shard-by dialogue`，
+  分片产物只落本片对话目录 + 账本，数据集级由 `fuse` 补齐。
 - A/B 副本是源实验目录或数据集目录的整理结果：源是实验目录时整树复制并保留其内部相对位置；
   源是数据集目录时在 `A/runs/<dataset>/` 下重建，缺任务级 `reports/` 时由 compare 从数据集级报告补齐。
 

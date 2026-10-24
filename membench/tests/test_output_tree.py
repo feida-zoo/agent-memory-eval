@@ -119,8 +119,11 @@ def test_experiment_tree_layers(tmp_path: Path) -> None:
         "report.md",
         "results.jsonl",
     ]
+    # 数据集目录里只有报告层与对话目录：分片账本只在分片评测时出现
+    assert sorted(p.name for p in dataset_dir.iterdir()) == ["d1", "d2", "report"]
 
-    # 对话层：report/（纯文字）与 runtime/ 始终建出；未开 --snapshot 时没有 memory_snapshot/
+    # 对话层：report/（纯文字）与 runtime/ 始终建出；快照默认导出但该适配器不声明
+    # 快照能力，跳过导出后自然没有 memory_snapshot/
     for dialogue_id in ("d1", "d2"):
         dialogue_dir = dataset_dir / dialogue_id
         assert sorted(p.name for p in dialogue_dir.iterdir()) == ["report", "runtime"]

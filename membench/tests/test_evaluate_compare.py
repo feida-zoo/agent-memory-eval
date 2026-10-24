@@ -691,3 +691,109 @@ def test_cli_evaluate_compare_dataset_flag(tmp_path, monkeypatch) -> None:
                 "--quick",
             ]
         )
+
+
+# ---------------------------------------------------------------------------
+# 就地模式（task_dir）与快照开关
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_compare_task_dir_in_place(
+    mini_datasets, scripts, tmp_path, monkeypatch
+) -> None:
+    """就地模式：两臂写 ``DIR/A`` ``DIR/B``，对比报告落 ``DIR/reports/``，不建 ``compare_*``。"""
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(tmp_path / "output"))
+    base = tmp_path / "out"
+    task = Path(layout.init_task_dir(str(base), "ab", platform="t"))
+
+    result = evaluate_compare(
+        ScriptedAdapter(scripts["baseline"], name="base"),
+        ScriptedAdapter(scripts["candidate"], name="cand"),
+        "heuristic",
+        task_dir=str(task),
+        tag="base_vs_cand",
+        specs=_specs(mini_datasets),
+        adapter_version_baseline="v1",
+        adapter_version_candidate="v2",
+    )
+
+    assert result["compare_dir"] == str(task)
+    for arm in (layout.DIR_ARM_A, layout.DIR_ARM_B):
+        arm_dir = task / arm
+        for key in ("a", "b", "c"):
+            dataset_report = arm_dir / layout.DIR_RUNS / key / layout.DIR_REPORT
+            assert (dataset_report / layout.FILE_METRICS).is_file()
+            assert (dataset_report / layout.FILE_RESULTS).is_file()
+        for name in (
+            layout.FILE_REPORT_MD,
+            layout.FILE_METRICS,
+            layout.FILE_SUMMARY,
+            layout.FIG_DATASET_OVERVIEW,
+        ):
+            assert (arm_dir / layout.DIR_REPORTS / name).is_file(), f"{arm} 缺少 reports/{name}"
+        # 该臂自身就是一个完整单臂实验形态：summary 里的 experiment_dir 就是它
+        arm_summary = json.loads(
+            (arm_dir / layout.DIR_REPORTS / layout.FILE_SUMMARY).read_text(encoding="utf-8")
+        )
+        assert Path(arm_summary["experiment_dir"]) == arm_dir
+
+    reports = task / layout.DIR_REPORTS
+    for name in (layout.FILE_COMPARISON_MD, FIG_PER_DATASET_DIFF, FIG_FUSED_DIFF):
+        assert (reports / name).is_file(), f"缺少 reports/{name}"
+    md = (reports / layout.FILE_COMPARISON_MD).read_text(encoding="utf-8")
+    assert "**门禁结论：" in md and "跨数据集融合 diff" in md
+    # 就地：没有另外新建 compare_* 实验目录
+    assert [p.name for p in base.iterdir()] == [task.name]
+
+    with pytest.raises(SystemExit, match="任务目录不存在"):
+        evaluate_compare(task_dir=str(base / "nope"), specs=_specs(mini_datasets))
+    with pytest.raises(SystemExit, match="互斥"):
+        evaluate_compare(
+            task_dir=str(task), report_out=str(base), specs=_specs(mini_datasets)
+        )
+
+
+def test_evaluate_compare_forwards_snapshot_to_both_sides(
+    mini_datasets, scripts, tmp_path, monkeypatch
+) -> None:
+    """``snapshot`` 逐侧透传：默认不覆盖 Runner 默认值（导出），False 时两侧都收到 False。"""
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(tmp_path / "output"))
+    import membench.evaluate as ev_mod
+    from membench.runner import Runner as RealRunner
+
+    sent: list[object] = []
+
+    class _RecordingRunner:
+        """包一层真 Runner：只记 ``snapshot`` 实参，其余照旧（真跑，不是桩）。"""
+
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            sent.append(kwargs.get("snapshot", "<未传>"))
+            self._inner = RealRunner(*args, **kwargs)
+
+        def run(self):
+            return self._inner.run()
+
+    monkeypatch.setattr(ev_mod, "Runner", _RecordingRunner)
+    specs = _specs(mini_datasets)[:1]  # 只跑 A：每侧一个数据集 = 每侧一次 Runner
+
+    evaluate_compare(
+        ScriptedAdapter(scripts["baseline"], name="base"),
+        ScriptedAdapter(scripts["candidate"], name="cand"),
+        "heuristic",
+        report_out=str(tmp_path / "out_default"),
+        tag="base_vs_cand",
+        specs=specs,
+    )
+    assert sent == ["<未传>", "<未传>"], "默认不表态：Runner 按自己的默认（导出）处理"
+
+    sent.clear()
+    evaluate_compare(
+        ScriptedAdapter(scripts["baseline"], name="base"),
+        ScriptedAdapter(scripts["candidate"], name="cand"),
+        "heuristic",
+        report_out=str(tmp_path / "out_quiet"),
+        tag="base_vs_cand",
+        specs=specs,
+        snapshot=False,
+    )
+    assert sent == [False, False], "snapshot=False 要传到两侧的每个数据集 Runner"

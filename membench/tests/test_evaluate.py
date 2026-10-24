@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from membench import cli
+from membench import cli, layout
 from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
 from membench.evaluate import (
     DatasetSpec,
@@ -49,6 +49,29 @@ class ScriptedAdapter(BaseMemoryAdapter):
     def query(self, question: str) -> QueryResult:
         answer, retrieved = self._script[question]
         return QueryResult(answer=answer, retrieved=list(retrieved))
+
+
+class SnapshotScriptedAdapter(ScriptedAdapter):
+    """脚本化适配器 + 快照能力：把已 ingest 的消息条数导出到 ``target_dir/state.json``。"""
+
+    name = "snap-scripted"
+
+    def __init__(self, script: dict[str, tuple[str, list[str]]]) -> None:
+        super().__init__(script)
+        self._n_messages = 0
+
+    def ingest(self, messages: list[dict]) -> IngestStats:
+        self._n_messages += len(messages)
+        return IngestStats()
+
+    def snapshot_capabilities(self) -> dict:
+        return {"supported": True, "restore": False, "rebuild": False, "format_version": 1}
+
+    def snapshot(self, target_dir: str, tag: str) -> dict:
+        Path(target_dir, "state.json").write_text(
+            f'{{"tag": "{tag}", "n": {self._n_messages}}}', encoding="utf-8"
+        )
+        return {"n_messages": self._n_messages}
 
 
 def _write_dataset(path: Path, dialogues: list[dict]) -> Path:
@@ -685,3 +708,78 @@ def test_cli_no_lme_s_no_beam_pass_through(
         cli.main(
             ["evaluate", "--adapter", "mock-strong", "--beam-10m", "--no-beam"]
         )
+
+
+# ---------------------------------------------------------------------------
+# 就地模式（task_dir）与快照开关
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_task_dir_writes_into_given_dir(
+    tmp_path: Path, mini_datasets: dict[str, Path], script: dict[str, tuple[str, list[str]]]
+) -> None:
+    """``evaluate(task_dir=...)``：产物直接写进该任务目录，不新建 ``eval_*``。"""
+    base = tmp_path / "out"
+    task = layout.init_task_dir(str(base), "solo", platform="t", arms=1)
+
+    rc = evaluate(
+        ScriptedAdapter(script), "heuristic", task_dir=task, specs=_specs(mini_datasets)
+    )
+
+    # A 是办公域槽位且 stale_rate=1.0 -> 门禁 FAIL（与既有用例同一口径）
+    assert rc == 1
+    dataset_report = (
+        Path(layout.dataset_dir(task, "a")) / layout.DIR_REPORT / layout.FILE_METRICS
+    )
+    assert dataset_report.is_file()
+    reports_dir = Path(layout.task_report_dir(task))
+    summary = json.loads((reports_dir / layout.FILE_SUMMARY).read_text(encoding="utf-8"))
+    assert Path(summary["experiment_dir"]) == Path(task)
+    assert sorted(summary["runs"]) == ["a", "b", "c"]
+    # 就地：任务目录的父目录下没有多出 eval_* 实验目录
+    assert [p.name for p in base.iterdir()] == [Path(task).name]
+
+    with pytest.raises(SystemExit, match="任务目录不存在"):
+        evaluate(adapter=ScriptedAdapter(script), judge="heuristic", task_dir=str(base / "nope"))
+    with pytest.raises(SystemExit, match="互斥"):
+        evaluate(
+            adapter=ScriptedAdapter(script),
+            judge="heuristic",
+            task_dir=task,
+            report_out=str(base),
+        )
+
+
+def test_evaluate_snapshot_default_export_and_no_snapshot(
+    tmp_path: Path, mini_datasets: dict[str, Path], script: dict[str, tuple[str, list[str]]]
+) -> None:
+    """快照开关一路透传到 Runner：默认每对话一份 ``memory_snapshot/``，``snapshot=False`` 一份都不导。"""
+    # 只跑 A（1 个对话）：快照数一目了然
+    specs = [_specs(mini_datasets)[0]]
+    base = tmp_path / "out"
+
+    with_snap = layout.init_task_dir(str(base), "with_snap", platform="t", arms=1)
+    evaluate(SnapshotScriptedAdapter(script), "heuristic", task_dir=with_snap, specs=specs)
+    dataset_dir = Path(layout.dataset_dir(with_snap, "a"))
+    snapshots = [p for p in dataset_dir.iterdir() if (p / layout.DIR_SNAPSHOT).is_dir()]
+    assert len(snapshots) == 1, "默认应导出逐对话快照（每对话一份）"
+    assert (snapshots[0] / layout.DIR_SNAPSHOT / "manifest.json").is_file()
+    exported = json.loads(
+        (dataset_dir / layout.DIR_REPORT / layout.FILE_METRICS).read_text(encoding="utf-8")
+    )
+    assert exported["state_snapshot"]["role"] == "exported"
+
+    quiet = layout.init_task_dir(str(base), "no_snap", platform="t", arms=1)
+    evaluate(
+        SnapshotScriptedAdapter(script),
+        "heuristic",
+        task_dir=quiet,
+        specs=specs,
+        snapshot=False,
+    )
+    quiet_dir = Path(layout.dataset_dir(quiet, "a"))
+    assert not list(quiet_dir.glob(f"*/{layout.DIR_SNAPSHOT}")), "snapshot=False 不该导出快照"
+    quiet_metrics = json.loads(
+        (quiet_dir / layout.DIR_REPORT / layout.FILE_METRICS).read_text(encoding="utf-8")
+    )
+    assert "state_snapshot" not in quiet_metrics

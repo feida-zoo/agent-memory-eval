@@ -70,6 +70,13 @@
   （重复条目白占前 5 窗口）；③ 报注入的那一份全量（只报 top-k 会让 `evidence_recall` 虚低，
   报未经注入裁剪的内部 top-N 会虚高）；④ 在构造 prompt 的那一处直接记下列表，别事后另算。
 - 拿不到 token / 调用数就填 `0`，不要瞎填——成本指标失真比缺省更糟。
+- **快照默认导出**：`run` / `evaluate` / `evaluate-compare` 默认在每个对话 ingest 完成后、
+  第一道 query 之前调一次 `/snapshot`，把该对话的 `memory_snapshot/` 填满——桥写进去的内容
+  （模板 = `memory/` + 标记文件）加上框架写的 `manifest.json` 就是该目录的全部；跑完 ingest
+  就能在对话级 `report.md` 里点开 `../memory_snapshot/` 翻记忆文件。桥没实现
+  `/snapshot-capabilities`（或返回 `supported=false`）时框架警告一次并跳过、评测照常完成
+  （`state_snapshot.role=unsupported`，报告渲染成「不支持（适配器未声明快照能力）」），
+  不需要快照用 `--no-snapshot` 关闭（`--snapshot` 已删）。
 - **快照回放要"真恢复"**：`/restore` 必须把记忆库换回快照那一刻（含内存里的索引/缓存），
   并拒绝不认识的目录（防误传路径把库清空）；回放模式下框架不再调 `/reset`、`/ingest`。
 - `reset` 只清会话不清记忆库 → 跨 dialogue 串扰，`single_hop` 异常高、`abstention` 异常低。

@@ -2,9 +2,14 @@
 
 流程（ingest 阶段始终串行，print 打印进度）：
     load_dataset -> 每个 dialogue: adapter.reset() -> 逐 session adapter.ingest()
+    -> 该对话 ingest 完成后（第一道 query 之前）导出它唯一一份状态快照
     -> 每题 adapter.query() + 文本/检索指标 + judge.grade()
     -> 逐对话聚合写对话级 report/ -> 全对话聚合写数据集级 report/（含图）
     -> write_task_reports 时把数据集级报告复制到 <实验目录>/reports/
+
+分片（``shards>1``）只写本片负责的对话目录与分片账本，**不写**数据集级 ``report/`` 与
+任务级 ``reports/``——分片产物不再"看起来像完整实验"；数据集级与任务级产物一律由
+``fuse`` 补齐。
 
 并发：query+judge+证据匹配 阶段在 ``jobs>1`` 时用 ThreadPoolExecutor 题目级并发
 （对话时序和记忆状态敏感的 ingest 阶段必须保持串行）；收集结果后按原始题目
@@ -22,8 +27,13 @@ results.jsonl（不浪费 LLM 调用，metrics 聚合分母口径自然正确）
     <实验目录>/runs/<dataset>/report/{results.jsonl,metrics.json,report.md,fig_*.png}
     <实验目录>/runs/<dataset>/<对话目录>/report/{results.jsonl,metrics.json,report.md}
     <实验目录>/runs/<dataset>/<对话目录>/runtime/          # 运行时数据（reset 备份等）
-    <实验目录>/runs/<dataset>/<对话目录>/memory_snapshot/  # --snapshot 时（含 manifest.json）
+    <实验目录>/runs/<dataset>/<对话目录>/memory_snapshot/  # 快照默认导出（含 manifest.json）
+    <实验目录>/runs/<dataset>/shards.json                  # 分片账本（分片评测时；读/写/校验见 layout）
     <实验目录>/reports/                                    # 任务级（数据集级报告副本）
+
+快照默认导出（``snapshot=True``）：每个对话只有一份，打点在该对话全部 session ingest
+完成之后、第一道 query 之前——正是回放时的入口状态。适配器未声明快照能力时打印一次
+警告并跳过（metrics 记 ``state_snapshot.role="unsupported"``），不中断评测。
 """
 
 from __future__ import annotations
@@ -52,6 +62,9 @@ from membench.report import (
     render_dialogue_report,
 )
 from membench import snapshot as snapshot_mod
+
+#: 单份对话快照超过该字节数时告警一次（提示可用 --no-snapshot 关闭）。
+SNAPSHOT_WARN_BYTES = 100 * 1024 * 1024
 
 
 def _write_run_artifacts(
@@ -101,7 +114,7 @@ def _shard_units(dialogues: list[Any], shard_by: str) -> int:
     return sum(len(dialogue.questions) for dialogue in dialogues)
 
 
-def _select_questions(
+def select_shard_questions(
     dialogues: list[Any],
     shards: int,
     shard_index: int,
@@ -121,6 +134,9 @@ def _select_questions(
 
     调用方（:meth:`Runner.run`）保证 ``shards`` 已按数据集上限解析过
     （``max`` / 超限整数在此前收敛），本函数不做上限校验。
+
+    本函数是分片选取口径的**唯一实现**：``fuse`` 用它复算"每一片本该有哪些对话 /
+    哪些题"，与账本和实际产物逐项核对覆盖完整性（缺片、重复覆盖都要报）。
     """
     if shard_by == "dialogue":
         out: list[Any] = []
@@ -198,10 +214,16 @@ class Runner:
         write_task_reports: True（默认）时把数据集级报告复制到实验目录的
             ``reports/``（单数据集 run 的任务级报告 = 数据集级报告内容）；
             evaluate 跑多数据集时传 False，由调用方统一写任务级 reports/。
-        snapshot: True 时在每个对话 ingest 完成后（第一道 query 之前）调用适配器
+            分片（``shards>1``）不写，由 ``fuse`` 补齐。
+        shared: True 表示 ``out_dir`` 是多方共用的任务目录（CLI ``--task-dir``）：允许
+            写进已存在且非空的实验目录，分片归属与进度按分片账本判重——同一个分片
+            重复跑直接拒绝。共用目录下只支持 ``shard_by="dialogue"``：题目级分片会让
+            多个分片写同一对话目录、互相覆盖。
+        snapshot: 默认 True：在每个对话 ingest 完成后（第一道 query 之前）调用适配器
             的 ``snapshot()`` 把状态导出到该对话的 ``memory_snapshot/`` 并写
             ``manifest.json``——之后改读取侧代码可用 ``replay`` 免重跑 ingest。
-            与 ``replay`` 互斥；适配器未声明快照能力则在开跑前拒绝。
+            适配器未声明快照能力时打印一次警告并跳过（metrics 记
+            ``state_snapshot.role="unsupported"``）；``replay`` 模式下自动不导出。
         replay: 实验目录或数据集目录（``<实验目录>/runs/<dataset>``）；给定时
             跳过 reset+ingest，按对话 ``restore()``（或 ``rebuild()``）后只跑
             query。清单齐备性 / 数据集指纹 / 对话覆盖 / 能力 / 模式都在**开跑前**
@@ -234,20 +256,21 @@ class Runner:
         evidence_matcher: Any = None,
         adapter_version: Union[str, None] = None,
         write_task_reports: bool = True,
-        snapshot: bool = False,
+        shared: bool = False,
+        snapshot: bool = True,
         replay: Union[str, None] = None,
         replay_mode: str = "auto",
         replay_verify_source: Union[str, None] = None,
     ) -> None:
         if jobs < 1:
             raise ValueError(f"jobs 必须 >= 1，当前为 {jobs}")
-        if snapshot and replay:
-            raise ValueError("snapshot 与 replay 互斥（导快照 / 用快照回放，二选一）")
         if replay_verify_source and not replay:
             raise ValueError("replay_verify_source 只在 replay 模式下有意义（需同时给 replay）")
         if replay_mode not in ("auto", "restore", "rebuild"):
             raise ValueError(f"replay_mode 必须是 auto / restore / rebuild，当前为 {replay_mode!r}")
-        self.snapshot = bool(snapshot)
+        # 回放只读快照、不写记忆：再导出快照没有意义，给了 replay 就自动不导出（不是参数冲突）
+        self.snapshot = bool(snapshot) and not replay
+        self.shared = bool(shared)
         self.replay = replay
         self.replay_mode = replay_mode
         self.replay_verify_source = replay_verify_source
@@ -344,8 +367,10 @@ class Runner:
         """执行评测并落盘，返回数据集产物目录（``<out_dir>/runs/<dataset>``）。
 
         数据集为空 / 分片索引越界（本进程无事可做）时返回 None、不产生任何产物；
-        回放与快照能力的校验都在建目录之前完成，失败即 SystemExit、同样不留半成品。
-        本实验目录下该数据集已有产物时同样在写盘前拒绝（不静默覆盖上一次的结果）。
+        回放与快照能力的校验、分片账本的核对都在建目录之前完成，失败即 SystemExit、
+        同样不留半成品。本实验目录下该数据集已有完整产物时同样在写盘前拒绝（不静默
+        覆盖上一次的结果）；分片（``shards>1``）只写本片负责的对话目录与分片账本，
+        数据集级与任务级产物由 ``fuse`` 补齐。
         """
         dialogues = load_dataset(self.dataset_path)
 
@@ -372,18 +397,33 @@ class Runner:
             )
             return None
         if shards > 1 or self.limit is not None:
-            dialogues = _select_questions(
+            dialogues = select_shard_questions(
                 dialogues, shards, self.shard_index, self.limit, self.shard_by
             )
 
         adapter_name = str(getattr(self.adapter, "name", self.adapter.__class__.__name__))
         dataset_name = os.path.splitext(os.path.basename(self.dataset_path))[0]
-        # 写入前的覆盖拒绝：同一实验目录下该数据集已有产物时，本次会静默盖掉上一次的
-        # metrics / 逐题明细（分片误用同一 --report-out 尤其容易丢数据），先拦下。
+        sharded = shards > 1
+        # 共用任务目录（CLI --task-dir）下多个分片写同一棵对话树：题目级分片会让多片
+        # 写同一对话目录并互相覆盖，只有对话级分片是"各写各的对话"。
+        if self.shared and sharded and self.shard_by != "dialogue":
+            raise SystemExit(
+                "共享任务目录下只支持 --shard-by dialogue：题目级分片会让多个分片写"
+                "同一对话目录并互相覆盖；请改用 --shard-by dialogue，"
+                "或给各分片独立的 --report-out"
+            )
+        # 写入前的覆盖拒绝：分片不写数据集级报告，该位置有 metrics 只可能来自不分片的
+        # 评测或 fuse 产物——两种情况下这棵树都已有完整结果，不该再往里写分片。
         existing_metrics = os.path.join(
             layout.dataset_report_dir(self.out_dir, dataset_name), layout.FILE_METRICS
         )
         if os.path.isfile(existing_metrics):
+            if sharded:
+                raise SystemExit(
+                    f"数据集 {dataset_name} 在本实验目录下已有完整产物: {existing_metrics}；"
+                    "分片只写本片负责的对话目录、数据集级报告由 fuse 补齐，"
+                    "请换一个实验目录写分片"
+                )
             raise SystemExit(
                 f"数据集 {dataset_name} 已在本实验目录下完成评测: {existing_metrics}；"
                 "继续会在同一位置静默覆盖上一次的 metrics / 逐题明细，"
@@ -410,6 +450,32 @@ class Runner:
             tags=layout.run_id_tags(shards, self.shard_index, self.shard_by, self.limit),
         )
         dialogue_ids = [str(d.dialogue_id) for d in dialogues]
+        dataset_dir = os.path.abspath(layout.dataset_dir(self.out_dir, dataset_name))
+
+        # 分片账本：开跑前先核对身份/范围、看本片是否已经跑过——全是读操作，
+        # 失败即停，不产生任何产物（账本的读 / 写 / 校验都在 layout）
+        ledger_path: Union[str, None] = None
+        ledger_header: dict[str, Any] = {}
+        ledger_key = layout.shard_key(self.shard_index)
+        if sharded:
+            ledger_path = layout.shard_ledger_path(self.out_dir, dataset_name)
+            ledger_header = layout.shard_ledger_header(
+                dataset=dataset_name,
+                shards=shards,
+                shard_by=self.shard_by,
+                limit=self.limit,
+                fingerprint=dataset_fingerprint(self.dataset_path),
+            )
+            ledger = layout.read_shard_ledger(dataset_dir)
+            layout.check_shard_ledger(ledger, ledger_header, path=ledger_path)
+            known = ((ledger or {}).get("entries") or {}).get(ledger_key)
+            if known:
+                raise SystemExit(
+                    f"分片 {self.shard_index}/{shards} 已经在本实验目录下跑过"
+                    f"（账本状态 {known.get('status')!r}）：{ledger_path}；"
+                    "同一分片重复跑会覆盖它已写好的对话目录，请换一个实验目录，"
+                    "或确认没有进程在跑后删掉账本里这一条再重跑"
+                )
 
         # 回放 / 快照能力的校验全部前移到建目录之前：失败即停，不留半成品产物
         replay_plan: Union[dict, None] = None
@@ -428,18 +494,20 @@ class Runner:
                 f"{len(dialogues)} 个对话）——写入侧固定，结论只覆盖读取/回答层"
             )
         snapshot_caps: dict[str, Any] = {}
+        # 快照默认导出；适配器没有这个能力就跳过（只打印一次警告，不中断评测），
+        # metrics 里如实记 state_snapshot.role="unsupported"
         if self.snapshot:
             snapshot_caps = snapshot_mod.read_capabilities(self.adapter)
             if not snapshot_caps.get("supported"):
-                raise SystemExit(
-                    "该适配器未声明快照能力，无法 --snapshot："
-                    "请实现 snapshot()（可选 restore()/rebuild()）并让 "
-                    "snapshot_capabilities() 返回 supported=True；HTTP 桥同理"
+                print(
+                    "[membench] ⚠️ 该适配器未声明快照能力，本次跳过状态快照"
+                    "（metrics 记 state_snapshot.role=unsupported）：适配器实现 "
+                    "snapshot() 并让 snapshot_capabilities() 返回 supported=True 后即可导出；"
+                    "不需要快照可用 CLI 的 --no-snapshot 关闭"
                 )
 
         os.makedirs(self.out_dir, exist_ok=True)
         experiment_dir = os.path.abspath(self.out_dir)
-        dataset_dir = os.path.abspath(layout.dataset_dir(self.out_dir, dataset_name))
         # ignore=true 的题整条跳过（不查询、不计分），n_active 为实际评测题数。
         total = sum(len(d.questions) for d in dialogues)
         n_ignored = sum(
@@ -452,6 +520,27 @@ class Runner:
         print(f"[membench] dialogues={len(dialogues)} questions={total} judge={self.judge_name}")
         if n_ignored:
             print(f"[membench] 已忽略 {n_ignored} 道标记题（ignore=true）")
+
+        shard_started_at: Union[str, None] = None
+        if ledger_path is not None:
+            # 分片开跑：先把"哪片在跑"写进账本，跑的过程中就能看出进度
+            print(
+                f"[membench] 分片 {self.shard_index}/{shards}"
+                f"（{self.shard_by}）写入 {experiment_dir}"
+            )
+            shard_started_at = datetime.now().isoformat(timespec="seconds")
+            layout.update_shard_ledger(
+                dataset_dir,
+                ledger_header,
+                ledger_key,
+                {
+                    "status": "running",
+                    "dialogues": dialogue_ids,
+                    "run_id": run_id,
+                    "started_at": shard_started_at,
+                },
+            )
+            print(f"[membench] 分片账本: {ledger_path}（{ledger_key} running）")
 
         # 适配器可选的 describe() -> dict：记录其配置/版本等自描述信息；
         # 调用失败记 None，不中断评测。放在开跑前，对话级与数据集级元数据取同一份。
@@ -480,6 +569,9 @@ class Runner:
         match_fallbacks_start = int(getattr(self._evidence_matcher, "fallbacks", 0) or 0)
         # 快照目录登记：导出时逐对话登记，回放时来自计划；state_snapshot 依据
         snapshot_dirs: dict[str, str] = dict(replay_plan["snapshots"]) if replay_plan else {}
+        # 快照导出开关：请求了导出、适配器支持、且不是在回放（回放只读快照）
+        export_snapshots = bool(self.snapshot and snapshot_caps.get("supported"))
+        snapshot_oversize_warned = False
 
         def _retrieval_meta(fallbacks: int) -> dict[str, Any]:
             """检索命中口径落账（substring / overlap / llm；阈值与回退数按需）。"""
@@ -491,18 +583,24 @@ class Runner:
                 meta["retrieval_match_fallbacks"] = fallbacks
             return meta
 
-        def _snapshot_state(dialogue_id: Union[str, None]) -> Union[dict, None]:
-            """state_snapshot 块：数据集级含全部对话，对话级只含自己。"""
-            if not snapshot_dirs:
-                return None
+        def _snapshot_scope(dialogue_id: Union[str, None]) -> Union[dict[str, str], None]:
+            """该层级的快照范围：数据集级=全部对话，对话级=自己；该对话没快照则 None。"""
             if dialogue_id is None:
-                subset = snapshot_dirs
-            else:
-                path = snapshot_dirs.get(dialogue_id)
-                if path is None:
-                    return None
-                subset = {dialogue_id: path}
+                return snapshot_dirs
+            path = snapshot_dirs.get(dialogue_id)
+            return {dialogue_id: path} if path else None
+
+        def _snapshot_state(dialogue_id: Union[str, None]) -> Union[dict, None]:
+            """state_snapshot 块：数据集级含全部对话，对话级只含自己。
+
+            角色三态：``replayed``（回放）/ ``exported``（本次导出）/ ``unsupported``
+            （请求了导出但适配器不支持，如实记"没导"）；没开快照时整块不落——读取方
+            据此就能区分"这次没导快照"与"适配器导不了"。
+            """
             if replay_plan:
+                subset = _snapshot_scope(dialogue_id)
+                if subset is None:
+                    return None
                 return {
                     "role": "replayed",
                     "root": replay_plan["root"],
@@ -512,13 +610,27 @@ class Runner:
                     "replay_mode": replay_plan["mode"],
                     "n_dialogues": len(subset),
                 }
-            return {
-                "role": "exported",
-                "root": dataset_dir,
-                "manifest_sha256": snapshot_mod.manifests_digest(subset),
-                "format_version": snapshot_caps.get("format_version", 1),
-                "n_dialogues": len(subset),
-            }
+            if export_snapshots:
+                subset = _snapshot_scope(dialogue_id)
+                if subset is None:
+                    return None
+                return {
+                    "role": "exported",
+                    "root": dataset_dir,
+                    "manifest_sha256": snapshot_mod.manifests_digest(subset),
+                    "format_version": snapshot_caps.get("format_version", 1),
+                    "n_dialogues": len(subset),
+                }
+            if self.snapshot:
+                # 适配器不支持：快照字段没有值，但对话数与根目录照旧给出
+                return {
+                    "role": "unsupported",
+                    "root": dataset_dir,
+                    "manifest_sha256": None,
+                    "format_version": None,
+                    "n_dialogues": 1 if dialogue_id is not None else len(dialogues),
+                }
+            return None
 
         def _compose_metrics(
             subset: list[dict[str, Any]],
@@ -625,8 +737,9 @@ class Runner:
                 q for q in dialogue.questions if not getattr(q, "ignore", False)
             ]
 
-            if self.snapshot:
-                # 快照打点：该对话 ingest 完成后、第一道 query 之前（回放的入口状态）
+            if export_snapshots:
+                # 快照打点：该对话 ingest 完成后、第一道 query 之前（回放的入口状态）。
+                # 一个对话只导这一份：per-session 导出会得到用不上的中间态。
                 snapshot_path = layout.dialogue_snapshot_dir(
                     self.out_dir, dataset_name, dialogue_id
                 )
@@ -654,6 +767,16 @@ class Runner:
                     f"[membench] 快照: {snapshot_path}（{entry['bytes']} 字节，"
                     f"sha256 {entry['sha256'][:12]}）"
                 )
+                if (
+                    int(entry.get("bytes") or 0) > SNAPSHOT_WARN_BYTES
+                    and not snapshot_oversize_warned
+                ):
+                    snapshot_oversize_warned = True
+                    print(
+                        f"[membench] ⚠️ 单份快照 {int(entry['bytes']) / (1 << 20):.0f} MB 超过 "
+                        f"{SNAPSHOT_WARN_BYTES >> 20} MB：快照体积随对话数线性增长，"
+                        "可用 CLI 的 --no-snapshot 关闭（关掉后改读取侧只能重跑 ingest）"
+                    )
 
             def _eval(q: Any) -> dict[str, Any]:
                 # 单题内部计时：latency_ms 是该题 query 调用的墙钟时间，不受并发影响。
@@ -768,22 +891,47 @@ class Runner:
         if replay_verify is not None:
             metrics["replay_verify"] = replay_verify
 
-        dataset_report_dir = layout.dataset_report_dir(self.out_dir, dataset_name)
-        _write_run_artifacts(dataset_report_dir, records, metrics, figures=True)
-        print(f"[membench] 数据集报告: {dataset_report_dir}")
-
-        if self.write_task_reports:
-            # 任务级报告 = 数据集级报告内容（md 连带图片 + metrics）；逐题明细留在
-            # 数据集目录，不重复落一份可能很大的 results.jsonl。
-            task_dir = layout.task_report_dir(self.out_dir)
-            copy_report(
-                os.path.join(dataset_report_dir, layout.FILE_REPORT_MD),
-                task_dir,
-                layout.FILE_REPORT_MD,
-                extra_files=[os.path.join(dataset_report_dir, layout.FILE_METRICS)],
+        if ledger_path is not None:
+            # 分片：数据集级与任务级产物一律由 fuse 补齐——分片产物不是"完整实验"。
+            # 上面那份聚合只用于控制台汇总（overall.* 的打印），不落盘。
+            layout.update_shard_ledger(
+                dataset_dir,
+                ledger_header,
+                ledger_key,
+                {
+                    "status": "done",
+                    "dialogues": dialogue_ids,
+                    "n_questions": n_active,
+                    "run_id": run_id,
+                    "started_at": shard_started_at,
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                },
             )
-            print(f"[membench] 任务级报告: {task_dir}")
-        if self.snapshot:
+            print(
+                f"[membench] 分片账本: {ledger_path}（{ledger_key} done，"
+                f"{len(dialogue_ids)} 个对话 / {n_active} 题）"
+            )
+            print(
+                "[membench] 本分片只落对话目录：数据集级 report/ 与任务级 reports/ "
+                "由 fuse 补齐"
+            )
+        else:
+            dataset_report_dir = layout.dataset_report_dir(self.out_dir, dataset_name)
+            _write_run_artifacts(dataset_report_dir, records, metrics, figures=True)
+            print(f"[membench] 数据集报告: {dataset_report_dir}")
+
+            if self.write_task_reports:
+                # 任务级报告 = 数据集级报告内容（md 连带图片 + metrics）；逐题明细留在
+                # 数据集目录，不重复落一份可能很大的 results.jsonl。
+                task_dir = layout.task_report_dir(self.out_dir)
+                copy_report(
+                    os.path.join(dataset_report_dir, layout.FILE_REPORT_MD),
+                    task_dir,
+                    layout.FILE_REPORT_MD,
+                    extra_files=[os.path.join(dataset_report_dir, layout.FILE_METRICS)],
+                )
+                print(f"[membench] 任务级报告: {task_dir}")
+        if export_snapshots:
             print(
                 f"[membench] 快照: {len(snapshot_dirs)} 个对话 → {dataset_dir}"
                 "（--replay 传该数据集目录或实验目录即可免重跑 ingest）"

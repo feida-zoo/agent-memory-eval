@@ -1,17 +1,28 @@
 """实验产物布局的唯一入口：目录名 / 报告文件名常量与路径 helper。
 
-终态结构（报告与数据就近归属，一次实验一个自包含子目录）::
+一次评测 = 一个自包含的**任务目录**（报告与对应数据就近归属）：
+
+- 单臂任务（``arms==1``）是 ``eval_<name>_<platform>_<ts>``，本身就是完整评测产物根；
+- 双臂任务（``arms==2``）是 ``compare_<name>_<platform>_<ts>``，``A/`` 与 ``B/`` 是任务
+  目录下的两个臂，各为一个完整的单臂评测产物根。
+
+任务目录的命名与骨架由 :func:`task_subdir` / :func:`init_task_dir` 唯一决定、臂目录经
+:func:`arm_dir` 取；同一次评测的多个分片写进同一个任务目录时，各片的进度与归属记在
+分片账本 :data:`FILE_SHARDS` 里（路径见 :func:`shard_ledger_path`，读 / 写 / 校验见
+:func:`read_shard_ledger` / :func:`write_shard_ledger` / :func:`check_shard_ledger`——
+写入方（Runner）与读取方（fuse 等）共用同一套账本口径）。::
 
     <root>/eval_<name>_<platform>_<ts>[_s<i>][_l<limit>]/
     ├── runs/<dataset>/
     │   ├── report/                      # 数据集级聚合报告（md + metrics + 逐题明细 + 图）
+    │   ├── shards.json                  # 分片账本（分片评测时记录各片进度与归属）
     │   └── <dialogue_id>/
     │       ├── runtime/                 # 运行时数据（如桥的 reset 前备份）
-    │       ├── memory_snapshot/         # --snapshot 导出的对话快照（含 manifest.json）
+    │       ├── memory_snapshot/         # 对话快照（默认导出，含 manifest.json）
     │       └── report/                  # 对话级报告（纯文字，不出图）
     └── reports/                         # 任务级报告（单数据集 run = 数据集级报告内容）
 
-    <root>/compare_<name>_<platform>_<ts>/   A/ B/（各为完整 eval 实验形态）+ reports/
+    <root>/compare_<name>_<platform>_<ts>/   A/ B/（各为完整评测产物根）+ reports/
     <root>/matrix_<ts>/                      reports/ + runs/<label>/（内部同 eval 树）
 
 ``<root>`` 由 :func:`membench.paths.output_root` 解析（CLI ``--report-out DIR`` 即指它）。
@@ -22,8 +33,9 @@
 
 本模块是这些目录名与报告文件名的**唯一来源**：其它模块拼路径一律调用这里的常量与
 helper，不要手写字面量。helper 只计算路径、不建目录——需要落盘时调用方自行
-``os.makedirs(..., exist_ok=True)``。读取侧把「产物目录」（实验目录或数据集目录）归一成
-数据集目录也只走这里的 :func:`resolve_dataset_dir`。
+``os.makedirs(..., exist_ok=True)``（:func:`experiment_path` / :func:`init_task_dir` 例外，
+它们按契约建目录）。读取侧把「产物目录」（实验目录或数据集目录）归一成数据集目录
+也只走这里的 :func:`resolve_dataset_dir`。
 """
 
 from __future__ import annotations
@@ -33,6 +45,7 @@ import os
 import re
 from collections.abc import Iterable
 from datetime import datetime
+from typing import Any, Union
 
 from membench.paths import output_root
 
@@ -58,6 +71,8 @@ FILE_METRICS = "metrics.json"
 FILE_RESULTS = "results.jsonl"
 FILE_SUMMARY = "evaluate_summary.json"
 FILE_MATRIX_RESULT = "matrix_result.json"
+#: 分片账本（落数据集目录下）：同一次评测各分片的进度与归属，见 :func:`shard_ledger_path`。
+FILE_SHARDS = "shards.json"
 
 #: 图表文件名（报告内引用一律同目录相对文件名）。
 FIG_CATEGORY = "fig_category_accuracy.png"
@@ -206,6 +221,56 @@ def experiment_path(base: str | None, name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 任务目录：一次评测的产物根（单臂 eval_*，双臂 A/B compare_*）
+# ---------------------------------------------------------------------------
+
+def task_subdir(
+    name: str,
+    platform: str | None = None,
+    arms: int = 2,
+    ts: str | None = None,
+) -> str:
+    """任务目录名：``arms==2`` 走 :func:`compare_subdir`，``arms==1`` 走 :func:`eval_subdir`。
+
+    任务目录的命名只有这一个来源：两种 arms 共用 ``<name>_<platform>_<ts>`` 词表，
+    差别只在前缀（``eval_`` / ``compare_``）。
+    """
+    if arms == 2:
+        return compare_subdir(name, platform, ts)
+    if arms == 1:
+        return eval_subdir(name, platform, ts)
+    raise ValueError(f"arms 必须是 1 或 2，当前为 {arms!r}")
+
+
+def init_task_dir(
+    base: str | None,
+    name: str,
+    platform: str | None = None,
+    arms: int = 2,
+    ts: str | None = None,
+) -> str:
+    """在 ``base``（默认 :func:`membench.paths.output_root`）下建任务目录骨架，返回绝对路径。
+
+    骨架：``arms==2`` 建 ``A/`` 与 ``B/``（两个臂各是一个完整评测产物根），``arms==1``
+    建 ``runs/``；两种形态都建任务级 ``reports/``。目标**已存在且非空**时拒绝新建
+    （守卫语义与报错文案复用 :func:`experiment_path`：上一次跑在校验阶段失败留下的
+    空目录可以复用，已有产物的目录一律不覆盖）。
+    """
+    path = experiment_path(base, task_subdir(name, platform, arms, ts))
+    subdirs = (DIR_ARM_A, DIR_ARM_B) if arms == 2 else (DIR_RUNS,)
+    for subdir in (*subdirs, DIR_REPORTS):
+        os.makedirs(os.path.join(path, subdir), exist_ok=True)
+    return os.path.abspath(path)
+
+
+def arm_dir(task_dir: str, arm: str) -> str:
+    """任务目录下的臂目录：``<task_dir>/A`` 或 ``<task_dir>/B``（arm 取 ``DIR_ARM_A/B``）。"""
+    if arm not in (DIR_ARM_A, DIR_ARM_B):
+        raise ValueError(f"arm 必须是 {DIR_ARM_A!r} 或 {DIR_ARM_B!r}，当前为 {arm!r}")
+    return os.path.join(task_dir, arm)
+
+
+# ---------------------------------------------------------------------------
 # 实验目录内的路径
 # ---------------------------------------------------------------------------
 
@@ -224,6 +289,15 @@ def dataset_report_dir(experiment_dir: str, dataset: str) -> str:
     return os.path.join(dataset_dir(experiment_dir, dataset), DIR_REPORT)
 
 
+def shard_ledger_path(experiment_dir: str, dataset: str) -> str:
+    """分片账本路径：``<exp>/runs/<dataset>/shards.json``。
+
+    账本记同一次评测各分片的进度与归属（谁在跑、跑完没、覆盖了哪些对话），因此落在
+    数据集目录里：多片共用一个任务目录时，它就是那棵树"跑到哪了"的唯一记录。
+    """
+    return os.path.join(dataset_dir(experiment_dir, dataset), FILE_SHARDS)
+
+
 def dialogue_dir(experiment_dir: str, dataset: str, dialogue_id: str) -> str:
     """对话目录：``<exp>/runs/<dataset>/<tag_dir_name(dialogue_id)>``。"""
     return os.path.join(dataset_dir(experiment_dir, dataset), tag_dir_name(dialogue_id))
@@ -240,13 +314,159 @@ def dialogue_runtime_dir(experiment_dir: str, dataset: str, dialogue_id: str) ->
 
 
 def dialogue_snapshot_dir(experiment_dir: str, dataset: str, dialogue_id: str) -> str:
-    """对话级快照目录（``--snapshot`` 时含 ``manifest.json``）。"""
+    """对话级快照目录（默认导出，含框架写的 ``manifest.json``；``--no-snapshot`` 关闭）。"""
     return os.path.join(dialogue_dir(experiment_dir, dataset, dialogue_id), DIR_SNAPSHOT)
 
 
 def task_report_dir(experiment_dir: str) -> str:
     """实验根层的任务级报告目录：``<exp>/reports``。"""
     return os.path.join(experiment_dir, DIR_REPORTS)
+
+
+# ---------------------------------------------------------------------------
+# 分片账本：同一次分片评测各片的进度与归属（读 / 写 / 校验的唯一实现）
+# ---------------------------------------------------------------------------
+
+#: 分片账本结构版本：结构变了就 +1，读到不认识的版本即拒绝（别让新账本被旧读者改写）。
+SHARD_LEDGER_SCHEMA = 1
+
+
+def shard_key(shard_index: int) -> str:
+    """账本里分片的键：``s<i>``（与 ``--shard-index`` 同一套序号，从 0 起）。"""
+    return f"s{shard_index}"
+
+
+def shard_key_index(key: str) -> Union[int, None]:
+    """账本键 ``s<i>`` 反解出的分片序号；不是这个形状时返回 None。
+
+    键的格式只由 :func:`shard_key` 决定，反解必须走本函数——读取方（fuse）要靠它把
+    账本条目对回 ``--shard-index`` 的序号，自己切字符串就会在格式变化时静默错位。
+    """
+    if not isinstance(key, str) or not key.startswith("s"):
+        return None
+    digits = key[1:]
+    return int(digits) if digits.isdigit() else None
+
+
+def has_shard_ledger(dataset_dir: str) -> bool:
+    """该目录是不是**分片产物目录**（数据集目录下有账本文件）。"""
+    return os.path.isfile(os.path.join(dataset_dir, FILE_SHARDS))
+
+
+def shard_ledger_header(
+    *,
+    dataset: str,
+    shards: int,
+    shard_by: str,
+    limit: Union[int, None],
+    fingerprint: Union[dict[str, Any], None],
+) -> dict[str, Any]:
+    """本次运行的分片口径（账本头部）：写入新账本时落盘，也是比对的基准。
+
+    字段：``schema`` / ``dataset`` / ``shards`` / ``shard_by`` / ``limit`` /
+    ``dataset_fingerprint``。同一个数据集目录里的账本只能记**同一次评测**的各片：
+    口径或数据集指纹换了却写进同一目录，各片产物就不可归因（融合得到的是混片结果）。
+    """
+    return {
+        "schema": SHARD_LEDGER_SCHEMA,
+        "dataset": dataset,
+        "shards": shards,
+        "shard_by": shard_by,
+        "limit": limit,
+        "dataset_fingerprint": fingerprint,
+    }
+
+
+def read_shard_ledger(dataset_dir: str) -> Union[dict[str, Any], None]:
+    """读数据集目录下的分片账本（没有账本返回 None）。
+
+    结构非法当场报错：坏账本被静默覆盖，就等于丢掉"哪些分片已跑过、哪一片还在跑"
+    的唯一记录。账本条目 ``entries["s<i>"]`` 的字段：``status``（``running`` /
+    ``done``）、``dialogues``（该片负责的对话 id）、``n_questions``（实测题数，
+    running 时可能还没有）、``run_id``、``started_at``、``finished_at``。
+    """
+    path = os.path.join(dataset_dir, FILE_SHARDS)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            ledger = json.load(handle)
+    except ValueError as exc:
+        raise SystemExit(f"分片账本损坏（{path}）：{exc}；请修复或删除该文件后重跑")
+    if not isinstance(ledger, dict) or not isinstance(ledger.get("entries"), dict):
+        raise SystemExit(
+            f"分片账本结构非法（{path}）：缺少 entries 段；请修复或删除该文件后重跑"
+        )
+    return ledger
+
+
+def write_shard_ledger(dataset_dir: str, ledger: dict[str, Any]) -> str:
+    """落盘分片账本，返回账本路径（临时文件 + ``os.replace``，同目录内原子替换）。
+
+    各分片是独立进程，读-改-写之间不能把别的分片刚写下的条目擦掉；同目录内的原子
+    替换足以保证（不需要跨进程锁），最后写入的进程带上此前所有分片的条目。
+    """
+    path = os.path.join(dataset_dir, FILE_SHARDS)
+    os.makedirs(dataset_dir, exist_ok=True)
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(ledger, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return path
+
+
+def update_shard_ledger(
+    dataset_dir: str,
+    header: dict[str, Any],
+    key: str,
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    """读-改-写一条分片条目（新账本用 ``header`` 起头），返回写入后的账本。"""
+    ledger = read_shard_ledger(dataset_dir) or {**header, "entries": {}}
+    ledger.setdefault("entries", {})[key] = entry
+    write_shard_ledger(dataset_dir, ledger)
+    return ledger
+
+
+def check_shard_ledger(
+    existing: Union[dict[str, Any], None],
+    header: dict[str, Any],
+    *,
+    path: str,
+) -> None:
+    """已有账本必须与本次运行属于同一次评测（:func:`shard_ledger_header` 逐项比对）。
+
+    同一个数据集目录里的账本只能记同一次评测：``--shards`` / ``--shard-by`` /
+    ``limit`` / 数据集指纹换了却写进同一目录，各片产物就不可归因（融合得到的是混片
+    结果），必须在写盘前拒绝。``existing`` 为 None（还没账本）时直接通过。
+
+    Raises:
+        SystemExit: 账本 schema 不受支持，或口径 / 数据集指纹与本次不一致。
+    """
+    if existing is None:
+        return
+    if existing.get("schema") != SHARD_LEDGER_SCHEMA:
+        raise SystemExit(
+            f"分片账本结构版本不受支持（{path}）：账本 schema={existing.get('schema')!r}，"
+            f"本版本支持 {SHARD_LEDGER_SCHEMA}；请换一个实验目录重跑"
+        )
+    for key in ("dataset", "shards", "shard_by", "limit"):
+        if existing.get(key) != header.get(key):
+            raise SystemExit(
+                f"分片账本与本次运行不一致（{key}）：账本 {existing.get(key)!r} vs "
+                f"本次 {header.get(key)!r}（{path}）——同一个实验目录里只能放同一次评测的分片"
+            )
+    known = (existing.get("dataset_fingerprint") or {}).get("sha256")
+    want = (header.get("dataset_fingerprint") or {}).get("sha256")
+    if known and want and known != want:
+        raise SystemExit(
+            f"分片账本与本次运行的数据集指纹不一致：账本 {known} vs 本次 {want}（{path}）"
+            "——数据集变过就换实验目录，否则各片结果不可归因"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +481,12 @@ LEGACY_LAYOUT_MSG = "产物结构为旧版（缺少 report/ 层级），本版�
 #: 报错要说清真实原因，否则用户会去重跑评测而不是换一个目录。
 NO_DATASET_PRODUCT_MSG = (
     "实验目录下没有任何数据集产物（缺 runs/<dataset>/report/），无法读取"
+)
+
+#: 未融合的分片产物（数据集目录下有 :data:`FILE_SHARDS`）的统一报错文案。分片只落各片
+#: 负责的对话目录，数据集级产物要由 ``fuse`` 补齐——这与"没有产物"是两回事。
+UNFUSED_SHARD_MSG = (
+    f"这是未融合的分片产物（含 {FILE_SHARDS}），请先用 fuse 补齐数据集级产物"
 )
 
 #: 旧版产物落在 ``runs/`` 层（平铺 run）或实验目录根时的特征文件。
@@ -336,8 +562,10 @@ def resolve_dataset_dir(target: str, dataset: str | None = None) -> str:
     - **对话目录**（``report/metrics.json`` 里落账了 ``dialogue_id``）一律拒绝：
       一段对话的指标不是数据集汇总，拿它当数据集会得到以偏概全的结论；
     - 两者都不是（缺 ``report/`` 层级）→ 按形态报错：像旧版产物（报告 / 指标落在
-      目录根，``runs/`` 下是平铺 run）报 :data:`LEGACY_LAYOUT_MSG`；目录里根本没有
-      数据集产物（空目录、跑到一半崩掉）报 :data:`NO_DATASET_PRODUCT_MSG`。
+      目录根，``runs/`` 下是平铺 run）报 :data:`LEGACY_LAYOUT_MSG`；未融合的分片产物
+      （数据集目录下有 :data:`FILE_SHARDS`，只落了各片的对话目录）报
+      :data:`UNFUSED_SHARD_MSG`；目录里根本没有数据集产物（空目录、跑到一半崩掉）
+      报 :data:`NO_DATASET_PRODUCT_MSG`。
 
     Args:
         target: 数据集目录或实验目录。
@@ -349,7 +577,8 @@ def resolve_dataset_dir(target: str, dataset: str | None = None) -> str:
     Raises:
         SystemExit: 入参目录不存在、入参是对话级产物目录、数据集目录缺
             ``report/metrics.json``（产物不完整）、实验目录下有多个数据集目录而
-            调用方未指定、入参是旧版产物结构，或实验目录下没有任何数据集产物。
+            调用方未指定、入参是旧版产物结构、入参是未融合的分片产物，或实验目录下
+            没有任何数据集产物。
     """
     if not os.path.isdir(target):
         raise SystemExit(f"产物目录不存在: {target}")
@@ -361,6 +590,8 @@ def resolve_dataset_dir(target: str, dataset: str | None = None) -> str:
         )
     if _is_dataset_dir(abspath):
         return _require_metrics(abspath)
+    if has_shard_ledger(abspath):
+        raise SystemExit(f"{UNFUSED_SHARD_MSG}：{abspath}")
 
     runs = runs_root(abspath)
     if os.path.isdir(runs):
@@ -368,9 +599,10 @@ def resolve_dataset_dir(target: str, dataset: str | None = None) -> str:
             candidate = dataset_dir(abspath, dataset)
             if _is_dataset_dir(candidate):
                 return _require_metrics(candidate)
+        names_in_runs = os.listdir(runs)
         found = sorted(
             os.path.join(runs, name)
-            for name in os.listdir(runs)
+            for name in names_in_runs
             if _is_dataset_dir(os.path.join(runs, name))
         )
         if len(found) == 1:
@@ -381,10 +613,13 @@ def resolve_dataset_dir(target: str, dataset: str | None = None) -> str:
                 f"实验目录 {abspath} 下有多个数据集目录（{names}），无法确定读哪一个；"
                 f"请把入参指向具体的数据集目录 {runs}/<dataset>"
             )
-        # runs/ 下没有可用的数据集产物：平铺形态是旧版结构，其余如实说"没有产物"
+        # runs/ 下没有可用的数据集产物：分片（未融合）与旧版结构各有专门文案，
+        # 其余如实说"没有产物"
+        if any(has_shard_ledger(os.path.join(runs, name)) for name in names_in_runs):
+            raise SystemExit(f"{UNFUSED_SHARD_MSG}：{abspath}")
         if any(
             _looks_like_legacy_product(os.path.join(runs, name))
-            for name in os.listdir(runs)
+            for name in names_in_runs
         ):
             raise SystemExit(f"{LEGACY_LAYOUT_MSG}：{abspath}")
         raise SystemExit(f"{NO_DATASET_PRODUCT_MSG}：{abspath}")

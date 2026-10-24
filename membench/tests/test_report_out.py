@@ -372,7 +372,7 @@ def test_default_report_out_uses_output_root(
 
 
 def test_removed_flags_rejected(tmp_path: Path) -> None:
-    """旧参数 --out / --snapshot-out 已删除：传入即被 argparse 拒绝（退出码 2）。"""
+    """旧参数 --out / --snapshot-out / --snapshot 已删除：传入即被 argparse 拒绝（退出码 2）。"""
     run_prefix = [
         "run",
         "--adapter",
@@ -385,7 +385,10 @@ def test_removed_flags_rejected(tmp_path: Path) -> None:
     for command in (
         run_prefix + ["--out", str(tmp_path)],
         run_prefix + ["--snapshot-out", str(tmp_path)],
+        # 快照改为默认导出，开关只剩 --no-snapshot（不留 --snapshot 兼容别名）
+        run_prefix + ["--snapshot"],
         ["evaluate", "--out", str(tmp_path)],
+        ["evaluate", "--snapshot"],
     ):
         with pytest.raises(SystemExit) as excinfo:
             cli.main(command)
@@ -419,10 +422,10 @@ def test_cli_run_failure_leaves_no_empty_experiment_dir(tmp_path: Path) -> None:
         str(out),
     ]
 
-    # ① --snapshot 与 --replay 互斥（Runner 构造期报错）
-    with pytest.raises(SystemExit, match="互斥"):
-        cli.main([*base, "--snapshot", "--replay", str(tmp_path / "nope")])
-    assert _subdirs(out) == [], "互斥参数失败后残留空实验目录"
+    # ① 构造期参数错误（--replay-verify-source 需与 --replay 同时给）→ 友好退出且不留空实验目录
+    with pytest.raises(SystemExit, match="参数错误"):
+        cli.main([*base, "--replay-verify-source", str(tmp_path / "nope")])
+    assert _subdirs(out) == [], "参数错误失败后残留空实验目录"
 
     # ② --replay 指向不存在的产物目录（回放源校验失败）
     with pytest.raises(SystemExit, match="产物目录不存在"):

@@ -39,7 +39,9 @@ npm start             # = node bridge.mjs，默认 http://127.0.0.1:8787
 #   （目录名带 reset 序号与 dialogue_id，与 results.jsonl 对得上）；
 #   设成具体目录则快照到该目录。默认关闭（每个对话调一次 reset，长跑别开）。
 #   另有一组快照回放端点（无需环境变量）：POST /snapshot-capabilities|/snapshot|/restore，
-#   配合 membench run --snapshot / --replay 使用（改读取侧代码免重跑 ingest）。
+#   配合 membench run 的默认快照导出 / --replay 使用（改读取侧代码免重跑 ingest）。
+#   快照默认就导出：每个对话 ingest 完成后、第一道 query 之前一份，落该对话的
+#   memory_snapshot/（跑完就能翻）；不需要时用 --no-snapshot 关闭。
 
 # 4) 自检（另开一个终端）
 cd <仓库根>/membench
@@ -97,8 +99,9 @@ python -m membench.cli run --adapter http \
   `.membench-snapshot.json` 标记，框架还会在同目录写清单 `manifest.json`），`/restore` 替换
   `DATA_DIR` 并**重建记忆实例**（真实系统若在内存缓存索引，必须在这里重新创建实例，
   否则恢复的只是磁盘）；`/restore` 只认带标记的快照目录，防止路径传错把库清空。用法：
-  `run --snapshot`（每对话 ingest 后导出到该对话的 `memory_snapshot/`）→ 改读取侧代码 →
-  `run --replay <实验目录或数据集目录> --replay-verify-source <源数据集目录>`
+  快照**默认导出**（每个对话 ingest 完成后一份到该对话的 `memory_snapshot/`，跑完 ingest
+  就能在对话级 `report.md` 里点开 `../memory_snapshot/` 翻记忆文件；不需要用 `--no-snapshot` 关闭）
+  → 改读取侧代码 → `run --replay <实验目录或数据集目录> --replay-verify-source <源数据集目录>`
   （回放跳过 reset + ingest，写入侧固定，结论只覆盖读取/回答层）。
 - **别用 express 等额外框架**：三端点用 `node:http` 足够，少一个依赖少一类 native/构建坑。
 

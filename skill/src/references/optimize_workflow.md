@@ -91,6 +91,11 @@ python -m membench.cli run --adapter <adapter> --dataset <同一数据集> --jud
 
 - 基线产物天然留档：每次 run 新建 `eval_<adapter>_<platform>_<ts>/`，不会覆盖旧实验目录
   （同一秒重复运行会被直接拒绝）；要给某次结果固定名字就整体复制那个实验目录。
+- 记忆快照**默认导出**（每对话 ingest 完成后一份，落该对话目录的 `memory_snapshot/`）：
+  对话级 `report.md` 里有 `../memory_snapshot/` 的可点击链接与清单条目数 / 体积——
+  诊断写入侧问题时可直接翻记忆文件，不必自己拼路径；不需要 `--no-snapshot` 关闭。
+- 大数据集分片跑时（工作流 2.6）：`task init` 建任务目录 → 各片 `run --task-dir <任务目录>`
+  → `fuse --task-dir <任务目录>`，分片产物只写各片对话目录 + 账本，数据集级由 fuse 补齐。
 - 改动过程中如顺手改了别处，**回退**——多变量会让 AB 结论失效。
 
 **执行方式（subagent 不是默认动作，按改动性质决定）**：
@@ -121,6 +126,9 @@ python -m membench.cli compare \
   --baseline <基线实验目录或 runs/<dataset> 数据集目录> \
   --candidate <候选实验目录或 runs/<dataset> 数据集目录> \
   --require-comparable --tag <标签> --report-out output/
+
+# A/B 两臂本来就写在同一个任务目录里时（分片 A/B 通路）就地出报告：
+python -m membench.cli compare --task-dir <任务目录> --require-comparable
 ```
 
 - `--require-comparable`：关键维度（`driver_llm` / `judge_model` / `adapter_version` / `dataset_fingerprint` 等）不一致或无法核验 → 可比性门禁 **FAIL**（整体 verdict=FAIL、退出码 1），即拒绝当 A/B 用；不加该参数时不一致只降级为 WARN。详见 `references/compare_workflows.md`。

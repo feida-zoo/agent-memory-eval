@@ -16,7 +16,7 @@ membench/                 # 评测工程（Python 包工程根）
 │   ├── judges/           # heuristic / llm（OpenAI 兼容）/ client（复用 agent 的 LLM）
 │   ├── metrics/          # token_f1 / bleu1 / recall@k + 六维汇总
 │   ├── paths.py          # 【唯一】默认产物根目录判定（output_root）
-│   ├── layout.py         # 【唯一】实验目录命名与路径 helper（eval_* / compare_* / matrix_* / resolve_dataset_dir）
+│   ├── layout.py         # 【唯一】任务目录 / 实验目录命名与路径 helper（task_subdir / init_task_dir / arm_dir / eval_* / compare_* / matrix_* / 分片账本 / resolve_dataset_dir）
 │   ├── agent_loop.py     # tool-call 循环复用（run_tool_loop / AgentLoopAdapter）
 │   ├── doctor.py         # 三端点连通性与契约校验
 │   ├── runner.py / evaluate.py / compare.py / matrix.py / fuse.py / report.py
@@ -54,14 +54,16 @@ docs/                     # 深度研究报告 + 配图
 
 ## 核心约定（改代码前必读）
 
-1. **一次实验一个自包含子目录**（报告与对应数据就近归属）：
+1. **一次实验一个自包含任务目录**（报告与对应数据就近归属）：一次评测 = 一个**任务目录**，单臂任务（`arms=1`）就是 `eval_<name>_<platform>_<ts>`（自身即完整产物根），双臂 A/B 任务（`arms=2`）是 `compare_<name>_<platform>_<ts>`，`A/` 与 `B/` 是它下面的两个臂（**各为一个完整的单臂产物根**，含自己的 `runs/` 与 `reports/`）。骨架由 `layout.init_task_dir` 唯一决定（`task init --name NAME [--platform P] [--arms 1|2]`，stdout 只打印任务目录绝对路径）；`run`/`evaluate`/`evaluate-compare`/`compare`/`fuse` 都可用 `--task-dir DIR` **就地**写进/读已存在的任务目录（与 `--report-out` 互斥、不新建目录），`task status DIR` 是只读进度视图（骨架 / 分片账本 / 快照 / 下一步）：
    - `output/eval_<name>_<platform>_<ts>[_s<i>][_l<limit>]/`（`ts` = `YYYYMMDD-HHMMSS`；`_s<i>` = `--shards` 的分片序号、`_l<limit>` = `--limit`，无分片无 limit 时不带后缀，词表见 `layout.experiment_tags`）：
      - `runs/<dataset>/report/`：数据集级 `report.md`、`metrics.json`、`results.jsonl`、`fig_*.png`
-     - `runs/<dataset>/<dialogue_id>/`：对话级 `runtime/`（桥的 reset 前备份落 `runtime/reset_backup/`；`MEMBENCH_RUN_DIR` 指本对话目录）、`memory_snapshot/`（`--snapshot` 时含 `manifest.json`）、`report/`（`report.md`、`metrics.json`、`results.jsonl`，不出图）
+     - `runs/<dataset>/shards.json`：**分片账本**（分片评测才有；进度与归属的唯一记录，读 / 写 / 校验见 `layout.read_shard_ledger` / `write_shard_ledger` / `check_shard_ledger`，`fuse` 与 `task status` 都读它）
+     - `runs/<dataset>/<dialogue_id>/`：对话级 `runtime/`（桥的 reset 前备份落 `runtime/reset_backup/`；`MEMBENCH_RUN_DIR` 指本对话目录）、`memory_snapshot/`（**默认导出**，含框架写的 `manifest.json`；适配器未声明快照能力时警告一次并跳过，`metrics["state_snapshot"]["role"] == "unsupported"`）、`report/`（`report.md`、`metrics.json`、`results.jsonl`，不出图；含 `../memory_snapshot/` 的可点击链接与清单条目数 / 体积）
      - `reports/`：任务级报告（`report.md`、`metrics.json`、`evaluate_summary.json`、`fig_dataset_overview.png`——`evaluate_summary.json` **无条件产出**，不区分单/多数据集）
    - `output/compare_<name>_<platform>_<ts>/`：`A/`、`B/`（`layout.DIR_ARM_A` / `DIR_ARM_B`；各为完整 eval 实验形态，含自己的 `runs/` 与 `reports/`）+ `reports/{comparison.md,fig_*.png}`
    - `output/matrix_<ts>/`：`reports/{report.md,matrix_result.json,fig_matrix_accuracy.png}` + `runs/<label>/`
-   - CLI `--report-out DIR` 一律指**实验目录的父目录**（缺省 `output_root()`）；`fuse --out` / `matrix --out` 指**完整实验目录**。
+   - 分片（`shards>1`）**只写本片负责的对话目录 + 账本** `runs/<dataset>/shards.json`，不写数据集级 `report/` 与任务级 `reports/`（分片产物不是"完整实验"，一律由 `fuse` 补齐：`--task-dir DIR` 就地补齐，或 `--runs ... --out ...` 跨目录融合）；多片共用一个任务目录时**只允许 `--shard-by dialogue`**（题目级分片会让多片写同一对话目录互相覆盖），同一分片重复跑直接拒绝。
+   - CLI `--report-out DIR` 一律指**实验目录的父目录**（缺省 `output_root()`）；`fuse --out` / `matrix --out` 指**完整实验目录**，`--task-dir` 指已存在的任务目录（或其臂目录）。
    - 「产物目录」入参（`--baseline` / `--candidate` / `--from-runs` / `--baseline-run` / `--candidate-run` / `fuse --runs` 各项 / `matrix --runs` 的 `=` 右值 / `--replay` / `--replay-verify-source`）统一接受**实验目录**或 `runs/<dataset>` 数据集目录，经 `layout.resolve_dataset_dir` 解析。`--from-runs` 的 `KEY` 另按数据集注册表核对身份（`office` ↔ `office_dataset` / `user_dataset`），key 认错直接报错——`resolve_dataset_dir` 的"提示不命中回退到唯一数据集目录"只服务真正的自定义 key。
    - 旧版产物（平铺 run 目录、缺 `report/` 层级、旧版对比实验目录）一律报错拒绝，不留兼容层；目录里**根本没有**数据集产物（空目录、跑到一半中断）走另一条文案（`layout.NO_DATASET_PRODUCT_MSG`），别把"没有产物"说成"版本旧"。命名与落位**只走** `membench/layout.py`，不要在业务代码里手写目录名或手抄复制逻辑；`run_id` 一律经 `layout.run_id` 组装（词表 `layout.run_id_tags`）。
    - CLI 各命令在创建实验目录后失败时要把**本次新建且仍为空**的目录清掉（`cli._no_leftover_experiment` / `_discard_empty_experiment`）：`Runner` 层"失败不留半成品"的约定不能被 CLI 的提前建目录破坏；有任何产物的目录保留现场。
@@ -70,7 +72,8 @@ docs/                     # 深度研究报告 + 配图
 4. **数据集政策**：仓库**不内置**开源大数据集。`office_dataset.jsonl` / `sample_dataset.jsonl` 是自造演示集；`locomo` / `longmemeval_*` / `gatemem_office` / `beam_*` 一律 `dataset fetch` 到 `~/.membench/datasets/`。
    - `membench/.gitignore` 已忽略这些文件：**绝不**加入 git，也绝不让它们进入 skill 包（`skill/build_skill.py` 自带自检，混入即报错）。
 5. **改 CLI 要三处同步**：`cli.py` 的参数定义、`cli.py` 顶部 docstring 用法、`membench/README.md`；`skill/src/SKILL.md` 里有命令示例时同样同步。
-6. **`--shards` 的分片维度**：默认按题目分片（`i % N == shard_index`）。对「几乎每个对话都有题」的 ingest 密集型数据集（office / BEAM-1M），题目级分片会让每片仍对全部对话 ingest（成本 ×N）——用 `--shard-by dialogue`（整段对话归片、分片间不重复 ingest），再用 `fuse` 融合。两种维度都能融合，但**混维融合会被 fuse 拒绝**。
+6. **`--shards` 的分片维度**：默认按题目分片（`i % N == shard_index`）。对「几乎每个对话都有题」的 ingest 密集型数据集（office / BEAM-1M），题目级分片会让每片仍对全部对话 ingest（成本 ×N）——用 `--shard-by dialogue`（整段对话归片、分片间不重复 ingest），再用 `fuse` 融合。两种维度都能融合，但**混维融合会被 fuse 拒绝**。**多个分片共用同一个任务目录（`--task-dir`）时只允许 `--shard-by dialogue`**（题目级分片会让多片写同一对话目录并互相覆盖），题目级分片请各片各落一个实验目录再跨目录 `fuse`。
+7. **记忆快照默认启用**：每个对话在**全部 session ingest 完成后、第一道 query 之前**导出唯一一份到 `<对话目录>/memory_snapshot/`（框架写 `manifest.json`，适配器自己往该目录写内容；一个对话只导这一份，per-session 导出是没用的中间态）。适配器未声明快照能力时**警告一次并跳过**，`metrics["state_snapshot"]["role"] == "unsupported"`（此时 `manifest_sha256` / `format_version` 为 `null`，报告渲染成「不支持（适配器未声明快照能力）」而不是空值）；`--no-snapshot` 关闭（`--snapshot` 已删，不留兼容层）；回放模式自动不导出。对话级报告里给出 `../memory_snapshot/` 的可点击相对链接与清单条目数 / 体积——「跑完 ingest 就能翻记忆文件」是这个特性的第一价值，别把它藏进日志。
 
 ## skill 打包
 

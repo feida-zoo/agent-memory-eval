@@ -11,12 +11,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 from typing import Any, Iterable
 
 from .layout import (
+    DIR_SNAPSHOT,
     FIG_CATEGORY,
     FIG_CATEGORY_DIFF,
     FIG_LATENCY,
@@ -24,6 +26,7 @@ from .layout import (
     FILE_COMPARISON_MD,
     FILE_REPORT_MD,
 )
+from .snapshot import MANIFEST_NAME
 
 try:
     import matplotlib
@@ -266,6 +269,44 @@ METADATA_FIELD_ZH: dict[str, str] = {
 def metadata_label(key: str) -> str:
     """metadata 字段的中文标签。未知 key 原样返回。"""
     return METADATA_FIELD_ZH.get(key, str(key))
+
+
+#: ``state_snapshot.role`` -> 显示文案。``unsupported`` 是"请求了导出但适配器没声明快照
+#: 能力"，不是快照坏掉：渲染成 ``n/a`` / ``vNone`` 会被读成产物质损，这里如实写成一句话。
+SNAPSHOT_ROLE_ZH: dict[str, str] = {
+    "replayed": "回放（读取侧口径）",
+    "exported": "导出（本次为全量 run）",
+    "unsupported": "不支持（适配器未声明快照能力）",
+}
+
+
+def snapshot_role_display(role: Any) -> str:
+    """快照角色的显示文案；未知角色原样返回，缺失显示 ``n/a``。"""
+    if role is None or role == "":
+        return "n/a"
+    return SNAPSHOT_ROLE_ZH.get(str(role), str(role))
+
+
+def shard_scope_text(metrics: dict[str, Any]) -> "str | None":
+    """本片范围短标（``分片 1/2``）；不分片与 fuse 融合产物返回 None。
+
+    ``shard_index`` 为 None 表示这份产物不是某一分片而是**整场融合结果**（fuse 只记
+    分片总数）——它覆盖全部题目，标"仅覆盖部分题目"就成了假声明。
+    """
+    shards = metrics.get("shards")
+    index = metrics.get("shard_index")
+    if not isinstance(shards, int) or not isinstance(index, int) or shards <= 1:
+        return None
+    return f"分片 {index}/{shards}"
+
+
+def shard_note(metrics: dict[str, Any]) -> "str | None":
+    """分片产物的顶部标注文案；非分片产物返回 None（口径见 :func:`shard_scope_text`）。"""
+    scope = shard_scope_text(metrics)
+    if scope is None:
+        return None
+    by = str(metrics.get("shard_by") or "question")
+    return f"{scope}（按 {by}）——仅覆盖部分题目"
 
 
 # 验收基线（report.md 对照表）：(指标 key, 展示名「中文（英文 key）」, 目标描述, 判定函数)
@@ -619,6 +660,78 @@ def _md_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
+def _human_bytes(value: Any) -> "str | None":
+    """字节数的可读写法（``1.2 MB（1258291 字节）``）；非数值返回 None。"""
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return None
+    for unit, step in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if size >= step:
+            return f"{size / step:.1f} {unit}（{size} 字节）"
+    return f"{size} 字节"
+
+
+def _snapshot_entry(snapshot_dir: str) -> "dict[str, Any] | None":
+    """读快照清单的 ``entry`` 段；目录 / 清单缺失或损坏按"读不到"处理（返回 None）。
+
+    报告是只读消费者：清单不在只说明本次没有条目可写（``--no-snapshot``、适配器不
+    支持快照、回放读的是源 run 的快照），不能因此把整份报告写成错误。
+    """
+    try:
+        with open(os.path.join(snapshot_dir, MANIFEST_NAME), encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    entry = manifest.get("entry") if isinstance(manifest, dict) else None
+    return entry if isinstance(entry, dict) else None
+
+
+def _entry_counts(entry: dict[str, Any]) -> str:
+    """清单 ``entry`` 的规模简述：``3 session / 42 消息 / 14 题``（缺字段不写该段）。"""
+    parts = [
+        f"{entry[key]} {unit}"
+        for key, unit in (
+            ("n_sessions", "session"),
+            ("n_messages", "消息"),
+            ("n_questions", "题"),
+        )
+        if isinstance(entry.get(key), int)
+    ]
+    return " / ".join(parts)
+
+
+def dialogue_snapshot_rows(out_dir: str) -> list[list[str]]:
+    """对话级报告里的快照行：可点击的同目录相对链接 + 清单条目规模与体积。
+
+    「跑完 ingest 就能翻记忆文件」是快照的第一价值，因此只在磁盘上真实存在
+    ``<对话目录>/memory_snapshot/``（即报告目录 ``report/`` 的 ``../memory_snapshot/``）
+    时才给 markdown 链接——报告里不留打不开的相对路径。清单缺 ``entry`` 时只给目录
+    链接，不编条目数。
+
+    Args:
+        out_dir: 对话级报告目录（``<实验目录>/runs/<dataset>/<对话>/report``）。
+
+    Returns:
+        ``[[项目, 值], ...]``；该对话没有快照时返回空列表。
+    """
+    snapshot_dir = os.path.normpath(os.path.join(out_dir, os.pardir, DIR_SNAPSHOT))
+    if not os.path.isdir(snapshot_dir):
+        return []
+    rel = f"../{DIR_SNAPSHOT}/"
+    rows = [["本对话快照目录", f"[`{rel}`]({rel})"]]
+    entry = _snapshot_entry(snapshot_dir)
+    if entry is None:
+        return rows
+    counts = _entry_counts(entry)
+    if counts:
+        rows.append(["快照条目", counts])
+    size = _human_bytes(entry.get("bytes"))
+    if size:
+        rows.append(["快照体积", size])
+    return rows
+
+
 def _baseline_rows(overall: dict[str, Any]) -> list[list[str]]:
     rows = []
     for key, label, target, ok in BASELINES:
@@ -669,6 +782,14 @@ def write_run_report_md(
     lines: list[str] = []
     lines.append(f"# membench 评测报告 — {metrics.get('run_id', '')}")
     lines.append("")
+    # 分片产物：先说清"这份报告不是全量结论"，它的题目数只是本片的
+    shard_scope = shard_scope_text(metrics)
+    if shard_scope:
+        lines.append(
+            f"> 📌 **{shard_note(metrics)}**：本报告只覆盖本分片负责的对话与题目，"
+            "数据集级完整结论见 `fuse` 融合产物。"
+        )
+        lines.append("")
 
     # 0. 评测配置（硬需求：必须位于标题之后、正文第一段之前）
     lines.append("## 评测配置")
@@ -722,7 +843,11 @@ def write_run_report_md(
     lines.append(f"- {metadata_label('dataset')}: `{metrics.get('dataset', 'n/a')}`")
     lines.append(f"- {metadata_label('judge')}: `{metrics.get('judge', 'n/a')}`")
     lines.append(f"- {metadata_label('timestamp')}: {metrics.get('timestamp', 'n/a')}")
-    lines.append(f"- {metadata_label('n_questions')}: {overall.get('n_questions', len(records))}")
+    n_questions = str(overall.get("n_questions", len(records)))
+    if shard_scope:
+        # 分片产物：这个数字是**本片**的题数（不是整场），写清分母与完整结果的去向
+        n_questions += f"（{shard_scope}，总量见融合报告）"
+    lines.append(f"- {metadata_label('n_questions')}: {n_questions}")
     n_ignored = int(metrics.get("n_ignored", 0) or 0)
     if n_ignored:
         lines.append(f"- {metadata_label('n_ignored')}: {n_ignored}（ignore=true，未参与评分）")
@@ -874,10 +999,13 @@ def write_run_report_md(
     # 3.6 快照与回放（写入侧固定时必须在报告里说清，避免被当完整评测读）
     state = metrics.get("state_snapshot") or {}
     verify = metrics.get("replay_verify") or {}
-    if state or verify:
+    # 对话级报告额外给"去哪翻记忆文件"：磁盘上真实存在才给链接（见 dialogue_snapshot_rows）
+    snap_rows = dialogue_snapshot_rows(out_dir) if metrics.get("dialogue_id") else []
+    if state or verify or snap_rows:
         lines.append("## 快照与回放")
         lines.append("")
-        if state.get("role") == "replayed":
+        role = str(state.get("role") or "")
+        if role == "replayed":
             lines.append(
                 "> ⚠️ **本 run 为快照回放（写入侧固定）**：跳过 reset + ingest，"
                 "分数只覆盖**读取 / 检索 / 回答层**，不得与全量 run 直接对比"
@@ -885,21 +1013,35 @@ def write_run_report_md(
                 "的结论必须来自重新 ingest。"
             )
             lines.append("")
-        snapshot_rows = [
-            ["快照角色", {"replayed": "回放（读取侧口径）", "exported": "导出（本次为全量 run）"}.get(
-                str(state.get("role")), "n/a"
-            )],
-            ["快照根目录（`--replay` 入参）", f"`{state.get('root', 'n/a')}`"],
-            ["格式版本", f"v{state.get('format_version', 'n/a')}"],
-            ["清单 sha256（逐对话清单合并）", f"`{state.get('manifest_sha256', 'n/a')}`"],
-            ["对话数", str(state.get("n_dialogues", "n/a"))],
-        ]
-        if state.get("role") == "replayed":
-            snapshot_rows.append(["源 run", f"`{state.get('source_run', 'n/a')}`"])
-            snapshot_rows.append(["回放模式", str(state.get("replay_mode", "n/a"))])
+        snapshot_rows: list[list[str]] = []
+        if state:
+            snapshot_rows.append(["快照角色", snapshot_role_display(state.get("role"))])
+            if role == "unsupported":
+                # 适配器没声明快照能力：没有可回放的根目录、也没有格式版本与清单指纹，
+                # 空值会被读成"快照坏了"，故只给对话数与原因
+                snapshot_rows.append(["对话数", str(state.get("n_dialogues", "n/a"))])
+                snapshot_rows.append(
+                    [
+                        "说明",
+                        "适配器未声明快照能力，本 run 未导出快照、也无法用 `--replay` 免重跑 "
+                        "ingest；适配器实现 `snapshot()` 并让 `snapshot_capabilities()` 返回 "
+                        "supported 后即可导出（默认开启，不需要时用 `--no-snapshot` 关闭）。",
+                    ]
+                )
+            else:
+                snapshot_rows.append(["快照根目录（`--replay` 入参）", f"`{state.get('root', 'n/a')}`"])
+                if state.get("format_version") is not None:
+                    snapshot_rows.append(["格式版本", f"v{state['format_version']}"])
+                if state.get("manifest_sha256"):
+                    snapshot_rows.append(["清单 sha256（逐对话清单合并）", f"`{state['manifest_sha256']}`"])
+                snapshot_rows.append(["对话数", str(state.get("n_dialogues", "n/a"))])
+                if role == "replayed":
+                    snapshot_rows.append(["源 run", f"`{state.get('source_run', 'n/a')}`"])
+                    snapshot_rows.append(["回放模式", str(state.get("replay_mode", "n/a"))])
+        snapshot_rows.extend(snap_rows)
         lines.append(_md_table(["项目", "值"], snapshot_rows))
         lines.append("")
-        if state.get("role") == "exported":
+        if role == "exported":
             lines.append(
                 "改**读取侧**代码后可用 `--replay <快照根目录>`（数据集目录，或含它的"
                 "实验目录）免重跑 ingest；改写入侧（抽取 / 更新 / 去重）则必须重新 ingest。"
@@ -978,6 +1120,9 @@ def render_dialogue_report(
 
     对话的题目往往只有个位数，出图既没信息量又会把产物撑成两倍；整场评测的
     图表留给数据集级报告。因此这里也不引用图片，避免留下打不开的相对路径。
+    正文除六维指标外另给两件对话级专属信息：该对话的**记忆快照**（
+    ``../memory_snapshot/`` 的链接与清单条目规模，跑完 ingest 就能翻记忆文件），
+    以及分片产物（``shards > 1``）的"仅覆盖部分题目"标注。
     """
     os.makedirs(out_dir, exist_ok=True)
     return write_run_report_md(out_dir, records, metrics, with_figures=False)

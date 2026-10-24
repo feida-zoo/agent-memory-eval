@@ -3,6 +3,7 @@
 流程：
     plan_datasets 规划数据集清单（办公域槽位 + 按需下载公开集 + BEAM 槽位）
     -> 建一个实验目录 ``<report_out>/eval_<adapter>_<platform>_<ts>/``
+       （``task_dir`` 给定时容器即该已存在的任务目录，不再新建实验目录）
     -> 每个数据集用 Runner 各跑一次写进它的 ``runs/<dataset>/``
        （adapter 实例复用，reset 由 Runner 内部负责；write_task_reports=False）
     -> 读取各数据集 ``report/metrics.json``
@@ -742,6 +743,7 @@ def run_datasets(
     driver_llm: Union[str, None] = None,
     adapter_version: Union[str, None] = None,
     evidence_matcher: Any = None,
+    snapshot: Union[bool, None] = None,
 ) -> list[DatasetResult]:
     """对每个数据集用 Runner 各跑一次写进同一个实验目录，收集 metrics。
 
@@ -751,8 +753,11 @@ def run_datasets(
     故 Runner 传 ``write_task_reports=False``。
     jobs 透传给 Runner 的题目级并发参数。driver_llm / adapter_version 透传给
     Runner，记入每个 run 的元数据。evidence_matcher 为检索命中口径匹配器
-    （默认 substring）。
+    （默认 substring）。snapshot 默认 None = 用 Runner 的默认（导出对话状态快照），
+    显式 False 才关掉（不传该参数时按 Runner 默认处理，别把 None 当成"不导出"）。
     """
+    # snapshot=None 表示"不表态"，交给 Runner 的默认值（导出）；显式值才透传
+    snapshot_kwarg: dict[str, Any] = {} if snapshot is None else {"snapshot": snapshot}
     results: list[DatasetResult] = []
     for spec in specs:
         print(f"[membench] ===== 评测数据集: {spec.name} ({spec.path}) =====")
@@ -769,6 +774,7 @@ def run_datasets(
             adapter_version=adapter_version,
             evidence_matcher=evidence_matcher,
             write_task_reports=False,
+            **snapshot_kwarg,
         )
         run_dir = runner.run()
         if run_dir is None:
@@ -1226,6 +1232,8 @@ def evaluate(
     driver_llm: Union[str, None] = None,
     adapter_version: Union[str, None] = None,
     evidence_matcher: Any = None,
+    task_dir: Union[str, None] = None,
+    snapshot: Union[bool, None] = None,
 ) -> int:
     """执行全量评估：一个实验目录承载全部数据集 + 宏平均融合 + 门禁 + 报告。
 
@@ -1253,10 +1261,23 @@ def evaluate(
         adapter_version: 适配器实现版本标识，透传给每个 run 的元数据（默认 None）。
         evidence_matcher: 检索命中口径匹配器（默认 substring；CLI 以
             ``--evidence-match`` 构造后注入）。
+        task_dir: **就地模式**：本次实验目录就是这个已存在的任务目录——各数据集直接
+            写进 ``<task_dir>/runs/``、任务级报告写 ``<task_dir>/reports/``，
+            不新建 ``eval_*`` 目录。与 ``report_out`` 互斥。
+        snapshot: 是否导出对话状态快照。None（缺省）= 用 Runner 默认（导出）；
+            False = 关闭（``--no-snapshot``），透传到每个数据集的 Runner。
 
     Returns:
         进程退出码：门禁 FAIL 为 1，否则 0（与 compare 一致）。
     """
+    if task_dir is not None:
+        if report_out is not None:
+            raise SystemExit("evaluate 的 task_dir 与 report_out 互斥：就地写进任务目录时不再给父目录")
+        if not os.path.isdir(task_dir):
+            raise SystemExit(
+                f"任务目录不存在: {task_dir}；"
+                "请先运行 python -m membench.cli task init --name <NAME> 建任务目录"
+            )
     if from_runs and specs is None and (quick or beam_10m or no_beam or no_lme_s):
         raise SystemExit("--from-runs 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）互斥")
 
@@ -1338,10 +1359,15 @@ def evaluate(
         )
 
     now = datetime.now()
-    experiment_dir = layout.experiment_path(
-        report_out, layout.eval_subdir(adapter_name, platform, layout.ts_now(now))
-    )
-    print(f"[membench] 实验目录: {experiment_dir}")
+    if task_dir is not None:
+        # 就地：本次实验目录就是该任务目录（不新建 eval_*），各数据集落它的 runs/
+        experiment_dir = os.path.abspath(task_dir)
+        print(f"[membench] 任务目录: {experiment_dir}")
+    else:
+        experiment_dir = layout.experiment_path(
+            report_out, layout.eval_subdir(adapter_name, platform, layout.ts_now(now))
+        )
+        print(f"[membench] 实验目录: {experiment_dir}")
 
     # 复用的产物并入本次实验目录：报告与 run 数据就近归属，实验目录可整体搬移
     provided_by_key: dict[str, DatasetResult] = {}
@@ -1370,6 +1396,7 @@ def evaluate(
             driver_llm=driver_llm,
             adapter_version=adapter_version,
             evidence_matcher=evidence_matcher,
+            snapshot=snapshot,
         ):
             provided_by_key[r.spec.key] = r
 

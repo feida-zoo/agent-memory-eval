@@ -75,6 +75,7 @@ def test_layout_constants_are_single_source() -> None:
         layout.FILE_RESULTS,
         layout.FILE_SUMMARY,
         layout.FILE_MATRIX_RESULT,
+        layout.FILE_SHARDS,
     ) == (
         "report.md",
         "comparison.md",
@@ -82,6 +83,7 @@ def test_layout_constants_are_single_source() -> None:
         "results.jsonl",
         "evaluate_summary.json",
         "matrix_result.json",
+        "shards.json",
     )
     assert (
         layout.FIG_CATEGORY,
@@ -197,6 +199,9 @@ def test_path_helpers_build_expected_tree(tmp_path: Path) -> None:
         exp / "runs" / "office" / "d_001" / "memory_snapshot"
     )
     assert layout.task_report_dir(str(exp)) == str(exp / "reports")
+    assert layout.shard_ledger_path(str(exp), "office") == str(
+        exp / "runs" / "office" / layout.FILE_SHARDS
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +235,64 @@ def test_experiment_path_defaults_to_output_root(tmp_path: Path, monkeypatch: py
     exp = Path(layout.experiment_path(None, layout.matrix_subdir(ts="20260101-120000")))
     assert exp.parent == root
     assert exp.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# 任务目录：命名、骨架与守卫
+# ---------------------------------------------------------------------------
+
+
+def test_task_subdir_reuses_single_arm_and_two_arm_naming() -> None:
+    """task_subdir：arms==2 就是 compare_*，arms==1 就是 eval_*（任务目录命名只有一个来源）。"""
+    assert layout.task_subdir("a1_vs_b1", "wx", ts="20260101-120000") == layout.compare_subdir(
+        "a1_vs_b1", "wx", ts="20260101-120000"
+    )
+    assert layout.task_subdir(
+        "mock-strong", "wx", arms=1, ts="20260101-120000"
+    ) == layout.eval_subdir("mock-strong", "wx", ts="20260101-120000")
+    with pytest.raises(ValueError, match="arms"):
+        layout.task_subdir("x", arms=3)
+
+
+def test_init_task_dir_skeleton_and_non_empty_guard(tmp_path: Path) -> None:
+    """双臂任务建 A/ B/ reports/，单臂任务建 runs/ reports/；非空目录拒绝复用。"""
+    base = tmp_path / "output"
+    task = Path(layout.init_task_dir(str(base), "a1_vs_b1", "wx", arms=2, ts="20260101-120000"))
+    assert task.is_absolute() and task.name == "compare_a1_vs_b1_wx_20260101-120000"
+    assert sorted(p.name for p in task.iterdir()) == ["A", "B", "reports"]
+    assert layout.arm_dir(str(task), layout.DIR_ARM_A) == str(task / "A")
+    assert layout.arm_dir(str(task), layout.DIR_ARM_B) == str(task / "B")
+    with pytest.raises(ValueError, match="arm"):
+        layout.arm_dir(str(task), "C")
+
+    single = Path(
+        layout.init_task_dir(str(base), "mock-strong", "wx", arms=1, ts="20260101-120000")
+    )
+    assert single.name == "eval_mock-strong_wx_20260101-120000"
+    assert sorted(p.name for p in single.iterdir()) == ["reports", "runs"]
+
+    # 已有骨架（非空）的任务目录拒绝复用：上一场评测的现场不被覆盖
+    with pytest.raises(SystemExit, match="非空"):
+        layout.init_task_dir(str(base), "a1_vs_b1", "wx", arms=2, ts="20260101-120000")
+
+    # 校验阶段失败留下的空目录可以复用（与 experiment_path 同一套守卫语义）
+    (base / layout.task_subdir("empty-task", "wx", arms=1, ts="20260101-130000")).mkdir(
+        parents=True
+    )
+    reused = layout.init_task_dir(str(base), "empty-task", "wx", arms=1, ts="20260101-130000")
+    assert reused == str(base / "eval_empty-task_wx_20260101-130000")
+    assert sorted(p.name for p in Path(reused).iterdir()) == ["reports", "runs"]
+
+
+def test_init_task_dir_defaults_to_output_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """base 缺省时落 MEMBENCH_OUTPUT_DIR（默认产物根的唯一入口）。"""
+    root = tmp_path / "custom-root"
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(root))
+    task = Path(layout.init_task_dir(None, "x", arms=1, ts="20260101-120000"))
+    assert task.parent == root
+    assert task.name == "eval_x_default_20260101-120000"
 
 
 # ---------------------------------------------------------------------------

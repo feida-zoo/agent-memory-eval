@@ -8,6 +8,7 @@ A/B 没有现成入口——本模块补齐：逐数据集 diff + 跨数据集�
     plan_datasets（复用 evaluate.plan_datasets，与 evaluate 一致的数据集清单）
     -> 建对比实验目录 ``<report_out>/compare_<name>_<platform>_<ts>/``，其下
        ``A/``（基线）、``B/``（候选）各是一个完整 eval 实验形态（runs/ + reports/）
+       （``task_dir`` 给定时容器即该已存在的任务目录，不新建 ``compare_*``）
     -> 每个数据集分别用 baseline / candidate 两个 adapter 各跑一次 Runner
        （write_task_reports=False，直接落进该侧的 ``runs/<dataset>/``）
     -> 逐数据集 diff（精度复用 :mod:`membench.compare` 的 _diff_overall / 门禁）
@@ -233,18 +234,18 @@ def _single_source_experiment(raw_runs: Union[dict[str, str], None]) -> Union[st
 
 
 def _stage_side_dir(
-    compare_dir: str,
+    container_dir: str,
     arm_label: str,
     provided: dict[str, DatasetResult],
     raw_runs: Union[dict[str, str], None],
 ) -> dict[str, DatasetResult]:
-    """把该侧复用的产物摆进 ``<compare_dir>/<arm_label>/``，返回重定位后的结果。
+    """把该侧复用的产物摆进 ``<container_dir>/<arm_label>/``，返回重定位后的结果。
 
     入参同为一个已存在的实验目录时整树复制（该侧的 ``runs/`` 与 ``reports/``
     一并带过来）；其余情形逐个把数据集产物并入该侧目录的 ``runs/`` 下。产物本就
     在该侧目录内时不做复制。
     """
-    side_dir = os.path.join(compare_dir, arm_label)
+    side_dir = layout.arm_dir(container_dir, arm_label)
     source_exp = _single_source_experiment(raw_runs)
     staged: dict[str, DatasetResult] = {}
     if source_exp:
@@ -572,6 +573,8 @@ def evaluate_compare(
     stale_threshold: float = 0.02,
     latency_warn: float = 0.30,
     evidence_matcher: Any = None,
+    task_dir: Union[str, None] = None,
+    snapshot: Union[bool, None] = None,
 ) -> dict[str, Any]:
     """两组（baseline vs candidate）× 多数据集融合 A/B 对比。
 
@@ -601,11 +604,28 @@ def evaluate_compare(
         stale_threshold: stale_rate 允许最大上升（融合 diff 维度）。
         latency_warn: latency_p95 相对上升告警比例（融合 diff 维度）。
         evidence_matcher: 检索命中口径匹配器（默认 substring）。
+        task_dir: **就地模式**：输出容器就是这个已存在的任务目录——两臂分别写
+            ``<task_dir>/A`` ``<task_dir>/B``，对比报告与两张对比图写
+            ``<task_dir>/reports/``，不新建 ``compare_*`` 目录。与 ``report_out`` 互斥。
+        snapshot: 是否导出对话状态快照。None（缺省）= 用 Runner 默认（导出）；
+            False = 关闭（``--no-snapshot``），逐侧透传到每个数据集的 Runner。
 
     Returns:
         ``{"compare_dir", "verdict", "gates", "fused_diffs", "per_dataset",
-        "fused_baseline", "fused_candidate"}``。
+        "fused_baseline", "fused_candidate"}``；``compare_dir`` 指向本次输出容器
+        （新建的 ``compare_<name>_<platform>_<ts>`` 实验目录，或就地模式下的
+        ``task_dir``）。
     """
+    if task_dir is not None:
+        if report_out is not None:
+            raise SystemExit(
+                "evaluate-compare 的 task_dir 与 report_out 互斥：就地写进任务目录时不再给父目录"
+            )
+        if not os.path.isdir(task_dir):
+            raise SystemExit(
+                f"任务目录不存在: {task_dir}；"
+                "请先运行 python -m membench.cli task init --name <NAME> --arms 2"
+            )
     if (
         (baseline_runs or candidate_runs)
         and specs is None
@@ -712,15 +732,19 @@ def evaluate_compare(
         evidence_matcher,
     )
 
-    # 产物落 <report_out>/compare_<name>_<platform>_<ts>/
+    # 产物落 <report_out>/compare_<name>_<platform>_<ts>/；就地模式则落给定的任务目录
     now = datetime.now()
-    compare_dir = layout.experiment_path(
-        report_out,
-        layout.compare_subdir(
-            tag or f"{baseline_name}_vs_{candidate_name}", dir_platform, layout.ts_now(now)
-        ),
-    )
-    print(f"[membench] 对比实验目录: {compare_dir}")
+    if task_dir is not None:
+        compare_dir = os.path.abspath(task_dir)
+        print(f"[membench] 任务目录（就地）: {compare_dir}")
+    else:
+        compare_dir = layout.experiment_path(
+            report_out,
+            layout.compare_subdir(
+                tag or f"{baseline_name}_vs_{candidate_name}", dir_platform, layout.ts_now(now)
+            ),
+        )
+        print(f"[membench] 对比实验目录: {compare_dir}")
 
     # A/B 两侧各摆成完整 eval 实验形态（产物齐备与身份预检已在上方做完，再复制 / 补跑）
     baseline_provided = _stage_side_dir(compare_dir, DIR_ARM_A, baseline_provided, baseline_runs)
@@ -736,7 +760,7 @@ def evaluate_compare(
         driver_llm_value: Union[str, None],
         adapter_version_value: Union[str, None],
     ) -> list[DatasetResult]:
-        side_dir = os.path.join(compare_dir, arm_label)
+        side_dir = layout.arm_dir(compare_dir, arm_label)
         by_key = dict(provided)
         for spec in specs:
             if spec.key in provided:
@@ -752,6 +776,7 @@ def evaluate_compare(
             driver_llm=driver_llm_value,
             adapter_version=adapter_version_value,
             evidence_matcher=evidence_matcher,
+            snapshot=snapshot,
         ):
             by_key[r.spec.key] = r
         out: list[DatasetResult] = []
@@ -863,14 +888,14 @@ def evaluate_compare(
         per_dataset_verdict = "SKIP"
 
     # 产物落位：A/B 两侧各写一份任务级 reports/（该侧自身就是一个完整 eval 实验形态），
-    # 对比报告与两张对比图写对比实验目录的 reports/。
+    # 对比报告与两张对比图写输出容器的 reports/（就地模式下即任务目录的）。
     _check_plt()
     for arm_label, arm_name, side_results, side_platform, side_fused in (
         (DIR_ARM_A, baseline_name, baseline_results, platform_a, fused_baseline),
         (DIR_ARM_B, candidate_name, candidate_results, platform_b, fused_candidate),
     ):
         write_task_reports(
-            os.path.join(compare_dir, arm_label),
+            layout.arm_dir(compare_dir, arm_label),
             adapter_name=arm_name,
             judge_name=judge_name,
             platform=side_platform,
@@ -924,7 +949,7 @@ def evaluate_compare(
 
 
 def _write_evaluate_compare_report(
-    compare_dir: str,
+    container_dir: str,
     baseline_name: str,
     candidate_name: str,
     judge_name: str,
@@ -944,7 +969,7 @@ def _write_evaluate_compare_report(
     extra_notes: list[str] | None = None,
     comparability_findings: list[dict[str, Any]] | None = None,
 ) -> str:
-    """生成对比实验目录 ``reports/`` 下的 ``comparison.md``（中文）。
+    """生成输出容器 ``reports/`` 下的 ``comparison.md``（中文）。
 
     ``comparability_findings`` 非空时：抬头给一行汇总，并在「门禁明细」后附
     「两侧可比性（逐数据集）」小节（逐数据集列出关键不一致 / 关键缺失 / 次要差异，
@@ -1337,7 +1362,7 @@ def _write_evaluate_compare_report(
     lines.append("")
 
     out_path = os.path.join(
-        layout.task_report_dir(compare_dir), layout.FILE_COMPARISON_MD
+        layout.task_report_dir(container_dir), layout.FILE_COMPARISON_MD
     )
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))

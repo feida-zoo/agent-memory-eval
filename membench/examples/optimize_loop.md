@@ -46,8 +46,24 @@ python -m membench.cli run --adapter my-system \
 # 产物: output/eval_my-system_default_<ts>/
 #   ├── runs/sample_dataset/
 #   │   ├── report/{report.md, metrics.json, results.jsonl, fig_*.png}    # 数据集级
-#   │   └── <dialogue_id>/{report/, runtime/}                             # 对话级（report/ 不出图）
+#   │   ├── shards.json                                                   # 分片账本（分片跑才有）
+#   │   └── <dialogue_id>/{report/, runtime/, memory_snapshot/}            # 对话级（report/ 不出图）
 #   └── reports/{report.md, metrics.json, fig_*.png}                      # 任务级
+```
+
+**记忆快照默认导出**：每个对话 ingest 完成后、第一道 query 之前落一份到
+`<对话目录>/memory_snapshot/`（框架另写 `manifest.json`）——**跑完 ingest 就能翻记忆文件**：
+对话级 `report.md` 里有 `../memory_snapshot/` 的可点击链接与清单条目数 / 体积，不用自己拼路径。
+适配器没声明快照能力时会警告一次并跳过（评测照常完成）；不需要用 `--no-snapshot` 关闭。
+
+大数据集分片跑时，先建任务目录再让各片写进去，最后就地补齐（`task status` 随时看进度）：
+
+```bash
+TASK=$(python -m membench.cli task init --name office --arms 1 --report-out output/)   # stdout 只有路径
+python -m membench.cli run --adapter my-system --dataset <大数据集> \
+    --task-dir "$TASK" --shards 4 --shard-index 0 --shard-by dialogue    # 各片共享目录只用 dialogue 分片
+# ... --shard-index 1..3；分片只写本片对话目录 + runs/<dataset>/shards.json 账本
+python -m membench.cli fuse --task-dir "$TASK"        # 补齐数据集级与任务级产物（指标重算 + 门禁）
 ```
 
 基线读的是数据集级报告目录 `runs/sample_dataset/report/`：
@@ -126,6 +142,15 @@ python -m membench.cli compare \
 #   ├── A/  B/             # 各为完整实验形态（自己的 runs/ 与 reports/）
 #   └── reports/           # comparison.md + fig_metric_diff.png + fig_category_diff.png
 # 自定义门禁阈值：--acc-threshold 0.02 --stale-threshold 0.02 --latency-warn 0.30
+
+# 大数据集分片做 A/B：任务目录里就地跑两侧、就地出报告（A/B 两臂落在同一棵树下）
+TASK=$(python -m membench.cli task init --name update-on-ingest --arms 2 --report-out output/)
+python -m membench.cli run --adapter my-system --dataset <大数据集> \
+    --task-dir "$TASK/A" --shards 4 --shard-index 0 --shard-by dialogue   # A = 基线；各片共享目录只用 dialogue 分片
+python -m membench.cli run --adapter my-system --dataset <大数据集> \
+    --task-dir "$TASK/B" --shards 4 --shard-index 0 --shard-by dialogue   # B = 候选（其余分片同理）
+python -m membench.cli fuse --task-dir "$TASK/A" && python -m membench.cli fuse --task-dir "$TASK/B"
+python -m membench.cli compare --task-dir "$TASK" --require-comparable   # comparison.md 落 $TASK/reports/
 ```
 
 - **消融纪律**：`compare` 只测差异，**不判定**两组是否只差一个变量。你必须自己固定模型 / harness / 数据集，只切优化开关；否则 diff 无法归因。
@@ -216,6 +241,8 @@ python -m membench.cli run --adapter my-system --dataset <数据集> \
 ## 9. 常见坑
 
 - **数据集变了但没重跑基线**：compare 假设两次 run 同数据集同判分器，否则 diff 无意义。现在有 `--require-comparable` 会机检数据集指纹等关键维度，能在跑之前就拦下这类错误。
+- **拿分片产物当完整实验**：分片只落本片负责的对话目录 + 账本 `runs/<dataset>/shards.json`，数据集级报告与任务级 `reports/` 由 `fuse --task-dir <任务目录>`（或跨目录 `fuse --runs ... --out ...`）补齐；未融合的分片产物直接拿去 `compare` 会被明确拒绝。
+- **把分片报告的题目数当整场**：分片产物的对话级报告顶部标了「分片 i/N（按 dialogue|question）——仅覆盖部分题目」，题目数写成 `14（分片 i/N，总量见融合报告）`——引用分数时要用融合产物。
 - **换了驱动/判分模型却没记账**：用 `--driver-llm` / `--judge llm --llm-model` 把模型标识落进元数据，否则"分数涨了"可能只是换了个更强的模型。
 - **多变量同改**：accuracy 涨了却不知道是哪一处生效。
 - **只看 accuracy**：stale_rate、abstention、latency 的退化同样致命，交给门禁。
