@@ -523,17 +523,29 @@ def plan_replay(
     same_version = snap_version == str(caps.get("format_version", 1))
 
     def _restore_ok() -> bool:
-        return same_version or compatible
+        """``restore`` 只接受**当前**格式版本；跨版本一律走 rebuild 的迁移路径。"""
+        return same_version
+
+    def _rebuild_ok() -> bool:
+        """``rebuild`` 接受当前版本，或 ``compatible_from`` 窗口内的旧版本。"""
+        return bool(caps.get("rebuild")) and (same_version or compatible)
 
     if requested_mode == "restore" and not _restore_ok():
+        hint = "（该格式在 rebuild 窗口内，改用 rebuild）" if _rebuild_ok() else "，请重新导出快照"
         raise SystemExit(
-            f"快照格式 v{snap_version} 与当前适配器 v{caps.get('format_version')} 不兼容，"
-            "无法 --replay-mode restore（改用 rebuild 或重新导出快照）"
+            f"快照格式 v{snap_version} 不是当前适配器版本 v{caps.get('format_version')}："
+            f"--replay-mode restore 只接受当前格式版本{hint}"
         )
-    if requested_mode == "rebuild" and not caps.get("rebuild"):
+    if requested_mode == "rebuild" and not _rebuild_ok():
+        if not caps.get("rebuild"):
+            raise SystemExit(
+                "适配器未声明 rebuild 能力，无法 --replay-mode rebuild"
+                "（仅声明了 restore，或需要先用当前版本重新导出快照）"
+            )
         raise SystemExit(
-            "适配器未声明 rebuild 能力，无法 --replay-mode rebuild"
-            "（仅声明了 restore，或需要先用当前版本重新导出快照）"
+            f"快照格式 v{snap_version} 不在 rebuild 窗口 "
+            f"{caps.get('compatible_from') or []} 内（当前 v{caps.get('format_version')}）："
+            "无法 --replay-mode rebuild，请用当前版本重新导出快照"
         )
 
     if requested_mode == "rebuild":
@@ -542,13 +554,19 @@ def plan_replay(
         mode = "restore"
     elif _restore_ok() and caps.get("restore"):
         mode = "restore"
-    elif caps.get("rebuild"):
+    elif _rebuild_ok():
         mode = "rebuild"
-    else:
+    elif not caps.get("rebuild"):
         raise SystemExit(
             f"快照格式 v{snap_version} 与当前适配器 v{caps.get('format_version')} 不兼容，"
             "且适配器未声明 rebuild 能力：该改动必须重新 ingest（快照回放只能覆盖"
             "读取侧；派生结构/存储结构变更需要系统提供 rebuild，或重跑）"
+        )
+    else:
+        raise SystemExit(
+            f"快照格式 v{snap_version} 不在 rebuild 窗口 "
+            f"{caps.get('compatible_from') or []} 内（当前 v{caps.get('format_version')}）："
+            "无法回放，请用当前版本重新导出快照"
         )
     return {
         "root": root_label,

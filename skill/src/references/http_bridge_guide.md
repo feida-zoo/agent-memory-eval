@@ -2,27 +2,44 @@
 
 适用于被测 Agent 的源码**不是 Python**、且记忆能力是**库内能力、没有独立服务**的情况
 （典型：Electron 主进程的 TS 记忆模块、Node/Electron 桌面应用）。
-做法是写一个极薄的 **HTTP bridge** 把库内能力暴露成三端点，再用 membench 内置
+做法是写一个极薄的 **HTTP bridge** 把库内能力暴露成 REST 端点，再用 membench 内置
 `HttpAdapter` 跑评测。跑之前用 `doctor.check_target` 自检契约。
 
-要点：**协议只有三个端点**，桥的难点全在"与协议无关的工程问题"（打包、stub 宿主、原生依赖、常量）。
-可直接复制的模板见 `membench/examples/http_bridge_node/`。
+要点：**必需协议只有三个端点**（`/reset` `/ingest` `/query`），另有五个可选端点
+（快照组 4 + 自描述 1，缺失即视为不支持）；桥的难点全在"与协议无关的工程问题"
+（打包、stub 宿主、原生依赖、常量）。可直接复制的模板见
+`membench/examples/http_bridge_node/`。
 
-## 三端点契约（bridge 必须实现）
+## 端点契约
+
+### 必需（三个）
 
 | 端点 | 请求体 | 响应（最少） | 说明 |
 |---|---|---|---|
 | `POST /reset` | `{}` 或 `{"run_dir","dialogue_id","dialogue_index"}`（可选提示；`run_dir` = **该对话的目录** `<实验目录>/runs/<dataset>/<对话目录>`） | 2xx 即可（体可空） | 真清空记忆库（向量 collection / 事实表 / 情景缓冲 / 图谱），测试库与生产库隔离；上下文只用于"清空前快照"等回溯能力，可忽略 |
 | `POST /ingest` | `{"messages":[{"role","content","timestamp"}]}` | `{"input_tokens":int,"llm_calls":int,"latency_ms":float}` | 走**记忆写入路径**；拿不到 token/调用数填 `0`（报告标「未上报」） |
 | `POST /query` | `{"question":str}` | `{"answer":str,"retrieved":[str],...}` | 走**记忆读取+回答**；`retrieved` 填实际注入 prompt 的**记忆原文**，注入即口径（优先级顺序、多轮检索先合并去重、报全量，见下方常见坑）；`input_tokens`/`output_tokens` 填了才会进「Token 消耗」账 |
-| `POST /snapshot-capabilities`（可选） | `{}` | `{"supported":true,"restore":true,"rebuild":false,"format_version":1}` | 声明快照能力；老桥缺该端点 → 框架按不支持处理 |
-| `POST /snapshot`（可选） | `{"target_dir","tag"}` | `{"items":int}` | 把当前记忆整体导出到 target_dir（普通 run 传该对话的 `memory_snapshot/`，回放时传任务级快照池里的临时目录；**内容与布局由桥决定**，模板 = `memory/` + 标记文件） |
-| `POST /restore`（可选） | `{"source_dir","tag"}` | `{"restored":true}` | 从快照恢复；**只认带标记文件的快照**，并重建进程内实例（只换磁盘不重建缓存等于没恢复） |
+
+### 可选（五个；缺失即视为不支持，不报错、不中断评测）
+
+| 端点 | 请求体 | 响应（最少） | 说明 |
+|---|---|---|---|
+| `POST /snapshot-capabilities` | `{}` | `{"supported":true,"restore":true,"rebuild":true,"format_version":1,"compatible_from":[1]}` | 声明快照能力；老桥缺该端点 → 框架按不支持处理 |
+| `POST /snapshot` | `{"target_dir","tag"}` | `{"items":int}` | 把当前记忆整体导出到 target_dir（普通 run 传该对话的 `memory_snapshot/`，回放时传任务级快照池里的临时目录；**内容与布局由桥决定**，模板 = `memory/` + 标记文件） |
+| `POST /restore` | `{"source_dir","tag"}` | `{"restored":true}` | **只接受当前 `format_version`**；从快照恢复并重建进程内实例（只换磁盘不重建缓存等于没恢复） |
+| `POST /rebuild` | `{"source_dir","tag"}` | `{"ok":true,"mode":"rebuild","format_version":int}` | 接受 `compatible_from` 列出的旧版本，拿快照**源数据**重建派生结构（索引 / 向量 / 摘要 / 缓存）；窗口外必须返回 4xx + `{"error"}`，不静默降级 |
+| `POST /describe` | `{}` | `{"bridge":str,"bridge_version":... ,"memory_module":str,"format_version":int,...}` | 桥与记忆模块自描述；原样进 `metrics.adapter_describe`，**不参与评分**；老桥缺该端点 → `HttpAdapter.describe()` 返回 `{}` |
+
+`/restore` 与 `/rebuild` 的分工：restore 只在快照格式与当前代码兼容时用（直接把状态
+放回去）；rebuild 读快照里的源数据、用当前代码的构建路径重建派生结构，所以存储结构 /
+schema 变了也能回放，且不必重跑 LLM 抽取。框架的 `plan_replay` 依赖桥的明确拒绝：
+窗口外版本若静默成功，"回放"就变成了不可归因的假结果。
 
 - `Content-Type: application/json`；如果服务要求鉴权，客户端用 `api_key` 时发
   `Authorization: Bearer <key>`，bridge 侧做对应校验即可。
 - `latency_ms` 可由 bridge 实测，也可留空——`HttpAdapter` 本地用 `perf_counter` 兜底。
-- 契约源码以 `membench/membench/adapters/http.py` 为准；自检判据见下节。
+- 契约源码以 `membench/membench/adapters/http.py` 为准；自检判据见下节（`doctor`
+  只探测三个必需端点）。
 
 ## checklist
 
@@ -80,7 +97,13 @@
   （`state_snapshot.role=unsupported`，报告渲染成「不支持（适配器未声明快照能力）」），
   不需要快照用 `--no-snapshot` 关闭。
 - **快照回放要"真恢复"**：`/restore` 必须把记忆库换回快照那一刻（含内存里的索引/缓存），
-  并拒绝不认识的目录（防误传路径把库清空）；回放模式下框架不再调 `/reset`、`/ingest`。
+  只接受当前格式版本，并拒绝不认识的目录（防误传路径把库清空）；回放模式下框架不再调
+  `/reset`、`/ingest`。
+- **`/rebuild` 要真重建**：只把快照里的源数据落回数据目录，派生结构（索引 / 向量 / 摘要 /
+  缓存）由当前代码的构建路径重新生成；`compatible_from` 窗口外的版本返回 4xx + `{"error"}`，
+  别假装成功——框架的模式协商依赖这个明确拒绝。
+- **`/describe` 是可选信息**：返回桥 / 记忆模块的版本与配置即可；取不到就只回静态字段，
+  不要为了自描述阻断启动（它不进评分，也不影响可比性）。
 - `reset` 只清会话不清记忆库 → 跨 dialogue 串扰，`single_hop` 异常高、`abstention` 异常低。
 
 ### 6. 自检：`doctor.check_target`
@@ -93,9 +116,9 @@ result = check_target("http://127.0.0.1:8787", timeout=10.0, api_key=None)
 #            "checks": [{"name","status","detail"}, ...]}   # 顺序 reset/ingest/query
 ```
 
-- 顺序探测三端点：`/reset`、`/ingest` 2xx 即 PASS（`/ingest` 若返回 JSON dict，额外校验
+- 顺序探测**三个必需端点**：`/reset`、`/ingest` 2xx 即 PASS（`/ingest` 若返回 JSON dict，额外校验
   `input_tokens`/`llm_calls` 为数值，缺失可接受）；`/query` 须 2xx + JSON dict + 字符串 `answer`，
-  `retrieved` 若出现（且非 null）必须是字符串列表。
+  `retrieved` 若出现（且非 null）必须是字符串列表。可选端点不在自检范围内。
 - **单端点失败不抛异常**：网络错误/超时/非 2xx/非 JSON 都记 `FAIL`，`detail` 可直接定位
   （`HTTP 404` / `响应非 JSON` / `缺少 answer 字段` / `retrieved 必须是字符串列表`）。
 - `/reset` 失败**不短路**后续端点（接入方常把 reset 做成可选），故 `SKIP` 当前不产出。
@@ -114,7 +137,7 @@ result = check_target("http://127.0.0.1:8787", timeout=10.0, api_key=None)
 
 | checklist 项 | 模板位置 |
 |---|---|
-| 三端点 + 挂点 | `membench/examples/http_bridge_node/bridge.mjs`（顶部 import 为挂点） |
+| 三必需端点 + 五可选端点 + 挂点 | `membench/examples/http_bridge_node/bridge.mjs`（顶部 import 为挂点） |
 | 打包 / alias / external / define | `membench/examples/http_bridge_node/build.mjs` |
 | 宿主 stub | `membench/examples/http_bridge_node/stubs/electron.mjs`、`stubs/i18n.mjs` |
 | 依赖与脚本 | `membench/examples/http_bridge_node/package.json` |

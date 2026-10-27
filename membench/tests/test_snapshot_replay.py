@@ -51,12 +51,15 @@ class _FileMemoryAdapter(BaseMemoryAdapter):
         format_version: int = 1,
         support_restore: bool = True,
         support_rebuild: bool = False,
+        compatible_from: list[int] | None = None,
         answer_suffix: str = "",
     ) -> None:
         self.data_dir = Path(data_dir)
         self.format_version = format_version
         self.support_restore = support_restore
         self.support_rebuild = support_rebuild
+        # rebuild 窗口：默认只有当前版本；声明跨版本重建时由用例显式列出旧版本
+        self.compatible_from = list(compatible_from or [format_version])
         self.answer_suffix = answer_suffix  # 改读取侧：答案加后缀（模拟代码变更）
 
     # ---- 三动词契约 ----
@@ -90,7 +93,7 @@ class _FileMemoryAdapter(BaseMemoryAdapter):
             "restore": self.support_restore,
             "rebuild": self.support_rebuild,
             "format_version": self.format_version,
-            "compatible_from": [self.format_version],
+            "compatible_from": list(self.compatible_from),
         }
 
     def snapshot(self, target_dir: str, tag: str) -> dict:
@@ -518,14 +521,17 @@ def test_replay_incompatible_format_needs_rebuild(tmp_path: Path) -> None:
 
 
 def test_replay_incompatible_format_with_rebuild(tmp_path: Path) -> None:
-    """声明了 rebuild → 自动走 replay-rebuild（派生/结构变更的通道）。"""
+    """声明了 rebuild 且旧版本在窗口内 → 自动走 replay-rebuild（派生/结构变更的通道）。"""
     source_dataset = _full_run(tmp_path, name="src", snapshot=True)
     replay_dataset = _replay_run(
         tmp_path,
         name="replay",
         replay=source_dataset,
         adapter=_FileMemoryAdapter(
-            tmp_path / "mem-replay", format_version=2, support_rebuild=True
+            tmp_path / "mem-replay",
+            format_version=2,
+            support_rebuild=True,
+            compatible_from=[1, 2],
         ),
         verify_source=source_dataset,
     )
@@ -533,6 +539,43 @@ def test_replay_incompatible_format_with_rebuild(tmp_path: Path) -> None:
     assert metrics["run_mode"] == "replay-rebuild"
     assert metrics["state_snapshot"]["replay_mode"] == "rebuild"
     assert metrics["replay_verify"]["n_answer_diff"] == 0
+
+
+def test_replay_old_format_outside_rebuild_window_rejected(tmp_path: Path) -> None:
+    """rebuild 声明了，但源版本不在 ``compatible_from`` 窗口内 → 跑前拒绝。"""
+    source_dataset = _full_run(tmp_path, name="src", snapshot=True)
+    with pytest.raises(SystemExit, match="不在 rebuild 窗口"):
+        Runner(
+            _FileMemoryAdapter(
+                tmp_path / "mem-replay",
+                format_version=3,
+                support_rebuild=True,
+                compatible_from=[2, 3],
+            ),
+            str(tmp_path / "ds.jsonl"),
+            judge="heuristic",
+            out_dir=str(tmp_path / "replay"),
+            replay=str(source_dataset),
+        ).run()
+
+
+def test_replay_restore_requires_current_format(tmp_path: Path) -> None:
+    """``--replay-mode restore`` 只接受当前格式版本：跨版本提示改用 rebuild。"""
+    source_dataset = _full_run(tmp_path, name="src", snapshot=True)
+    with pytest.raises(SystemExit, match="只接受当前格式版本"):
+        Runner(
+            _FileMemoryAdapter(
+                tmp_path / "mem-replay",
+                format_version=2,
+                support_rebuild=True,
+                compatible_from=[1, 2],
+            ),
+            str(tmp_path / "ds.jsonl"),
+            judge="heuristic",
+            out_dir=str(tmp_path / "replay"),
+            replay=str(source_dataset),
+            replay_mode="restore",
+        ).run()
 
 
 def test_run_mode_is_critical_for_comparability(tmp_path: Path) -> None:
@@ -554,7 +597,7 @@ def test_run_mode_is_critical_for_comparability(tmp_path: Path) -> None:
 
 
 def test_http_adapter_snapshot_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
-    """HttpAdapter 把快照操作转发到桥端点；老桥（异常）按不支持处理。"""
+    """HttpAdapter 把快照 / 自描述操作转发到桥端点；老桥（异常）按不支持处理。"""
     import sys
     import types
 
@@ -575,7 +618,9 @@ def test_http_adapter_snapshot_endpoints(monkeypatch: pytest.MonkeyPatch) -> Non
     def _post(url, json=None, headers=None, timeout=None):
         calls.append({"url": url, "json": json})
         if url.endswith("/snapshot-capabilities"):
-            return _Resp({"supported": True, "restore": True, "rebuild": False, "format_version": 2})
+            return _Resp({"supported": True, "restore": True, "rebuild": True, "format_version": 2})
+        if url.endswith("/describe"):
+            return _Resp({"bridge": "http_bridge_node", "format_version": 2})
         return _Resp({"ok": True})
 
     monkeypatch.setitem(
@@ -589,14 +634,50 @@ def test_http_adapter_snapshot_endpoints(monkeypatch: pytest.MonkeyPatch) -> Non
     adapter.snapshot("/tmp/snap/d1", "d1")
     adapter.restore("/tmp/snap/d1", "d1")
     adapter.rebuild("/tmp/snap/d1", "d1")
+    assert adapter.describe() == {"bridge": "http_bridge_node", "format_version": 2}
     assert [c["url"].rsplit("/", 1)[-1] for c in calls] == [
         "snapshot-capabilities",
         "snapshot",
         "restore",
         "rebuild",
+        "describe",
     ]
     assert calls[1]["json"] == {"target_dir": "/tmp/snap/d1", "tag": "d1"}
     assert calls[2]["json"] == {"source_dir": "/tmp/snap/d1", "tag": "d1"}
+    # rebuild 与 restore 转发同样的请求体：桥侧靠端点区分「同版本恢复 / 跨版本重建」
+    assert calls[3]["json"] == {"source_dir": "/tmp/snap/d1", "tag": "d1"}
+    assert calls[4]["json"] == {}
+
+
+def test_http_adapter_describe_absent_or_non_dict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """老桥没有 /describe（404）或返回非 dict → describe() 返回 {}，不报错。"""
+    import sys
+    import types
+
+    from membench.adapters.http import HttpAdapter
+
+    state = {"mode": "404"}
+
+    class _Resp:
+        def __init__(self, payload) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self):
+            return self._payload
+
+    def _post(url, json=None, headers=None, timeout=None):
+        if state["mode"] == "404":
+            raise RuntimeError("HTTP 404")
+        return _Resp(["not", "a", "dict"])
+
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(post=_post))
+    adapter = HttpAdapter("http://example.invalid:9")
+    assert adapter.describe() == {}
+    state["mode"] = "list"
+    assert adapter.describe() == {}
 
 
 def test_http_adapter_capabilities_absent_is_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,8 +1,8 @@
 # http_bridge_node：Node / Electron 系统的 HTTP bridge 参考模板
 
 被测系统的记忆能力是**库内能力**、没有独立服务（典型是 Electron 主进程里的 TS 源码）时，
-用本目录把三个动作暴露成 membench 认识的 REST 端点，再用内置 `HttpAdapter` 跑评测。
-协议层（三端点契约 + HttpAdapter）已经够用，本目录补的是**与协议无关的工程脚手架**：
+用本目录把记忆动作暴露成 membench 认识的 REST 端点，再用内置 `HttpAdapter` 跑评测。
+协议层（3 个必需端点 + 5 个可选端点 + HttpAdapter）已经够用，本目录补的是**与协议无关的工程脚手架**：
 单文件打包、宿主运行时 stub、原生依赖处理、自检。
 
 > 只交付可读模板，不预装依赖。`node_modules/` 由你按需 `npm i` 生成（唯一需要的是 esbuild）。
@@ -11,7 +11,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `bridge.mjs` | `node:http` 服务，暴露 `POST /reset\|/ingest\|/query`；顶部「挂点」import 你的记忆模块 |
+| `bridge.mjs` | `node:http` 服务，暴露必需端点 `POST /reset\|/ingest\|/query` 与可选端点 `POST /snapshot-capabilities\|/snapshot\|/restore\|/rebuild\|/describe`；顶部「挂点」import 你的记忆模块 |
 | `build.mjs` | esbuild 打包脚本：真实源码 → 单文件 CJS，处理 stub / external / define |
 | `stubs/electron.mjs` | `electron` 最小 stub（`app.getPath` / `ipcMain` / `BrowserWindow`） |
 | `stubs/i18n.mjs` | `i18n` 最小 stub（`t()` 原样回退，可注入真实文案） |
@@ -38,8 +38,11 @@ npm start             # = node bridge.mjs，默认 http://127.0.0.1:8787
 #   /reset 前把记忆目录快照到本次对话目录的 runtime/reset_backup/
 #   （目录名带 reset 序号与 dialogue_id，与 results.jsonl 对得上）；
 #   设成具体目录则快照到该目录。默认关闭（每个对话调一次 reset，长跑别开）。
-#   另有一组快照回放端点（无需环境变量）：POST /snapshot-capabilities|/snapshot|/restore，
+#   另有可选端点（无需环境变量）：POST /snapshot-capabilities|/snapshot|/restore|/rebuild|/describe，
 #   配合 membench run 的默认快照导出 / --replay 使用（改读取侧代码免重跑 ingest）。
+#   /restore 只接受当前格式版本；/rebuild 接受 compatible_from 列出的旧版本，读源数据重建
+#   派生结构（窗口外版本返回 4xx + {"error"}，不静默降级）。/describe 返回桥与记忆模块的
+#   自描述，进 metrics.adapter_describe（不参与评分）。
 #   快照默认就导出：每个对话 ingest 完成后、第一道 query 之前一份，落该对话的
 #   memory_snapshot/（跑完就能翻）；不需要时用 --no-snapshot 关闭。
 
@@ -96,14 +99,20 @@ python -m membench.cli run --adapter http \
   逐题 `retrieved` 已在 `results.jsonl` 里，快照只用来查"内部存储为什么这样"，
   别在所有长跑里常开（每对话一份 = 磁盘翻倍）。
 - **快照回放端点**：`/snapshot` 把记忆整体导出到 `target_dir`（模板布局 = `memory/` +
-  `.membench-snapshot.json` 标记，框架还会在同目录写清单 `manifest.json`），`/restore` 替换
+  `.membench-snapshot.json` 标记，框架还会在同目录写清单 `manifest.json`）；`/restore` 替换
   `DATA_DIR` 并**重建记忆实例**（真实系统若在内存缓存索引，必须在这里重新创建实例，
-  否则恢复的只是磁盘）；`/restore` 只认带标记的快照目录，防止路径传错把库清空。用法：
-  快照**默认导出**（每个对话 ingest 完成后一份到该对话的 `memory_snapshot/`，跑完 ingest
-  就能在对话级 `report.md` 里点开 `../memory_snapshot/` 翻记忆文件；不需要用 `--no-snapshot` 关闭）
+  否则恢复的只是磁盘），且只接受当前格式版本、只认带标记的快照目录（防路径传错清库）；
+  `/rebuild` 接受 `compatible_from` 列出的旧版本，读快照**源数据**重建派生结构（索引 /
+  向量 / 摘要 / 缓存），窗口外返回 4xx。用法：快照**默认导出**（每个对话 ingest 完成后一份
+  到该对话的 `memory_snapshot/`，跑完 ingest 就能在对话级 `report.md` 里点开
+  `../memory_snapshot/` 翻记忆文件；不需要用 `--no-snapshot` 关闭）
   → 改读取侧代码 → `run --replay <实验目录或数据集目录> --replay-verify-source <源数据集目录>`
-  （回放跳过 reset + ingest，写入侧固定，结论只覆盖读取/回答层）。
-- **别用 express 等额外框架**：三端点用 `node:http` 足够，少一个依赖少一类 native/构建坑。
+  （回放跳过 reset + ingest，写入侧固定，结论只覆盖读取/回答层）。跨格式版本用
+  `--replay-mode rebuild`；适配器 / 桥不支持 rebuild 时框架会在开跑前拒绝。
+- **`/describe` 是可选自描述**：返回桥与记忆模块的版本 / 配置（键名自由），会进
+  `metrics.adapter_describe` 与报告「适配器自描述」；不参与评分，也不是可比性维度。
+  记忆模块有 `describe()` / `version` 就带上，没有只回静态字段。
+- **别用 express 等额外框架**：端点用 `node:http` 足够，少一个依赖少一类 native/构建坑。
 
 对应 checklist（打包 / stub / external / define / 契约字段 / doctor 用法）见
 `skill/src/references/http_bridge_guide.md`。

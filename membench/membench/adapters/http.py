@@ -1,6 +1,6 @@
 """HttpAdapter：REST 接口模板适配器。
 
-用于接入提供 HTTP 接口的在线记忆系统。约定被测服务暴露三个端点：
+用于接入提供 HTTP 接口的在线记忆系统。**必需**三个端点：
 
 - ``POST {base_url}/reset``  ：清空记忆。请求体形如 ``{"run_dir": ...,
   "dialogue_id": ..., "dialogue_index": ...}``——框架给的**可选提示**，供服务端在
@@ -10,11 +10,18 @@
 - ``POST {base_url}/query``  ：请求体 ``{"question": "..."}``；
   响应 ``{"answer": str, "retrieved": [str], "input_tokens": int,
   "output_tokens": int, "llm_calls": int}``（除 answer 外均可缺省）。
-- **可选**状态快照与回放（桥实现时可用，缺失按不支持处理）：
+
+**可选**端点五个（缺失即视为不支持，不报错、不中断评测）：
+
+- 状态快照与回放（声明了就要实现；用途：改读取侧代码后用
+  ``membench run --replay <快照根>`` 免重跑 ingest）：
   ``POST /snapshot-capabilities`` → ``{"supported", "restore", "rebuild",
   "format_version", "compatible_from"}``；``POST /snapshot {target_dir, tag}``；
-  ``POST /restore {source_dir, tag}``；``POST /rebuild {source_dir, tag}``。
-  用途：改读取侧代码后用 ``membench run --replay <快照根>`` 免重跑 ingest。
+  ``POST /restore {source_dir, tag}``（只接受当前格式版本）；
+  ``POST /rebuild {source_dir, tag}``（接受 ``compatible_from`` 列出的旧版本，
+  读源数据重建派生结构）。
+- 自描述：``POST /describe`` 请求体 ``{}``，返回任意 dict（如桥 / 记忆模块的
+  版本与配置）——原样进 ``metrics["adapter_describe"]``，不参与评分与可比性。
 
 延迟（latency_ms）由客户端本地用 ``time.perf_counter`` 实测；
 token / 调用数优先取服务端返回值，缺省填 0（报告中标注 n/a）。
@@ -125,6 +132,17 @@ class HttpAdapter(BaseMemoryAdapter):
             output_tokens=int(data.get("output_tokens", 0)),
             llm_calls=int(data.get("llm_calls", 0)),
         )
+
+    def describe(self) -> dict:
+        """探测桥的自描述（``POST /describe``，请求体 ``{}``）。
+
+        2xx 且返回 dict 就用它；端点缺失（老桥 404）、非 2xx、非 dict 一律返回
+        ``{}``——自描述是可选信息，缺了不影响评测，也不该让整场跑挂掉。
+        """
+        try:
+            return self._post("/describe", {})
+        except Exception:  # noqa: BLE001 - 可选端点缺失：不记录自描述，不中断评测
+            return {}
 
     # ------------------------------------------------------------------
     # 可选能力：状态快照与回放（桥实现对应端点时可用；老桥 404 视为不支持）

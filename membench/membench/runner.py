@@ -701,15 +701,39 @@ class Runner:
             )
             print(f"[membench] 分片账本: {ledger_path}（{ledger_key} running）")
 
-        # 适配器可选的 describe() -> dict：记录其配置/版本等自描述信息；
-        # 调用失败记 None，不中断评测。放在开跑前，对话级与数据集级元数据取同一份。
+        # 适配器可选的 describe() -> dict：记录其配置/版本等自描述信息（不参与评分
+        # 与可比性）。失败只警告一次并记 None，不中断评测。放在开跑前，对话级与
+        # 数据集级元数据取同一份。
         adapter_describe: Any = None
         describe_fn = getattr(self.adapter, "describe", None)
         if callable(describe_fn):
             try:
-                adapter_describe = describe_fn()
-            except Exception:  # noqa: BLE001 - 自描述信息失败不应中断评测
-                adapter_describe = None
+                described = describe_fn()
+            except Exception as exc:  # noqa: BLE001 - 自描述失败不应中断评测
+                print(
+                    f"[membench] ⚠️ 适配器 describe() 抛错（{exc}），本次不记录"
+                    "自描述（metrics.adapter_describe=null）；评测与评分不受影响"
+                )
+            else:
+                if isinstance(described, dict):
+                    try:
+                        json.dumps(described, ensure_ascii=False)
+                    except (TypeError, ValueError) as exc:
+                        # metrics.json 在跑完之后才写：不可序列化的自描述若留到最后
+                        # 才炸，等于让整场评测白跑——这里提前拦下。
+                        print(
+                            "[membench] ⚠️ 适配器 describe() 返回值无法 JSON 序列化"
+                            f"（{exc}），本次不记录自描述"
+                            "（metrics.adapter_describe=null）"
+                        )
+                    else:
+                        adapter_describe = described
+                else:
+                    print(
+                        "[membench] ⚠️ 适配器 describe() 返回 "
+                        f"{type(described).__name__}，契约要求 dict；本次不记录"
+                        "自描述（metrics.adapter_describe=null）"
+                    )
 
         # 全流程 token / LLM 调用记账（ingest 按对话真实调用计一次；query 逐题累加）：
         # 与 records 的「每题归属」不同，这里是总量的唯一真相来源——question 分片下

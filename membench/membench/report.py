@@ -660,6 +660,32 @@ def _md_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
+#: 适配器自描述值的最大展示长度：超出即截断（完整值仍在 metrics.json）。
+ADAPTER_DESCRIBE_VALUE_MAX = 200
+
+
+def adapter_describe_rows(describe: Any) -> list[list[str]]:
+    """``metrics["adapter_describe"]`` -> 报告表格行（非 dict / 空 dict 返回空列表）。
+
+    自描述由适配器自由给出，可能是嵌套结构或超长配置：字符串原样展示，其余
+    值转紧凑 JSON，并统一折叠换行、截断到 :data:`ADAPTER_DESCRIBE_VALUE_MAX`，
+    避免把表格撑裂。该信息不参与评分，渲染只求可读。
+    """
+    if not isinstance(describe, dict) or not describe:
+        return []
+    rows: list[list[str]] = []
+    for key, value in describe.items():
+        if isinstance(value, str):
+            text = value
+        else:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ")
+        if len(text) > ADAPTER_DESCRIBE_VALUE_MAX:
+            text = text[: ADAPTER_DESCRIBE_VALUE_MAX - 1] + "…"
+        rows.append([str(key), text])
+    return rows
+
+
 def _human_bytes(value: Any) -> "str | None":
     """字节数的可读写法（``1.2 MB（1258291 字节）``）；非数值返回 None。"""
     try:
@@ -914,6 +940,19 @@ def write_run_report_md(
         ]
         lines.append(f"- 能力标注: {'、'.join(cap_strs)}")
     lines.append("")
+
+    # 0.1 适配器自描述（可选；只有适配器给出非空 describe() 时才出现）
+    describe_rows = adapter_describe_rows(metrics.get("adapter_describe"))
+    if describe_rows:
+        lines.append("### 适配器自描述")
+        lines.append("")
+        lines.append(
+            "<sub>由适配器 `describe()` 提供，供了解被测系统的配置 / 版本；"
+            "不参与评分，也不是 compare 的可比性维度。</sub>"
+        )
+        lines.append("")
+        lines.append(_md_table(["配置项", "值"], describe_rows))
+        lines.append("")
 
     # 1. 摘要表（六维核心指标）
     lines.append("## 摘要（六维核心指标）")

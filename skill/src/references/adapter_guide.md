@@ -5,7 +5,14 @@
 `membench/examples/quickstart.py`；非 Python 系统另见 `references/http_bridge_guide.md`。
 
 membench 与被测系统之间**只有一个协议**：`BaseMemoryAdapter`
-（`membench/adapters/base.py`）——实现 `reset / ingest / query` 三个方法即可，
+（`membench/adapters/base.py`）。契约分三组：
+
+- **必需**：`name` 属性 + `reset / ingest / query` 三个方法——实现这三个就完成了接入；
+- **可选·快照组（4）**：`snapshot_capabilities()` / `snapshot()` / `restore()` / `rebuild()`
+  ——用于 `--replay` 免重跑 ingest，**声明了就必须实现**；
+- **可选·自描述（1）**：`describe()`——返回 dict 写进 `metrics.adapter_describe`，
+  **不参与评分与可比性**。
+
 其余（数据集、判分、指标、报告、门禁）全部由 harness 负责。
 
 一次 run 的数据流：
@@ -20,14 +27,15 @@ membench 与被测系统之间**只有一个协议**：`BaseMemoryAdapter`
 | 你的被测系统形态 | 路径 | 入口 |
 |---|---|---|
 | Python 库/进程，记忆写入与检索能在 Python 侧调用 | **① 实现 `BaseMemoryAdapter`**（推荐） | 本文第 2 节 |
-| 独立服务（Node/Electron/其他进程），不便嵌 Python | **② HTTP 三端点 + 内置 `HttpAdapter`** | 第 6 节 + `references/http_bridge_guide.md` |
+| 独立服务（Node/Electron/其他进程），不便嵌 Python | **② HTTP 三必需端点 + 五个可选端点 + 内置 `HttpAdapter`** | 第 6 节 + `references/http_bridge_guide.md` |
 | 记忆能力本身就是"LLM + 工具调用"循环（ingest/query 同构） | **③ `AgentLoopAdapter` 复用循环** | 第 2.5 节 |
 | 不改系统、先量现状，或复现线上 badcase | **④ `TranscriptAdapter` 回放真实日志** | 第 2.6 节 |
 
-## 2. 三个挂点怎么找、怎么写
+## 2. 必需三挂点怎么找、怎么写
 
 本节的一句话版：**在被测 Agent 源码里找"记忆清空"、
 "记忆写入路径"、"记忆读取路径 + 回答生成"三处入口**，包成三个方法。
+快照组与自描述是可选项，见 §2.7 / §2.8。
 
 ### 2.1 `reset()`——每个 dialogue 开始前调用
 
@@ -131,7 +139,7 @@ membench 与被测系统之间**只有一个协议**：`BaseMemoryAdapter`
 「逐对话状态快照」直接回放。框架只做编排（目录与 tag、清单、哈希、跑前校验、保真校验），
 状态的产出与消费**全部走你的代码**——框架不解析快照内容，也不读你的存储格式。
 
-需要实现四个可选方法（不实现 = 不支持本能力，框架明确提示而不是静默跳过）：
+需要实现**快照组的四个可选方法**（不实现 = 不支持本能力，框架明确提示而不是静默跳过）：
 
 ```python
 def snapshot_capabilities(self) -> dict:
@@ -139,9 +147,13 @@ def snapshot_capabilities(self) -> dict:
             "format_version": 1, "compatible_from": [1]}   # 声明了就必须实现对应方法
 
 def snapshot(self, target_dir: str, tag: str) -> dict:   # 导出当前状态（tag=对话 id）
-def restore(self, source_dir: str, tag: str) -> None:    # 同版本恢复
-def rebuild(self, source_dir: str, tag: str) -> None:    # 跨版本/重建派生结构（可选）
+def restore(self, source_dir: str, tag: str) -> None:    # 同版本恢复（只接受当前 format_version）
+def rebuild(self, source_dir: str, tag: str) -> None:    # 跨版本 / 重建派生结构（接受 compatible_from）
 ```
+
+`restore` 只在快照格式与当前代码兼容时使用；`rebuild` 拿快照里的**源数据**，用当前
+代码的构建路径重建索引 / 向量 / 摘要 / 缓存，所以存储结构或 schema 变了也能回放，
+且不必重跑 LLM 抽取。
 
 - **时机与落位**：runner 在每个对话 ingest 完成后、第一道 query 之前调用 `snapshot()`——回放
   就是"恢复这个状态，然后跑该对话的题"；runner 每对话 `reset()`，所以按对话切片天然等价。
@@ -176,6 +188,22 @@ def rebuild(self, source_dir: str, tag: str) -> None:    # 跨版本/重建派�
 - **HTTP 桥**：同款端点 `POST /snapshot-capabilities|/snapshot|/restore|/rebuild`（见
   `references/http_bridge_guide.md`）——桥侧要注意"恢复后重建进程内实例"，只换磁盘不重建
   缓存等于没恢复。
+
+### 2.8 `describe()`——自描述（可选，不参与评分）
+
+返回一个 dict，写进 `metrics.json` 的 `adapter_describe`，并在报告「适配器自描述」小节
+展示；**不参与评分，也不是 compare 的可比性维度**。适合放 `embedding_model` / `retrieval` /
+`top_k` / `index_type` / `features` 这类"事后看懂这跑分背后系统长什么样"的信息（比
+`--adapter-meta` 自由文本更结构化）。
+
+```python
+def describe(self) -> dict:
+    return {"embedding_model": "bge-m3", "retrieval": "hybrid",
+            "top_k": 8, "index_type": "hnsw", "features": ["summary_cache"]}
+```
+
+默认返回 `{}`（报告里该小节整节不出现）；抛异常只打印一次警告并记 `None`，评测照常完成；
+返回非 dict 会被忽略并警告。HTTP 路径对应 `POST /describe`（缺失即视为没有自描述）。
 
 ## 3. 真实性红线（评测有效性的前提，必读）
 
@@ -224,7 +252,7 @@ def rebuild(self, source_dir: str, tag: str) -> None:    # 跨版本/重建派�
 
 ## 6. HTTP 路径：契约与自检
 
-在 Agent 侧实现三个端点（细节与模板见 `references/http_bridge_guide.md`、
+在 Agent 侧实现**三个必需端点**（细节与模板见 `references/http_bridge_guide.md`、
 `membench/examples/http_bridge_node/`）：
 
 - `POST /reset` → 2xx；
@@ -232,6 +260,11 @@ def rebuild(self, source_dir: str, tag: str) -> None:    # 跨版本/重建派�
   可选 `{"input_tokens": int, "llm_calls": int, "latency_ms": float}`；
 - `POST /query` body `{"question": str}` → 2xx + JSON + 字符串 `answer`；
   `retrieved` 若出现须为字符串列表。
+
+**可选端点五个**（缺失即视为不支持，不报错、不中断评测）：`POST /snapshot-capabilities`、
+`POST /snapshot`、`POST /restore`、`POST /rebuild`、`POST /describe`——语义与 Python 侧的
+快照组 / `describe()` 一一对应（`/restore` 只接受当前格式版本，`/rebuild` 接受
+`compatible_from` 列出的旧版本并重建派生结构）。`doctor` 只探测三个必需端点。
 
 正式评测前先自检（连通性 + 契约校验，避免把"接错"误判成"记忆能力差"）：
 
@@ -273,7 +306,9 @@ python -m membench.cli doctor --target http://127.0.0.1:8787 [--timeout 10.0] [-
 
 ## 9. 接入完成定义（Checklist）
 
-- [ ] 三个方法走的是**线上同款**写入/读取路径（完整评测的唯一前提）；若降级为读取层评测：已由用户确认口径、元数据（`--adapter-meta`）声明、A/B 同口径；
+- [ ] **必需三个方法**（`reset` / `ingest` / `query`）走的是**线上同款**写入/读取路径（完整评测的唯一前提）；若降级为读取层评测：已由用户确认口径、元数据（`--adapter-meta`）声明、A/B 同口径；
+- [ ] 声明了快照组能力时四个方法（`snapshot_capabilities` / `snapshot` / `restore` / `rebuild`）都已实现，且 `restore` 只接受当前格式版本、`rebuild` 覆盖 `compatible_from` 列出的旧版本；
+- [ ] `describe()` 已返回结构化配置（嵌入模型 / 检索方式 / top_k / 索引类型等）；不打算提供时保持默认 `{}` 即可（报告不出现该小节）；
 - [ ] `reset` 真清空（独立测试实例，不碰生产）；
 - [ ] timestamp 已落库；`retrieved` 填的是注入 prompt 的记忆原文；
 - [ ] 写入/查询触发的 LLM 调用与 token 已计入统计；

@@ -25,7 +25,7 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 │   ├── runner.py          # Runner: 执行评测，直接写实验目录的 runs/<dataset>/…
 │   ├── snapshot.py        # 状态快照与回放：逐对话 manifest / 池源解析、跑前校验、保真比对
 │   ├── agent_loop.py      # AgentLoopAdapter: 复用 ingest/query 的 tool-call 循环
-│   ├── doctor.py          # check_target: HTTP bridge 三端点契约自检（纯标准库）
+│   ├── doctor.py          # check_target: HTTP bridge 必需三端点契约自检（纯标准库）
 │   ├── fuse.py            # fuse: 分片产物融合为完整实验目录（就地 --task-dir 或跨目录，指标重算 + 门禁）
 │   ├── compare.py         # compare_runs: 可比性前置校验 + diff + 回归门禁（支持就地 --task-dir）
 │   ├── matrix.py          # compare_matrix: 多 run 矩阵对比（platform × commit）
@@ -293,7 +293,7 @@ fuse 的融合产物（`shard_index=None`）不带这个标注，它覆盖全部
 - `adapter_version`：适配器实现版本 / commit（`--adapter-version`）；
 - `dataset_fingerprint`：`{"sha256": 内容 sha256 前 16 位, "bytes": 字节数, "name": 文件名}`，`compare` 的可比性校验据此机检"数据集是否变了"；
 - `adapter_meta`：`--adapter-meta "model=deepseek-v3;temp=0"` 自由文本，原样记入；
-- `adapter_describe`：adapter 定义了可选 `describe() -> dict` 时自动调用记入（调用失败记 null，不中断评测）；
+- `adapter_describe`：adapter 定义了可选 `describe() -> dict` 时自动调用记入（原样进 metrics，非空时报告渲染「适配器自描述」小节；抛错 / 返回非 dict / 不可 JSON 序列化时警告一次并记 null，不中断评测）；
 - `experiment_dir` / `dataset_dir`：本次实验目录与数据集产物目录（读取方据此定位，不必猜层级）；
 - `run_mode`：`full` / `replay-restore` / `replay-rebuild`（见「状态快照与回放」）；
 - `state_snapshot`：快照**默认导出**（适配器声明了快照能力时；`--no-snapshot` 关闭）或快照回放时记入；普通 run 的 `root` 指向**数据集目录**（即 `--replay` 可传的目录）；回放任务的 `root` 是快照源（数据集目录或回放任务路径），另给 `snapshots_dir`（本 run 的任务级池）与 `n_buckets` / `n_reused` / `n_new`（对话级给 `bucket` / `reused`）。适配器不支持快照时该块记 `role="unsupported"`（如实说明"没导"，读完可区分"这次没导"与"导不了"）。
@@ -382,7 +382,8 @@ python -m membench.cli run --adapter <你的适配器> --dataset <同一个数�
   这类看起来像"产物质损"的空值，也不给打不开的快照链接。想彻底安静可用 `--no-snapshot`；
 - **谁产出快照**：被测系统自己（适配器可选接口 `snapshot_capabilities()` /
   `snapshot()` / `restore()` / `rebuild()`）——框架只给目录与 tag、算哈希、做校验，
-  不解析快照内容（HTTP 桥对应 `POST /snapshot-capabilities|/snapshot|/restore`）；
+  不解析快照内容（HTTP 桥对应 `POST /snapshot-capabilities|/snapshot|/restore|/rebuild`，
+  另有可选自描述端点 `POST /describe`）；
 - **体积**：快照随对话数与记忆规模线性增长（逐对话各一份），单份超过 100 MB 会打印
   一次告警（提示可用 `--no-snapshot` 关掉）；`task status` 会列出快照目录数与合计体积；
 - **三种模式**（`metrics.json` 的 `run_mode`）：`full` / `replay-restore`（格式兼容，
@@ -638,13 +639,13 @@ DIR/matrix_<ts>/
 
 ## 如何接入自己的记忆系统
 
-> 详细接入指导（三个挂点写法、**真实性红线与降级口径流程**、验收判据、接入 checklist）见 skill 包内 `references/adapter_guide.md`。
+> 详细接入指导（必需三挂点与可选接口的写法、**真实性红线与降级口径流程**、验收判据、接入 checklist）见 skill 包内 `references/adapter_guide.md`。
 
 四条路径，按推荐程度排序：
 
 ### 路径一：继承 BaseMemoryAdapter（推荐，最灵活）
 
-只需实现 `reset / ingest / query` 三个方法：
+必需接口是 `name` 属性 + `reset / ingest / query` 三个方法：
 
 ```python
 from membench import layout
@@ -669,9 +670,16 @@ exp_dir = layout.experiment_path(None, layout.eval_subdir("my-system"))
 Runner(MyAdapter(), "membench/data/sample_dataset.jsonl", out_dir=exp_dir).run()
 ```
 
-可选能力：需要「快照回放」（改读取侧免重跑 ingest，见「状态快照与回放」）时，再实现
-`snapshot_capabilities()`（声明 `supported/restore/rebuild/format_version`）、`snapshot(target_dir, tag)`、
-必要时 `restore(source_dir, tag)` / `rebuild(source_dir, tag)`——框架只传目录与 tag，导出什么由你决定。
+可选能力分两组，都不是接入必需：
+
+- **快照组**（需要「快照回放」、改读取侧免重跑 ingest 时实现，见「状态快照与回放」）：
+  `snapshot_capabilities()`（声明 `supported/restore/rebuild/format_version/compatible_from`）、
+  `snapshot(target_dir, tag)`、`restore(source_dir, tag)`、`rebuild(source_dir, tag)`——
+  **声明了就必须实现**；`restore` 只在快照格式兼容时用，`rebuild` 拿快照里的源数据重建
+  派生结构（跨格式版本也可用）。框架只传目录与 tag，导出什么由你决定。
+- **自描述**：`describe()` 返回 dict（如嵌入模型、检索方式、索引类型、版本），原样写进
+  `metrics.adapter_describe`，并在报告「适配器自描述」小节展示——**不参与评分，也不是
+  可比性维度**。默认返回 `{}`（报告里整节不出现）；抛异常只警告一次，评测照常完成。
 
 完整可运行示例见 `examples/quickstart.py`。token / llm_calls 填不了就填 0（报告中视为 n/a /「未上报」）。`reset()` 里若要实现"清空前快照"这类回溯能力，可读框架给的可选提示环境变量 `MEMBENCH_RUN_DIR`（**本次对话目录**，即 `<实验目录>/runs/<dataset>/<对话目录>`，备份建议落它的 `runtime/reset_backup/`）/ `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`（框架不读也不写你的存储）。
 
@@ -679,16 +687,21 @@ Runner(MyAdapter(), "membench/data/sample_dataset.jsonl", out_dir=exp_dir).run()
 
 ### 路径二：实现 REST 契约，用 HttpAdapter
 
-如果你的记忆系统已有 HTTP 服务，实现三个端点即可，无需写 Python：
+如果你的记忆系统已有 HTTP 服务，实现三个必需端点即可，无需写 Python：
 
 - `POST /reset`：清空全部记忆状态。请求体带**可选**上下文 `{"run_dir", "dialogue_id", "dialogue_index"}`（`run_dir` = 本次**对话目录**，备份建议落它的 `runtime/reset_backup/`）——供服务端在清空前自行快照/归档；不认识就忽略，不影响契约。
 - `POST /ingest`：body `{"messages": [{"role", "content", "timestamp"}]}`
 - `POST /query`：body `{"question": "..."}`，返回 `{"answer": str, "retrieved": [str], ...}`
 
-可选端点（需要快照回放时实现，缺失按不支持处理；`HttpAdapter` 会转发目录与 tag，
-内容由桥自己决定）：`POST /snapshot-capabilities`、`POST /snapshot`、
-`POST /restore`、`POST /rebuild`；参考模板 `examples/http_bridge_node` 已实现前三个
-（文件级快照，带标记文件防误恢复）。
+可选端点五个（缺失即视为不支持，不报错、不中断评测；`HttpAdapter` 会转发目录与 tag，
+内容由桥自己决定）：
+
+- `POST /snapshot-capabilities`：快照能力声明（`supported/restore/rebuild/format_version/compatible_from`）；
+- `POST /snapshot` / `POST /restore` / `POST /rebuild`：导出状态 / 同版本恢复 / 跨版本重建；
+- `POST /describe`：返回 dict 自描述（老桥没有该端点时 `HttpAdapter.describe()` 返回 `{}`）。
+
+参考模板 `examples/http_bridge_node` 五个都已实现（文件级快照，带标记文件防误恢复；
+`/restore` 只接受当前格式版本，`/rebuild` 接受 `compatible_from` 列出的旧版本并重建派生结构）。
 
 然后在 Python 侧用内置 `HttpAdapter` 指向你的服务地址，照常跑 `Runner`。服务地址经通用构造参数 `--adapter-arg` 传入，命令行一步到位，无需再包一层适配器：
 

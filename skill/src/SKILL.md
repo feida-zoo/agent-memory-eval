@@ -54,7 +54,7 @@ python scripts/run_task.py eval --adapter <适配器名> --dataset <数据集 JS
 
 - 多数据集重复 `--dataset`；全量宏平均走原生 `evaluate`。`--recall-mode` 与 `--judge` 必填，`--judge heuristic` 只能配 `--limit`。
 - 脚本串起 `task init → run（含分片）→ fuse → verify_artifacts`；按需下载集先 `dataset fetch <key>`。
-- 首次接入先读 `references/adapter_guide.md`（三挂点 / 三端点 / 持久化 / 验收）。
+- 首次接入先读 `references/adapter_guide.md`（必需三挂点 + 可选快照/自描述 / HTTP 端点 / 持久化 / 验收）。
 
 ### 2. A/B（两个 commit、两版系统）
 
@@ -139,7 +139,7 @@ python -m membench.cli matrix --runs "wx@<shaA>=<产物目录>" "fs@<shaA>=<产�
 | 路径 | 用途 / 何时读 |
 |---|---|
 | `membench/` | 评测工程本体（CLI `python -m membench.cli`）；产物布局、指标说明、接入章节以其 README 为准 |
-| `references/adapter_guide.md` | 接入被测系统时读：三挂点、真实性红线、快照接口、验收与自查 |
+| `references/adapter_guide.md` | 接入被测系统时读：必需三挂点与可选接口、真实性红线、快照回放、验收与自查 |
 | `references/compare_workflows.md` | 做 commit / 平台 / 矩阵对比与可比性排查时读 |
 | `references/optimize_workflow.md` | 走优化闭环（诊断→建议→plan→执行→AB→报告）时读 |
 | `references/http_bridge_guide.md` | 被测系统非 Python、要写 HTTP bridge 时读 |
