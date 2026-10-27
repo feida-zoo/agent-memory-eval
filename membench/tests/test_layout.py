@@ -166,9 +166,19 @@ def test_tag_dir_name_normalizes_dialogue_ids() -> None:
 
 def test_legacy_layout_api_is_gone() -> None:
     """旧版 API 不得复活：命名与落位只能走本模块的 helper。"""
-    for name in ("subdir_for", "ab_subdir", "copy_runs_into", "_plan_run_targets", "copy_report_into"):
+    for name in (
+        "subdir_for",
+        "ab_subdir",
+        "copy_runs_into",
+        "_plan_run_targets",
+        "copy_report_into",
+        "materialize_run_experiment",
+        "materialize_ab_experiment",
+        "materialize_matrix_experiment",
+    ):
         assert not hasattr(layout, name), f"旧 API {name} 不应存在"
-    assert [n for n in dir(layout) if n.startswith("materialize_")] == []
+    # 快照池的派生索引物化是当前 API（真源 = entries/，索引只是视图）
+    assert callable(layout.materialize_snapshot_index)
 
 
 # ---------------------------------------------------------------------------

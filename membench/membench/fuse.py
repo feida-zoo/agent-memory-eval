@@ -56,6 +56,11 @@
 快照文件本身随对话目录并入（就地模式本来就在位），能不能回放由 manifest 决定
 （``membench.snapshot.plan_replay`` 只读 manifest），不看这段元数据。
 
+回放任务（任务根带 ``snapshots/``）走完 fuse 时顺手重算一次快照池的派生索引
+``snapshots/index.json``（真源是 ``snapshots/entries/`` 的逐对话条目 + 各桶清单）：
+分片并行回放各写各的条目，索引只在收尾时由这里的 :func:`membench.layout.materialize_snapshot_index`
+物化，读者不会看到半成品。
+
 门禁判定（stale 一票否决）对融合结果同样生效：存在 knowledge_update 题且 stale_rate
 超过阈值（与 evaluate 的办公域门禁同阈值）即 FAIL。
 """
@@ -872,6 +877,16 @@ def fuse_runs(
         layout.FILE_REPORT_MD,
         extra_files=[os.path.join(dataset_report, layout.FILE_METRICS)],
     )
+
+    # fuse 是分片流程的收尾：回放任务的分片并行回放只写各自的条目 / 桶，这里把
+    # 派生索引按真源（entries/ + 桶清单）重算一次，供人直接翻 index.json。旧产物
+    # （只有 index.json、没有条目树）的索引是唯一记录，跳过刷新，别拿空条目覆盖它。
+    pool_root = layout.snapshot_pool_root(experiment_dir)
+    if os.path.isdir(pool_root) and (
+        layout.has_snapshot_entries(pool_root)
+        or not os.path.isfile(layout.snapshot_index_path(pool_root))
+    ):
+        layout.materialize_snapshot_index(pool_root)
 
     return {
         "out_dir": out_dir,

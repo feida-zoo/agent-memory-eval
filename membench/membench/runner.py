@@ -33,8 +33,9 @@ results.jsonl（不浪费 LLM 调用，metrics 聚合分母口径自然正确）
 
 回放任务（``task init --replay``）另有任务级快照池::
 
-    <任务>/snapshots/<sha256 前 12 位>/    # 内容寻址桶（含 manifest.json，来源记在 source 段）
-    <任务>/snapshots/index.json            # 桶 / 逐臂逐对话映射 / 各臂来源与计数
+    <任务>/snapshots/<sha256 前 12 位>/             # 内容寻址桶（含 manifest.json，来源记在 source 段）
+    <任务>/snapshots/entries/<臂>/<数据集>/<对话>.json  # 逐对话条目（真源，各进程各写各的）
+    <任务>/snapshots/index.json                    # 派生视图（由条目 + 桶清单重算，fuse/status 刷新）
 
 快照默认导出（``snapshot=True``）：每个对话只有一份，打点在该对话全部 session ingest
 完成之后、第一道 query 之前——正是回放时的入口状态。适配器未声明快照能力时打印一次
@@ -44,7 +45,8 @@ results.jsonl（不浪费 LLM 调用，metrics 聚合分母口径自然正确）
 但落点是任务级内容寻址池 ``<任务>/snapshots/<sha256 前 12 位>/``（见
 :class:`_SnapshotPoolWriter` 与 :mod:`membench.layout` 的池 helper）：状态内容相同的
 导出共用同一个桶，A/B 两臂回放同一源时只产生一份；``--no-snapshot`` 关闭，关闭时
-既不写桶也不写 ``snapshots/index.json``。
+既不写桶也不写条目 / 索引。并行分片回放时各进程只写自己对话的条目，池里没有需要
+争抢的共享可变状态。
 """
 
 from __future__ import annotations
@@ -192,14 +194,18 @@ class _SnapshotPoolWriter:
 
     每个对话先导出到池内临时目录（``.tmp-<uuid>``），算完内容哈希（沿用
     :func:`membench.snapshot.dir_sha256` 的口径，排除 ``manifest.json``）后按前 12 位
-    定桶：桶不存在则整体移入（新写），已存在则校验桶内清单的 ``entry.sha256`` 与本次
-    一致后丢弃临时目录（复用）；不一致只可能是哈希前缀撞车或桶被改动，直接拒绝。
-    每处理一个对话就原子更新一次 ``snapshots/index.json``——中途崩溃时已完成的部分
-    仍然可读。
+    定桶：桶首次出现则整体移入，已存在则校验桶内清单的 ``entry.sha256`` 与本次一致
+    后丢弃临时目录（复用）；不一致只可能是哈希前缀撞车或桶被改动，直接拒绝。
+
+    落位只靠一次 ``os.replace`` 的成败判"本次创建 / 别人已建好"——不预判目录存在性、
+    不读共享索引：两个分片进程同时建同一个桶时，失败的一方按磁盘上的清单校验后记
+    复用即可。每个对话另写一个自足的条目文件
+    （``snapshots/entries/<臂>/<数据集>/<对话>.json``，见
+    :func:`membench.layout.write_snapshot_entry`），对话级分片下各进程只写自己的
+    对话 ⇒ **并行回放没有共享可变状态要抢，不需要任何锁**。
 
     池属于**任务**而不是臂：``out_dir`` 是 ``<任务>/A`` / ``B`` 时池在父任务目录，
-    臂键即目录名；单臂任务 / 普通实验目录的臂键是空串。索引是跨臂共享的，本写入器
-    只做同进程内的读-改-写（多进程同时对同一池回放不是支持场景）。
+    臂键即目录名；单臂任务 / 普通实验目录的臂键是空串。
     """
 
     def __init__(self, out_dir: str, plan: dict[str, Any], dataset: str) -> None:
@@ -207,28 +213,10 @@ class _SnapshotPoolWriter:
         self.arm = layout.snapshot_arm_key(out_dir)
         self.dataset = dataset
         self.plan = plan
-        self.index = layout.read_snapshot_index(self.pool_root) or layout.empty_snapshot_index()
         #: 本 run 逐对话的桶登记：``{对话 id: {"bucket": digest12, "reused": bool}}``
         self.buckets: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
-    def _arm_info(self) -> dict[str, Any]:
-        """当前臂的索引段：来源取**最近一次**回放（同臂多次回放时以最后一次为准）。"""
-        info = self.index["arms"].get(self.arm)
-        if not isinstance(info, dict):
-            info = {}
-            self.index["arms"][self.arm] = info
-        info["source"] = self.plan["source"]
-        info["source_manifest_sha256"] = self.plan.get("manifest_sha256")
-        info.setdefault("n_reused", 0)
-        info.setdefault("n_new", 0)
-        info["n_dialogues"] = sum(
-            1
-            for key in self.index["entries"]
-            if (layout.parse_snapshot_entry_key(key) or ("",))[0] == self.arm
-        )
-        return info
-
     def _require_same_bucket(self, bucket: str, state_sha256: str) -> None:
         """桶已存在时必须装的是同一份内容（桶名是内容哈希前 12 位）。
 
@@ -243,6 +231,22 @@ class _SnapshotPoolWriter:
                 "撞车或桶被改动；请检查该桶（必要时删除）后重跑，不要硬塞进同一桶"
             )
 
+    def _place_bucket(self, tmp: str, bucket: str, state_sha256: str) -> bool:
+        """把临时导出目录整体落成桶；返回 True 表示复用了别的进程已建好的桶。
+
+        成败由 ``os.replace`` 本身裁决（目录整体改名是原子的）：成功 = 本次创建；
+        抛 ``OSError``（目标已存在且非空）→ 以磁盘上的桶为准校验内容哈希、删临时目录。
+        不先 ``isdir`` 预判——预判与改名之间正是两个分片进程同时建同一个桶的竞态窗口。
+        """
+        try:
+            os.replace(tmp, bucket)
+        except OSError:
+            if not os.path.isdir(bucket):
+                raise
+            self._require_same_bucket(bucket, state_sha256)
+            return True
+        return False
+
     def export(
         self,
         adapter: Any,
@@ -252,7 +256,7 @@ class _SnapshotPoolWriter:
         sessions: list[list[dict]],
         n_questions: int,
     ) -> dict[str, Any]:
-        """导出一个对话到池并更新索引，返回 ``{bucket, reused, entry}``。"""
+        """导出一个对话到池、写它的条目文件，返回 ``{bucket, reused, entry}``。"""
         tmp = layout.new_snapshot_tmp_dir(self.pool_root)
         try:
             manifest["source"] = {
@@ -274,51 +278,33 @@ class _SnapshotPoolWriter:
                 sessions=sessions,
                 n_questions=n_questions,
             )
+            n_bytes, n_files = snapshot_mod.dir_stats(
+                tmp, exclude=(snapshot_mod.MANIFEST_NAME,)
+            )
             digest = layout.snapshot_bucket_id(entry["sha256"])
             bucket = layout.snapshot_bucket_dir(self.pool_root, digest)
-            if os.path.isdir(bucket):
-                self._require_same_bucket(bucket, entry["sha256"])
+            reused = self._place_bucket(tmp, bucket, entry["sha256"])
+            if reused:
                 shutil.rmtree(tmp, ignore_errors=True)
-                tmp = None
-                reused = True
-            else:
-                try:
-                    os.replace(tmp, bucket)
-                    tmp = None
-                    reused = False
-                except OSError:
-                    # 另一个进程刚建好同名桶：以磁盘上的为准重新校验
-                    if not os.path.isdir(bucket):
-                        raise
-                    self._require_same_bucket(bucket, entry["sha256"])
-                    shutil.rmtree(tmp, ignore_errors=True)
-                    tmp = None
-                    reused = True
-
-            known = self.index["buckets"].get(digest)
-            if isinstance(known, dict) and known.get("state_sha256") != entry["sha256"]:
-                raise SystemExit(
-                    f"快照池索引与该桶不一致（{layout.snapshot_index_path(self.pool_root)}）："
-                    f"桶 {digest} 记的是 {known.get('state_sha256')}，本次 {entry['sha256']}；"
-                    "索引可能被手改过，请修复或删除索引后重跑"
-                )
-            if not isinstance(known, dict):
-                n_bytes, n_files = snapshot_mod.dir_stats(
-                    bucket, exclude=(snapshot_mod.MANIFEST_NAME,)
-                )
-                self.index["buckets"][digest] = {
-                    "dataset": self.dataset,
-                    "dialogue_id": str(dialogue_id),
+            tmp = None
+            layout.write_snapshot_entry(
+                self.pool_root,
+                {
+                    "schema": layout.SNAPSHOT_ENTRY_SCHEMA,
+                    "digest": digest,
+                    "state_sha256": entry["sha256"],
                     "bytes": n_bytes,
                     "n_files": n_files,
-                    "state_sha256": entry["sha256"],
-                }
-            self.index["entries"][
-                layout.snapshot_entry_key(self.arm, self.dataset, dialogue_id)
-            ] = digest
-            arm_info = self._arm_info()
-            arm_info["n_reused" if reused else "n_new"] += 1
-            layout.write_snapshot_index(self.pool_root, self.index)
+                    "dataset": self.dataset,
+                    "dialogue_id": str(dialogue_id),
+                    "arm": self.arm,
+                    "source": self.plan["source"],
+                    "source_manifest_sha256": self.plan.get("manifest_sha256"),
+                    "reused": reused,
+                    "run_id": str(manifest.get("run_id") or ""),
+                    "written_at": datetime.now().isoformat(timespec="seconds"),
+                },
+            )
             self.buckets[str(dialogue_id)] = {
                 "bucket": digest,
                 "reused": reused,

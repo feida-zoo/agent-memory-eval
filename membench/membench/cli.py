@@ -73,8 +73,10 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
     <report-out>/matrix_<ts>/{reports/,runs/<label>/}
 
 回放任务（``task init --replay``）在任务目录根多一个内容寻址快照池 ``snapshots/``：
-回放导出的状态按内容哈希去重成桶 ``snapshots/<sha256 前 12 位>/``，
-``snapshots/index.json`` 记 ``臂|数据集|对话 -> 桶``；A/B 两臂回放同一源时只产生
+回放导出的状态按内容哈希去重成桶 ``snapshots/<sha256 前 12 位>/``，每个对话一个
+条目文件 ``snapshots/entries/<臂>/<数据集>/<对话>.json``（真源；分片并行回放时各
+进程只写自己负责的对话，不需要锁），``snapshots/index.json`` 只是由条目 + 桶清单
+重算的派生视图（``task status`` / ``fuse`` 收尾刷新）。A/B 两臂回放同一源时只产生
 一份桶（两臂指向同一 digest），不同则各存一份——差异本身就是"回放不保真"的证据。
 回放任务本身可以继续作为 ``--replay`` 源（链式回放）。
 
@@ -959,24 +961,52 @@ def _human_bytes(size: int) -> str:
     return f"{value:.1f} GB"
 
 
+def _refresh_snapshot_index(pool_root: str, index: dict[str, Any]) -> None:
+    """索引缺失 / 过期时按条目与桶重算写回（best effort：写不进去不影响展示）。
+
+    ``index.json`` 是派生视图，status 展示不信任它；但顺手刷新一次，人直接看文件时
+    也能看到与展示一致的内容。
+    """
+    try:
+        current = layout.read_snapshot_index(pool_root)
+    except SystemExit:
+        current = None
+    if current == index:
+        return
+    try:
+        layout.write_snapshot_index(pool_root, index)
+    except OSError:
+        pass
+
+
 def _snapshot_pool_lines(target: str) -> list[str]:
     """回放任务快照池的进度行：桶数 / 体积 / 各臂来源与复用计数 / 两臂一致性。
 
-    普通任务（任务根没有 ``snapshots/index.json``）返回空列表——它们的快照用量仍
-    按数据集目录统计（见 :func:`_snapshot_usage`）。索引损坏只报告不中断：status 是
-    诊断视图，一份坏索引不该让它连分片进度都看不了。
+    新产物从条目树 + 各桶清单**重算**（:func:`membench.layout.build_snapshot_index`），
+    不信任可能过期的 ``index.json``；缺索引 / 索引过期时顺手刷新一次（best effort）。
+    旧产物（只有 ``index.json``、没有条目树）以索引为唯一记录，原样展示、不重算覆盖。
+    普通任务（任务根没有 ``snapshots/``）返回空列表——它们的快照用量仍按数据集目录
+    统计（见 :func:`_snapshot_usage`）。坏条目 / 坏桶 / 坏索引只报告不中断：status 是
+    诊断视图，一份坏数据不该让它连分片进度都看不了。
     """
     task_dir = layout.snapshot_task_root(target)
-    if not layout.has_snapshot_index(task_dir):
+    if not layout.has_snapshot_pool(task_dir):
         return []
     pool_root = os.path.join(task_dir, layout.DIR_SNAPSHOTS)
     try:
-        index = layout.read_snapshot_index(pool_root) or {}
+        if layout.has_snapshot_entries(pool_root):
+            index = layout.build_snapshot_index(pool_root)
+            _refresh_snapshot_index(pool_root, index)
+        else:
+            # 旧产物：没有条目文件，索引是唯一记录（重算会得到一个空 entries 的索引）
+            index = layout.read_snapshot_index(pool_root) or layout.build_snapshot_index(
+                pool_root
+            )
     except SystemExit as exc:
         return [f"快照池: ⚠️ {exc}"]
-    buckets = index.get("buckets") or {}
-    entries = index.get("entries") or {}
-    arms = index.get("arms") or {}
+    buckets = index["buckets"]
+    entries = index["entries"]
+    arms = index["arms"]
     total_bytes = sum(
         int(item.get("bytes") or 0)
         for item in buckets.values()
@@ -1055,8 +1085,9 @@ def _cmd_task_init(args: argparse.Namespace) -> int:
             f"python -m membench.cli run --adapter <适配器> --dataset <数据集> "
             f"--task-dir {first_arm} --replay <源：实验目录 / 数据集目录 / 回放任务>"
             "（两臂分别 --task-dir <任务>/A、<任务>/B 回放同一源时，状态相同的对话共用"
-            "同一个桶）；进度用 python -m membench.cli task status "
-            f"{task_dir}",
+            "同一个桶；同一臂可再加 --shards <N> --shard-index <I> --shard-by dialogue "
+            "让多个进程并行回放，各进程只写自己对话的条目）；进度用 "
+            f"python -m membench.cli task status {task_dir}",
             file=sys.stderr,
         )
     else:
@@ -1089,7 +1120,7 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
         )
     print(f"[membench] 任务目录: {target}")
     print(f"[membench] 骨架: {skeleton}")
-    is_replay_task = layout.has_snapshot_index(layout.snapshot_task_root(target))
+    is_replay_task = layout.has_snapshot_pool(layout.snapshot_task_root(target))
     for line in _snapshot_pool_lines(target):
         print(f"[membench] {line}")
 

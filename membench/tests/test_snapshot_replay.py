@@ -384,12 +384,19 @@ def test_replay_exports_to_task_pool_not_dialogue_dirs(tmp_path: Path) -> None:
     replay_dataset = _replay_run(tmp_path, name="replay", replay=exp)
     assert _metrics(replay_dataset)["state_snapshot"]["role"] == "replayed"
     assert not list(Path(replay_dataset).glob(f"*/{layout.DIR_SNAPSHOT}"))
-    # 池在实验目录（单臂任务根）下：两个对话各一个桶 + 索引
+    # 池在实验目录（单臂任务根）下：两个对话各一个桶 + 各一个逐对话条目
     task_dir = tmp_path / "replay"
     pool = task_dir / layout.DIR_SNAPSHOTS
-    assert layout.has_snapshot_index(str(task_dir))
-    index = json.loads((pool / layout.FILE_SNAPSHOT_INDEX).read_text(encoding="utf-8"))
+    assert layout.has_snapshot_pool(str(task_dir))
+    index = layout.materialize_snapshot_index(str(pool))
     assert len(index["buckets"]) == 2
+    entries_dir = pool / layout.DIR_SNAPSHOT_ENTRIES / layout.snapshot_arm_segment("")
+    entry_files = sorted(entries_dir.glob(f"*/{layout.tag_dir_name('d1')}.json"))
+    assert entry_files and entry_files[0].is_file()
+    assert sorted(path.stem for path in (pool / layout.DIR_SNAPSHOT_ENTRIES).glob("*/*/*.json")) == [
+        "d1",
+        "d2",
+    ]
     assert _metrics(replay_dataset)["state_snapshot"]["snapshots_dir"] == str(pool)
 
     # 显式 snapshot=True + replay：与默认一致（导出到池，构造期不报错）
@@ -404,7 +411,13 @@ def test_replay_exports_to_task_pool_not_dialogue_dirs(tmp_path: Path) -> None:
     explicit_dir = Path(explicit.run())
     assert _metrics(explicit_dir)["state_snapshot"]["role"] == "replayed"
     assert not list(explicit_dir.glob(f"*/{layout.DIR_SNAPSHOT}"))
-    assert (tmp_path / "replay-explicit" / layout.DIR_SNAPSHOTS / layout.FILE_SNAPSHOT_INDEX).is_file()
+    assert (
+        tmp_path
+        / "replay-explicit"
+        / layout.DIR_SNAPSHOTS
+        / layout.DIR_SNAPSHOT_ENTRIES
+        / layout.snapshot_arm_segment("")
+    ).is_dir()
 
 
 def test_replay_refuses_on_other_dataset_or_changed_content(tmp_path: Path) -> None:

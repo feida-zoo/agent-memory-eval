@@ -194,9 +194,10 @@ run_id 带 `_limit{N}` 后缀、实验目录名带 `_l<N>` 后缀、metrics.json
 `"limit": N`，冒烟结果不会被误当全量结果对比。
 
 数据集级分片（BEAM / LongMemEval 这类大集，可选）。分片产物**只写各片负责的对话目录**
-（`runs/<dataset>/<对话>/report/`）与一份**分片账本** `runs/<dataset>/shards.json`——
-不写数据集级 `report/` 与任务级 `reports/`，所以分片产物不会"看起来像一份完整实验"；
-数据集级与任务级产物一律由 `fuse` 补齐：
+（`runs/<dataset>/<对话>/report/`）与一份**分片账本**（`runs/<dataset>/shards.<i>.json`
+逐片条目 + 物化视图 `runs/<dataset>/shards.json`）——不写数据集级 `report/` 与任务级
+`reports/`，所以分片产物不会"看起来像一份完整实验"；数据集级与任务级产物一律由
+`fuse` 补齐：
 
 ```bash
 # 先下载（落 ~/.membench/datasets/beam_1m.jsonl）：
@@ -241,11 +242,15 @@ python -m membench.cli fuse \
 
 `--shards` 与 `--limit` 可组合（先分片再截断），用于分片链路的廉价验证。
 
-**分片账本（`runs/<dataset>/shards.json`）**：同一次评测各分片的进度与归属的唯一记录——
-头部记口径（`schema` / `dataset` / `shards` / `shard_by` / `limit` / 数据集指纹），
-`entries.s<i>` 记该片的 `status`（`running` / `done`）、负责的对话、实测题数、`run_id` 与起止时间。
-账本口径或数据集指纹与本次不一致（换了 `--shards` / `--shard-by` / `--limit` / 数据集却写进
-同一目录）会被拒绝：同一个任务目录里只能放同一次评测的分片。`fuse` 与 `task status` 都读它。
+**分片账本（`runs/<dataset>/shards.<i>.json` + `runs/<dataset>/shards.json`）**：同一次
+评测各分片的进度与归属。**每个分片一个条目文件** `shards.<i>.json`（单文件原子写，并行
+分片只写自己那一片，不会互相覆盖，也不需要锁），`shards.json` 由这些条目物化成视图
+（人直接翻文件时看它；`fuse` / `task status` 走 `layout.read_shard_ledger` 的合并结果，
+只有旧产物没有逐片条目时才读 `shards.json` 本身）。头部记口径（`schema` / `dataset` /
+`shards` / `shard_by` / `limit` / 数据集指纹），`entries.s<i>` 记该片的 `status`
+（`running` / `done`）、负责的对话、实测题数、`run_id` 与起止时间。账本口径或数据集
+指纹与本次不一致（换了 `--shards` / `--shard-by` / `--limit` / 数据集却写进同一目录）
+会被拒绝：同一个任务目录里只能放同一次评测的分片。
 
 **分片 / 冒烟怎么进目录名**：分片用跨目录写法时（不带 `--task-dir`），实验目录名末尾追加
 `_s<分片序号>`、`--limit N` 追加 `_l<N>`（如 `eval_my-sys_wx_20261024-193000_s1_l50`）；
@@ -405,33 +410,76 @@ python -m membench.cli run --adapter <你的适配器> --dataset <同一个数�
 
 ```
 <任务>/
-├── runs/ 或 A/ B/              # 与普通任务相同（单臂 runs/；双臂 A/ B/）
+├── runs/ 或 A/ B/                       # 与普通任务相同（单臂 runs/；双臂 A/ B/）
 └── snapshots/
-    ├── <sha256 前 12 位>/       # 桶（含适配器导出的内容 + 框架写的 manifest.json）
-    ├── .tmp-<uuid>/             # 导出中的临时目录（成功即整体移入桶；不是桶）
-    └── index.json               # 桶 / 逐臂逐对话映射 / 各臂来源与计数
+    ├── <sha256 前 12 位>/               # 桶（含适配器导出的内容 + 框架写的 manifest.json）
+    ├── .tmp-<uuid>/                     # 导出中的临时目录（成功即整体移入桶；不是桶）
+    ├── entries/<臂>/<数据集>/<对话>.json  # 逐对话条目（真源；空臂键目录名为 _）
+    └── index.json                       # 派生视图：桶 / 逐臂逐对话映射 / 各臂来源与计数
 ```
 
-- **内容去重**：A/B 两臂回放同一源时，两臂恢复出的状态相同 → 只产生一份桶，索引里
-  `A|ds|d1` 与 `B|ds|d1` 指向同一 digest；状态不同（回放不保真）才各存一份——
+- **条目一对话一文件**：条目自足（`digest` / `state_sha256` / `bytes` / `n_files` /
+  `dataset` / `dialogue_id` / `arm` / `source` / `source_manifest_sha256` / `reused` /
+  `run_id` / `written_at`），单文件临时写 + `os.replace` 原子落位；对话级分片的各进程
+  只写自己负责的对话 ⇒ **并行回放没有共享可变状态要抢，不需要锁**。同一对话重复写
+  （同片重跑）按"覆盖自己的条目"处理，但 digest 必须一致，否则报错（状态变了）；
+- **内容去重**：A/B 两臂回放同一源时，两臂恢复出的状态相同 → 只产生一份桶，条目里
+  `A/ds/d1` 与 `B/ds/d1` 指向同一 digest；状态不同（回放不保真）才各存一份——
   **差异本身就是回放不保真的证据**；
-- **同源不重复**：B 臂回放时若桶已存在，校验桶内清单的 `entry.sha256` 与本次一致后
-  直接复用（不占额外磁盘）；不一致（前缀撞车 / 桶被改动）直接报错，不静默复用；
-- **`--no-snapshot`**：回放也不写桶、不写索引（`metrics.state_snapshot` 里没有
+- **同源不重复（并发安全）**：桶落位只靠一次 `os.replace` 的成败判"本次创建 / 别人已
+  建好"——成功即新写；失败（目标已存在）则读桶内清单的 `entry.sha256`，与本次一致就
+  删临时目录、记 `reused=true`；不一致（前缀撞车 / 桶被损坏）直接报错。不预判目录
+  存在性，因此两个分片进程同时建同一个桶也只会有一个真创建；
+- **索引是派生视图**：`index.json` 的真源是 `entries/` 树 + 各桶 `manifest.json`，
+  由 `layout.materialize_snapshot_index` 重算（`fuse --task-dir` 收尾、`task status`
+  发现缺失/过期时都会刷新）。并行回放的各进程**不写**它，所以不会丢条目；`--replay`
+  读源也优先读条目树，只有旧产物（没有 `entries/`）才回退读索引；
+- **并行分片回放**：同一臂可以多进程并行，必须 `--shard-by dialogue`：
+
+  ```bash
+  TASK=$(python -m membench.cli task init --name replay --arms 2 --replay)
+  for i in 0 1; do
+    python -m membench.cli run --adapter <adapter> --dataset <数据集> \
+        --task-dir "$TASK/A" --replay <源> \
+        --shards 2 --shard-index "$i" --shard-by dialogue &
+  done
+  wait
+  python -m membench.cli fuse --task-dir "$TASK/A"   # 收尾：物化快照池索引
+  python -m membench.cli task status "$TASK"
+  ```
+
+- **`--no-snapshot`**：回放也不写桶、不写条目 / 索引（`metrics.state_snapshot` 里没有
   `snapshots_dir` / `n_buckets`）；
 - **`task status`**：回放任务会打印池的桶数与总体积、各臂 `n_dialogues` / `n_reused` /
-  `n_new` 与来源，并给出两臂一致性的一句话（如
-  `数据集 ds: A 臂与 B 臂快照 7/7 逐对话一致（共用 7 个桶）`；有差异则列出
-  `内容不同 / 仅 A / 仅 B` 的对话数）；
+  `n_new` 与来源（从条目 + 桶重算，不信任可能过期的 `index.json`），并给出两臂一致性
+  的一句话（如 `数据集 ds: A 臂与 B 臂快照 7/7 逐对话一致（共用 7 个桶）`；有差异则
+  列出 `内容不同 / 仅 A / 仅 B` 的对话数）；
 - **链式回放**：`--replay` 接受回放任务本身——传臂目录（`<任务>/A`）按该臂取桶；传
-  任务根时索引里只有一个臂才自动用它，多个臂会报错并要求改传具体臂目录（两臂状态
+  任务根时池里只有一个臂才自动用它，多个臂会报错并要求改传具体臂目录（两臂状态
   可能不同，替你选一个臂就是替你选结论）。所以
   `run --task-dir <task2>/A --replay <task1>/A` 可直接跑；
 - **报告**：回放任务的对话级报告把「本对话快照桶」链接到
   `snapshots/<digest>/` 并标注「复用 / 新写」，数据集级报告给出任务级池目录与本 run
   的桶数（复用 / 新写）。
 
-`snapshots/index.json` 的结构（机器可读，`sort_keys` 落盘）：
+逐对话条目的结构（`snapshots/entries/A/ds/d1.json`，`sort_keys` 落盘）：
+
+```json
+{
+  "schema": 1,
+  "digest": "5f54ecf2363e",
+  "state_sha256": "5f54…（完整 64 位）",
+  "bytes": 71, "n_files": 1,
+  "dataset": "ds", "dialogue_id": "d1", "arm": "A",
+  "source": "<--replay 的源目录>",
+  "source_manifest_sha256": "<源清单合并 sha256>",
+  "reused": false,
+  "run_id": "<本次回放的 run_id>",
+  "written_at": "2026-10-27T15:12:13"
+}
+```
+
+物化后的 `snapshots/index.json`（结构对旧读者完全兼容）：
 
 ```json
 {
@@ -450,11 +498,11 @@ python -m membench.cli run --adapter <你的适配器> --dataset <同一个数�
 }
 ```
 
-`arms` 的 `n_dialogues` 是索引里该臂的条目数（跨数据集累计），`n_reused` / `n_new` 是
-该任务内累计的回放导出计数；`source` 取该臂**最近一次**回放的源。`buckets` 里的
+`arms` 的 `n_dialogues` 是该臂的条目数（跨数据集累计），`n_reused` / `n_new` 是该臂
+当前条目的 `reused` 统计；`source` 取该臂**最近一次**写入的条目。`buckets` 里的
 `dataset` / `dialogue_id` 是**首次写入该桶**的对话（桶按内容寻址，之后可能被其它对话
-或另一个臂复用）；`n_files` 不含框架写的 `manifest.json`。索引每处理完一个对话就原子
-替换一次（`os.replace`），中途崩溃也能读到已完成部分。
+或另一个臂复用）；`n_files` 不含框架写的 `manifest.json`。索引只在 `fuse` / `task status`
+收尾时物化，不参与回放写入路径。
 
 ## 判分健壮性说明
 
@@ -542,7 +590,7 @@ python -m membench.cli task status <任务目录>   # 只读进度：骨架 / �
 DIR/eval_<adapter>_<platform>_<ts>[_s<i>][_l<limit>]/   # ts = YYYYMMDD-HHMMSS；分片/冒烟后缀见上
 ├── runs/<dataset>/                      # 每个数据集一棵子树
 │   ├── report/{report.md,metrics.json,results.jsonl,fig_category_accuracy.png,fig_latency_hist.png}
-│   ├── shards.json                      # 分片账本：各片的进度与归属（分片评测才有，见「冒烟与分片」）
+│   ├── shards.<i>.json, shards.json     # 分片账本：逐片条目 + 物化视图（分片评测才有，见「冒烟与分片」）
 │   └── <对话目录>/                       # 对话 id 归一成安全目录名（非法字符换 `_`，空值回退 dialogue）
 │       ├── runtime/                     # 运行时数据（桥的 reset 前备份落 runtime/reset_backup/）
 │       ├── memory_snapshot/             # 默认导出的对话快照（含框架写的 manifest.json；--no-snapshot 关）
@@ -564,7 +612,8 @@ DIR/{eval_<name>_<platform>_<ts> | compare_<name>_<platform>_<ts>}/
 ├── runs/ 或 A/ B/                       # 与普通任务相同
 └── snapshots/
     ├── <sha256 前 12 位>/                # 桶：适配器导出的状态 + 框架写的 manifest.json（记来源）
-    └── index.json                       # 桶 / 臂|数据集|对话 -> 桶 / 各臂来源与计数
+    ├── entries/<臂>/<数据集>/<对话>.json  # 逐对话条目（真源；并行分片各写各的）
+    └── index.json                       # 派生视图：桶 / 臂|数据集|对话 -> 桶 / 各臂来源与计数
 
 # 矩阵对比（matrix：--report-out DIR 为父目录，--out 直接指定完整实验目录，--out 优先）
 DIR/matrix_<ts>/
@@ -580,10 +629,10 @@ DIR/matrix_<ts>/
 - `fuse --task-dir DIR`：就地补齐数据集级与任务级产物（各片本来就写在这一棵树里），与 `--runs/--out` 互斥。
 
 - 不传 `--report-out` / `--task-dir` / `--out` 时一律落 `output_root()`：`run` / `evaluate` 落 `output_root()/eval_<adapter>_<platform>_<ts>/`，`compare` / `evaluate-compare` 落 `output_root()/compare_<name>_<platform>_<ts>/`，`matrix` 落 `output_root()/matrix_<ts>/`。
-- **分片账本** `runs/<dataset>/shards.json`：多片共用一个任务目录（或跨目录各落一棵）时那棵树"跑到哪了"的唯一记录；口径（`shards` / `shard_by` / `limit` / 数据集指纹）与本次不一致会被拒绝，`fuse` 与 `task status` 都读它。分片只写各片负责的对话目录 + 账本，数据集级与任务级产物由 `fuse` 补齐（见「大数据集：冒烟与分片」）。
+- **分片账本** `runs/<dataset>/shards.<i>.json`（逐片条目）+ `runs/<dataset>/shards.json`（物化视图）：多片共用一个任务目录（或跨目录各落一棵）时那棵树"跑到哪了"的记录；口径（`shards` / `shard_by` / `limit` / 数据集指纹）与本次不一致会被拒绝，`fuse` 与 `task status` 都经 `layout.read_shard_ledger` 读合并结果（旧产物没有逐片条目时才读 `shards.json`）。分片只写各片负责的对话目录 + 账本，数据集级与任务级产物由 `fuse` 补齐（见「大数据集：冒烟与分片」）。
 - **对话级报告**除本对话指标外，还给该对话记忆快照的可点击相对链接（`../memory_snapshot/`）与清单条目数 / 体积——跑完 ingest 就能翻记忆文件；分片产物的对话级报告顶部另有「分片 i/N——仅覆盖部分题目」标注。
-- 命名与落位 helper 是**公开 API**（不必自己重写约定）：`membench.layout` 的 `task_subdir` / `init_task_dir` / `arm_dir` / `eval_subdir` / `compare_subdir` / `matrix_subdir` / `experiment_tags` / `run_id` / `run_id_tags` / `experiment_path` / `runs_root` / `dataset_dir` / `dataset_report_dir` / `dialogue_dir` / `dialogue_report_dir` / `dialogue_runtime_dir` / `dialogue_snapshot_dir` / `shard_ledger_path` / `read_shard_ledger` / `task_report_dir` / `resolve_dataset_dir`，以及回放任务快照池的 `snapshot_pool_root` / `snapshot_arm_key` / `snapshot_bucket_dir` / `snapshot_index_path` / `read_snapshot_index` / `write_snapshot_index`；产物根 `membench.paths.output_root()`。
-- **读取方的「产物目录」入参**（`compare --baseline/--candidate`、`evaluate --from-runs`、`evaluate-compare --baseline-run/--candidate-run`、`matrix --runs` 右值、`run --replay`、`run --replay-verify-source`、`fuse --runs`）统一经 `layout.resolve_dataset_dir` 解析：传**实验目录**（其下恰有一个数据集目录时自动定位；有多个则要求指向具体数据集目录）或**数据集目录**（`<实验目录>/runs/<dataset>`）都行；指标固定读 `<数据集目录>/report/metrics.json`。`run --replay` 另接受**回放任务**（含 `snapshots/index.json` 的任务根或臂目录），按池索引取桶而不是走数据集目录（见「回放任务的快照池」）。未融合的分片产物（数据集目录下只有账本与对话目录）会明确要求先 `fuse`——"没融合"与"没产物"是两回事。`--from-runs` 的 `KEY` 还会与实际产物身份核对：`office` ↔ `office_dataset`（或用户测试集的 `user_dataset`）这类"key 与目录名不同"的映射由数据集注册表反推，不会拿 key 与目录名直接比字符串；key 认错时直接报错，不把别的数据集的分数记到该 key 名下。
+- 命名与落位 helper 是**公开 API**（不必自己重写约定）：`membench.layout` 的 `task_subdir` / `init_task_dir` / `arm_dir` / `eval_subdir` / `compare_subdir` / `matrix_subdir` / `experiment_tags` / `run_id` / `run_id_tags` / `experiment_path` / `runs_root` / `dataset_dir` / `dataset_report_dir` / `dialogue_dir` / `dialogue_report_dir` / `dialogue_runtime_dir` / `dialogue_snapshot_dir` / `shard_ledger_path` / `read_shard_ledger` / `task_report_dir` / `resolve_dataset_dir`，以及回放任务快照池的 `snapshot_pool_root` / `snapshot_arm_key` / `snapshot_entry_path` / `snapshot_bucket_dir` / `snapshot_index_path` / `read_snapshot_entry` / `write_snapshot_entry` / `build_snapshot_index` / `materialize_snapshot_index` / `read_snapshot_index` / `write_snapshot_index`；产物根 `membench.paths.output_root()`。
+- **读取方的「产物目录」入参**（`compare --baseline/--candidate`、`evaluate --from-runs`、`evaluate-compare --baseline-run/--candidate-run`、`matrix --runs` 右值、`run --replay`、`run --replay-verify-source`、`fuse --runs`）统一经 `layout.resolve_dataset_dir` 解析：传**实验目录**（其下恰有一个数据集目录时自动定位；有多个则要求指向具体数据集目录）或**数据集目录**（`<实验目录>/runs/<dataset>`）都行；指标固定读 `<数据集目录>/report/metrics.json`。`run --replay` 另接受**回放任务**（带 `snapshots/` 的任务根或臂目录），按逐对话条目取桶而不是走数据集目录（见「回放任务的快照池」）。未融合的分片产物（数据集目录下只有账本与对话目录）会明确要求先 `fuse`——"没融合"与"没产物"是两回事。`--from-runs` 的 `KEY` 还会与实际产物身份核对：`office` ↔ `office_dataset`（或用户测试集的 `user_dataset`）这类"key 与目录名不同"的映射由数据集注册表反推，不会拿 key 与目录名直接比字符串；key 认错时直接报错，不把别的数据集的分数记到该 key 名下。
 - Runner API 使用者传 `Runner(..., out_dir=实验目录)`：Runner 直接写 `<实验目录>/runs/<dataset>/…`（数据集级报告 + 逐对话报告 + `runtime/`），任务级报告落 `<实验目录>/reports/`，并把 `experiment_dir` / `dataset_dir` 写回 `metrics.json`。
 - 旧版产物（平铺的 run 目录、缺 `report/` 层级）**不再兼容**：读取时统一报错「产物结构为旧版（缺少 report/ 层级），本版本不再兼容，请重新跑评测」。目录里**根本没有**数据集产物（空目录、跑到一半中断）另有独立报错文案——那是"没有产物"而不是"版本旧"，别去改代码兼容，换个目录或重跑即可。
 

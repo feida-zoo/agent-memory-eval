@@ -150,12 +150,6 @@ def _ledger(dataset_dir: str) -> dict:
     )
 
 
-def _write_ledger(dataset_dir: str, ledger: dict[str, Any]) -> None:
-    (Path(dataset_dir) / layout.FILE_SHARDS).write_text(
-        json.dumps(ledger, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-
 def _drop_last_record(dataset_dir: str, name: str) -> None:
     """从某个对话的逐题明细里删掉最后一条（模拟产物被削掉一题）。"""
     path = Path(dataset_dir) / name / layout.DIR_REPORT / layout.FILE_RESULTS
@@ -453,9 +447,13 @@ def test_fuse_rejects_unfinished_shard(tmp_path: Path) -> None:
     """账本里还有 running 的片（跑到一半）时拒绝：半成品会被当成完整的一片。"""
     s0 = _shard_run(tmp_path, "s0", MockStrongAdapter(), 2, 0)
     s1 = _shard_run(tmp_path, "s1", MockStrongAdapter(), 2, 1)
-    ledger = _ledger(s1)
-    ledger["entries"]["s1"]["status"] = "running"
-    _write_ledger(s1, ledger)
+    # 账本真源是逐片条目文件（shards.json 只是物化视图），改状态要走 write API
+    ledger = layout.read_shard_ledger(s1)
+    assert ledger is not None
+    header = {key: value for key, value in ledger.items() if key != "entries"}
+    layout.update_shard_ledger(
+        s1, header, "s1", {**ledger["entries"]["s1"], "status": "running"}
+    )
 
     with pytest.raises(ValueError, match="还没跑完"):
         fuse_runs([s0, s1], str(tmp_path / "fused"))

@@ -8,14 +8,15 @@
 
 任务目录的命名与骨架由 :func:`task_subdir` / :func:`init_task_dir` 唯一决定、臂目录经
 :func:`arm_dir` 取；同一次评测的多个分片写进同一个任务目录时，各片的进度与归属记在
-分片账本 :data:`FILE_SHARDS` 里（路径见 :func:`shard_ledger_path`，读 / 写 / 校验见
-:func:`read_shard_ledger` / :func:`write_shard_ledger` / :func:`check_shard_ledger`——
-写入方（Runner）与读取方（fuse 等）共用同一套账本口径）。::
+分片账本里——**每个分片一个条目文件** ``shards.<i>.json``（:func:`shard_entry_path`，
+并行分片各写各的），``shards.json`` 是由条目物化的视图（:func:`read_shard_ledger` /
+:func:`update_shard_ledger` / :func:`check_shard_ledger`——写入方（Runner）与读取方
+（fuse 等）共用同一套账本口径）。::
 
     <root>/eval_<name>_<platform>_<ts>[_s<i>][_l<limit>]/
     ├── runs/<dataset>/
     │   ├── report/                      # 数据集级聚合报告（md + metrics + 逐题明细 + 图）
-    │   ├── shards.json                  # 分片账本（分片评测时记录各片进度与归属）
+    │   ├── shards.<i>.json, shards.json  # 分片账本：逐片条目（真源）+ 物化视图（分片评测才有）
     │   └── <dialogue_id>/
     │       ├── runtime/                 # 运行时数据（如桥的 reset 前备份）
     │       ├── memory_snapshot/         # 对话快照（默认导出，含 manifest.json）
@@ -26,11 +27,12 @@
     <root>/matrix_<ts>/                      reports/ + runs/<label>/（内部同 eval 树）
 
 **回放任务**（``task init --replay``）在任务目录根多一个内容寻址快照池 ``snapshots/``：
-回放导出的状态按内容哈希去重成桶 ``snapshots/<sha256 前 12 位>/``，任务级索引
-``snapshots/index.json`` 记录桶、各臂逐对话映射与来源（路径 helper 见
-:func:`snapshot_pool_root` / :func:`snapshot_bucket_dir`，读 / 写见
-:func:`read_snapshot_index` / :func:`write_snapshot_index`）。池属于**任务**而不是臂：
-双臂回放同一源时两臂指向同一批桶，差异本身即"回放不保真"的证据。
+回放导出的状态按内容哈希去重成桶 ``snapshots/<sha256 前 12 位>/``，**每个对话一个
+条目文件** ``snapshots/entries/<臂>/<数据集>/<对话>.json``（真源，路径见
+:func:`snapshot_entry_path`），任务级 ``snapshots/index.json`` 是由条目树 + 各桶清单
+重算出来的**派生视图**（:func:`build_snapshot_index` / :func:`materialize_snapshot_index`）。
+对话级分片下各进程只写自己负责的对话条目 ⇒ 并行回放不需要任何锁。池属于**任务**
+而不是臂：双臂回放同一源时两臂指向同一批桶，差异本身即"回放不保真"的证据。
 
 ``<root>`` 由 :func:`membench.paths.output_root` 解析（CLI ``--report-out DIR`` 即指它）。
 
@@ -68,6 +70,8 @@ DIR_RUNTIME = "runtime"
 DIR_SNAPSHOT = "memory_snapshot"
 #: 回放任务的内容寻址快照池（任务根层，与 runs/ 平级）：桶 = ``<池>/<sha256 前 12 位>``。
 DIR_SNAPSHOTS = "snapshots"
+#: 快照池里的逐对话条目树（``<池>/entries/<臂>/<数据集>/<对话>.json``，池的真源）。
+DIR_SNAPSHOT_ENTRIES = "entries"
 
 #: A/B 对比实验目录（compare / evaluate-compare）下两侧副本的目录名：A = 基线、B = 候选。
 #: 兼作报告里的侧标签。
@@ -82,9 +86,12 @@ FILE_RESULTS = "results.jsonl"
 FILE_SUMMARY = "evaluate_summary.json"
 FILE_MATRIX_RESULT = "matrix_result.json"
 #: 分片账本（落数据集目录下）：同一次评测各分片的进度与归属，见 :func:`shard_ledger_path`。
+#: 真源是逐片条目文件 ``shards.<i>.json``（并行分片各写各的），本文件是物化视图。
 FILE_SHARDS = "shards.json"
 #: 快照池索引文件名（落回放任务的 ``snapshots/`` 下），见 :func:`snapshot_index_path`。
 FILE_SNAPSHOT_INDEX = "index.json"
+#: 快照桶 / 对话快照目录里的清单文件名（框架写，适配器不碰），池的派生索引也读它。
+FILE_SNAPSHOT_MANIFEST = "manifest.json"
 
 #: 图表文件名（报告内引用一律同目录相对文件名）。
 FIG_CATEGORY = "fig_category_accuracy.png"
@@ -289,17 +296,23 @@ def arm_dir(task_dir: str, arm: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 回放任务的快照池：内容寻址的桶 + 任务级索引（读 / 写 / 校验的唯一实现）
+# 回放任务的快照池：内容寻址的桶 + 逐对话条目（真源）+ 派生索引
 # ---------------------------------------------------------------------------
 
 #: 快照池索引结构版本：结构变了就 +1，读到不认识的版本即拒绝。
 SNAPSHOT_POOL_SCHEMA = 1
+
+#: 逐对话快照条目（``snapshots/entries/**/<对话>.json``）的结构版本。
+SNAPSHOT_ENTRY_SCHEMA = 1
 
 #: 桶名长度：状态内容 sha256 的前 12 位（既够短、又足以区分一次评测里的各对话状态）。
 SNAPSHOT_BUCKET_CHARS = 12
 
 #: 池内临时导出目录前缀（导出算完哈希后整体移入桶，失败即删；不是桶，遍历时必须跳过）。
 SNAPSHOT_TMP_PREFIX = ".tmp-"
+
+#: 空臂键（单臂任务 / 普通实验根）在条目树里的目录名：目录名不能是空串。
+_EMPTY_ARM_SEGMENT = "_"
 
 #: 桶名只允许小写十六进制：索引里的条目指向什么目录必须能一眼校验，防止手改索引越出池。
 _BUCKET_RE = re.compile(r"^[0-9a-f]{%d}$" % SNAPSHOT_BUCKET_CHARS)
@@ -326,7 +339,10 @@ def snapshot_pool_root(target: str) -> str:
 
 
 def snapshot_arm_key(target: str) -> str:
-    """臂在索引里的键：目标产物根相对任务目录的路径（``A`` / ``B``；任务根本身为 ``""``）。"""
+    """臂键（条目树目录名 / 索引键的来源）：目标产物根相对任务目录的路径。
+
+    ``A`` / ``B``；任务自身（单臂任务 / 普通实验根）为 ``""``（条目树里映射为 ``_``）。
+    """
     rel = os.path.relpath(os.path.abspath(target), snapshot_task_root(target))
     return "" if rel == os.curdir else rel.replace(os.sep, "/")
 
@@ -377,14 +393,303 @@ def snapshot_index_path(pool_root: str) -> str:
     return os.path.join(pool_root, FILE_SNAPSHOT_INDEX)
 
 
-def has_snapshot_index(task_dir: str) -> bool:
-    """该任务目录是不是**回放任务**（任务根 ``snapshots/index.json`` 存在）。"""
-    return os.path.isfile(snapshot_index_path(os.path.join(task_dir, DIR_SNAPSHOTS)))
+def has_snapshot_pool(task_dir: str) -> bool:
+    """该任务目录是不是**回放任务**（任务根有 ``snapshots/`` 目录）。
+
+    判定只看目录存在：``task init --replay`` 建骨架时就建了它，还没导出任何状态的池
+    同样算回放任务——把它当 ``--replay`` 源要给出"池里还没有快照"的明确报错，而不是
+    退回"目录里没有数据集产物"。普通任务不建 ``snapshots/``。
+    """
+    return os.path.isdir(os.path.join(task_dir, DIR_SNAPSHOTS))
 
 
-def empty_snapshot_index() -> dict[str, Any]:
-    """空索引：``buckets`` / ``entries`` / ``arms`` 三段（结构版本见 :data:`SNAPSHOT_POOL_SCHEMA`）。"""
-    return {"schema": SNAPSHOT_POOL_SCHEMA, "buckets": {}, "entries": {}, "arms": {}}
+def snapshot_entries_root(pool_root: str) -> str:
+    """条目树根：``<pool_root>/entries``（每个对话一个条目文件，池的真源）。"""
+    return os.path.join(pool_root, DIR_SNAPSHOT_ENTRIES)
+
+
+def snapshot_arm_segment(arm: str) -> str:
+    """臂键在条目树里的目录名：空臂键（单臂任务 / 普通实验根）用 ``_``。
+
+    目录名不能是空串；臂键口径（``""`` / ``A`` / ``B``）仍由 :func:`snapshot_arm_key`
+    决定，反向解析见 :func:`snapshot_arm_from_segment`。
+    """
+    return tag_dir_name(arm) if arm else _EMPTY_ARM_SEGMENT
+
+
+def snapshot_arm_from_segment(segment: str) -> str:
+    """条目树目录名回到臂键（``_`` → ``""``）。"""
+    return "" if segment == _EMPTY_ARM_SEGMENT else segment
+
+
+def snapshot_entry_path(
+    pool_root: str, arm: str, dataset: str, dialogue_id: str
+) -> str:
+    """条目文件路径：``<池>/entries/<臂>/<数据集>/<对话目录名>.json``。
+
+    条目自足（含身份、桶名、内容哈希、来源、复用标记、run_id、写入时间），读取方
+    不必再读那个跨臂共享的 ``index.json``。对话级分片下各进程只写自己负责的对话
+    文件，因此并行回放没有任何共享可变状态要抢。
+    """
+    return os.path.join(
+        snapshot_entries_root(pool_root),
+        snapshot_arm_segment(arm),
+        slug(dataset),
+        f"{tag_dir_name(dialogue_id)}.json",
+    )
+
+
+def _load_snapshot_entry_file(path: str) -> dict[str, Any]:
+    """读一个条目文件并校验结构；损坏 / 版本不认识当场报错（不猜）。"""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            entry = json.load(handle)
+    except ValueError as exc:
+        raise SystemExit(f"快照池条目损坏（{path}）：{exc}；请修复或删除该条目后重跑")
+    if not isinstance(entry, dict) or entry.get("schema") != SNAPSHOT_ENTRY_SCHEMA:
+        found = entry.get("schema") if isinstance(entry, dict) else None
+        raise SystemExit(
+            f"快照池条目结构版本不受支持（{path}）：schema={found!r}，"
+            f"本版本支持 {SNAPSHOT_ENTRY_SCHEMA}；请换一个任务目录重跑"
+        )
+    for key in ("digest", "dataset", "dialogue_id", "arm"):
+        if not isinstance(entry.get(key), str):
+            raise SystemExit(f"快照池条目结构非法（{path}）：缺少 {key} 字段")
+    if not entry["dataset"] or not entry["dialogue_id"]:
+        raise SystemExit(f"快照池条目结构非法（{path}）：dataset / dialogue_id 不能为空")
+    if not _BUCKET_RE.match(entry["digest"]):
+        raise SystemExit(
+            f"快照池条目里的桶名非法（{path}）：{entry['digest']!r}"
+            f"（应为 {SNAPSHOT_BUCKET_CHARS} 位小写十六进制）"
+        )
+    return entry
+
+
+def read_snapshot_entry(
+    pool_root: str, arm: str, dataset: str, dialogue_id: str
+) -> Union[dict[str, Any], None]:
+    """读一个对话的条目（没有返回 None）；条目身份与所在位置不一致即报错。"""
+    path = snapshot_entry_path(pool_root, arm, dataset, dialogue_id)
+    if not os.path.isfile(path):
+        return None
+    entry = _load_snapshot_entry_file(path)
+    expected = {"arm": arm, "dataset": dataset, "dialogue_id": str(dialogue_id)}
+    for key, want in expected.items():
+        if entry.get(key) != want:
+            raise SystemExit(
+                f"快照池条目的身份与所在位置不一致（{path}）：{key}={entry.get(key)!r}，"
+                f"本次需要 {want!r}——条目可能被移动或改名，请重新导出"
+            )
+    return entry
+
+
+def write_snapshot_entry(pool_root: str, entry: dict[str, Any]) -> str:
+    """原子写一个对话的条目文件，返回其路径（临时文件 + ``os.replace``）。
+
+    每对话一个文件 ⇒ 分片进程只写自己的对话，互不覆盖。同一对话被重复写（同片重跑）
+    按"覆盖自己的条目"处理，但 digest 必须一致：状态变了还覆盖，就会让"哪个对话是
+    哪个桶"与桶内实际内容脱节，宁可拒绝并要求检查。
+    """
+    if entry.get("schema") != SNAPSHOT_ENTRY_SCHEMA:
+        raise SystemExit(
+            f"快照池条目结构版本不受支持：schema={entry.get('schema')!r}，"
+            f"本版本要求 {SNAPSHOT_ENTRY_SCHEMA}"
+        )
+    arm = str(entry.get("arm") or "")
+    dataset = str(entry.get("dataset") or "")
+    dialogue_id = str(entry.get("dialogue_id") or "")
+    if not dataset or not dialogue_id:
+        raise SystemExit("快照池条目缺少 dataset / dialogue_id，无法落盘")
+    digest = str(entry.get("digest") or "")
+    snapshot_bucket_dir(pool_root, digest)  # 只做桶名形状校验
+    path = snapshot_entry_path(pool_root, arm, dataset, dialogue_id)
+    existing = read_snapshot_entry(pool_root, arm, dataset, dialogue_id)
+    if existing is not None and existing.get("digest") != digest:
+        raise SystemExit(
+            f"快照池条目已存在且内容不同（{path}）：原桶 {existing.get('digest')} vs "
+            f"本次 {digest}——同一对话重复写入必须是同一份状态（状态变了说明回放不"
+            "保真或池被改动）；请检查后换一个任务目录重跑"
+        )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(entry, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return path
+
+
+def iter_snapshot_entries(pool_root: str) -> list[dict[str, Any]]:
+    """条目树里的全部条目（按 臂 / 数据集 / 对话 排序；条目树不存在时为空）。"""
+    root = snapshot_entries_root(pool_root)
+    entries: list[dict[str, Any]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(filenames):
+            if name.endswith(".json"):
+                entries.append(_load_snapshot_entry_file(os.path.join(dirpath, name)))
+    entries.sort(
+        key=lambda e: (e["arm"], e["dataset"], e["dialogue_id"])
+    )
+    return entries
+
+
+def has_snapshot_entries(pool_root: str) -> bool:
+    """条目树里有没有任何条目文件（旧产物只有 ``index.json``，没有条目树）。
+
+    ``task status`` / ``fuse`` 用它区分"新产物"与"旧产物"：前者从条目 + 桶重算并
+    刷新索引，后者索引是唯一记录，只能原样读、绝不能拿空条目重算覆盖掉。
+    """
+    root = snapshot_entries_root(pool_root)
+    if not os.path.isdir(root):
+        return False
+    for _dirpath, _dirnames, filenames in os.walk(root):
+        if any(name.endswith(".json") for name in filenames):
+            return True
+    return False
+
+
+def snapshot_pool_arms(pool_root: str) -> list[str]:
+    """池里出现过的臂键（条目树优先；只有旧产物、没有条目树时才读索引的 ``arms`` 段）。"""
+    root = snapshot_entries_root(pool_root)
+    if os.path.isdir(root):
+        arms = sorted(
+            snapshot_arm_from_segment(name)
+            for name in os.listdir(root)
+            if os.path.isdir(os.path.join(root, name))
+        )
+        if arms:
+            return arms
+    index = read_snapshot_index(pool_root)
+    return sorted(str(name) for name in index["arms"]) if index else []
+
+
+def list_snapshot_buckets(pool_root: str) -> list[str]:
+    """池里的桶名（按名排序；``.tmp-*`` / ``entries`` / 索引文件都不算桶）。"""
+    if not os.path.isdir(pool_root):
+        return []
+    return sorted(
+        name
+        for name in os.listdir(pool_root)
+        if _BUCKET_RE.match(name) and os.path.isdir(os.path.join(pool_root, name))
+    )
+
+
+def _bucket_stats(bucket: str) -> tuple[int, int]:
+    """桶的内容统计 ``(字节数, 文件数)``：排除顶层 ``manifest.json``。
+
+    与 :func:`membench.snapshot.dir_stats` 的口径一致（``n_files`` 不含框架写的清单），
+    这里不 import snapshot（它会 import 本模块），故自带同样的小遍历。
+    """
+    total = 0
+    count = 0
+    for root, _dirs, files in os.walk(bucket):
+        for name in files:
+            if root == bucket and name == FILE_SNAPSHOT_MANIFEST:
+                continue
+            count += 1
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+    return total, count
+
+
+def _read_bucket_manifest(bucket: str) -> dict[str, Any]:
+    """读桶内清单（派生索引的桶身份来源）；缺失 / 损坏当场报错。"""
+    path = os.path.join(bucket, FILE_SNAPSHOT_MANIFEST)
+    if not os.path.isfile(path):
+        raise SystemExit(
+            f"快照桶缺少清单: {path}——桶被改动或未完整落位，请检查或删除该桶后重跑"
+        )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except ValueError as exc:
+        raise SystemExit(f"快照桶清单损坏（{path}）：{exc}；请检查或删除该桶后重跑")
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("entry"), dict):
+        raise SystemExit(f"快照桶清单结构非法（{path}）：缺少 entry 段")
+    return manifest
+
+
+def build_snapshot_index(pool_root: str) -> dict[str, Any]:
+    """从条目树 + 各桶清单重算索引（不落盘）。
+
+    真源是 ``snapshots/entries/``（逐对话自足条目）与各桶的 ``manifest.json``；
+    ``index.json`` 只是便于人看、兼容旧读者的派生视图。并行回放时没有任何进程需要
+    读-改-写它，因此不需要锁。
+
+    ``arms`` 段的 ``source`` 取该臂**最近一次**写入的条目（同秒时按 run_id 定序），
+    计数是该臂当前全部条目的 ``reused`` / ``reused=false`` 统计。
+    """
+    buckets: dict[str, Any] = {}
+    for digest in list_snapshot_buckets(pool_root):
+        bucket = os.path.join(pool_root, digest)
+        manifest = _read_bucket_manifest(bucket)
+        state_sha256 = (manifest.get("entry") or {}).get("sha256")
+        if not isinstance(state_sha256, str) or not state_sha256:
+            raise SystemExit(
+                f"快照桶清单缺少 entry.sha256: "
+                f"{os.path.join(bucket, FILE_SNAPSHOT_MANIFEST)}"
+            )
+        if snapshot_bucket_id(state_sha256) != digest:
+            raise SystemExit(
+                f"快照桶名与内容哈希不一致（{bucket}）：清单记 {state_sha256}，"
+                f"桶名应为 {snapshot_bucket_id(state_sha256)}——桶被搬动或改动过"
+            )
+        n_bytes, n_files = _bucket_stats(bucket)
+        buckets[digest] = {
+            "dataset": manifest.get("dataset"),
+            "dialogue_id": str(manifest.get("dialogue_id")),
+            "bytes": n_bytes,
+            "n_files": n_files,
+            "state_sha256": state_sha256,
+        }
+
+    entries = iter_snapshot_entries(pool_root)
+    index_entries: dict[str, str] = {}
+    latest: dict[str, tuple[tuple[str, str], dict[str, Any]]] = {}
+    counts: dict[str, list[int]] = {}
+    for entry in entries:
+        arm = entry["arm"]
+        index_entries[snapshot_entry_key(arm, entry["dataset"], entry["dialogue_id"])] = (
+            entry["digest"]
+        )
+        counts.setdefault(arm, [0, 0])[0 if entry.get("reused") else 1] += 1
+        stamp = (str(entry.get("written_at") or ""), str(entry.get("run_id") or ""))
+        if arm not in latest or stamp >= latest[arm][0]:
+            latest[arm] = (stamp, entry)
+
+    arms: dict[str, Any] = {}
+    for arm, (reused, new) in counts.items():
+        source = latest[arm][1]
+        arms[arm] = {
+            "source": source.get("source"),
+            "source_manifest_sha256": source.get("source_manifest_sha256"),
+            "n_dialogues": reused + new,
+            "n_reused": reused,
+            "n_new": new,
+        }
+    return {
+        "schema": SNAPSHOT_POOL_SCHEMA,
+        "buckets": buckets,
+        "entries": index_entries,
+        "arms": arms,
+    }
+
+
+def materialize_snapshot_index(pool_root: str) -> dict[str, Any]:
+    """重算并原子写回 ``snapshots/index.json``，返回写回的索引。
+
+    这是 fuse / task status 的收尾动作（分片回放结束后刷新派生视图）；写入方（回放）
+    不碰索引，因此并行分片不需要任何锁。结构见 :func:`build_snapshot_index`。
+    """
+    index = build_snapshot_index(pool_root)
+    write_snapshot_index(pool_root, index)
+    return index
 
 
 def read_snapshot_index(pool_root: str) -> Union[dict[str, Any], None]:
@@ -392,8 +697,8 @@ def read_snapshot_index(pool_root: str) -> Union[dict[str, Any], None]:
 
     结构：``buckets`` 按桶名登记内容身份（``dataset`` / ``dialogue_id`` / ``bytes`` /
     ``n_files`` / ``state_sha256``），``entries`` 是 ``arm|dataset|dialogue -> 桶名``，
-    ``arms`` 记每个臂的回放来源与计数。坏索引被静默覆盖，就等于丢掉"哪些状态已经
-    在池里、哪些臂指向它"的唯一记录，故宁可拒绝也不猜。
+    ``arms`` 记每个臂的回放来源与计数。索引是**派生视图**（真源 = ``entries/`` 树 +
+    各桶清单，见 :func:`build_snapshot_index`），只有旧产物才把它当真源读。
     """
     path = snapshot_index_path(pool_root)
     if not os.path.isfile(path):
@@ -422,14 +727,15 @@ def read_snapshot_index(pool_root: str) -> Union[dict[str, Any], None]:
 
 
 def write_snapshot_index(pool_root: str, index: dict[str, Any]) -> str:
-    """落盘池索引，返回索引路径（临时文件 + ``os.replace``，同目录内原子替换）。
+    """落盘池索引，返回索引路径（唯一名临时文件 + ``os.replace``，同目录内原子替换）。
 
-    索引是跨臂共享的：A、B 两臂各自回放时都要在同一个文件里追加自己的条目，读到
-    半个文件就会丢条目，故只做同目录原子替换（与分片账本同一套写法）。
+    索引会被多个进程各自重算（fuse / task status 可能同时刷新），临时文件名必须唯一，
+    否则两个进程会往同一个 ``index.json.tmp`` 里写、互相截断；替换本身是原子的，
+    最后落盘的是一份完整快照。
     """
     path = snapshot_index_path(pool_root)
     os.makedirs(pool_root, exist_ok=True)
-    tmp = f"{path}.tmp"
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(index, handle, ensure_ascii=False, indent=2, sort_keys=True)
@@ -460,10 +766,12 @@ def dataset_report_dir(experiment_dir: str, dataset: str) -> str:
 
 
 def shard_ledger_path(experiment_dir: str, dataset: str) -> str:
-    """分片账本路径：``<exp>/runs/<dataset>/shards.json``。
+    """分片账本**视图**路径：``<exp>/runs/<dataset>/shards.json``。
 
     账本记同一次评测各分片的进度与归属（谁在跑、跑完没、覆盖了哪些对话），因此落在
-    数据集目录里：多片共用一个任务目录时，它就是那棵树"跑到哪了"的唯一记录。
+    数据集目录里。真源是逐片条目文件 ``shards.<i>.json``（:func:`shard_entry_path`，
+    并行分片各写各的）；``shards.json`` 由条目物化，供人直接翻，读取方走
+    :func:`read_shard_ledger` 的合并结果。
     """
     return os.path.join(dataset_dir(experiment_dir, dataset), FILE_SHARDS)
 
@@ -519,8 +827,39 @@ def shard_key_index(key: str) -> Union[int, None]:
 
 
 def has_shard_ledger(dataset_dir: str) -> bool:
-    """该目录是不是**分片产物目录**（数据集目录下有账本文件）。"""
-    return os.path.isfile(os.path.join(dataset_dir, FILE_SHARDS))
+    """该目录是不是**分片产物目录**（有账本视图，或有逐片条目文件）。"""
+    return os.path.isfile(os.path.join(dataset_dir, FILE_SHARDS)) or bool(
+        shard_entry_files(dataset_dir)
+    )
+
+
+#: 逐片条目文件名：``shards.<i>.json``（i 即 ``--shard-index``）。落在数据集目录**文件**
+#: 而不是子目录：数据集目录下的子目录一律被当成对话目录（fuse 按这个约定遍历）。
+_SHARD_ENTRY_RE = re.compile(r"^shards\.(\d+)\.json$")
+
+
+def shard_entry_files(dataset_dir: str) -> list[str]:
+    """逐片条目文件（按分片序号排序；目录不存在时为空）。"""
+    if not os.path.isdir(dataset_dir):
+        return []
+    found = [
+        (int(match.group(1)), name)
+        for name in os.listdir(dataset_dir)
+        if (match := _SHARD_ENTRY_RE.match(name))
+        and os.path.isfile(os.path.join(dataset_dir, name))
+    ]
+    return [os.path.join(dataset_dir, name) for _index, name in sorted(found)]
+
+
+def shard_entry_path(dataset_dir: str, key: str) -> str:
+    """某一分片的条目文件路径：``<数据集目录>/shards.<i>.json``。
+
+    键走 :func:`shard_key_index` 反解（``s<i>`` → ``i``），不合法直接拒绝（防路径穿越）。
+    """
+    index = shard_key_index(key)
+    if index is None:
+        raise ValueError(f"分片键非法: {key!r}（应为 s<i>，见 layout.shard_key）")
+    return os.path.join(dataset_dir, f"shards.{index}.json")
 
 
 def shard_ledger_header(
@@ -547,38 +886,86 @@ def shard_ledger_header(
     }
 
 
+def _read_shard_entry_items(dataset_dir: str) -> list[dict[str, Any]]:
+    """读逐片条目文件并按分片序号排序；任何一份损坏 / 身份对不上都当场报错。"""
+    items: list[dict[str, Any]] = []
+    for path in shard_entry_files(dataset_dir):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                item = json.load(handle)
+        except ValueError as exc:
+            raise SystemExit(f"分片账本条目损坏（{path}）：{exc}；请修复或删除该文件后重跑")
+        if (
+            not isinstance(item, dict)
+            or item.get("schema") != SHARD_LEDGER_SCHEMA
+            or not isinstance(item.get("header"), dict)
+            or not isinstance(item.get("entry"), dict)
+        ):
+            raise SystemExit(
+                f"分片账本条目结构非法（{path}）：需要 schema / header / entry 三段"
+            )
+        key = item.get("key")
+        index = shard_key_index(key) if isinstance(key, str) else None
+        if index is None:
+            raise SystemExit(f"分片账本条目里的分片键非法（{path}）：{key!r}")
+        if os.path.basename(path) != f"shards.{index}.json":
+            raise SystemExit(
+                f"分片账本条目的键与文件名不一致（{path}）：{key!r}——"
+                "条目可能被移动或改名，请重新跑该分片"
+            )
+        items.append(item)
+    return items
+
+
 def read_shard_ledger(dataset_dir: str) -> Union[dict[str, Any], None]:
     """读数据集目录下的分片账本（没有账本返回 None）。
 
+    **逐片条目文件优先**（``shards.<i>.json``：并行分片各写各的、原子落盘，不会互相
+    覆盖），合并成账本；只有旧产物（没有逐片条目）才读物化视图 ``shards.json``。
+    所有条目的口径（header）必须一致——同一个数据集目录里只能放同一次评测的各片。
     结构非法当场报错：坏账本被静默覆盖，就等于丢掉"哪些分片已跑过、哪一片还在跑"
-    的唯一记录。账本条目 ``entries["s<i>"]`` 的字段：``status``（``running`` /
-    ``done``）、``dialogues``（该片负责的对话 id）、``n_questions``（实测题数，
-    running 时可能还没有）、``run_id``、``started_at``、``finished_at``。
+    的记录。账本条目 ``entries["s<i>"]`` 的字段：``status``（``running`` / ``done``）、
+    ``dialogues``（该片负责的对话 id）、``n_questions``（实测题数，running 时可能还
+    没有）、``run_id``、``started_at``、``finished_at``。
     """
+    items = _read_shard_entry_items(dataset_dir)
     path = os.path.join(dataset_dir, FILE_SHARDS)
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as handle:
-            ledger = json.load(handle)
-    except ValueError as exc:
-        raise SystemExit(f"分片账本损坏（{path}）：{exc}；请修复或删除该文件后重跑")
-    if not isinstance(ledger, dict) or not isinstance(ledger.get("entries"), dict):
-        raise SystemExit(
-            f"分片账本结构非法（{path}）：缺少 entries 段；请修复或删除该文件后重跑"
-        )
-    return ledger
+    if not items:
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as handle:
+                ledger = json.load(handle)
+        except ValueError as exc:
+            raise SystemExit(f"分片账本损坏（{path}）：{exc}；请修复或删除该文件后重跑")
+        if not isinstance(ledger, dict) or not isinstance(ledger.get("entries"), dict):
+            raise SystemExit(
+                f"分片账本结构非法（{path}）：缺少 entries 段；请修复或删除该文件后重跑"
+            )
+        return ledger
+
+    header = items[0]["header"]
+    entries: dict[str, Any] = {}
+    for item in items:
+        if item["header"] != header:
+            raise SystemExit(
+                f"分片账本的逐片条目口径不一致（{shard_entry_path(dataset_dir, item['key'])}）："
+                f"{item['header']!r} vs {header!r}——同一数据集目录里只能放同一次评测的分片"
+            )
+        entries[item["key"]] = item["entry"]
+    return {**header, "entries": entries}
 
 
 def write_shard_ledger(dataset_dir: str, ledger: dict[str, Any]) -> str:
-    """落盘分片账本，返回账本路径（临时文件 + ``os.replace``，同目录内原子替换）。
+    """落盘账本**视图** ``shards.json``，返回路径（唯一名临时文件 + 原子替换）。
 
-    各分片是独立进程，读-改-写之间不能把别的分片刚写下的条目擦掉；同目录内的原子
-    替换足以保证（不需要跨进程锁），最后写入的进程带上此前所有分片的条目。
+    真源是逐片条目文件（:func:`update_shard_ledger` 写）；这个视图只为"直接翻文件"
+    方便，读者仍以 :func:`read_shard_ledger` 的合并结果为准。临时文件名必须唯一，
+    否则并行进程会互相截断 / 抢走对方正在写的临时文件（固定名 ``.tmp`` 就这么崩过）。
     """
     path = os.path.join(dataset_dir, FILE_SHARDS)
     os.makedirs(dataset_dir, exist_ok=True)
-    tmp = f"{path}.tmp"
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(ledger, handle, ensure_ascii=False, indent=2, sort_keys=True)
@@ -595,9 +982,35 @@ def update_shard_ledger(
     key: str,
     entry: dict[str, Any],
 ) -> dict[str, Any]:
-    """读-改-写一条分片条目（新账本用 ``header`` 起头），返回写入后的账本。"""
+    """写一条分片条目并物化账本视图，返回合并后的账本。
+
+    每个分片一个条目文件（``shards.<i>.json``，单文件原子写）⇒ 并行分片只写自己的
+    那一片，读-改-写不会擦掉别人的条目，也不需要锁。``shards.json`` 随后按全部条目
+    重新物化，供人直接翻；并发下它可能短暂落后，读者（fuse / status）走
+    :func:`read_shard_ledger` 的合并结果。
+    """
+    path = shard_entry_path(dataset_dir, key)
+    os.makedirs(dataset_dir, exist_ok=True)
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema": SHARD_LEDGER_SCHEMA,
+                    "header": header,
+                    "key": key,
+                    "entry": entry,
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     ledger = read_shard_ledger(dataset_dir) or {**header, "entries": {}}
-    ledger.setdefault("entries", {})[key] = entry
     write_shard_ledger(dataset_dir, ledger)
     return ledger
 
