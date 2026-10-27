@@ -324,7 +324,8 @@ def _resolve_dataset(raw: str) -> DatasetArg:
     """解析 ``--dataset``：存在的路径转绝对路径，否则按数据集 key 原样传递。
 
     membench 子进程的 cwd 是工程根，而用户在任意目录调用本脚本；相对路径必须在
-    调用方 cwd 下解析后传绝对路径，否则会被工程根重新解释。
+    调用方 cwd 下解析后传绝对路径，否则会被工程根重新解释。不存在的 key / 路径
+    由 membench 的 ``run`` / ``evaluate`` 统一校验并报错（列出可用 key）。
     """
     candidate = Path(os.path.expanduser(raw))
     if not candidate.is_absolute():

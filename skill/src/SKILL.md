@@ -49,10 +49,10 @@ description: >
 ### 1. 评测（单集 / 多集）
 
 ```bash
-python scripts/run_task.py eval --adapter <适配器名> --dataset <数据集 JSONL 路径> --recall-mode llm --judge llm
+python scripts/run_task.py eval --adapter <适配器名> --dataset <key|路径> --recall-mode llm --judge llm
 ```
 
-- 多数据集重复 `--dataset`；全量宏平均走原生 `evaluate`。`--recall-mode` 与 `--judge` 必填，`--judge heuristic` 只能配 `--limit`。
+- 多数据集重复 `--dataset`；`--dataset` 接受数据集 key（如 `--dataset office`）或 JSONL 路径，按需下载集先 `dataset fetch <key>`；全量宏平均走原生 `evaluate`。`--recall-mode` 与 `--judge` 必填，`--judge heuristic` 只能配 `--limit`。
 - 脚本串起 `task init → run（含分片）→ fuse → verify_artifacts`；按需下载集先 `dataset fetch <key>`。
 - 首次接入先读 `references/adapter_guide.md`（必需三挂点 + 可选快照/自描述 / HTTP 端点 / 持久化 / 验收）。
 

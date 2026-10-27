@@ -307,6 +307,37 @@ def resolve_available_path(key: str) -> Path | None:
     return None
 
 
+def dataset_key_hint() -> str:
+    """一行可用数据集 key 清单，按「能否直接使用」分组。
+
+    分组口径：
+
+    - 可直接用：:func:`resolve_available_path` 能解析到文件的 key（内置文件
+      或已 ``dataset fetch``）；
+    - 需先 dataset fetch：注册表标 ``status="fetch"`` 但本地还没有文件的 key；
+    - 暂不可用：注册表标 ``status="unavailable"`` 的 key。
+
+    Returns:
+        形如 ``可直接用: office, sample；需先 dataset fetch: locomo, …`` 的字符串。
+    """
+    ready: list[str] = []
+    fetchable: list[str] = []
+    unavailable: list[str] = []
+    for info in DATASET_REGISTRY.values():
+        if resolve_available_path(info.key) is not None:
+            ready.append(info.key)
+        elif info.status == "fetch":
+            fetchable.append(info.key)
+        else:
+            unavailable.append(info.key)
+    parts = [f"可直接用: {', '.join(ready) or '（无）'}"]
+    if fetchable:
+        parts.append(f"需先 dataset fetch: {', '.join(fetchable)}")
+    if unavailable:
+        parts.append(f"暂不可用: {', '.join(unavailable)}")
+    return "；".join(parts)
+
+
 def _first_sentences(text: str, n: int) -> str:
     """取中文文本的前 n 句（按"。"切分，保留句号）。"""
     parts = [p for p in text.split("。") if p.strip()]

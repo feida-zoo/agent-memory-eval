@@ -79,10 +79,12 @@ def test_delete(user_dir: Path) -> None:
     assert user_dataset_status()["exists"] is False
 
 
-def test_resolve_dataset_priority(user_dir: Path) -> None:
-    # 1. 显式指定优先
-    path, source = resolve_dataset("/some/where.jsonl")
-    assert path == "/some/where.jsonl"
+def test_resolve_dataset_priority(user_dir: Path, tmp_path: Path) -> None:
+    explicit = tmp_path / "custom.jsonl"
+    explicit.write_text("", encoding="utf-8")
+    # 1. 显式指定的已有文件优先（路径规范化为绝对路径）
+    path, source = resolve_dataset(str(explicit))
+    assert path == str(explicit.resolve())
     assert source == "user-specified"
     # 2. 未安装用户测试集时回退内置 office 数据集
     path, source = resolve_dataset(None)
@@ -95,5 +97,22 @@ def test_resolve_dataset_priority(user_dir: Path) -> None:
     assert source == "user"
     assert path == str(user_dir / USER_DATASET_FILENAME)
     # 显式指定仍最高优先
-    path, source = resolve_dataset("/some/where.jsonl")
+    path, source = resolve_dataset(str(explicit))
+    assert path == str(explicit.resolve())
     assert source == "user-specified"
+
+
+def test_resolve_dataset_accepts_registry_key(user_dir: Path) -> None:
+    """显式值可以是注册表 key：office 走用户集 / 内置 office，其它 key 走注册表。"""
+    path, source = resolve_dataset("office")
+    assert source == "builtin-office"
+    assert path.endswith("office_dataset.jsonl")
+
+    path, source = resolve_dataset("sample")
+    assert source == "fetch"
+    assert path.endswith("sample_dataset.jsonl")
+
+    install_user_dataset(str(SAMPLE_DATASET_PATH))
+    path, source = resolve_dataset("office")
+    assert source == "user"
+    assert path == str(user_dir / USER_DATASET_FILENAME)

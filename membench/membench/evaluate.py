@@ -53,6 +53,7 @@ from membench.userdata import (
     USER_DATASET_FILENAME,
     builtin_office_dataset_path,
     resolve_dataset,
+    resolve_dataset_arg,
 )
 
 #: 参与融合的六项质量指标（宏平均口径）。
@@ -143,7 +144,8 @@ def _beam_path(beam_10m: bool) -> Path:
 def dataset_specs(values: list[str]) -> list[DatasetSpec]:
     """把 CLI ``--dataset`` 值（数据集 key 或 JSONL 路径）解析为评测清单。
 
-    解析规则（列表顺序即评测顺序）：
+    解析规则与 ``run --dataset`` 完全一致，共用
+    :func:`membench.userdata.resolve_dataset_arg`；列表顺序即评测顺序：
 
     - 存在的文件路径 -> ``user-specified`` 收录，key 取文件名 stem；
     - ``office`` -> 办公域槽位（优先级：用户测试集 > 内置 office）；
@@ -161,52 +163,29 @@ def dataset_specs(values: list[str]) -> list[DatasetSpec]:
         DatasetSpec 列表。
 
     Raises:
-        SystemExit: 列表为空、含空值，或某个 key 无法解析。
+        SystemExit: 列表为空、含空值，或某个 key / 路径无法解析。
     """
     if not values:
         raise SystemExit("--dataset 需要至少一个数据集（key 或 JSONL 路径）")
     specs: list[DatasetSpec] = []
     for raw in values:
-        value = raw.strip()
-        if not value:
-            raise SystemExit("--dataset 收到空值（key 或 JSONL 路径）")
-        if os.path.exists(value):
-            path = Path(value)
-            specs.append(
-                DatasetSpec(
-                    key=path.stem,
-                    name=path.stem,
-                    path=str(path.resolve()),
-                    source="user-specified",
-                )
-            )
-        elif value == "office":
-            office_path, office_source = resolve_dataset(None)
-            office_name = (
+        resolved = resolve_dataset_arg(raw)
+        if resolved.source in ("user", "builtin-office"):
+            name = (
                 "office（用户测试集）"
-                if office_source == "user"
+                if resolved.source == "user"
                 else "office（内置办公黄金集）"
             )
-            specs.append(
-                DatasetSpec(
-                    key="office",
-                    name=office_name,
-                    path=office_path,
-                    source=office_source,
-                    is_office_slot=True,
-                )
-            )
         else:
-            resolved = resolve_available_path(value)
-            if resolved is None:
-                raise SystemExit(
-                    f"数据集 {value!r} 无法解析：既不是存在的文件路径，也不是可用"
-                    f"的数据集 key（可用 key 见 list-datasets）；若需按需下载，"
-                    f"先运行 python -m membench.cli dataset fetch {value}"
-                )
-            specs.append(
-                DatasetSpec(key=value, name=value, path=str(resolved), source="fetch")
+            name = resolved.key
+        specs.append(
+            DatasetSpec(
+                key=resolved.key,
+                name=name,
+                path=resolved.path,
+                source=resolved.source,
             )
+        )
     mark_office_slot(specs)
     return specs
 

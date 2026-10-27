@@ -595,6 +595,10 @@ def test_dataset_specs_parsing_rules(tmp_path: Path, monkeypatch: pytest.MonkeyP
     """--dataset 解析：路径收录、key 解析、办公域槽位规则、错误提示。"""
     import membench.evaluate as ev_mod
 
+    empty_datasets = tmp_path / "datasets"
+    empty_datasets.mkdir()
+    monkeypatch.setenv("MEMBENCH_DATASETS_DIR", str(empty_datasets))
+
     # 路径 → user-specified，key 取 stem，第一个承担办公域槽位
     ds = _write_dataset(
         tmp_path / "custom.jsonl",
@@ -607,25 +611,29 @@ def test_dataset_specs_parsing_rules(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     # key 解析（内置文件优先、其次 fetch 目录由 resolve_available_path 负责）
     monkeypatch.setattr(
-        ev_mod, "resolve_available_path", lambda key: tmp_path / f"{key}.jsonl"
+        "membench.userdata.resolve_available_path",
+        lambda key: tmp_path / f"{key}.jsonl",
     )
     specs = ev_mod.dataset_specs(["locomo", "longmemeval_s"])
     assert [s.key for s in specs] == ["locomo", "longmemeval_s"]
     assert all(s.source == "fetch" for s in specs)
     assert specs[0].is_office_slot is True and specs[1].is_office_slot is False
 
-    # 显式 office 参与时以它为准
-    monkeypatch.setattr(
-        ev_mod, "resolve_dataset", lambda specified: (str(tmp_path / "user.jsonl"), "user")
-    )
+    # 显式 office 参与时以它为准（已安装用户测试集 → 来源 user）
+    user_dir = tmp_path / "user_dataset"
+    user_dir.mkdir()
+    user_file = user_dir / "user_dataset.jsonl"
+    user_file.write_text("", encoding="utf-8")
+    monkeypatch.setenv("MEMBENCH_USER_DATA_DIR", str(user_dir))
     specs = ev_mod.dataset_specs(["locomo", "office"])
     assert specs[1].key == "office" and specs[1].is_office_slot is True
+    assert specs[1].source == "user" and specs[1].path == str(user_file)
     assert specs[0].is_office_slot is False
 
     # key 不可解析 → SystemExit 提示 fetch
-    monkeypatch.setattr(ev_mod, "resolve_available_path", lambda key: None)
+    monkeypatch.setattr("membench.userdata.resolve_available_path", lambda key: None)
     with pytest.raises(SystemExit, match="dataset fetch"):
-        ev_mod.dataset_specs(["nope"])
+        ev_mod.dataset_specs(["locomo"])
 
 
 def test_cli_evaluate_dataset_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

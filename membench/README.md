@@ -47,6 +47,10 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 
 ## 快速开始
 
+`run --dataset` 既接受数据集 key（`office` / `sample` / `locomo` 等，按需下载的集先
+`python -m membench.cli dataset fetch <key>`），也接受 JSONL 文件路径；不传时依次回退到
+已安装的用户测试集、内置 office 数据集。
+
 ```bash
 # 1. 用内置强 mock 适配器跑内置示例数据集（产物落 <output 根>/eval_mock-strong_default_<ts>/）
 python -m membench.cli run --adapter mock-strong \
@@ -516,7 +520,8 @@ python -m membench.cli run --adapter <你的适配器> --dataset <同一个数�
 
 `--dataset` 现在是可选参数。不传时按优先级自动选择测试集：
 
-1. 显式 `--dataset <路径>`（来源标签 `user-specified`）；
+1. 显式 `--dataset <key|路径>`（文件 → `user-specified`；`office` → 用户集 / 内置 office；
+   其它注册表 key → 内置文件或按需下载文件，来源 `fetch`）；
 2. 已安装的用户测试集（来源标签 `user`）；
 3. 内置 `office_dataset.jsonl`（来源标签 `builtin-office`）。
 

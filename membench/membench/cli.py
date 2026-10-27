@@ -14,7 +14,7 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
         # 日志；该臂/任务没有 runtime/ 时明确写「无运行时数据」）/ 下一步该跑什么；
         # DIR 是任务目录（含 A/ B/）或单臂实验目录
     python -m membench.cli run --adapter mock-strong \
-        [--dataset membench/data/sample_dataset.jsonl] --judge heuristic \
+        [--dataset KEY|PATH] --judge heuristic \
         [--platform wx --commit a1b2c3] [--driver-llm gpt-4o] \
         [--adapter-version a1b2c3] \
         [--report-out DIR | --task-dir DIR] \
@@ -23,6 +23,7 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
         [--shards N|max --shard-index I --shard-by question|dialogue] \
         [--evidence-match substring|overlap|llm] \
         [--no-snapshot]   # 默认每对话 ingest 后导出状态快照（适配器不支持时警告一次并跳过）
+        # --dataset：key（office / sample / locomo…，按需下载集先 dataset fetch）或 JSONL 路径
     python -m membench.cli run --adapter mock-strong --dataset ... \
         --replay <实验目录|数据集目录|回放任务或它的臂目录> \
         [--replay-mode auto|restore|rebuild] \
@@ -153,7 +154,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--dataset",
         default=None,
-        help="数据集 JSONL 路径；不传时依次回退到已安装的用户测试集、内置 office 数据集"
+        metavar="KEY|PATH",
+        help="数据集 key（office/sample/locomo/…；按需下载集先 dataset fetch）或 JSONL 路径；"
+        "不传时依次回退到已安装的用户测试集、内置 office 数据集"
         "（可用 dataset info 查看全部支持数据集）",
     )
     p_run.add_argument("--judge", default="heuristic", choices=["heuristic", "llm", "client"], help="判分器（默认 heuristic；llm=OpenAI兼容接口；client=agent内置LLM）")
