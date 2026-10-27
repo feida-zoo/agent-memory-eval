@@ -3,6 +3,11 @@
 # 用法: ./eval_two_commits.sh <AGENT_REPO> <SHA_A> <SHA_B> <ADAPTER> [DATASET]
 # 使用前按你的项目修改 BUILD_CMD。详细说明见 references/compare_workflows.md
 #
+# 新流程建议先用同目录的 run_task.py 编排标准步骤（task init → 分片 run → fuse →
+# compare --require-comparable → verify_artifacts 自检），本脚本保留为「两个 git
+# worktree 各自构建」的模板；交付前自检可直接运行：
+#   python scripts/verify_artifacts.py <任务目录>
+#
 # 产物形态：每次 run 新建 <OUT_ROOT>/eval_<adapter>_<platform>_<ts>/ 自包含实验目录，
 # 数据集产物在其 runs/<dataset>/（报告在 report/，逐题明细 results.jsonl），
 # 对比实验落 <OUT_ROOT>/compare_<name>_<platform>_<ts>/（A/、B/、reports/comparison.md）。

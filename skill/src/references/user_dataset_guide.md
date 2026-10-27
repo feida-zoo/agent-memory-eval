@@ -28,7 +28,7 @@
    ds = load_dataset("user_dataset_draft.jsonl")   # schema 校验
    # 逐题检查 evidence/gold_stale 为原文子串（脚本见 membench README FAQ）
    ```
-6. **安装**：
+6. **安装**（在 `<skill目录>/membench` 内执行）：
    ```bash
    MEMBENCH_USER_DATA_DIR=<skill目录>/user_dataset \
    python -m membench.cli user-data install user_dataset_draft.jsonl
@@ -42,7 +42,7 @@
 
 ## 删除
 
-用户显式要求后，先确认再执行：
+用户显式要求后，先确认再执行（在 `<skill目录>/membench` 内）：
 
 ```bash
 MEMBENCH_USER_DATA_DIR=<skill目录>/user_dataset python -m membench.cli user-data delete

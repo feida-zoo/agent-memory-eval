@@ -6,7 +6,7 @@
 `HttpAdapter` 跑评测。跑之前用 `doctor.check_target` 自检契约。
 
 要点：**协议只有三个端点**，桥的难点全在"与协议无关的工程问题"（打包、stub 宿主、原生依赖、常量）。
-可直接复制的模板见 [`membench/examples/http_bridge_node/`](../../membench/examples/http_bridge_node/)。
+可直接复制的模板见 `membench/examples/http_bridge_node/`。
 
 ## 三端点契约（bridge 必须实现）
 
@@ -78,7 +78,7 @@
   目录（内容相同的状态只存一份桶）——桥只需照常写 `target_dir`。桥没实现
   `/snapshot-capabilities`（或返回 `supported=false`）时框架警告一次并跳过、评测照常完成
   （`state_snapshot.role=unsupported`，报告渲染成「不支持（适配器未声明快照能力）」），
-  不需要快照用 `--no-snapshot` 关闭（`--snapshot` 已删）。
+  不需要快照用 `--no-snapshot` 关闭。
 - **快照回放要"真恢复"**：`/restore` 必须把记忆库换回快照那一刻（含内存里的索引/缓存），
   并拒绝不认识的目录（防误传路径把库清空）；回放模式下框架不再调 `/reset`、`/ingest`。
 - `reset` 只清会话不清记忆库 → 跨 dialogue 串扰，`single_hop` 异常高、`abstention` 异常低。
@@ -104,28 +104,21 @@ result = check_target("http://127.0.0.1:8787", timeout=10.0, api_key=None)
 
 ### 7. 跑评测（内置 HttpAdapter 直连）
 
-`HttpAdapter` 的 `base_url` 是构造参数，用通用参数 `--adapter-arg` 传（不需要再包一层适配套件）：
-
-```bash
-# 建议先 doctor 自检，再跑评测；--report-out 是实验目录的父目录
-python -m membench.cli run --adapter http \
-  --adapter-arg base_url=http://127.0.0.1:8787 --adapter-arg timeout=10 \
-  --dataset membench/data/office_dataset.jsonl --judge heuristic --report-out <实验目录父目录>
-# 接受的构造参数：base_url（必填）、api_key、timeout；缺 base_url / key 写错会在开跑前报错
-```
-
-并行分片时各分片可共用同一个 `--report-out`——实验目录名末尾带分片序号 `_s<i>`
-（`--limit` 另带 `_l<N>`），不会互相覆盖；同片重跑落同名目录仍会被非空守卫拒绝。
+用内置适配器：`--adapter http --adapter-arg base_url=<服务地址>`（`base_url` 是构造参数，
+不需要再包一层适配套件；完整命令形态见 `SKILL.md` 标准流程）。接受的构造参数：
+`base_url`（必填）、`api_key`、`timeout`；缺 `base_url` / key 写错会在开跑前报错。
+分片时每片仍须独占一个桥实例（见文末挂点提示），产物落位由 `--task-dir` / `--report-out`
+与 `--shards` 编排，不要手拼目录名。
 
 ### 8. 与模板的对应关系
 
 | checklist 项 | 模板位置 |
 |---|---|
-| 三端点 + 挂点 | `examples/http_bridge_node/bridge.mjs`（顶部 import 为挂点） |
-| 打包 / alias / external / define | `examples/http_bridge_node/build.mjs` |
-| 宿主 stub | `examples/http_bridge_node/stubs/electron.mjs`、`stubs/i18n.mjs` |
-| 依赖与脚本 | `examples/http_bridge_node/package.json` |
-| 从零到跑通 + 常见坑 | `examples/http_bridge_node/README.md` |
+| 三端点 + 挂点 | `membench/examples/http_bridge_node/bridge.mjs`（顶部 import 为挂点） |
+| 打包 / alias / external / define | `membench/examples/http_bridge_node/build.mjs` |
+| 宿主 stub | `membench/examples/http_bridge_node/stubs/electron.mjs`、`stubs/i18n.mjs` |
+| 依赖与脚本 | `membench/examples/http_bridge_node/package.json` |
+| 从零到跑通 + 常见坑 | `membench/examples/http_bridge_node/README.md` |
 
 ## 挂点提示（"记忆是库内能力、无独立服务"的系统）
 
@@ -134,5 +127,5 @@ python -m membench.cli run --adapter http \
 - 若系统只在 UI 事件里触发记忆写入，注意 bridge 调用的是**纯函数/服务层**，绕开 UI 依赖
   （stub 掉 `ipcMain`/`BrowserWindow` 即可），否则会因缺窗口上下文而失败。
 - 评测用独立数据目录（`BRIDGE_DATA_DIR`）与独立实例：`reset` 必须真清空，且**绝不能碰生产数据**。
-- **并行分片 = 每分片一个桥实例**：评测对每个 dialogue 调 `reset()`，两个分片共享一个实例会互相清库（跨片串扰）。N 分片并行就起 N 个桥（各自 `BRIDGE_PORT` + `BRIDGE_DATA_DIR`）；只有一个实例时请串行跑分片。被测系统若自带多命名空间隔离，可自行在桥上按命名空间路由——那是系统能力增强，不是本模板的默认行为。分片评测的输出目录不必各自指定 `--report-out`：实验目录名带 `_s<i>` 后缀，各片（乃至同秒起跑的 N 片）可共用同一个父目录。
+- **并行分片 = 每分片一个桥实例**：评测对每个 dialogue 调 `reset()`，两个分片共享一个实例会互相清库（跨片串扰）。N 分片并行就起 N 个桥（各自 `BRIDGE_PORT` + `BRIDGE_DATA_DIR`）；只有一个实例时请串行跑分片。被测系统若自带多命名空间隔离，可自行在桥上按命名空间路由——那是系统能力增强，不是本模板的默认行为。分片产物落位由 `--task-dir` / `--report-out` 与 `--shards` 编排，不要手拼目录名。
 - **清空前快照（可选，回溯用）**：框架在每次 `reset` 前把上下文放进请求体（`run_dir` / `dialogue_id` / `dialogue_index`），**不读不写**你的记忆存储。`run_dir` 现在指向**该对话的目录**（`<实验目录>/runs/<dataset>/<对话目录>`，框架已把它的 `runtime/` 建好）：要"清空前留一份"就在桥里自己做，约定落 `runtime/reset_backup/reset_<序号>_<dialogue_id>/`，**默认关闭**。逐题 `retrieved` 已在 `results.jsonl`，快照只用于查"内部存储为什么长这样"（stale / 误改记忆 / 该记没记）；reset 每对话一次，长跑常开等于每对话复制一份记忆目录。

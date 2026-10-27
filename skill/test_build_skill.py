@@ -85,6 +85,33 @@ def test_skill_src_output_gitkeep_not_flagged(fake_repo: Path) -> None:
     assert bad == [], f"占位文件不应被误报；违规 {bad}"
 
 
+def test_pycache_under_skill_src_excluded(fake_repo: Path) -> None:
+    """skill/src 下的 __pycache__ / *.pyc 不得进包（曾把 scripts 的 .pyc 打进包）。"""
+    _touch(fake_repo / "skill" / "src" / "scripts" / "__pycache__" / "run_task.cpython-313.pyc")
+    _touch(fake_repo / "skill" / "src" / "scripts" / "run_task.py")
+
+    included, _ = bs.plan(str(fake_repo))
+    included_arcs = {arc for _, arc in included}
+    assert not any("__pycache__" in a or a.endswith(".pyc") for a in included_arcs), (
+        f"缓存文件不应入选；实际 {included_arcs}"
+    )
+    assert any(a.endswith("scripts/run_task.py") for a in included_arcs)
+
+
+def test_check_zip_catches_pyc(fake_repo: Path) -> None:
+    """手动把 .pyc 塞进包里时 check_zip 必须拦下。"""
+    out_path = str(fake_repo / "out.skill")
+    pyc = fake_repo / "skill" / "src" / "scripts" / "__pycache__" / "x.pyc"
+    _touch(pyc)
+    included = [
+        (str(pyc), "agent-memory-eval/scripts/__pycache__/x.pyc"),
+        (str(fake_repo / "skill" / "src" / "SKILL.md"), "agent-memory-eval/SKILL.md"),
+    ]
+    bs.build(included, out_path)
+    bad = bs.check_zip(out_path)
+    assert bad, "check_zip 必须拦下 .pyc"
+
+
 def test_check_zip_catches_venv(fake_repo: Path) -> None:
     """如果 .venv 重新混入（手动绕过 plan），check_zip 必须拦下。"""
     out_path = str(fake_repo / "out.skill")

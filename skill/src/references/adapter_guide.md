@@ -1,7 +1,7 @@
 # Adapter 接入指南（把被测 Agent 的记忆系统接上 membench）
 
 本文是「agent 接入 membench」的完整指导：选路径 → 实现三个挂点 → 真实性与口径红线
-→ 持久化与自检 → 冒烟与验收。速查卡见 `SKILL.md` 工作流 0；最小可运行示例见
+→ 持久化与自检 → 冒烟与验收。命令与流程编排见 `SKILL.md` 的决策表与标准流程；最小可运行示例见
 `membench/examples/quickstart.py`；非 Python 系统另见 `references/http_bridge_guide.md`。
 
 membench 与被测系统之间**只有一个协议**：`BaseMemoryAdapter`
@@ -26,7 +26,7 @@ membench 与被测系统之间**只有一个协议**：`BaseMemoryAdapter`
 
 ## 2. 三个挂点怎么找、怎么写
 
-`references/adapter_guide.md` 的定位方法一句话版：**在被测 Agent 源码里找"记忆清空"、
+本节的一句话版：**在被测 Agent 源码里找"记忆清空"、
 "记忆写入路径"、"记忆读取路径 + 回答生成"三处入口**，包成三个方法。
 
 ### 2.1 `reset()`——每个 dialogue 开始前调用
@@ -145,8 +145,8 @@ def rebuild(self, source_dir: str, tag: str) -> None:    # 跨版本/重建派�
 
 - **时机与落位**：runner 在每个对话 ingest 完成后、第一道 query 之前调用 `snapshot()`——回放
   就是"恢复这个状态，然后跑该对话的题"；runner 每对话 `reset()`，所以按对话切片天然等价。
-  快照落该对话目录的 `memory_snapshot/`（框架另写一份 `manifest.json` 清单），整棵产物树见
-  `references/compare_workflows.md` 的"产物目录"；
+  快照落该对话目录的 `memory_snapshot/`（框架另写一份 `manifest.json` 清单），完整产物布局见
+  `membench/README.md`「产物布局」；
 - **回放时同样会调用 `snapshot()`**：`restore()` / `rebuild()` 完成后、第一道 query 之前，
   框架把恢复出来的状态再导出一次（这是"这次回放保真吗"的证据）。落点由框架决定：普通 run 是
   对话目录的 `memory_snapshot/`，回放任务则是任务级内容寻址池 `snapshots/<内容哈希前 12 位>/`
@@ -154,7 +154,7 @@ def rebuild(self, source_dir: str, tag: str) -> None:    # 跨版本/重建派�
   导出的内容哈希口径不变（排除框架写的 `manifest.json`），因此同一份状态无论落到哪里哈希一致；
 - **默认导出**：`run` / `evaluate` / `evaluate-compare` 默认就导出（每个对话只导这一份，
   per-session 导出是没用的中间态），不需要额外加开关，目录也固定不用指定；不需要时用
-  `--no-snapshot` 关闭（`--snapshot` 已删除；回放时连池也不写）。跑完 ingest 就能在对话级
+  `--no-snapshot` 关闭（回放时连池也不写）。跑完 ingest 就能在对话级
   `report.md` 里点开 `../memory_snapshot/` 翻记忆文件（报告另给清单条目数与体积），不必自己拼路径；
 - **不实现会怎样**：框架打印一次警告并**跳过**快照，评测照常完成——`metrics.json` 的
   `state_snapshot.role` 记 `unsupported`（报告渲染成「不支持（适配器未声明快照能力）」而不是
@@ -217,13 +217,7 @@ def rebuild(self, source_dir: str, tag: str) -> None:    # 跨版本/重建派�
 
 ## 5. 持久化与加载
 
-```bash
-cd <skill目录>/membench
-python -m membench.cli adapter install /path/to/your_adapter.py --name <适配器名>
-# 落盘 ~/.membench/adapters/（可用 MEMBENCH_ADAPTERS_DIR 覆盖）
-python -m membench.cli adapter list      # 查看
-python -m membench.cli adapter remove <名>  # 删除
-```
+把适配器落盘：`python -m membench.cli adapter install /path/to/your_adapter.py --name <适配器名>`（落 `~/.membench/adapters/`，可用 `MEMBENCH_ADAPTERS_DIR` 覆盖；`adapter list` / `adapter remove` 见 `membench/README.md`「适配器持久化」）。
 
 - 临时/CI 场景用环境变量 `MEMBENCH_ADAPTER_MODULES=module.path`（同名时优先于持久化）；
 - 也可以在 Python 侧直接传实例（`Runner(MyAdapter(), ...)`），不经注册表。
@@ -245,31 +239,17 @@ python -m membench.cli adapter remove <名>  # 删除
 python -m membench.cli doctor --target http://127.0.0.1:8787 [--timeout 10.0] [--api-key K]
 ```
 
-自检通过后直连跑评测：`base_url` 是 `HttpAdapter` 的构造参数，用通用参数
-`--adapter-arg` 传（不需要为桥再包一层适配套件）：
-
-```bash
-python -m membench.cli run --adapter http \
-  --adapter-arg base_url=http://127.0.0.1:8787 --adapter-arg timeout=10 \
-  --dataset membench/data/sample_dataset.jsonl --judge heuristic --report-out <skill目录>/output
-# 接受的构造参数：base_url（必填）、api_key、timeout；缺必填参数 / key 写错会在开跑前报错
-```
+自检通过后用 `--adapter http --adapter-arg base_url=<服务地址>` 直连跑评测（`base_url` 是
+`HttpAdapter` 的构造参数，不需要为桥再包一层适配套件；命令形态见 `SKILL.md` 标准流程）。
+接受的构造参数：`base_url`（必填）、`api_key`、`timeout`；缺必填参数 / key 写错会在开跑前报错。
 
 ## 7. 冒烟与验收
 
-```bash
-cd <skill目录>/membench
-# 1) 冒烟：迷你集跑通链路
-python -m membench.cli run --adapter <你的adapter> --dataset membench/data/sample_dataset.jsonl --judge heuristic \
-  --report-out <skill目录>/output
-# 2) 业务验收：办公黄金集
-python -m membench.cli run --adapter <你的adapter> --dataset membench/data/office_dataset.jsonl --judge heuristic \
-  --report-out <skill目录>/output
-```
+冒烟用 `membench/data/sample_dataset.jsonl`，业务验收用 `membench/data/office_dataset.jsonl`
+（命令同 `SKILL.md` 标准流程「评测」，`--dataset` 换成对应路径）。
 
-不传 `--report-out` 时实验目录落 `output_root()`（skill 环境 = `<skill目录>/output`，可用
-`MEMBENCH_OUTPUT_DIR` 覆盖）；报告在 `<实验目录>/runs/<dataset>/report/report.md`，任务级副本在
-`<实验目录>/reports/report.md`，逐题明细（含 `retrieved`）在同目录 `results.jsonl`。
+产物布局见 `membench/README.md`「产物布局」；接入排查最常用的逐题明细（含 `retrieved`）在
+`<数据集目录>/report/results.jsonl`。
 
 **验收判据**：
 

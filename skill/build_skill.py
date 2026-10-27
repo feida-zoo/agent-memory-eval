@@ -100,9 +100,16 @@ def _is_excluded_data(name: str) -> bool:
 
 
 def _walk_files(root: str) -> Iterator[str]:
-    """遍历目录下的文件绝对路径（不含目录项）。"""
-    for dirpath, _dirnames, filenames in os.walk(root):
+    """遍历目录下的文件绝对路径（跳过构建缓存与系统垃圾）。
+
+    skill/src 与 docs 也走这里：``__pycache__`` / ``*.pyc`` / ``.pytest_cache``
+    一度被整目录打进包，故与 membench 来源共用同一套排除口径。
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not _is_excluded_dir(d)]
         for fname in filenames:
+            if _is_excluded_file(fname):
+                continue
             yield os.path.join(dirpath, fname)
 
 
@@ -235,7 +242,8 @@ def check_zip(out_path: str) -> List[str]:
 
     - data 目录下出现被排除数据集（locomo / longmemeval_* / gatemem_office / beam_*）；
     - membench 来源下出现被禁止进包的目录（.venv / __pycache__ / runs / output 等）——
-      ``skill/src/output/.gitkeep`` 之类的占位文件不在此列。
+      ``skill/src/output/.gitkeep`` 之类的占位文件不在此列；
+    - **任何来源**出现 ``__pycache__/`` 或 ``*.pyc``：skill/src/scripts 曾被整目录打进包。
     """
     bad: List[str] = []
     with zipfile.ZipFile(out_path) as zf:
@@ -251,6 +259,9 @@ def check_zip(out_path: str) -> List[str]:
                     if part in EXCLUDE_DIR_NAMES_FORBIDDEN:
                         bad.append(name)
                         break
+            # 构建缓存对任何来源都是垃圾（含 skill/src/scripts 的 .pyc）
+            if name not in bad and ("__pycache__" in parts[:-1] or name.endswith(".pyc")):
+                bad.append(name)
     return bad
 
 

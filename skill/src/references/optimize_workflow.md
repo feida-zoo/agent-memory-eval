@@ -1,6 +1,6 @@
 # 记忆系统优化闭环操作手册
 
-本文是「工作流 4：记忆系统优化闭环」的详细操作手册。目标是让每一次优化都有**可量化、可回归、可归因**的证据，而不是"改完感觉好像好了"。
+本文是 `SKILL.md` 决策表「优化闭环」的详细操作手册。目标是让每一次优化都有**可量化、可回归、可归因**的证据，而不是"改完感觉好像好了"。
 
 闭环六阶段：
 
@@ -10,9 +10,10 @@
 
 配套材料：入门教程 `membench/examples/optimize_loop.md`；对比与可比性见 `references/compare_workflows.md`。
 
-> **两个强制检查点**（贯穿全程，不得跳过）
+> **三个强制检查点**（贯穿全程，不得跳过）
 > ① 任何优化/改动完成后，**先询问用户**是否执行 A/B 对比，不得径自开跑；
-> ② 启动 A/B 前，**先与用户确认数据集范围**（单集/多集/全量）、A/B 分组（基线 vs 候选）与平台/标签。
+> ② 启动 A/B 前，**先与用户确认数据集范围**（单集/多集/全量）、A/B 分组（基线 vs 候选）、平台/标签与**召回口径**（`--recall-mode`，无默认）；
+> ③ 交付前跑 `scripts/verify_artifacts.py <任务目录>` 并把输出贴给用户，失败不得宣布完成（见 `SKILL.md` 检查点 3）。
 
 ---
 
@@ -80,22 +81,16 @@
 
 **输入**：阶段 3 的 plan 中的一条改动。
 
-**动作**：落地这一条改动（只改一处），改完自测跑通：
-
-```bash
-cd <skill目录>/membench
-python -m membench.cli run --adapter <adapter> --dataset <同一数据集> --judge <同一判分器> \
-  --report-out <skill目录>/output
-# 每次 run 新建 <report-out>/eval_<adapter>_<platform>_<ts>/，控制台末行打印数据集产物目录
-```
+**动作**：落地这一条改动（只改一处），改完按 `SKILL.md` 标准流程「评测」跑一次同口径的候选 run（同一数据集、同一判分器、同一召回口径）。
 
 - 基线产物天然留档：每次 run 新建 `eval_<adapter>_<platform>_<ts>/`，不会覆盖旧实验目录
   （同一秒重复运行会被直接拒绝）；要给某次结果固定名字就整体复制那个实验目录。
 - 记忆快照**默认导出**（每对话 ingest 完成后一份，落该对话目录的 `memory_snapshot/`）：
   对话级 `report.md` 里有 `../memory_snapshot/` 的可点击链接与清单条目数 / 体积——
   诊断写入侧问题时可直接翻记忆文件，不必自己拼路径；不需要 `--no-snapshot` 关闭。
-- 大数据集分片跑时（工作流 2.6）：`task init` 建任务目录 → 各片 `run --task-dir <任务目录>`
-  → `fuse --task-dir <任务目录>`，分片产物只写各片对话目录 + 账本，数据集级由 fuse 补齐。
+- 大数据集分片跑时（见 `SKILL.md` 标准流程「分片」）：`task init` 建任务目录 → 各片
+  `run --task-dir <任务目录>` → `fuse --task-dir <任务目录>`；分片产物只写各片对话目录 +
+  逐片条目 `runs/<dataset>/shards.<i>.json`（真源，`shards.json` 是物化视图），数据集级由 `fuse` 补齐。
 - 改动过程中如顺手改了别处，**回退**——多变量会让 AB 结论失效。
 
 **执行方式（subagent 不是默认动作，按改动性质决定）**：
@@ -117,19 +112,9 @@ python -m membench.cli run --adapter <adapter> --dataset <同一数据集> --jud
 
 **动作**：
 
-1. **⛔ 检查点②**：先与用户确认**数据集范围**（单集/多集/全量）、**A/B 分组**（基线 vs 候选）与**平台/标签**。
+1. **⛔ 检查点②**：先与用户确认**数据集范围**（单集/多集/全量）、**A/B 分组**（基线 vs 候选）、**平台/标签**与**召回口径**（`--recall-mode`，无默认）。
 2. **保证消融**：固定驱动模型与 harness，只切优化开关；两次 run 用**同一数据集、同一判分器**。
-3. **可比性前置校验 + 对比**：
-
-```bash
-python -m membench.cli compare \
-  --baseline <基线实验目录或 runs/<dataset> 数据集目录> \
-  --candidate <候选实验目录或 runs/<dataset> 数据集目录> \
-  --require-comparable --tag <标签> --report-out output/
-
-# A/B 两臂本来就写在同一个任务目录里时（分片 A/B 通路）就地出报告：
-python -m membench.cli compare --task-dir <任务目录> --require-comparable
-```
+3. **可比性前置校验 + 对比**：按 `SKILL.md` 标准流程「A/B」跑 `compare --require-comparable --tag <标签>`；两臂本来就写在同一个任务目录里时用 `compare --task-dir <任务目录> --require-comparable`。
 
 - `--require-comparable`：关键维度（`driver_llm` / `judge_model` / `adapter_version` / `dataset_fingerprint` 等）不一致或无法核验 → 可比性门禁 **FAIL**（整体 verdict=FAIL、退出码 1），即拒绝当 A/B 用；不加该参数时不一致只降级为 WARN。详见 `references/compare_workflows.md`。
 - `--tag <标签>`：决定产物目录 `compare_<name>_<platform>_<ts>/` 的 `<name>` 段（缺省 `<基线 adapter>_vs_<候选 adapter>`）。
