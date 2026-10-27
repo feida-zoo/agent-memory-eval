@@ -1,7 +1,8 @@
 """task 子命令与 --task-dir / --no-snapshot 的 CLI 面（冻结契约）。
 
-- ``task init --name NAME [--platform P] [--arms 1|2] [--report-out DIR]``：建任务目录
-  骨架（arms=2 -> ``A/`` ``B/``；arms=1 -> ``runs/``，都带 ``reports/``），**stdout
+- ``task init --name NAME [--platform P] [--arms 1|2] [--report-out DIR] [--replay]``：建任务
+  目录骨架（arms=2 -> ``A/`` ``B/``；arms=1 -> ``runs/``，都带 ``reports/``；``--replay``
+  额外建任务级快照池 ``snapshots/``，见 ``tests/test_replay_snapshots.py``），**stdout
   只有一行绝对路径**（脚本 ``TASK=$(...)`` 要能直接接走），非空目标目录拒绝；
 - ``task status DIR``：进度视图——骨架、各臂各数据集的分片账本进度（s<i> 的 status /
   题数 / 对话数 / run_id）、数据集级产物是否齐备、快照目录数与体积、下一步该做什么；

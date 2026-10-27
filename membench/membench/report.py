@@ -701,20 +701,62 @@ def _entry_counts(entry: dict[str, Any]) -> str:
     return " / ".join(parts)
 
 
-def dialogue_snapshot_rows(out_dir: str) -> list[list[str]]:
-    """对话级报告里的快照行：可点击的同目录相对链接 + 清单条目规模与体积。
+def _path_cell(target: str, out_dir: str) -> str:
+    """报告里的路径单元：目录存在就给相对链接，否则给不可点击的绝对路径。
 
-    「跑完 ingest 就能翻记忆文件」是快照的第一价值，因此只在磁盘上真实存在
-    ``<对话目录>/memory_snapshot/``（即报告目录 ``report/`` 的 ``../memory_snapshot/``）
-    时才给 markdown 链接——报告里不留打不开的相对路径。清单缺 ``entry`` 时只给目录
-    链接，不编条目数。
+    不可点击也要写绝对路径：报告可能被移动，绝对路径至少能说明"去哪找"。
+    """
+    if not os.path.isdir(target):
+        return f"`{target}`"
+    rel = os.path.relpath(target, out_dir)
+    suffix = "" if rel.endswith(os.sep) else "/"
+    return f"[`{rel}{suffix}`]({rel}{suffix})"
+
+
+def dialogue_snapshot_rows(
+    out_dir: str, state: "dict[str, Any] | None" = None
+) -> list[list[str]]:
+    """对话级报告里的快照行：可点击的相对链接 + 清单条目规模与体积。
+
+    「跑完 ingest 就能翻记忆文件」是快照的第一价值，因此只在磁盘上真实存在目标
+    目录时才给 markdown 链接——报告里不留打不开的相对路径。两种落点：
+
+    - 普通 run：``<对话目录>/memory_snapshot/``（报告目录 ``report/`` 的
+      ``../memory_snapshot/``）；
+    - 回放 run：任务级内容寻址池里的该对话桶 ``<snapshots_dir>/<bucket>/``（相对
+      报告目录可能跨几层，按 ``os.path.relpath`` 现算），并写明这个桶是复用还是新写。
 
     Args:
         out_dir: 对话级报告目录（``<实验目录>/runs/<dataset>/<对话>/report``）。
+        state: 该对话 metrics 的 ``state_snapshot`` 块（回放时带 ``bucket`` /
+            ``reused`` / ``snapshots_dir``）。
 
     Returns:
         ``[[项目, 值], ...]``；该对话没有快照时返回空列表。
     """
+    state = state or {}
+    if state.get("role") == "replayed" and state.get("snapshots_dir") and state.get("bucket"):
+        bucket_dir = os.path.join(str(state["snapshots_dir"]), str(state["bucket"]))
+        rows = [["本对话快照桶", _path_cell(bucket_dir, out_dir)]]
+        rows.append(
+            [
+                "桶来源",
+                "复用（池内已有同样内容的状态，未新增）"
+                if state.get("reused")
+                else "新写（该状态在池内首次出现）",
+            ]
+        )
+        entry = _snapshot_entry(bucket_dir)
+        if entry is None:
+            return rows
+        counts = _entry_counts(entry)
+        if counts:
+            rows.append(["快照条目", counts])
+        size = _human_bytes(entry.get("bytes"))
+        if size:
+            rows.append(["快照体积", size])
+        return rows
+
     snapshot_dir = os.path.normpath(os.path.join(out_dir, os.pardir, DIR_SNAPSHOT))
     if not os.path.isdir(snapshot_dir):
         return []
@@ -1000,7 +1042,9 @@ def write_run_report_md(
     state = metrics.get("state_snapshot") or {}
     verify = metrics.get("replay_verify") or {}
     # 对话级报告额外给"去哪翻记忆文件"：磁盘上真实存在才给链接（见 dialogue_snapshot_rows）
-    snap_rows = dialogue_snapshot_rows(out_dir) if metrics.get("dialogue_id") else []
+    snap_rows = (
+        dialogue_snapshot_rows(out_dir, state) if metrics.get("dialogue_id") else []
+    )
     if state or verify or snap_rows:
         lines.append("## 快照与回放")
         lines.append("")
@@ -1038,6 +1082,18 @@ def write_run_report_md(
                 if role == "replayed":
                     snapshot_rows.append(["源 run", f"`{state.get('source_run', 'n/a')}`"])
                     snapshot_rows.append(["回放模式", str(state.get("replay_mode", "n/a"))])
+        if role == "replayed" and state.get("snapshots_dir"):
+            # 回放的状态已按内容去重写入任务级池：报告要指向桶，而不是对话目录
+            snapshot_rows.append(
+                ["快照池（任务级，内容寻址）", _path_cell(str(state["snapshots_dir"]), out_dir)]
+            )
+            n_buckets = state.get("n_buckets")
+            if isinstance(n_buckets, int):
+                reused = int(state.get("n_reused") or 0)
+                new = int(state.get("n_new") or (n_buckets - reused))
+                snapshot_rows.append(
+                    ["桶数（本 run 复用 / 新写）", f"{n_buckets}（复用 {reused} / 新写 {new}）"]
+                )
         snapshot_rows.extend(snap_rows)
         lines.append(_md_table(["项目", "值"], snapshot_rows))
         lines.append("")
@@ -1045,6 +1101,13 @@ def write_run_report_md(
             lines.append(
                 "改**读取侧**代码后可用 `--replay <快照根目录>`（数据集目录，或含它的"
                 "实验目录）免重跑 ingest；改写入侧（抽取 / 更新 / 去重）则必须重新 ingest。"
+            )
+            lines.append("")
+        if role == "replayed" and state.get("snapshots_dir"):
+            lines.append(
+                "本次回放的状态已按内容去重写入任务级快照池（桶名 = 状态内容 sha256 前 "
+                "12 位）：同一源回放到另一臂时内容一致的对话共用同一个桶，差异即"
+                "「回放不保真」的证据；回放任务本身也可继续作为 `--replay` 源（链式回放）。"
             )
             lines.append("")
         if verify:

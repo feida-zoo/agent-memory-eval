@@ -3,12 +3,14 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
 
 用法（SPEC 第 6 节）：
     python -m membench.cli task init --name NAME [--platform P] [--arms 1|2] \
-        [--report-out DIR]
+        [--report-out DIR] [--replay]
         # 建任务目录骨架（arms=2 -> A/ B/；arms=1 -> runs/，都带任务级 reports/）并
-        # 打印它的绝对路径；stdout 只有这一行路径，可 TASK=$(...) 接走
+        # 打印它的绝对路径；--replay 额外建任务级快照池 snapshots/（回放任务的
+        # 内容寻址桶 + index.json）；stdout 只有这一行路径，可 TASK=$(...) 接走
     python -m membench.cli task status DIR
         # 进度视图：骨架 / 各臂各数据集的分片账本进度（status、题数、对话数、run_id）/
-        # 数据集级产物齐备与否 / 快照目录数与体积 / 下一步该跑什么；
+        # 数据集级产物齐备与否 / 快照目录数与体积（回放任务改为快照池：桶数、体积、
+        # 各臂复用/新写、两臂是否逐对话一致）/ 下一步该跑什么；
         # DIR 是任务目录（含 A/ B/）或单臂实验目录
     python -m membench.cli run --adapter mock-strong \
         [--dataset membench/data/sample_dataset.jsonl] --judge heuristic \
@@ -21,8 +23,10 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
         [--evidence-match substring|overlap|llm] \
         [--no-snapshot]   # 默认每对话 ingest 后导出状态快照（适配器不支持时警告一次并跳过）
     python -m membench.cli run --adapter mock-strong --dataset ... \
-        --replay <实验目录或数据集目录> [--replay-mode auto|restore|rebuild] \
-        [--replay-verify-source <源产物：实验目录或数据集目录>]   # 快照回放：跳过 ingest，只跑 query
+        --replay <实验目录|数据集目录|回放任务或它的臂目录> \
+        [--replay-mode auto|restore|rebuild] \
+        [--replay-verify-source <源产物：实验目录或数据集目录>]   # 快照回放：跳过 ingest，只跑 query；
+        # 回放同样默认把恢复后的状态导出到任务级快照池 snapshots/（--no-snapshot 关闭）
     python -m membench.cli evaluate --adapter mock-strong \
         [--judge heuristic] [--platform wx --commit a1b2c3] \
         [--driver-llm gpt-4o] [--adapter-version a1b2c3] \
@@ -67,6 +71,12 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
     └── reports/                                # 任务级（report.md / metrics.json / evaluate_summary.json / fig_dataset_overview.png）
     <report-out>/compare_<name>_<platform>_<ts>/{A/,B/,reports/comparison.md}   # 双臂任务目录
     <report-out>/matrix_<ts>/{reports/,runs/<label>/}
+
+回放任务（``task init --replay``）在任务目录根多一个内容寻址快照池 ``snapshots/``：
+回放导出的状态按内容哈希去重成桶 ``snapshots/<sha256 前 12 位>/``，
+``snapshots/index.json`` 记 ``臂|数据集|对话 -> 桶``；A/B 两臂回放同一源时只产生
+一份桶（两臂指向同一 digest），不同则各存一份——差异本身就是"回放不保真"的证据。
+回放任务本身可以继续作为 ``--replay`` 源（链式回放）。
 
 "产物目录"入参（``--baseline`` / ``--candidate`` / ``--from-runs`` / ``--baseline-run`` /
 ``--candidate-run`` / matrix 的 label 右值 / ``--replay`` / ``--replay-verify-source``）
@@ -179,7 +189,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--replay",
         default=None,
-        help="回放源（实验目录或 runs/<dataset> 数据集目录）：跳过 reset+ingest，按对话恢复快照后只跑 query（写入侧固定，结论只覆盖读取/回答层）",
+        help="回放源：实验目录、runs/<dataset> 数据集目录，或回放任务（含 snapshots/index.json 的任务目录 / 其臂目录 A/ B/）；"
+        "跳过 reset+ingest，按对话恢复快照后只跑 query（写入侧固定，结论只覆盖读取/回答层）。"
+        "回放默认把恢复后的状态导出到任务级快照池 snapshots/（按内容去重，--no-snapshot 关闭）",
     )
     p_run.add_argument(
         "--replay-mode",
@@ -263,6 +275,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "1 = 单臂 eval_<name>_<platform>_<ts>/（含 runs/）",
     )
     p_task_init.add_argument("--report-out", default=None, help="任务目录的父目录（缺省 output_root()）")
+    p_task_init.add_argument(
+        "--replay",
+        action="store_true",
+        help="回放任务：骨架额外建任务级快照池 snapshots/（回放导出的状态按内容去重成桶，"
+        "A/B 回放同一源只存一份；不带本参数时不建 snapshots/）",
+    )
     p_task_init.set_defaults(func=_cmd_task_init)
     p_task_status = task_sub.add_parser(
         "status", help="进度视图：骨架 / 分片账本进度 / 数据集级产物 / 快照体积 / 下一步"
@@ -941,23 +959,114 @@ def _human_bytes(size: int) -> str:
     return f"{value:.1f} GB"
 
 
+def _snapshot_pool_lines(target: str) -> list[str]:
+    """回放任务快照池的进度行：桶数 / 体积 / 各臂来源与复用计数 / 两臂一致性。
+
+    普通任务（任务根没有 ``snapshots/index.json``）返回空列表——它们的快照用量仍
+    按数据集目录统计（见 :func:`_snapshot_usage`）。索引损坏只报告不中断：status 是
+    诊断视图，一份坏索引不该让它连分片进度都看不了。
+    """
+    task_dir = layout.snapshot_task_root(target)
+    if not layout.has_snapshot_index(task_dir):
+        return []
+    pool_root = os.path.join(task_dir, layout.DIR_SNAPSHOTS)
+    try:
+        index = layout.read_snapshot_index(pool_root) or {}
+    except SystemExit as exc:
+        return [f"快照池: ⚠️ {exc}"]
+    buckets = index.get("buckets") or {}
+    entries = index.get("entries") or {}
+    arms = index.get("arms") or {}
+    total_bytes = sum(
+        int(item.get("bytes") or 0)
+        for item in buckets.values()
+        if isinstance(item, dict)
+    )
+    lines = [f"快照池: {pool_root}（{len(buckets)} 个桶 / {_human_bytes(total_bytes)}）"]
+    for arm in sorted(str(name) for name in arms):
+        info = arms.get(arm) if isinstance(arms.get(arm), dict) else {}
+        label = f"臂 {arm}" if arm else "单臂"
+        source = str(info.get("source") or "n/a")
+        manifest_sha = str(info.get("source_manifest_sha256") or "")
+        lines.append(
+            f"  {label}: {int(info.get('n_dialogues') or 0)} 对话"
+            f"（复用 {int(info.get('n_reused') or 0)} / 新写 {int(info.get('n_new') or 0)}），"
+            f"源 {source}"
+            + (f"（源清单 sha256 {manifest_sha[:12]}）" if manifest_sha else "")
+        )
+    if layout.DIR_ARM_A in arms and layout.DIR_ARM_B in arms:
+        lines.extend(_arm_consistency_lines(entries))
+    return lines
+
+
+def _arm_consistency_lines(entries: dict[str, Any]) -> list[str]:
+    """两臂逐对话比对快照桶：全部指向同一批桶就是"回放保真"，否则列出差异规模。"""
+    by_dataset: dict[str, dict[str, dict[str, str]]] = {}
+    for key, digest in entries.items():
+        parsed = layout.parse_snapshot_entry_key(key)
+        if parsed is None:
+            continue
+        arm, dataset, dialogue_id = parsed
+        by_dataset.setdefault(dataset, {}).setdefault(arm, {})[dialogue_id] = str(digest)
+    lines: list[str] = []
+    for dataset in sorted(by_dataset):
+        per_arm = by_dataset[dataset]
+        arm_a = per_arm.get(layout.DIR_ARM_A) or {}
+        arm_b = per_arm.get(layout.DIR_ARM_B) or {}
+        if not arm_a or not arm_b:
+            continue
+        all_ids = set(arm_a) | set(arm_b)
+        same = [did for did in all_ids if arm_a.get(did) == arm_b.get(did)]
+        diff = [did for did in all_ids if did in arm_a and did in arm_b and arm_a[did] != arm_b[did]]
+        only_a = [did for did in arm_a if did not in arm_b]
+        only_b = [did for did in arm_b if did not in arm_a]
+        if len(same) == len(all_ids):
+            shared = len({arm_a[did] for did in all_ids})
+            lines.append(
+                f"  数据集 {dataset}: A 臂与 B 臂快照 {len(same)}/{len(all_ids)} 逐对话一致"
+                f"（共用 {shared} 个桶）"
+            )
+        else:
+            lines.append(
+                f"  数据集 {dataset}: A 臂与 B 臂快照有差异——一致 {len(same)}/{len(all_ids)}，"
+                f"内容不同 {len(diff)}、仅 A {len(only_a)}、仅 B {len(only_b)}"
+                "（差异即回放不保真的证据）"
+            )
+    return lines
+
+
 def _cmd_task_init(args: argparse.Namespace) -> int:
     """task init：建任务目录骨架，stdout 只打印它的绝对路径（供 ``TASK=$(...)`` 接走）。"""
-    task_dir = layout.init_task_dir(args.report_out, args.name, args.platform, args.arms)
+    task_dir = layout.init_task_dir(
+        args.report_out, args.name, args.platform, args.arms, replay=args.replay
+    )
     shape = f"{layout.DIR_ARM_A}/ {layout.DIR_ARM_B}/" if args.arms == 2 else f"{layout.DIR_RUNS}/"
+    if args.replay:
+        shape += f" {layout.DIR_SNAPSHOTS}/"
     first_arm = (
         layout.arm_dir(task_dir, layout.DIR_ARM_A) if args.arms == 2 else task_dir
     )
     # 人看的说明全部走 stderr：stdout 只有一行路径，脚本 $() 才能直接接走
     print(f"[membench] 任务目录: {task_dir}", file=sys.stderr)
     print(f"[membench] 骨架: arms={args.arms}（{shape} + {layout.DIR_REPORTS}/）", file=sys.stderr)
-    print(
-        f"[membench] 下一步: 各分片写进同一任务目录 —— "
-        f"python -m membench.cli run --adapter <适配器> --dataset <数据集> "
-        f"--task-dir {first_arm} --shards <N> --shard-index <I> --shard-by dialogue"
-        f"（I 取 0..N-1）；进度用 python -m membench.cli task status {task_dir}",
-        file=sys.stderr,
-    )
+    if args.replay:
+        print(
+            f"[membench] 下一步: 回放同一个源到该任务 —— "
+            f"python -m membench.cli run --adapter <适配器> --dataset <数据集> "
+            f"--task-dir {first_arm} --replay <源：实验目录 / 数据集目录 / 回放任务>"
+            "（两臂分别 --task-dir <任务>/A、<任务>/B 回放同一源时，状态相同的对话共用"
+            "同一个桶）；进度用 python -m membench.cli task status "
+            f"{task_dir}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[membench] 下一步: 各分片写进同一任务目录 —— "
+            f"python -m membench.cli run --adapter <适配器> --dataset <数据集> "
+            f"--task-dir {first_arm} --shards <N> --shard-index <I> --shard-by dialogue"
+            f"（I 取 0..N-1）；进度用 python -m membench.cli task status {task_dir}",
+            file=sys.stderr,
+        )
     print(task_dir)
     return 0
 
@@ -980,6 +1089,9 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
         )
     print(f"[membench] 任务目录: {target}")
     print(f"[membench] 骨架: {skeleton}")
+    is_replay_task = layout.has_snapshot_index(layout.snapshot_task_root(target))
+    for line in _snapshot_pool_lines(target):
+        print(f"[membench] {line}")
 
     next_steps: list[str] = []
     n_datasets = 0
@@ -1059,11 +1171,15 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
                         f"数据集 {name} 的分片已跑齐：补齐数据集级与任务级产物 "
                         f"python -m membench.cli fuse --task-dir {arm_root}"
                     )
-            snapshots, size = _snapshot_usage(dataset_dir)
+            if is_replay_task:
+                snapshot_text = "快照: 任务级池（见上）"
+            else:
+                snapshots, size = _snapshot_usage(dataset_dir)
+                snapshot_text = f"快照 {snapshots} 个 / {_human_bytes(size)}"
             print(
                 f"[membench]   数据集级产物: {'已齐备' if ready else '缺失'}（{metrics_path}）；"
                 f"对话目录 {len(_dialogue_dirs_of(dataset_dir))} 个；"
-                f"快照 {snapshots} 个 / {_human_bytes(size)}"
+                f"{snapshot_text}"
             )
         arms_all_ready = arms_all_ready and arm_ready
 

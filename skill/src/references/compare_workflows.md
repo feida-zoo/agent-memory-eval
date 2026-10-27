@@ -95,7 +95,8 @@ git -C $AGENT_REPO worktree remove /tmp/agent_new
 - `<ts>` = `YYYYMMDD-HHMMSS`；`<platform>` 缺省 `default`，两臂平台不同时 compare 目录用 `p1-p2`。
 - `runtime/` 每个对话都建（接入侧的运行时数据，如桥的 reset 前备份落 `runtime/reset_backup/`）；
   `memory_snapshot/` **默认导出**（每对话 ingest 完成后、第一道 query 之前一份，含框架写的
-  `manifest.json`；`--no-snapshot` 关闭，`--snapshot` 已删）；对话目录名 = 对话 id
+  `manifest.json`；`--no-snapshot` 关闭，`--snapshot` 已删；回放时导出落**任务级内容寻址池**
+  `<任务>/snapshots/`，见 SKILL.md 工作流 2.7）；对话目录名 = 对话 id
   归一化（非法字符换 `_`，无 id 时 `dialogue`）。对话级 `report.md` 给出 `../memory_snapshot/`
   的可点击链接与清单条目数 / 体积——跑完 ingest 就能翻记忆文件。
 - **任务目录与就地产出**：`task init --name NAME [--platform P] [--arms 1|2]` 先建骨架

@@ -14,6 +14,13 @@
 由 :func:`plan_replay` 扫描各对话清单统一校验，合并指纹见
 :func:`manifests_digest`。
 
+回放任务（``task init --replay``）不用逐对话目录，而是任务级内容寻址池
+``<任务>/snapshots/<sha256 前 12 位>/``（见 :mod:`membench.layout` 的池 helper）：
+桶内清单与普通快照同构，索引 ``snapshots/index.json`` 只回答"哪个臂的哪个对话在
+哪个桶"。:func:`plan_replay` 两种源都接受——传回放任务（任务根或臂目录）时按索引
+解析桶，传实验目录 / 数据集目录时按逐对话目录解析，校验强度一致（身份与指纹都以
+桶内 / 目录内的 ``manifest.json`` 为准）。
+
 三种模式（``run_mode``）：
 
 - ``full``：正常评测（默认导出对话状态快照，``--no-snapshot`` 关闭）；
@@ -39,6 +46,7 @@ __all__ = [
     "RUN_MODES",
     "read_capabilities",
     "dir_sha256",
+    "dir_stats",
     "payload_sha256",
     "new_manifest",
     "save_manifest",
@@ -80,18 +88,22 @@ def dir_sha256(path: str, exclude: tuple[str, ...] = ()) -> str:
     return digest.hexdigest()
 
 
-def _dir_bytes(path: str, exclude: tuple[str, ...] = ()) -> int:
-    """目录内文件字节数合计（``exclude`` 语义同 :func:`dir_sha256`）。"""
+def dir_stats(
+    path: str, exclude: tuple[str, ...] = ()
+) -> tuple[int, int]:
+    """目录内文件统计：``(字节数合计, 文件数)``（``exclude`` 语义同 :func:`dir_sha256`）。"""
     total = 0
+    count = 0
     for root, _dirs, files in os.walk(path):
         for name in files:
             if root == path and name in exclude:
                 continue
+            count += 1
             try:
                 total += os.path.getsize(os.path.join(root, name))
             except OSError:
                 continue
-    return total
+    return total, count
 
 
 def payload_sha256(sessions: list[list[dict]]) -> str:
@@ -218,7 +230,7 @@ def write_snapshot(
         "dir": layout.tag_dir_name(dialogue_id),
         "tag": dialogue_id,
         "sha256": dir_sha256(snapshot_dir, exclude=(MANIFEST_NAME,)),
-        "bytes": _dir_bytes(snapshot_dir, exclude=(MANIFEST_NAME,)),
+        "bytes": dir_stats(snapshot_dir, exclude=(MANIFEST_NAME,))[0],
         "n_sessions": len(sessions),
         "n_messages": sum(len(s) for s in sessions),
         "n_questions": n_questions,
@@ -268,6 +280,80 @@ def _source_run_id(dataset_dir: str) -> str:
     return os.path.basename(os.path.normpath(dataset_dir))
 
 
+def _replay_task_source(source: str) -> Union[tuple[str, str], None]:
+    """``--replay`` 入参指向**回放任务**时返回 ``(任务目录, 臂键)``，否则 None。
+
+    两种形态：任务根（自身带 ``snapshots/index.json``，臂待定）与臂目录
+    （``<任务>/A`` / ``B``，父任务目录带索引）。臂键的取值口径与 :func:`write_snapshot_index`
+    写入 ``entries`` 时一致（见 :func:`membench.layout.snapshot_arm_key`），因此这里
+    只把目录名交给后续解析，不自己拼字符串。
+    """
+    if layout.has_snapshot_index(source):
+        return source, ""
+    parent = os.path.dirname(source)
+    if (
+        os.path.basename(source) in (layout.DIR_ARM_A, layout.DIR_ARM_B)
+        and layout.has_snapshot_index(parent)
+    ):
+        return parent, os.path.basename(source)
+    return None
+
+
+def _pool_snapshot_dirs(
+    task_dir: str, arm: str, dataset: str, dialogue_ids: list[str]
+) -> tuple[dict[str, str], str]:
+    """按回放任务的池索引解析逐对话桶目录，返回 ``(snapshot_dirs, 臂键)``。
+
+    任务根作源且索引里只有**一个**臂时自动用它；多个臂必须传具体臂目录——两臂的
+    逐对话状态可能不同（那正是"回放不保真"的证据），替用户选一个臂就是替用户
+    选结论。
+    """
+    pool_root = os.path.join(task_dir, layout.DIR_SNAPSHOTS)
+    index = layout.read_snapshot_index(pool_root)
+    if index is None:  # _replay_task_source 已确认索引存在；这里只防手删竞态
+        raise SystemExit(f"回放任务缺少快照池索引: {layout.snapshot_index_path(pool_root)}")
+    arms = sorted(str(name) for name in index["arms"])
+    if not arm:
+        if len(arms) != 1:
+            hint = "、".join(os.path.join(task_dir, name) for name in arms) or "（索引里没有任何臂）"
+            raise SystemExit(
+                f"回放任务 {task_dir} 有 {len(arms)} 个臂，无法确定用哪一个：{hint}；"
+                f"请把 --replay 指向具体臂目录（如 {os.path.join(task_dir, layout.DIR_ARM_A)}）"
+            )
+        arm = arms[0]
+    elif arm not in arms:
+        raise SystemExit(
+            f"回放任务 {task_dir} 的快照池里没有臂 {arm!r}（现有："
+            f"{'、'.join(arms) or '无'}）；请确认该臂回放时导出了快照"
+        )
+
+    entries = index.get("entries") or {}
+    snapshot_dirs: dict[str, str] = {}
+    missing: list[str] = []
+    for dialogue_id in dialogue_ids:
+        digest = entries.get(layout.snapshot_entry_key(arm, dataset, dialogue_id))
+        if not digest:
+            missing.append(dialogue_id)
+            continue
+        snapshot_dirs[dialogue_id] = layout.snapshot_bucket_dir(pool_root, str(digest))
+    if missing:
+        raise SystemExit(
+            "回放任务的快照池缺少本 run 需要的对话，拒绝回放："
+            + "、".join(missing[:5])
+            + (f" 等 {len(missing)} 个" if len(missing) > 5 else "")
+            + f"——臂 {arm or '单臂'} 没有这些对话的桶（回放时要覆盖同一批对话，"
+            "链式回放也需上游导出过它们）"
+        )
+    absent = [f"{did} -> {path}" for did, path in snapshot_dirs.items() if not os.path.isdir(path)]
+    if absent:
+        raise SystemExit(
+            "快照池索引指向的桶不存在（池被搬动或删除？）："
+            + "、".join(absent[:3])
+            + (f" 等 {len(absent)} 个" if len(absent) > 3 else "")
+        )
+    return snapshot_dirs, arm
+
+
 def plan_replay(
     root: str,
     dataset: str,
@@ -277,11 +363,15 @@ def plan_replay(
     dataset_fingerprint: dict[str, Any] | None = None,
     requested_mode: str = "auto",
 ) -> dict[str, Any]:
-    """扫描逐对话清单、跑前校验并决定回放模式（``restore`` / ``rebuild``）。
+    """扫描快照（逐对话清单或池索引）、跑前校验并决定回放模式（``restore`` / ``rebuild``）。
 
     Args:
-        root: 实验目录（自动在其 ``runs/`` 下定位匹配 ``dataset`` 的数据集目录）
-            或数据集目录（``<实验目录>/runs/<dataset>``）。
+        root: 回放源，三种形态：
+            - 实验目录（自动在其 ``runs/`` 下定位匹配 ``dataset`` 的数据集目录）；
+            - 数据集目录（``<实验目录>/runs/<dataset>``）；
+            - **回放任务**（含 ``snapshots/index.json``）：任务根（索引里只有一个臂时
+              自动用它）或臂目录 ``<任务>/A``（按臂键取该臂的桶）。臂目录的源里，
+              每个对话的状态都来自内容寻址池，而不是对话目录下的 ``memory_snapshot/``。
         dataset: 本次评测的数据集名（用于定位与身份校验）。
         adapter: 当前适配器（读其快照能力声明）。
         dialogue_ids: 本 run 要跑的对话 id——每一个都必须有完整快照。
@@ -290,42 +380,59 @@ def plan_replay(
         requested_mode: ``auto`` / ``restore`` / ``rebuild``。
 
     校验（全部在开跑之前）：清单齐备且 ``complete=true``、清单身份与本次一致
-    （数据集 / 对话 id / 对话目录名）、数据集指纹一致、各对话格式版本一致。
+    （数据集 / 对话 id / 对话目录名）、数据集指纹一致、各对话格式版本一致。池源
+    校验强度不变——桶内 ``manifest.json`` 就是身份与指纹的凭证，索引只负责回答
+    "哪个臂的哪个对话在哪个桶"。
     模式协商：``auto`` 优先 ``restore``（要求格式兼容且适配器声明支持），
     否则退回 ``rebuild``（要求适配器声明支持），都不行则拒绝。
 
     Returns:
-        ``{"root": 数据集目录, "mode", "run_mode", "format_version",
-        "source_run", "manifest_sha256", "snapshots": {对话 id: 快照目录}}``。
+        ``{"root": 快照根（数据集目录，或回放任务的入参路径）, "source": --replay
+        入参的绝对路径, "source_pool": 池源的任务级 snapshots/（非池源为 None）,
+        "source_arm": 池源的臂键（非池源为 None）, "mode", "run_mode",
+        "format_version", "source_run", "manifest_sha256",
+        "snapshots": {对话 id: 快照目录}}``。
 
     Raises:
         SystemExit: 任一项不满足（宁可跑前拒绝，也不跑完才发现不可比）。
     """
-    dataset_root = layout.resolve_dataset_dir(root, dataset=dataset)
+    source = os.path.abspath(root)
+    task_source = _replay_task_source(source)
+    dialogue_ids = [str(d) for d in dialogue_ids]
+    if task_source is not None:
+        task_dir, arm = task_source
+        snapshot_dirs, arm = _pool_snapshot_dirs(task_dir, arm, dataset, dialogue_ids)
+        root_label = source
+        source_pool: Union[str, None] = os.path.join(task_dir, layout.DIR_SNAPSHOTS)
+        source_arm: Union[str, None] = arm
+    else:
+        dataset_root = layout.resolve_dataset_dir(root, dataset=dataset)
+        snapshot_dirs = {
+            did: os.path.join(
+                dataset_root, layout.tag_dir_name(did), layout.DIR_SNAPSHOT
+            )
+            for did in dialogue_ids
+        }
+        missing = [d for d, path in snapshot_dirs.items() if not os.path.isfile(
+            os.path.join(path, MANIFEST_NAME)
+        )]
+        if missing:
+            raise SystemExit(
+                "快照缺少本 run 需要的对话，拒绝回放："
+                + "、".join(missing[:5])
+                + (f" 等 {len(missing)} 个" if len(missing) > 5 else "")
+                + "——请确认快照导出覆盖了这些对话（分片导出时需覆盖同一分片口径）"
+            )
+        root_label = dataset_root
+        source_pool = None
+        source_arm = None
+
     caps = read_capabilities(adapter)
     if not caps.get("supported"):
         raise SystemExit(
             "该适配器未声明快照能力，无法回放（--replay）："
             "请在适配器里实现 snapshot/restore（或 rebuild）并让 "
             "snapshot_capabilities() 返回 supported=True；HTTP 桥同理"
-        )
-
-    dialogue_ids = [str(d) for d in dialogue_ids]
-    snapshot_dirs = {
-        did: os.path.join(
-            dataset_root, layout.tag_dir_name(did), layout.DIR_SNAPSHOT
-        )
-        for did in dialogue_ids
-    }
-    missing = [d for d, path in snapshot_dirs.items() if not os.path.isfile(
-        os.path.join(path, MANIFEST_NAME)
-    )]
-    if missing:
-        raise SystemExit(
-            "快照缺少本 run 需要的对话，拒绝回放："
-            + "、".join(missing[:5])
-            + (f" 等 {len(missing)} 个" if len(missing) > 5 else "")
-            + "——请确认快照导出覆盖了这些对话（分片导出时需覆盖同一分片口径）"
         )
 
     want_fp = (
@@ -413,7 +520,10 @@ def plan_replay(
             "读取侧；派生结构/存储结构变更需要系统提供 rebuild，或重跑）"
         )
     return {
-        "root": dataset_root,
+        "root": root_label,
+        "source": source,
+        "source_pool": source_pool,
+        "source_arm": source_arm,
         "mode": mode,
         "run_mode": f"replay-{mode}",
         "format_version": raw_versions[snap_version],

@@ -16,7 +16,7 @@
 | `POST /ingest` | `{"messages":[{"role","content","timestamp"}]}` | `{"input_tokens":int,"llm_calls":int,"latency_ms":float}` | 走**记忆写入路径**；拿不到 token/调用数填 `0`（报告标「未上报」） |
 | `POST /query` | `{"question":str}` | `{"answer":str,"retrieved":[str],...}` | 走**记忆读取+回答**；`retrieved` 填实际注入 prompt 的**记忆原文**，注入即口径（优先级顺序、多轮检索先合并去重、报全量，见下方常见坑）；`input_tokens`/`output_tokens` 填了才会进「Token 消耗」账 |
 | `POST /snapshot-capabilities`（可选） | `{}` | `{"supported":true,"restore":true,"rebuild":false,"format_version":1}` | 声明快照能力；老桥缺该端点 → 框架按不支持处理 |
-| `POST /snapshot`（可选） | `{"target_dir","tag"}` | `{"items":int}` | 把当前记忆整体导出到 target_dir（框架传的是该对话的 `memory_snapshot/`；**内容与布局由桥决定**，模板 = `memory/` + 标记文件） |
+| `POST /snapshot`（可选） | `{"target_dir","tag"}` | `{"items":int}` | 把当前记忆整体导出到 target_dir（普通 run 传该对话的 `memory_snapshot/`，回放时传任务级快照池里的临时目录；**内容与布局由桥决定**，模板 = `memory/` + 标记文件） |
 | `POST /restore`（可选） | `{"source_dir","tag"}` | `{"restored":true}` | 从快照恢复；**只认带标记文件的快照**，并重建进程内实例（只换磁盘不重建缓存等于没恢复） |
 
 - `Content-Type: application/json`；如果服务要求鉴权，客户端用 `api_key` 时发
@@ -73,7 +73,9 @@
 - **快照默认导出**：`run` / `evaluate` / `evaluate-compare` 默认在每个对话 ingest 完成后、
   第一道 query 之前调一次 `/snapshot`，把该对话的 `memory_snapshot/` 填满——桥写进去的内容
   （模板 = `memory/` + 标记文件）加上框架写的 `manifest.json` 就是该目录的全部；跑完 ingest
-  就能在对话级 `report.md` 里点开 `../memory_snapshot/` 翻记忆文件。桥没实现
+  就能在对话级 `report.md` 里点开 `../memory_snapshot/` 翻记忆文件。**回放时也会再调一次**：
+  `/restore`（或 `/rebuild`）之后、第一道 query 之前，把恢复出的状态导到任务级快照池的临时
+  目录（内容相同的状态只存一份桶）——桥只需照常写 `target_dir`。桥没实现
   `/snapshot-capabilities`（或返回 `supported=false`）时框架警告一次并跳过、评测照常完成
   （`state_snapshot.role=unsupported`，报告渲染成「不支持（适配器未声明快照能力）」），
   不需要快照用 `--no-snapshot` 关闭（`--snapshot` 已删）。

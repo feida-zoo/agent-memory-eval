@@ -25,6 +25,13 @@
     <root>/compare_<name>_<platform>_<ts>/   A/ B/（各为完整评测产物根）+ reports/
     <root>/matrix_<ts>/                      reports/ + runs/<label>/（内部同 eval 树）
 
+**回放任务**（``task init --replay``）在任务目录根多一个内容寻址快照池 ``snapshots/``：
+回放导出的状态按内容哈希去重成桶 ``snapshots/<sha256 前 12 位>/``，任务级索引
+``snapshots/index.json`` 记录桶、各臂逐对话映射与来源（路径 helper 见
+:func:`snapshot_pool_root` / :func:`snapshot_bucket_dir`，读 / 写见
+:func:`read_snapshot_index` / :func:`write_snapshot_index`）。池属于**任务**而不是臂：
+双臂回放同一源时两臂指向同一批桶，差异本身即"回放不保真"的证据。
+
 ``<root>`` 由 :func:`membench.paths.output_root` 解析（CLI ``--report-out DIR`` 即指它）。
 
 分片 / 冒烟标签（``_s<i>`` / ``_l<limit>``）只加在目录名末尾，见 :func:`experiment_tags`；
@@ -43,6 +50,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 from collections.abc import Iterable
 from datetime import datetime
 from typing import Any, Union
@@ -58,6 +66,8 @@ DIR_REPORT = "report"  # 对话级 / 数据集级报告目录
 DIR_REPORTS = "reports"  # 实验根层的任务级报告目录（与 runs/ 平级）
 DIR_RUNTIME = "runtime"
 DIR_SNAPSHOT = "memory_snapshot"
+#: 回放任务的内容寻址快照池（任务根层，与 runs/ 平级）：桶 = ``<池>/<sha256 前 12 位>``。
+DIR_SNAPSHOTS = "snapshots"
 
 #: A/B 对比实验目录（compare / evaluate-compare）下两侧副本的目录名：A = 基线、B = 候选。
 #: 兼作报告里的侧标签。
@@ -73,6 +83,8 @@ FILE_SUMMARY = "evaluate_summary.json"
 FILE_MATRIX_RESULT = "matrix_result.json"
 #: 分片账本（落数据集目录下）：同一次评测各分片的进度与归属，见 :func:`shard_ledger_path`。
 FILE_SHARDS = "shards.json"
+#: 快照池索引文件名（落回放任务的 ``snapshots/`` 下），见 :func:`snapshot_index_path`。
+FILE_SNAPSHOT_INDEX = "index.json"
 
 #: 图表文件名（报告内引用一律同目录相对文件名）。
 FIG_CATEGORY = "fig_category_accuracy.png"
@@ -248,16 +260,22 @@ def init_task_dir(
     platform: str | None = None,
     arms: int = 2,
     ts: str | None = None,
+    *,
+    replay: bool = False,
 ) -> str:
     """在 ``base``（默认 :func:`membench.paths.output_root`）下建任务目录骨架，返回绝对路径。
 
     骨架：``arms==2`` 建 ``A/`` 与 ``B/``（两个臂各是一个完整评测产物根），``arms==1``
-    建 ``runs/``；两种形态都建任务级 ``reports/``。目标**已存在且非空**时拒绝新建
+    建 ``runs/``；两种形态都建任务级 ``reports/``。``replay=True``（回放任务）在任务根
+    额外建内容寻址快照池 ``snapshots/``（见 :func:`snapshot_pool_root`）：回放导出的
+    状态按内容去重后落在这里，A/B 两臂共用同一批桶。目标**已存在且非空**时拒绝新建
     （守卫语义与报错文案复用 :func:`experiment_path`：上一次跑在校验阶段失败留下的
     空目录可以复用，已有产物的目录一律不覆盖）。
     """
     path = experiment_path(base, task_subdir(name, platform, arms, ts))
     subdirs = (DIR_ARM_A, DIR_ARM_B) if arms == 2 else (DIR_RUNS,)
+    if replay:
+        subdirs = (*subdirs, DIR_SNAPSHOTS)
     for subdir in (*subdirs, DIR_REPORTS):
         os.makedirs(os.path.join(path, subdir), exist_ok=True)
     return os.path.abspath(path)
@@ -268,6 +286,158 @@ def arm_dir(task_dir: str, arm: str) -> str:
     if arm not in (DIR_ARM_A, DIR_ARM_B):
         raise ValueError(f"arm 必须是 {DIR_ARM_A!r} 或 {DIR_ARM_B!r}，当前为 {arm!r}")
     return os.path.join(task_dir, arm)
+
+
+# ---------------------------------------------------------------------------
+# 回放任务的快照池：内容寻址的桶 + 任务级索引（读 / 写 / 校验的唯一实现）
+# ---------------------------------------------------------------------------
+
+#: 快照池索引结构版本：结构变了就 +1，读到不认识的版本即拒绝。
+SNAPSHOT_POOL_SCHEMA = 1
+
+#: 桶名长度：状态内容 sha256 的前 12 位（既够短、又足以区分一次评测里的各对话状态）。
+SNAPSHOT_BUCKET_CHARS = 12
+
+#: 池内临时导出目录前缀（导出算完哈希后整体移入桶，失败即删；不是桶，遍历时必须跳过）。
+SNAPSHOT_TMP_PREFIX = ".tmp-"
+
+#: 桶名只允许小写十六进制：索引里的条目指向什么目录必须能一眼校验，防止手改索引越出池。
+_BUCKET_RE = re.compile(r"^[0-9a-f]{%d}$" % SNAPSHOT_BUCKET_CHARS)
+
+
+def snapshot_task_root(target: str) -> str:
+    """``target`` 所属的任务目录：它是任务下的臂目录（``A/`` / ``B/``）时取父任务目录。
+
+    判定依据是父目录带任务级 ``reports/``（``task init`` 建的骨架）——实验目录与
+    任务目录的命名互不相同，只有臂目录名 ``A`` / ``B`` 是固定词表（:data:`DIR_ARM_A` /
+    :data:`DIR_ARM_B`）。不是臂目录时 ``target`` 自己就是任务目录（单臂任务 / 普通实验）。
+    """
+    path = os.path.abspath(target)
+    if os.path.basename(path) in (DIR_ARM_A, DIR_ARM_B):
+        parent = os.path.dirname(path)
+        if os.path.isdir(os.path.join(parent, DIR_REPORTS)):
+            return parent
+    return path
+
+
+def snapshot_pool_root(target: str) -> str:
+    """快照池根目录：``<target 所属任务目录>/snapshots``（普通 run 不会写它）。"""
+    return os.path.join(snapshot_task_root(target), DIR_SNAPSHOTS)
+
+
+def snapshot_arm_key(target: str) -> str:
+    """臂在索引里的键：目标产物根相对任务目录的路径（``A`` / ``B``；任务根本身为 ``""``）。"""
+    rel = os.path.relpath(os.path.abspath(target), snapshot_task_root(target))
+    return "" if rel == os.curdir else rel.replace(os.sep, "/")
+
+
+def snapshot_entry_key(arm: str, dataset: str, dialogue_id: str) -> str:
+    """索引 ``entries`` 的键：``<arm>|<dataset>|<dialogue_id>``。
+
+    臂键由 :func:`snapshot_arm_key` 决定（单臂任务为空串），这三段拼起来才能唯一确定
+    "哪个臂的哪个对话指向哪个桶"——桶本身只按内容寻址，不含身份。
+    """
+    return f"{arm}|{dataset}|{dialogue_id}"
+
+
+def parse_snapshot_entry_key(key: str) -> Union[tuple[str, str, str], None]:
+    """:func:`snapshot_entry_key` 的反解；不是三段形态时返回 None。"""
+    parts = str(key).split("|", 2)
+    return (parts[0], parts[1], parts[2]) if len(parts) == 3 else None
+
+
+def snapshot_bucket_id(state_sha256: str) -> str:
+    """桶名：状态内容 sha256（不含 manifest）的前 :data:`SNAPSHOT_BUCKET_CHARS` 位。"""
+    return str(state_sha256)[:SNAPSHOT_BUCKET_CHARS]
+
+
+def snapshot_bucket_dir(pool_root: str, digest: str) -> str:
+    """池里的桶目录：``<pool_root>/<digest>``（digest 不合法直接拒绝）。"""
+    if not _BUCKET_RE.match(str(digest)):
+        raise SystemExit(
+            f"快照桶名非法: {digest!r}（应为 {SNAPSHOT_BUCKET_CHARS} 位小写十六进制）"
+        )
+    return os.path.join(pool_root, digest)
+
+
+def new_snapshot_tmp_dir(pool_root: str) -> str:
+    """在池内建一个临时导出目录（``.tmp-<uuid>``），返回它的路径。
+
+    桶必须由完整内容一次性出现：先导出到这里、算完哈希再整体 ``os.replace`` 进桶，
+    中途崩溃最多留下一个 ``.tmp-*`` 目录，不会被误读成桶。
+    """
+    os.makedirs(pool_root, exist_ok=True)
+    path = os.path.join(pool_root, f"{SNAPSHOT_TMP_PREFIX}{uuid.uuid4().hex}")
+    os.makedirs(path)
+    return path
+
+
+def snapshot_index_path(pool_root: str) -> str:
+    """快照池索引路径：``<pool_root>/index.json``。"""
+    return os.path.join(pool_root, FILE_SNAPSHOT_INDEX)
+
+
+def has_snapshot_index(task_dir: str) -> bool:
+    """该任务目录是不是**回放任务**（任务根 ``snapshots/index.json`` 存在）。"""
+    return os.path.isfile(snapshot_index_path(os.path.join(task_dir, DIR_SNAPSHOTS)))
+
+
+def empty_snapshot_index() -> dict[str, Any]:
+    """空索引：``buckets`` / ``entries`` / ``arms`` 三段（结构版本见 :data:`SNAPSHOT_POOL_SCHEMA`）。"""
+    return {"schema": SNAPSHOT_POOL_SCHEMA, "buckets": {}, "entries": {}, "arms": {}}
+
+
+def read_snapshot_index(pool_root: str) -> Union[dict[str, Any], None]:
+    """读池索引（没有索引返回 None）；结构非法当场报错。
+
+    结构：``buckets`` 按桶名登记内容身份（``dataset`` / ``dialogue_id`` / ``bytes`` /
+    ``n_files`` / ``state_sha256``），``entries`` 是 ``arm|dataset|dialogue -> 桶名``，
+    ``arms`` 记每个臂的回放来源与计数。坏索引被静默覆盖，就等于丢掉"哪些状态已经
+    在池里、哪些臂指向它"的唯一记录，故宁可拒绝也不猜。
+    """
+    path = snapshot_index_path(pool_root)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            index = json.load(handle)
+    except ValueError as exc:
+        raise SystemExit(f"快照池索引损坏（{path}）：{exc}；请修复或删除该文件后重跑")
+    if not isinstance(index, dict) or index.get("schema") != SNAPSHOT_POOL_SCHEMA:
+        found = index.get("schema") if isinstance(index, dict) else None
+        raise SystemExit(
+            f"快照池索引结构版本不受支持（{path}）：schema={found!r}，"
+            f"本版本支持 {SNAPSHOT_POOL_SCHEMA}；请换一个任务目录重跑"
+        )
+    for key in ("buckets", "entries", "arms"):
+        if not isinstance(index.get(key), dict):
+            raise SystemExit(f"快照池索引结构非法（{path}）：缺少 {key} 段")
+    for digest in index["buckets"]:
+        if not _BUCKET_RE.match(str(digest)):
+            raise SystemExit(
+                f"快照池索引里的桶名非法（{path}）：{digest!r}"
+                f"（应为 {SNAPSHOT_BUCKET_CHARS} 位小写十六进制）"
+            )
+    return index
+
+
+def write_snapshot_index(pool_root: str, index: dict[str, Any]) -> str:
+    """落盘池索引，返回索引路径（临时文件 + ``os.replace``，同目录内原子替换）。
+
+    索引是跨臂共享的：A、B 两臂各自回放时都要在同一个文件里追加自己的条目，读到
+    半个文件就会丢条目，故只做同目录原子替换（与分片账本同一套写法）。
+    """
+    path = snapshot_index_path(pool_root)
+    os.makedirs(pool_root, exist_ok=True)
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(index, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return path
 
 
 # ---------------------------------------------------------------------------

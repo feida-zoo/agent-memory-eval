@@ -5,7 +5,9 @@
 ``report/`` 下；快照清单**每个对话一份**，落 ``<对话目录>/memory_snapshot/manifest.json``。
 
 快照**默认导出**（``snapshot=True``）；适配器未声明快照能力时只打印一次警告并跳过
-（metrics 记 ``state_snapshot.role="unsupported"``），``replay`` 模式下自动不导出。
+（metrics 记 ``state_snapshot.role="unsupported"``）。回放同样导出，但落任务级
+内容寻址池（见 ``tests/test_replay_snapshots.py``），不再写对话目录下的
+``memory_snapshot/``。
 """
 
 from __future__ import annotations
@@ -374,16 +376,23 @@ def test_snapshot_unsupported_adapter_warns_and_skips(tmp_path: Path) -> None:
     assert not list(dataset_dir.glob(f"*/{layout.DIR_SNAPSHOT}"))
 
 
-def test_replay_does_not_export_snapshots(tmp_path: Path) -> None:
-    """回放模式自动不导出快照：snapshot=True 也不再报互斥，回放目录不落 memory_snapshot/。"""
+def test_replay_exports_to_task_pool_not_dialogue_dirs(tmp_path: Path) -> None:
+    """回放同样导出快照，但落任务级内容寻址池：不写对话目录下的 memory_snapshot/。"""
     exp = tmp_path / "src"
     source_dataset = _full_run(tmp_path, name="src", snapshot=True)
 
     replay_dataset = _replay_run(tmp_path, name="replay", replay=exp)
     assert _metrics(replay_dataset)["state_snapshot"]["role"] == "replayed"
     assert not list(Path(replay_dataset).glob(f"*/{layout.DIR_SNAPSHOT}"))
+    # 池在实验目录（单臂任务根）下：两个对话各一个桶 + 索引
+    task_dir = tmp_path / "replay"
+    pool = task_dir / layout.DIR_SNAPSHOTS
+    assert layout.has_snapshot_index(str(task_dir))
+    index = json.loads((pool / layout.FILE_SNAPSHOT_INDEX).read_text(encoding="utf-8"))
+    assert len(index["buckets"]) == 2
+    assert _metrics(replay_dataset)["state_snapshot"]["snapshots_dir"] == str(pool)
 
-    # 显式 snapshot=True + replay：构造期不再报错，同样不导出
+    # 显式 snapshot=True + replay：与默认一致（导出到池，构造期不报错）
     explicit = Runner(
         _FileMemoryAdapter(tmp_path / "mem-explicit"),
         str(tmp_path / "ds.jsonl"),
@@ -395,6 +404,7 @@ def test_replay_does_not_export_snapshots(tmp_path: Path) -> None:
     explicit_dir = Path(explicit.run())
     assert _metrics(explicit_dir)["state_snapshot"]["role"] == "replayed"
     assert not list(explicit_dir.glob(f"*/{layout.DIR_SNAPSHOT}"))
+    assert (tmp_path / "replay-explicit" / layout.DIR_SNAPSHOTS / layout.FILE_SNAPSHOT_INDEX).is_file()
 
 
 def test_replay_refuses_on_other_dataset_or_changed_content(tmp_path: Path) -> None:

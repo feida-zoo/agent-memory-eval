@@ -31,9 +31,20 @@ results.jsonl（不浪费 LLM 调用，metrics 聚合分母口径自然正确）
     <实验目录>/runs/<dataset>/shards.json                  # 分片账本（分片评测时；读/写/校验见 layout）
     <实验目录>/reports/                                    # 任务级（数据集级报告副本）
 
+回放任务（``task init --replay``）另有任务级快照池::
+
+    <任务>/snapshots/<sha256 前 12 位>/    # 内容寻址桶（含 manifest.json，来源记在 source 段）
+    <任务>/snapshots/index.json            # 桶 / 逐臂逐对话映射 / 各臂来源与计数
+
 快照默认导出（``snapshot=True``）：每个对话只有一份，打点在该对话全部 session ingest
 完成之后、第一道 query 之前——正是回放时的入口状态。适配器未声明快照能力时打印一次
 警告并跳过（metrics 记 ``state_snapshot.role="unsupported"``），不中断评测。
+
+**回放**（``replay``）同样在 ``restore()`` / ``rebuild()`` 之后、第一道 query 之前导出，
+但落点是任务级内容寻址池 ``<任务>/snapshots/<sha256 前 12 位>/``（见
+:class:`_SnapshotPoolWriter` 与 :mod:`membench.layout` 的池 helper）：状态内容相同的
+导出共用同一个桶，A/B 两臂回放同一源时只产生一份；``--no-snapshot`` 关闭，关闭时
+既不写桶也不写 ``snapshots/index.json``。
 """
 
 from __future__ import annotations
@@ -41,6 +52,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Union
@@ -175,6 +187,158 @@ def select_shard_questions(
     return out
 
 
+class _SnapshotPoolWriter:
+    """回放任务的内容寻址快照池写入器（``<任务>/snapshots/``）。
+
+    每个对话先导出到池内临时目录（``.tmp-<uuid>``），算完内容哈希（沿用
+    :func:`membench.snapshot.dir_sha256` 的口径，排除 ``manifest.json``）后按前 12 位
+    定桶：桶不存在则整体移入（新写），已存在则校验桶内清单的 ``entry.sha256`` 与本次
+    一致后丢弃临时目录（复用）；不一致只可能是哈希前缀撞车或桶被改动，直接拒绝。
+    每处理一个对话就原子更新一次 ``snapshots/index.json``——中途崩溃时已完成的部分
+    仍然可读。
+
+    池属于**任务**而不是臂：``out_dir`` 是 ``<任务>/A`` / ``B`` 时池在父任务目录，
+    臂键即目录名；单臂任务 / 普通实验目录的臂键是空串。索引是跨臂共享的，本写入器
+    只做同进程内的读-改-写（多进程同时对同一池回放不是支持场景）。
+    """
+
+    def __init__(self, out_dir: str, plan: dict[str, Any], dataset: str) -> None:
+        self.pool_root = layout.snapshot_pool_root(out_dir)
+        self.arm = layout.snapshot_arm_key(out_dir)
+        self.dataset = dataset
+        self.plan = plan
+        self.index = layout.read_snapshot_index(self.pool_root) or layout.empty_snapshot_index()
+        #: 本 run 逐对话的桶登记：``{对话 id: {"bucket": digest12, "reused": bool}}``
+        self.buckets: dict[str, dict[str, Any]] = {}
+
+    # ------------------------------------------------------------------
+    def _arm_info(self) -> dict[str, Any]:
+        """当前臂的索引段：来源取**最近一次**回放（同臂多次回放时以最后一次为准）。"""
+        info = self.index["arms"].get(self.arm)
+        if not isinstance(info, dict):
+            info = {}
+            self.index["arms"][self.arm] = info
+        info["source"] = self.plan["source"]
+        info["source_manifest_sha256"] = self.plan.get("manifest_sha256")
+        info.setdefault("n_reused", 0)
+        info.setdefault("n_new", 0)
+        info["n_dialogues"] = sum(
+            1
+            for key in self.index["entries"]
+            if (layout.parse_snapshot_entry_key(key) or ("",))[0] == self.arm
+        )
+        return info
+
+    def _require_same_bucket(self, bucket: str, state_sha256: str) -> None:
+        """桶已存在时必须装的是同一份内容（桶名是内容哈希前 12 位）。
+
+        ``load_manifest`` 负责"桶里没有/读不出清单"的报错；这里只比对内容哈希：
+        一致才允许复用，不一致说明前缀撞车或桶被改动/损坏。
+        """
+        known = (snapshot_mod.load_manifest(bucket).get("entry") or {}).get("sha256")
+        if known != state_sha256:
+            raise SystemExit(
+                f"快照桶 {bucket} 已存在但内容哈希不一致：桶内 {known} vs 本次 "
+                f"{state_sha256}——桶名是内容哈希前 12 位，同名不同内容只可能是哈希前缀"
+                "撞车或桶被改动；请检查该桶（必要时删除）后重跑，不要硬塞进同一桶"
+            )
+
+    def export(
+        self,
+        adapter: Any,
+        manifest: dict[str, Any],
+        *,
+        dialogue_id: str,
+        sessions: list[list[dict]],
+        n_questions: int,
+    ) -> dict[str, Any]:
+        """导出一个对话到池并更新索引，返回 ``{bucket, reused, entry}``。"""
+        tmp = layout.new_snapshot_tmp_dir(self.pool_root)
+        try:
+            manifest["source"] = {
+                "kind": "replay",
+                "replay": self.plan["source"],
+                "replay_mode": self.plan["mode"],
+                "source_run": self.plan["source_run"],
+                "source_manifest_sha256": self.plan.get("manifest_sha256"),
+            }
+            if self.plan.get("source_pool"):
+                # 链式回放：上一轮也是回放任务，记下用的是哪个臂的桶
+                manifest["source"]["source_pool"] = self.plan["source_pool"]
+                manifest["source"]["source_arm"] = self.plan.get("source_arm")
+            entry = snapshot_mod.write_snapshot(
+                tmp,
+                adapter,
+                manifest,
+                dialogue_id=dialogue_id,
+                sessions=sessions,
+                n_questions=n_questions,
+            )
+            digest = layout.snapshot_bucket_id(entry["sha256"])
+            bucket = layout.snapshot_bucket_dir(self.pool_root, digest)
+            if os.path.isdir(bucket):
+                self._require_same_bucket(bucket, entry["sha256"])
+                shutil.rmtree(tmp, ignore_errors=True)
+                tmp = None
+                reused = True
+            else:
+                try:
+                    os.replace(tmp, bucket)
+                    tmp = None
+                    reused = False
+                except OSError:
+                    # 另一个进程刚建好同名桶：以磁盘上的为准重新校验
+                    if not os.path.isdir(bucket):
+                        raise
+                    self._require_same_bucket(bucket, entry["sha256"])
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    tmp = None
+                    reused = True
+
+            known = self.index["buckets"].get(digest)
+            if isinstance(known, dict) and known.get("state_sha256") != entry["sha256"]:
+                raise SystemExit(
+                    f"快照池索引与该桶不一致（{layout.snapshot_index_path(self.pool_root)}）："
+                    f"桶 {digest} 记的是 {known.get('state_sha256')}，本次 {entry['sha256']}；"
+                    "索引可能被手改过，请修复或删除索引后重跑"
+                )
+            if not isinstance(known, dict):
+                n_bytes, n_files = snapshot_mod.dir_stats(
+                    bucket, exclude=(snapshot_mod.MANIFEST_NAME,)
+                )
+                self.index["buckets"][digest] = {
+                    "dataset": self.dataset,
+                    "dialogue_id": str(dialogue_id),
+                    "bytes": n_bytes,
+                    "n_files": n_files,
+                    "state_sha256": entry["sha256"],
+                }
+            self.index["entries"][
+                layout.snapshot_entry_key(self.arm, self.dataset, dialogue_id)
+            ] = digest
+            arm_info = self._arm_info()
+            arm_info["n_reused" if reused else "n_new"] += 1
+            layout.write_snapshot_index(self.pool_root, self.index)
+            self.buckets[str(dialogue_id)] = {
+                "bucket": digest,
+                "reused": reused,
+            }
+            return {"bucket": digest, "reused": reused, "entry": entry}
+        finally:
+            if tmp is not None:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    def summary(self) -> dict[str, Any]:
+        """本 run 的池汇总：池路径 / 不同桶数 / 复用数 / 新写数。"""
+        digests = {info["bucket"] for info in self.buckets.values()}
+        return {
+            "snapshots_dir": os.path.abspath(self.pool_root),
+            "n_buckets": len(digests),
+            "n_reused": sum(1 for info in self.buckets.values() if info["reused"]),
+            "n_new": sum(1 for info in self.buckets.values() if not info["reused"]),
+        }
+
+
 class Runner:
     """评测执行器。
 
@@ -223,11 +387,14 @@ class Runner:
             的 ``snapshot()`` 把状态导出到该对话的 ``memory_snapshot/`` 并写
             ``manifest.json``——之后改读取侧代码可用 ``replay`` 免重跑 ingest。
             适配器未声明快照能力时打印一次警告并跳过（metrics 记
-            ``state_snapshot.role="unsupported"``）；``replay`` 模式下自动不导出。
-        replay: 实验目录或数据集目录（``<实验目录>/runs/<dataset>``）；给定时
-            跳过 reset+ingest，按对话 ``restore()``（或 ``rebuild()``）后只跑
-            query。清单齐备性 / 数据集指纹 / 对话覆盖 / 能力 / 模式都在**开跑前**
-            校验，失败即停且不产生任何产物。
+            ``state_snapshot.role="unsupported"``）。回放模式下同样导出，但落任务级
+            内容寻址池 ``<任务>/snapshots/<内容哈希前 12 位>/``（相同状态只存一份）；
+            ``--no-snapshot``（``snapshot=False``）两种模式都不写快照。
+        replay: 回放源：实验目录、数据集目录（``<实验目录>/runs/<dataset>``），或
+            **回放任务**（含 ``snapshots/index.json`` 的任务根 / 臂目录
+            ``<任务>/A``）。给定时跳过 reset+ingest，按对话 ``restore()``（或
+            ``rebuild()``）后只跑 query。清单齐备性 / 数据集指纹 / 对话覆盖 / 能力 /
+            模式都在**开跑前**校验，失败即停且不产生任何产物。
         replay_mode: ``auto``（默认，优先 restore，格式不兼容时退回 rebuild）/
             ``restore`` / ``rebuild``。
         replay_verify_source: 给定源数据集目录时，回放结束与之逐题比对
@@ -268,8 +435,9 @@ class Runner:
             raise ValueError("replay_verify_source 只在 replay 模式下有意义（需同时给 replay）")
         if replay_mode not in ("auto", "restore", "rebuild"):
             raise ValueError(f"replay_mode 必须是 auto / restore / rebuild，当前为 {replay_mode!r}")
-        # 回放只读快照、不写记忆：再导出快照没有意义，给了 replay 就自动不导出（不是参数冲突）
-        self.snapshot = bool(snapshot) and not replay
+        # 回放也从恢复后的状态导出快照，但落任务级内容寻址池（同样的状态只存一份），
+        # 因此 snapshot 开关在回放下同样生效（--no-snapshot 时不写任何桶与索引）
+        self.snapshot = bool(snapshot)
         self.shared = bool(shared)
         self.replay = replay
         self.replay_mode = replay_mode
@@ -493,6 +661,11 @@ class Runner:
                 f"{replay_plan['source_run']}，格式 v{replay_plan['format_version']}，"
                 f"{len(dialogues)} 个对话）——写入侧固定，结论只覆盖读取/回答层"
             )
+            if replay_plan.get("source_pool"):
+                print(
+                    f"[membench] 回放源是回放任务: {replay_plan['source_pool']}"
+                    f"（臂 {replay_plan['source_arm'] or '单臂'}）"
+                )
         snapshot_caps: dict[str, Any] = {}
         # 快照默认导出；适配器没有这个能力就跳过（只打印一次警告，不中断评测），
         # metrics 里如实记 state_snapshot.role="unsupported"
@@ -567,10 +740,15 @@ class Runner:
             token_usage["ingest_skipped"] = 1
         # 检索回退数按本次 run 增量统计（matcher 实例可在多数据集间共享）
         match_fallbacks_start = int(getattr(self._evidence_matcher, "fallbacks", 0) or 0)
-        # 快照目录登记：导出时逐对话登记，回放时来自计划；state_snapshot 依据
+        # 快照目录登记：普通 run 是本次导出的目录（逐对话 memory_snapshot/）；回放是
+        # **源**的逐对话快照目录（数据集目录或源池里的桶），state_snapshot 依据
         snapshot_dirs: dict[str, str] = dict(replay_plan["snapshots"]) if replay_plan else {}
-        # 快照导出开关：请求了导出、适配器支持、且不是在回放（回放只读快照）
+        # 快照导出开关：请求了导出且适配器支持（回放同样导出，只是落任务级内容寻址池）
         export_snapshots = bool(self.snapshot and snapshot_caps.get("supported"))
+        # 回放任务的池写入器：out_dir 是臂目录时池在父任务目录（见 layout 的池 helper）
+        snapshot_pool: Union[_SnapshotPoolWriter, None] = None
+        if replay_plan is not None and export_snapshots:
+            snapshot_pool = _SnapshotPoolWriter(self.out_dir, replay_plan, dataset_name)
         snapshot_oversize_warned = False
 
         def _retrieval_meta(fallbacks: int) -> dict[str, Any]:
@@ -595,13 +773,14 @@ class Runner:
 
             角色三态：``replayed``（回放）/ ``exported``（本次导出）/ ``unsupported``
             （请求了导出但适配器不支持，如实记"没导"）；没开快照时整块不落——读取方
-            据此就能区分"这次没导快照"与"适配器导不了"。
+            据此就能区分"这次没导快照"与"适配器导不了"。回放且导出到池时另给
+            ``snapshots_dir`` 与复用/新写计数（对话级给 ``bucket`` / ``reused``）。
             """
             if replay_plan:
                 subset = _snapshot_scope(dialogue_id)
                 if subset is None:
                     return None
-                return {
+                state = {
                     "role": "replayed",
                     "root": replay_plan["root"],
                     "manifest_sha256": snapshot_mod.manifests_digest(subset),
@@ -610,6 +789,20 @@ class Runner:
                     "replay_mode": replay_plan["mode"],
                     "n_dialogues": len(subset),
                 }
+                if snapshot_pool is not None:
+                    # 本 run 的导出侧：状态已按内容去重写入任务级池（--no-snapshot 时没有）
+                    summary = snapshot_pool.summary()
+                    state["snapshots_dir"] = summary["snapshots_dir"]
+                    if dialogue_id is None:
+                        state["n_buckets"] = summary["n_buckets"]
+                        state["n_reused"] = summary["n_reused"]
+                        state["n_new"] = summary["n_new"]
+                    else:
+                        info = snapshot_pool.buckets.get(dialogue_id)
+                        if info:
+                            state["bucket"] = info["bucket"]
+                            state["reused"] = bool(info["reused"])
+                return state
             if export_snapshots:
                 subset = _snapshot_scope(dialogue_id)
                 if subset is None:
@@ -738,11 +931,8 @@ class Runner:
             ]
 
             if export_snapshots:
-                # 快照打点：该对话 ingest 完成后、第一道 query 之前（回放的入口状态）。
-                # 一个对话只导这一份：per-session 导出会得到用不上的中间态。
-                snapshot_path = layout.dialogue_snapshot_dir(
-                    self.out_dir, dataset_name, dialogue_id
-                )
+                # 快照打点：该对话 ingest / restore 完成后、第一道 query 之前（回放的入口
+                # 状态）。一个对话只导这一份：per-session 导出会得到用不上的中间态。
                 manifest = snapshot_mod.new_manifest(
                     run_id=run_id,
                     adapter=adapter_name,
@@ -754,26 +944,43 @@ class Runner:
                     dialogue_id=dialogue_id,
                     capabilities=snapshot_caps,
                 )
-                entry = snapshot_mod.write_snapshot(
-                    snapshot_path,
-                    self.adapter,
-                    manifest,
-                    dialogue_id=dialogue_id,
-                    sessions=dialogue.sessions,
-                    n_questions=len(active_questions),
-                )
-                snapshot_dirs[dialogue_id] = snapshot_path
-                print(
-                    f"[membench] 快照: {snapshot_path}（{entry['bytes']} 字节，"
-                    f"sha256 {entry['sha256'][:12]}）"
-                )
-                if (
-                    int(entry.get("bytes") or 0) > SNAPSHOT_WARN_BYTES
-                    and not snapshot_oversize_warned
-                ):
+                if snapshot_pool is not None:
+                    exported = snapshot_pool.export(
+                        self.adapter,
+                        manifest,
+                        dialogue_id=dialogue_id,
+                        sessions=dialogue.sessions,
+                        n_questions=len(active_questions),
+                    )
+                    entry = exported["entry"]
+                    print(
+                        f"[membench] 快照池: {exported['bucket']} "
+                        f"（{'复用已有桶' if exported['reused'] else '新写'}，"
+                        f"{entry['bytes']} 字节，对话 {dialogue_id}）"
+                    )
+                    add_bytes = 0 if exported["reused"] else int(entry.get("bytes") or 0)
+                else:
+                    snapshot_path = layout.dialogue_snapshot_dir(
+                        self.out_dir, dataset_name, dialogue_id
+                    )
+                    entry = snapshot_mod.write_snapshot(
+                        snapshot_path,
+                        self.adapter,
+                        manifest,
+                        dialogue_id=dialogue_id,
+                        sessions=dialogue.sessions,
+                        n_questions=len(active_questions),
+                    )
+                    snapshot_dirs[dialogue_id] = snapshot_path
+                    print(
+                        f"[membench] 快照: {snapshot_path}（{entry['bytes']} 字节，"
+                        f"sha256 {entry['sha256'][:12]}）"
+                    )
+                    add_bytes = int(entry.get("bytes") or 0)
+                if add_bytes > SNAPSHOT_WARN_BYTES and not snapshot_oversize_warned:
                     snapshot_oversize_warned = True
                     print(
-                        f"[membench] ⚠️ 单份快照 {int(entry['bytes']) / (1 << 20):.0f} MB 超过 "
+                        f"[membench] ⚠️ 单份快照 {add_bytes / (1 << 20):.0f} MB 超过 "
                         f"{SNAPSHOT_WARN_BYTES >> 20} MB：快照体积随对话数线性增长，"
                         "可用 CLI 的 --no-snapshot 关闭（关掉后改读取侧只能重跑 ingest）"
                     )
@@ -931,7 +1138,15 @@ class Runner:
                     extra_files=[os.path.join(dataset_report_dir, layout.FILE_METRICS)],
                 )
                 print(f"[membench] 任务级报告: {task_dir}")
-        if export_snapshots:
+        if snapshot_pool is not None:
+            pool = snapshot_pool.summary()
+            print(
+                f"[membench] 快照池: {pool['snapshots_dir']}（{pool['n_buckets']} 个桶，"
+                f"复用 {pool['n_reused']} / 新写 {pool['n_new']}）"
+                "——同一源回放到另一臂不会新增桶；--replay 传该任务目录或其臂目录可"
+                "继续回放（链式）"
+            )
+        elif export_snapshots:
             print(
                 f"[membench] 快照: {len(snapshot_dirs)} 个对话 → {dataset_dir}"
                 "（--replay 传该数据集目录或实验目录即可免重跑 ingest）"

@@ -56,7 +56,7 @@ description: >
 1. 阅读 `references/adapter_guide.md`（含第 3 节真实性红线：真实写入/读取路径是完整评测的唯一前提；旁路不得自行采用，走不通时停下、由用户决定降级口径），在被测 Agent 源码中定位三个挂点：记忆清空、记忆写入、记忆读取+回答。
 2. 实现 `BaseMemoryAdapter` 三方法（`reset` / `ingest` / `query`），或在 Agent 侧暴露 `POST /reset|/ingest|/query` 三个端点后用内置 HttpAdapter（`run --adapter http --adapter-arg base_url=<服务地址>`，无需再包适配器）。
    - **`query` 必须回填 `retrieved`**：= 实际拼进回答 prompt 的**记忆条目原文**，按注入优先级排序，多轮检索**先合并去重**再返回，报**注入的那一份全量**（框架不合并、不去重、不截断；返回空列表 = 静默按 0 召回计）。它决定 `evidence_recall` / `recall@5` 是否成立，细则见 `references/adapter_guide.md` §2.3。
-   - 需要「快照回放」（改读取侧免重跑 ingest）时，额外实现可选接口 `snapshot_capabilities()` / `snapshot()` / `restore()`（`rebuild()` 可选，覆盖跨版本/重建派生结构）——框架只传目录与 tag，导出什么由你决定；细则见 `references/adapter_guide.md` §2.7。**快照默认导出**（每对话 ingest 完成后、第一道 query 之前一份，落该对话目录的 `memory_snapshot/`），适配器没声明快照能力时会警告一次并跳过、评测照常完成；不需要快照加 `--no-snapshot` 关闭（`--snapshot` 已删除）。跑完 ingest 就能在对话级 `report.md` 里点开 `../memory_snapshot/` 翻记忆文件。
+   - 需要「快照回放」（改读取侧免重跑 ingest）时，额外实现可选接口 `snapshot_capabilities()` / `snapshot()` / `restore()`（`rebuild()` 可选，覆盖跨版本/重建派生结构）——框架只传目录与 tag，导出什么由你决定；细则见 `references/adapter_guide.md` §2.7。**快照默认导出**（每对话 ingest 完成后、第一道 query 之前一份，落该对话目录的 `memory_snapshot/`），适配器没声明快照能力时会警告一次并跳过、评测照常完成；不需要快照加 `--no-snapshot` 关闭（`--snapshot` 已删除）。跑完 ingest 就能在对话级 `report.md` 里点开 `../memory_snapshot/` 翻记忆文件。回放时同一份 `snapshot()` 会被再次调用（`restore()`/`rebuild()` 之后），导出落任务级内容寻址池——适配器无需感知落点是逐对话目录还是池。
    - **若被测 Agent 的记忆能力本身就是"LLM + 工具调用"**（ingest 与 query 是同构的 tool-call 循环），不要各写一遍骨架——直接用 `membench.agent_loop.AgentLoopAdapter` 复用循环（见「本波新能力」）。
 3. **生成的适配器必须显式持久化**（否则跨 session 丢失）：
    ```bash
@@ -145,7 +145,7 @@ python -m membench.cli run --adapter <adapter> --dataset ~/.membench/datasets/lo
 
 | 命令 | 实验目录（`--report-out DIR` 的产出） | 内含 |
 |---|---|---|
-| `task init --name NAME --arms 1` | `DIR/eval_<name>_<platform>_<ts>/`（stdout 只打印绝对路径，故 `TASK=$(...)` 可接走） | 骨架：`runs/` + 任务级 `reports/`（`--arms 2` 建 `A/` `B/` 两臂 + `reports/`） |
+| `task init --name NAME --arms 1 [--replay]` | `DIR/eval_<name>_<platform>_<ts>/`（stdout 只打印绝对路径，故 `TASK=$(...)` 可接走） | 骨架：`runs/` + 任务级 `reports/`（`--arms 2` 建 `A/` `B/` 两臂 + `reports/`）；`--replay` 额外建任务级快照池 `snapshots/`（见工作流 2.7） |
 | `run --report-out DIR` | `DIR/eval_<adapter>_<platform>_<ts>[_s<i>][_l<limit>]/` | `runs/<dataset>/{report/{report.md,metrics.json,results.jsonl,fig_*.png},shards.json(分片账本),<对话目录>/{runtime/,memory_snapshot/,report/}}` + 任务级 `reports/` |
 | `run --task-dir DIR` | 不新建目录，直接写 `DIR`（跳过 `--report-out`） | 同上；多分片共享 `DIR` 时**只允许 `--shard-by dialogue`**，同片重复跑被拒 |
 | `evaluate --report-out DIR` | `DIR/eval_<adapter>_<platform>_<ts>/` | 各数据集落 `runs/<dataset>/…`；任务级 `reports/{report.md,metrics.json,evaluate_summary.json,fig_dataset_overview.png}` |
@@ -155,9 +155,9 @@ python -m membench.cli run --adapter <adapter> --dataset ~/.membench/datasets/lo
 | `fuse --out DIR` / `fuse --task-dir DIR` | 前者：`DIR` 即完整实验目录；后者：就地补齐 `DIR` | `runs/<dataset>/…` + `reports/`（分片产物只有对话目录与账本，数据集级/任务级靠这一步补齐） |
 
 - `<ts>` = `YYYYMMDD-HHMMSS`；`<platform>` 缺省 `default`；`--shards` 分片时目录名末尾加 `_s<分片序号>`、`--limit` 追加 `_l<limit>`（不分片无 limit 时不带后缀）——并行分片因此**可以共用同一个 `--report-out`**；同名且非空会被直接拒绝（不会静默覆盖）。
-- **`--task-dir DIR`（与 `--report-out` 互斥）**：写进/读**已存在**的任务目录（`task init` 建的目录，或它的臂目录 `A/` / `B/`），不新建目录——同一次评测的多个分片、A/B 两臂因此落在同一棵树里。`task status DIR` 是只读进度视图（骨架 / 分片账本进度 / 快照数与体积 / 下一步该跑什么）。
-- **记忆快照默认启用**：每个对话在 ingest 完成后、第一道 query 之前导出唯一一份到 `<对话目录>/memory_snapshot/`（框架另写 `manifest.json`）；跑完 ingest 就能在对话级 `report.md` 里点开 `../memory_snapshot/` 看记忆文件（报告给链接 + 清单条目数与体积）。适配器未声明快照能力时警告一次并跳过（评测照常完成，`state_snapshot.role="unsupported"`），不需要快照用 `--no-snapshot` 关闭（`--snapshot` 已删除）；回放模式自动不导出。
-- **读产物的入参**统一接受**实验目录**或**数据集目录**（`<实验目录>/runs/<dataset>`）：`compare --baseline/--candidate`、`evaluate --from-runs KEY=DIR`、`evaluate-compare --baseline-run/--candidate-run`、`matrix --runs`、`fuse --runs`、`run --replay`、`run --replay-verify-source`，都经 `membench.layout.resolve_dataset_dir` 解析；旧版平铺 run 产物（缺 `report/` 层级）一律报错，要求重跑；目录里根本没有数据集产物（空目录、跑到一半中断）另有一条"没有产物"的报错，不要说成版本问题；**未融合的分片产物**（数据集目录下只有账本与对话目录）又会要求先 `fuse`——"没融合"不是"没产物"。
+- **`--task-dir DIR`（与 `--report-out` 互斥）**：写进/读**已存在**的任务目录（`task init` 建的目录，或它的臂目录 `A/` / `B/`），不新建目录——同一次评测的多个分片、A/B 两臂因此落在同一棵树里。`task status DIR` 是只读进度视图（骨架 / 分片账本进度 / 快照数与体积 / 下一步该跑什么）；回放任务显示任务级池（桶数、体积、各臂复用/新写、两臂是否逐对话一致）。
+- **记忆快照默认启用**：每个对话在 ingest 完成后、第一道 query 之前导出唯一一份到 `<对话目录>/memory_snapshot/`（框架另写 `manifest.json`）；跑完 ingest 就能在对话级 `report.md` 里点开 `../memory_snapshot/` 看记忆文件（报告给链接 + 清单条目数与体积）。适配器未声明快照能力时警告一次并跳过（评测照常完成，`state_snapshot.role="unsupported"`），不需要快照用 `--no-snapshot` 关闭（`--snapshot` 已删除）。**回放也导出**，但落任务级内容寻址池 `snapshots/`（同一状态只存一份；`--no-snapshot` 连池也不写）——见工作流 2.7。
+- **读产物的入参**统一接受**实验目录**或**数据集目录**（`<实验目录>/runs/<dataset>`）：`compare --baseline/--candidate`、`evaluate --from-runs KEY=DIR`、`evaluate-compare --baseline-run/--candidate-run`、`matrix --runs`、`fuse --runs`、`run --replay`、`run --replay-verify-source`，都经 `membench.layout.resolve_dataset_dir` 解析（`run --replay` 另接受回放任务的任务根 / 臂目录）；旧版平铺 run 产物（缺 `report/` 层级）一律报错，要求重跑；目录里根本没有数据集产物（空目录、跑到一半中断）另有一条"没有产物"的报错，不要说成版本问题；**未融合的分片产物**（数据集目录下只有账本与对话目录）又会要求先 `fuse`——"没融合"不是"没产物"。
 - 不传 `--report-out` / `--task-dir` 时用 `output_root()`：`MEMBENCH_OUTPUT_DIR` > skill 包 `output/` > 工程根 `membench/output/`。目录命名只走 `membench/layout.py`（`task_subdir` / `init_task_dir` / `arm_dir` / `eval_subdir` / `compare_subdir` / `matrix_subdir` / `experiment_tags` / `run_id` / `run_id_tags` / `shard_ledger_path`），不要自己拼目录名。
 
 ### 工作流 2.5：全量评估（多数据集融合总分）
@@ -256,6 +256,40 @@ python -m membench.cli compare --task-dir "$TASK" --require-comparable   # 就�
 - 分片产物**只写本片负责的对话目录 + 账本 `runs/<dataset>/shards.json`**，数据集级 `report/` 与任务级 `reports/` 一律由 `fuse` 补齐（所以分片产物不会被误读成一份完整实验）；账本记各片的 `status` / 负责的对话 / 题数 / `run_id`，口径（`shards` / `shard_by` / `limit` / 数据集指纹）不一致或同片重复跑都会被拒绝。
 - 融合后的产物形态与不分片直跑一致，可直接进 `compare` / `evaluate` / `evaluate-compare` 或 `matrix`。
 - 两侧/各片必须各自独占一个记忆实例（HTTP 桥 → 每片独立桥进程与 `BRIDGE_PORT` / `BRIDGE_DATA_DIR`；Python 适配器 → 每片独立进程），否则跨片串扰。
+
+### 工作流 2.7：快照回放与回放任务的快照池
+
+改了**读取侧**（检索/排序/回答）代码后，用上一次评测导出的状态快照回放，跳过 `reset` + `ingest`，只跑 query。快照默认导出，无需额外开关。
+
+```bash
+# 1) 全量跑一次（快照默认导出到各对话目录的 memory_snapshot/）
+python -m membench.cli run --adapter <adapter> --dataset <数据集> --report-out ../output/
+
+# 2) 回放 + 保真校验地板（未改代码时答案应逐题一致）
+python -m membench.cli run --adapter <adapter> --dataset <同一数据集> \
+    --replay ../output/eval_<名>_<平台>_<ts> \
+    --replay-verify-source ../output/eval_<名>_<平台>_<ts>/runs/<dataset>
+
+# 3) A/B 两臂回放同一源：用回放任务，状态按内容去重只存一份
+TASK=$(python -m membench.cli task init --name replay --arms 2 --replay --report-out ../output/)
+python -m membench.cli run --adapter <基线 adapter> --dataset <数据集> \
+    --task-dir "$TASK/A" --replay ../output/eval_<名>_<平台>_<ts>
+python -m membench.cli run --adapter <候选 adapter> --dataset <数据集> \
+    --task-dir "$TASK/B" --replay ../output/eval_<名>_<平台>_<ts>
+python -m membench.cli task status "$TASK"   # 桶数 / 各臂复用新写 / 两臂是否逐对话一致
+
+# 4) 链式回放：上一轮回放任务本身可作源（传臂目录；任务根仅在索引只有一个臂时可用）
+TASK2=$(python -m membench.cli task init --name replay2 --arms 2 --replay --report-out ../output/)
+python -m membench.cli run --adapter <adapter> --dataset <数据集> \
+    --task-dir "$TASK2/A" --replay "$TASK/A"
+```
+
+- **池的位置与结构**：`task init --replay` 在任务根建 `snapshots/`；回放导出（`restore()`/`rebuild()` 之后、第一道 query 之前）落 `snapshots/<状态内容 sha256 前 12 位>/`，任务级 `snapshots/index.json` 记 `buckets`（桶 → 数据集/对话/体积/哈希）、`entries`（`臂|数据集|对话 -> 桶`）、`arms`（来源与 `n_dialogues/n_reused/n_new`）。池属于任务：`--task-dir <任务>/A|B` 时就是父任务的池。
+- **内容去重（核心价值）**：A/B 回放同一源、恢复出的状态相同 → 只产生一份桶，索引里两臂指向同一 digest；不同则各存一份——**差异本身就是"回放不保真"的证据**。`task status` 对"两臂共用同一批桶"给出人话（如 `A 臂与 B 臂快照 7/7 逐对话一致（共用 7 个桶）`），有差异则列出 `内容不同 / 仅 A / 仅 B` 的对话数。
+- **冲突即报错**：桶已存在但 `entry.sha256` 与本次不一致（哈希前缀撞车 / 桶被改动 / 坏 manifest）直接失败，不静默复用；索引损坏同样拒绝（别手改 `index.json`）。
+- **`--no-snapshot`**：回放也关掉池导出——不写桶、不写索引；`metrics.state_snapshot` 里没有 `snapshots_dir` / `n_buckets`。
+- **源解析**：`--replay` 接受实验目录 / 数据集目录 / 回放任务（含 `snapshots/index.json` 的任务根或臂目录）。传任务根且索引里有多个臂时会报错并要求改传具体臂目录（两臂状态可能不同，不能替用户选）。跑前校验强度不变（覆盖齐备、`complete=true`、数据集指纹、格式版本都按桶内 `manifest.json` 核）。
+- **报告与口径**：回放任务的对话级报告把「本对话快照桶」链到 `snapshots/<digest>/` 并标「复用 / 新写」，数据集级报告给池目录与本 run 桶数。回放仍**固定写入侧**：结论只覆盖读取/检索/回答层，`run_mode` 是 compare 的关键维度（回放分与全量分不可比），token 账 ingest 记 0 并标 `ingest_skipped`。
 
 ## 工作流 3：两个 commit 的 A/B 对比
 

@@ -147,16 +147,21 @@ def rebuild(self, source_dir: str, tag: str) -> None:    # 跨版本/重建派�
   就是"恢复这个状态，然后跑该对话的题"；runner 每对话 `reset()`，所以按对话切片天然等价。
   快照落该对话目录的 `memory_snapshot/`（框架另写一份 `manifest.json` 清单），整棵产物树见
   `references/compare_workflows.md` 的"产物目录"；
+- **回放时同样会调用 `snapshot()`**：`restore()` / `rebuild()` 完成后、第一道 query 之前，
+  框架把恢复出来的状态再导出一次（这是"这次回放保真吗"的证据）。落点由框架决定：普通 run 是
+  对话目录的 `memory_snapshot/`，回放任务则是任务级内容寻址池 `snapshots/<内容哈希前 12 位>/`
+  ——状态内容相同的导出（例如 A/B 两臂回放同一源）共用同一个桶，你不需要感知或自己拼接路径；
+  导出的内容哈希口径不变（排除框架写的 `manifest.json`），因此同一份状态无论落到哪里哈希一致；
 - **默认导出**：`run` / `evaluate` / `evaluate-compare` 默认就导出（每个对话只导这一份，
   per-session 导出是没用的中间态），不需要额外加开关，目录也固定不用指定；不需要时用
-  `--no-snapshot` 关闭（`--snapshot` 已删除）。跑完 ingest 就能在对话级 `report.md` 里点开
-  `../memory_snapshot/` 翻记忆文件（报告另给清单条目数与体积），不必自己拼路径；
+  `--no-snapshot` 关闭（`--snapshot` 已删除；回放时连池也不写）。跑完 ingest 就能在对话级
+  `report.md` 里点开 `../memory_snapshot/` 翻记忆文件（报告另给清单条目数与体积），不必自己拼路径；
 - **不实现会怎样**：框架打印一次警告并**跳过**快照，评测照常完成——`metrics.json` 的
   `state_snapshot.role` 记 `unsupported`（报告渲染成「不支持（适配器未声明快照能力）」而不是
   空值），除了不能用 `--replay` 免重跑 ingest 之外没有其它影响；
-- **回放命令**：`run --replay <实验目录或 runs/<dataset> 数据集目录>`——跳过 reset+ingest 只跑
-  query，清单齐备性 / 数据集指纹 / 对话覆盖 / 能力 / 模式都在开跑前校验，失败即停不留半成品
-  （回放模式自动不再导出快照）；
+- **回放命令**：`run --replay <实验目录或 runs/<dataset> 数据集目录>`（也接受回放任务的任务根 /
+  臂目录）——跳过 reset+ingest 只跑 query，清单齐备性 / 数据集指纹 / 对话覆盖 / 能力 / 模式都在
+  开跑前校验，失败即停不留半成品；
 - **模式**：`full` / `replay-restore`（格式兼容）/ `replay-rebuild`（格式不兼容或需重建
   派生结构）——不兼容且没声明 `rebuild` 会被**拒绝**，提示必须重新 ingest；
 - **口径**：回放固定写入侧，结论只覆盖读取/回答层；`run_mode` 是 compare 的关键维度，
