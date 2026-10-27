@@ -14,17 +14,18 @@
 （fuse 等）共用同一套账本口径）。::
 
     <root>/eval_<name>_<platform>_<ts>[_s<i>][_l<limit>]/
+    ├── runtime/                          # 实验级运行时数据（命令 / 日志 / 环境；见 membench.runtime）
     ├── runs/<dataset>/
     │   ├── report/                      # 数据集级聚合报告（md + metrics + 逐题明细 + 图）
     │   ├── shards.<i>.json, shards.json  # 分片账本：逐片条目（真源）+ 物化视图（分片评测才有）
     │   └── <dialogue_id>/
-    │       ├── runtime/                 # 运行时数据（如桥的 reset 前备份）
+    │       ├── runtime/                 # **对话级**运行时数据（如桥的 reset 前备份）
     │       ├── memory_snapshot/         # 对话快照（默认导出，含 manifest.json）
     │       └── report/                  # 对话级报告（纯文字，不出图）
     └── reports/                         # 任务级报告（单数据集 run = 数据集级报告内容）
 
-    <root>/compare_<name>_<platform>_<ts>/   A/ B/（各为完整评测产物根）+ reports/
-    <root>/matrix_<ts>/                      reports/ + runs/<label>/（内部同 eval 树）
+    <root>/compare_<name>_<platform>_<ts>/   A/ B/（各为完整评测产物根）+ runtime/ + reports/
+    <root>/matrix_<ts>/                      runtime/ + reports/ + runs/<label>/（内部同 eval 树）
 
 **回放任务**（``task init --replay``）在任务目录根多一个内容寻址快照池 ``snapshots/``：
 回放导出的状态按内容哈希去重成桶 ``snapshots/<sha256 前 12 位>/``，**每个对话一个
@@ -66,7 +67,7 @@ TS_FORMAT = "%Y%m%d-%H%M%S"
 DIR_RUNS = "runs"
 DIR_REPORT = "report"  # 对话级 / 数据集级报告目录
 DIR_REPORTS = "reports"  # 实验根层的任务级报告目录（与 runs/ 平级）
-DIR_RUNTIME = "runtime"
+DIR_RUNTIME = "runtime"  # 对话级运行时数据 / 实验根层运行时数据（后者见 membench.runtime）
 DIR_SNAPSHOT = "memory_snapshot"
 #: 回放任务的内容寻址快照池（任务根层，与 runs/ 平级）：桶 = ``<池>/<sha256 前 12 位>``。
 DIR_SNAPSHOTS = "snapshots"

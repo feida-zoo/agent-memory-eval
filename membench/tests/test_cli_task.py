@@ -145,7 +145,7 @@ def test_task_init_arms2_prints_only_abs_path(
     assert task.is_absolute(), f"stdout 必须是绝对路径，实际 {task}"
     assert task.is_dir() and task.parent == base
     assert task.name.startswith("compare_ab_t_")
-    assert sorted(p.name for p in task.iterdir()) == ["A", "B", "reports"]
+    assert sorted(p.name for p in task.iterdir()) == ["A", "B", "reports", "runtime"]
     # 骨架 / 下一步提示都在 stderr（不污染 stdout）
     assert "骨架: arms=2（A/ B/ + reports/）" in captured.err
     assert f"--task-dir {task / 'A'}" in captured.err
@@ -156,7 +156,7 @@ def test_task_init_arms1_builds_runs_skeleton(tmp_path: Path) -> None:
     """arms=1：单臂骨架 runs/ + reports/，目录名前缀 eval_。"""
     task = _init_task(tmp_path / "out", "solo", arms=1)
     assert task.name.startswith("eval_solo_t_")
-    assert sorted(p.name for p in task.iterdir()) == ["reports", "runs"]
+    assert sorted(p.name for p in task.iterdir()) == ["reports", "runs", "runtime"]
 
 
 def test_task_init_default_report_out_is_output_root(

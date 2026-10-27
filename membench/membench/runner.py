@@ -59,7 +59,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Union
 
-from membench import layout
+from membench import layout, runtime
 from membench.data.schema import (
     dataset_fingerprint,
     load_dataset,
@@ -667,6 +667,9 @@ class Runner:
 
         os.makedirs(self.out_dir, exist_ok=True)
         experiment_dir = os.path.abspath(self.out_dir)
+        # 预检全部通过、目录已建：从这一刻起本次命令的运行时数据归这个实验目录。
+        # 没有活动 CLI 会话时 set_dir 是空操作（库调用不会多出 runtime/）。
+        runtime.set_dir(experiment_dir)
         # ignore=true 的题整条跳过（不查询、不计分），n_active 为实际评测题数。
         total = sum(len(d.questions) for d in dialogues)
         n_ignored = sum(

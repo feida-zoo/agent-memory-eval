@@ -9,14 +9,14 @@
         [--platform P] [--commit SHA] [--driver-llm M] [--adapter-version V] \
         [--shards N|max] [--jobs N] [--limit N] [--report-out DIR] [--no-snapshot] \
         [--name TAG] [--evidence-match-threshold X] [--llm-* ...] \
-        [--adapter-arg KEY=VALUE]... [--dry-run]
+        [--adapter-arg KEY=VALUE]... [--task-dir DIR] [--background] [--dry-run]
 
     run_task.py ab --baseline-adapter NAME --candidate-adapter NAME \
         (--dataset KEY|PATH)... --judge {...} --recall-mode {...} \
         [--baseline-version V] [--candidate-version V] [--driver-llm-a/-b M] \
         [--platform P] [--commit SHA] [--shards N|max] [--jobs N] [--limit N] \
         [--name TAG] [--report-out DIR] [--no-snapshot] \
-        [--adapter-arg-a/-b KEY=VALUE]... [--dry-run]
+        [--adapter-arg-a/-b KEY=VALUE]... [--task-dir DIR] [--background] [--dry-run]
 
 固定流程（不许省步骤）
 ----------------------
@@ -58,6 +58,14 @@
   ``--driver-llm-a/-b`` 与 ``--baseline-version/--candidate-version``。
 - stdout 只打印任务目录绝对路径（最后一行），进度 / 子进程输出 / 自检摘要全部走
   stderr，因此 ``TASK=$(run_task.py ...)`` 可以直接接走路径；退出码见下。
+- ``--background``：父进程先建（或复用 ``--task-dir``）任务目录，把本次编排派生到
+  后台（独立会话，输出落 ``<任务>/runtime/logs/orchestrator-<ts>.log``），写
+  ``<任务>/runtime/orchestrator.json``（pid / argv / started_at / log /
+  status=running）后**stdout 只打印任务目录一行并立即退出 0**；子进程结束时把
+  status / exit_code / finished_at 原子更新掉。长跑请配 ``watch_task.py`` 定时看
+  进度，不要在同一轮里前台阻塞等待。``--background`` 与 ``--dry-run`` 互斥。
+- ``--task-dir DIR``：复用**已存在**的任务目录（跳过 ``task init``），前后台子进程
+  共用同一个目录；缺 ``runs/``（eval）或 ``A/`` ``B/``（ab）时拒绝。
 
 退出码
 ------
@@ -71,6 +79,8 @@
 自检失败优先于门禁 FAIL：产物本身不完整时，退出码是 3 而不是 1。
 ``--dry-run`` 只打印将要执行的命令序列（``$TASK`` 是占位符），不建目录、不跑评测；
 数据集目录名是预测值（``office`` 槽位与自定义 key 的实际目录名可能不同）。
+``--background`` 的父进程只表示"派生成功"（退出码 0）；本次编排的真实退出码写在
+``<任务>/runtime/orchestrator.json`` 的 ``exit_code``，用 ``watch_task.py`` 读取。
 """
 
 from __future__ import annotations
@@ -82,7 +92,9 @@ import re
 import shlex
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -98,6 +110,14 @@ EXIT_OK = 0
 EXIT_GATE_FAIL = 1
 EXIT_FLOW_FAIL = 2
 EXIT_VERIFY_FAIL = 3
+
+#: 后台编排的落点（与 membench 的实验级 runtime 同一棵树）。
+DIR_RUNTIME = "runtime"
+DIR_LOGS = "logs"
+FILE_ORCHESTRATOR = "orchestrator.json"
+
+#: 子进程环境变量：标识"我是 --background 派生的编排子进程"（结束时要回写状态）。
+ORCHESTRATOR_ENV = "MEMBENCH_ORCHESTRATOR_CHILD"
 
 #: membench 工程根候选（相对脚本目录）：仓库内是 ../../../membench，打包后是 ../membench。
 _MEMBENCH_ROOT_CANDIDATES: tuple[str, ...] = (
@@ -207,6 +227,7 @@ class EvalOptions:
     name: str
     report_out: Optional[str]
     shards: int | str
+    task_dir: Optional[str] = None
 
     @property
     def use_evaluate(self) -> bool:
@@ -233,6 +254,7 @@ class AbOptions:
     name: str
     report_out: Optional[str]
     shards: int | str
+    task_dir: Optional[str] = None
 
 
 @dataclass
@@ -351,8 +373,190 @@ def _heuristic_smoke_note(common: CommonArgs) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 任务目录 / 后台编排
+# ---------------------------------------------------------------------------
+
+
+def _membench_module(root: Path, name: str) -> Any:
+    """按工程根导入 ``membench.<name>``（目录名 / 脱敏 / 账本逻辑不重复实现）。"""
+    path = str(root)
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import importlib
+
+    return importlib.import_module(f"membench.{name}")
+
+
+def _validate_task_dir(task_dir: str, arms: int, root: Path) -> None:
+    """``--task-dir`` 必须是已有任务骨架（``runs/`` 或 ``A/`` ``B/``，且带 ``reports/``）。"""
+    layout = _membench_module(root, "layout")
+    if not os.path.isdir(task_dir):
+        raise UsageError(
+            f"--task-dir 不存在: {task_dir}；先运行 task init 建任务目录，"
+            "或去掉 --task-dir 让本脚本自己建"
+        )
+    needed = (
+        (layout.DIR_ARM_A, layout.DIR_ARM_B, layout.DIR_REPORTS)
+        if arms == 2
+        else (layout.DIR_RUNS, layout.DIR_REPORTS)
+    )
+    missing = [name for name in needed if not os.path.isdir(os.path.join(task_dir, name))]
+    if missing:
+        shape = "A/ B/ reports/" if arms == 2 else "runs/ reports/"
+        raise UsageError(
+            f"--task-dir 不是 arms={arms} 的任务目录（缺 {'、'.join(missing)}）: {task_dir}；"
+            f"该形态需要 {shape}"
+        )
+
+
+def _strip_flag(argv: Sequence[str], flag: str) -> list[str]:
+    """去掉一个无值开关（``--background``）；它后面紧跟的是别的选项 / 值，不能吞掉。"""
+    return [token for token in argv if token != flag]
+
+
+def _strip_option(argv: Sequence[str], option: str) -> list[str]:
+    """去掉 ``--opt VALUE`` / ``--opt=VALUE`` 两种形态（子进程参数重建用）。"""
+    result: list[str] = []
+    skip_value = False
+    for token in argv:
+        if skip_value:
+            skip_value = False
+            continue
+        if token == option:
+            skip_value = True
+            continue
+        if token.startswith(f"{option}="):
+            continue
+        result.append(token)
+    return result
+
+
+def _iso_now() -> str:
+    """本地时间（带时区偏移，精确到秒）。"""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _orchestrator_path(task_dir: str) -> str:
+    """``<任务>/runtime/orchestrator.json``。"""
+    return os.path.join(task_dir, DIR_RUNTIME, FILE_ORCHESTRATOR)
+
+
+def _write_json_atomic(path: str, data: dict[str, Any]) -> None:
+    """同目录唯一临时文件 + ``os.replace``（父 / 子进程可能同时更新）。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _finish_orchestrator(task_dir: str, exit_code: int) -> None:
+    """子进程结束时回写 ``orchestrator.json`` 的最终状态（原子写）。
+
+    只更新仍在 ``running`` 的记录：同一个任务目录被人工重跑（前台 ``--task-dir``）
+    时，不应把上一次后台编排的历史结论改掉。
+    """
+    path = _orchestrator_path(task_dir)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict) or data.get("status") != "running":
+        return
+    data["status"] = "done" if exit_code == 0 else "failed"
+    data["exit_code"] = int(exit_code)
+    data["finished_at"] = _iso_now()
+    try:
+        _write_json_atomic(path, data)
+    except OSError:
+        pass
+
+
+def _start_background(
+    options: EvalOptions | AbOptions,
+    root: Path,
+    raw_argv: Sequence[str],
+) -> int:
+    """把本次编排派生到后台，stdout 只打印任务目录一行后立即返回 0。
+
+    父进程负责建任务目录（或校验 ``--task-dir``）、开日志、写 ``orchestrator.json``；
+    子进程以独立会话运行同一份参数（去掉 ``--background``，补上 ``--task-dir``），
+    结束时由 :func:`_finish_orchestrator` 回写状态与退出码。
+    """
+    arms = 1 if isinstance(options, EvalOptions) else 2
+    if options.task_dir is not None:
+        task_dir = options.task_dir
+    else:
+        executor = Executor(root)
+        task_dir = executor.init_task(
+            _task_init_argv(
+                name=options.name,
+                arms=arms,
+                platform=options.common.platform,
+                report_out=options.report_out,
+            )
+        )
+
+    runtime = _membench_module(root, "runtime")
+    log_dir = os.path.join(task_dir, DIR_RUNTIME, DIR_LOGS)
+    os.makedirs(log_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = os.path.join(log_dir, f"orchestrator-{stamp}.log")
+    suffix = 1
+    while os.path.exists(log_path):
+        log_path = os.path.join(log_dir, f"orchestrator-{stamp}-{suffix}.log")
+        suffix += 1
+
+    child_argv = _strip_option(_strip_flag(raw_argv, "--background"), "--task-dir")
+    child_argv += ["--task-dir", task_dir]
+    command = [sys.executable, str(Path(__file__).resolve()), *child_argv]
+    env = os.environ.copy()
+    env[ORCHESTRATOR_ENV] = "1"
+    with open(log_path, "ab") as log_handle:
+        process = subprocess.Popen(
+            command,
+            cwd=os.getcwd(),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    _write_json_atomic(
+        _orchestrator_path(task_dir),
+        {
+            "schema": 1,
+            "pid": process.pid,
+            "argv": runtime.redact_argv(raw_argv),
+            "command": "eval" if isinstance(options, EvalOptions) else "ab",
+            "started_at": _iso_now(),
+            "log": os.path.relpath(log_path, task_dir).replace(os.sep, "/"),
+            "status": "running",
+            "exit_code": None,
+            "finished_at": None,
+        },
+    )
+    print(f"[run_task] 后台编排已启动: pid={process.pid}，日志 {log_path}", file=sys.stderr)
+    print(task_dir)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # 子进程执行
 # ---------------------------------------------------------------------------
+
+
+def _redacted_argv(root: Path, argv: Sequence[str]) -> list[str]:
+    """命令展示用的 argv：密钥参数掩成 ``***``（日志会长期留存，不能把 key 打进去）。"""
+    try:
+        return _membench_module(root, "runtime").redact_argv(argv)
+    except Exception:  # noqa: BLE001 - 展示逻辑不能因为导入失败中断
+        return list(argv)
 
 
 class Executor:
@@ -380,8 +584,8 @@ class Executor:
         return _cli_argv(self.root, argv)
 
     def display(self, argv: Sequence[str]) -> str:
-        """可读命令（dry-run 用）。"""
-        return shlex.join(self._cmd(argv))
+        """可读命令（dry-run 用；密钥参数已脱敏）。"""
+        return shlex.join(self._cmd(_redacted_argv(self.root, argv)))
 
     def init_task(self, argv: Sequence[str]) -> str:
         """``task init``：stdout 只取路径，stderr 继承。"""
@@ -910,16 +1114,20 @@ def _run_dataset(
 
 
 def _execute_eval(options: EvalOptions, root: Path) -> FlowState:
-    """执行 ``eval`` 全流程。"""
+    """执行 ``eval`` 全流程（``options.task_dir`` 给定时跳过 ``task init``）。"""
     executor = Executor(root)
-    task_dir = executor.init_task(
-        _task_init_argv(
-            name=options.name,
-            arms=1,
-            platform=options.common.platform,
-            report_out=options.report_out,
+    if options.task_dir is not None:
+        task_dir = options.task_dir
+        print(f"[run_task] 复用任务目录: {task_dir}", file=sys.stderr)
+    else:
+        task_dir = executor.init_task(
+            _task_init_argv(
+                name=options.name,
+                arms=1,
+                platform=options.common.platform,
+                report_out=options.report_out,
+            )
         )
-    )
     state = FlowState(task_dir=task_dir)
     if options.use_evaluate:
         # 官方多数据集路径：一次 evaluate 跑完全部数据集并写任务级报告
@@ -944,16 +1152,20 @@ def _execute_eval(options: EvalOptions, root: Path) -> FlowState:
 
 
 def _execute_ab(options: AbOptions, root: Path) -> FlowState:
-    """执行 ``ab`` 全流程。"""
+    """执行 ``ab`` 全流程（``options.task_dir`` 给定时跳过 ``task init``）。"""
     executor = Executor(root)
-    task_dir = executor.init_task(
-        _task_init_argv(
-            name=options.name,
-            arms=2,
-            platform=options.common.platform,
-            report_out=options.report_out,
+    if options.task_dir is not None:
+        task_dir = options.task_dir
+        print(f"[run_task] 复用任务目录: {task_dir}", file=sys.stderr)
+    else:
+        task_dir = executor.init_task(
+            _task_init_argv(
+                name=options.name,
+                arms=2,
+                platform=options.common.platform,
+                report_out=options.report_out,
+            )
         )
-    )
     state = FlowState(task_dir=task_dir)
     for label, arm in (("A", options.baseline), ("B", options.candidate)):
         arm_dir = os.path.join(task_dir, label)
@@ -1009,8 +1221,8 @@ def _execute_ab(options: AbOptions, root: Path) -> FlowState:
 
 
 def _display_argv(root: Path, argv: Sequence[str]) -> str:
-    """干燥运行的命令展示；``$TASK`` 占位符保持可 shell 展开。"""
-    text = shlex.join(_cli_argv(root, argv))
+    """干燥运行的命令展示；``$TASK`` 占位符保持可 shell 展开，密钥参数已脱敏。"""
+    text = shlex.join(_cli_argv(root, _redacted_argv(root, argv)))
     # shlex 会把 $TASK / $TASK/A 单引号包起来；占位符要留给 shell 展开
     return re.sub(r"'(\$TASK[^']*)'", r"\1", text)
 
@@ -1091,23 +1303,46 @@ def _print_run_steps(
     )
 
 
-def _print_dry_run_eval(options: EvalOptions, root: Path) -> None:
-    """``eval --dry-run``。"""
-    print("# run_task.py --dry-run：以下命令按顺序执行；$TASK 为 task init 的 stdout")
-    print("# 注: office 槽位与自定义 key 的数据集目录名是预测值，真实运行以 run 落盘目录为准")
-    print("# 真实运行时 stdout 只打印任务目录绝对路径；进度 / 自检摘要走 stderr")
+def _print_task_ref(
+    root: Path,
+    *,
+    task_dir: Optional[str],
+    name: str,
+    arms: int,
+    platform: Optional[str],
+    report_out: Optional[str],
+) -> None:
+    """dry-run 的任务目录来源：给了 --task-dir 就直接用，否则 ``TASK=$(task init ...)``。"""
+    if task_dir:
+        print(f"TASK={shlex.quote(task_dir)}")
+        return
     print(
         "TASK=$("
         + _display_argv(
             root,
             _task_init_argv(
-                name=options.name,
-                arms=1,
-                platform=options.common.platform,
-                report_out=options.report_out,
+                name=name,
+                arms=arms,
+                platform=platform,
+                report_out=report_out,
             ),
         )
         + ")"
+    )
+
+
+def _print_dry_run_eval(options: EvalOptions, root: Path) -> None:
+    """``eval --dry-run``。"""
+    print("# run_task.py --dry-run：以下命令按顺序执行；$TASK 为任务目录")
+    print("# 注: office 槽位与自定义 key 的数据集目录名是预测值，真实运行以 run 落盘目录为准")
+    print("# 真实运行时 stdout 只打印任务目录绝对路径；进度 / 自检摘要走 stderr")
+    _print_task_ref(
+        root,
+        task_dir=options.task_dir,
+        name=options.name,
+        arms=1,
+        platform=options.common.platform,
+        report_out=options.report_out,
     )
     if options.use_evaluate:
         print("# 多数据集且无分片 / limit：直接走官方 evaluate --dataset 路径")
@@ -1135,21 +1370,16 @@ def _print_dry_run_eval(options: EvalOptions, root: Path) -> None:
 
 def _print_dry_run_ab(options: AbOptions, root: Path) -> None:
     """``ab --dry-run``。"""
-    print("# run_task.py --dry-run：以下命令按顺序执行；$TASK 为 task init 的 stdout")
+    print("# run_task.py --dry-run：以下命令按顺序执行；$TASK 为任务目录")
     print("# 注: office 槽位与自定义 key 的数据集目录名是预测值，真实运行以 run 落盘目录为准")
     print("# 真实运行时 stdout 只打印任务目录绝对路径；进度 / 自检摘要走 stderr")
-    print(
-        "TASK=$("
-        + _display_argv(
-            root,
-            _task_init_argv(
-                name=options.name,
-                arms=2,
-                platform=options.common.platform,
-                report_out=options.report_out,
-            ),
-        )
-        + ")"
+    _print_task_ref(
+        root,
+        task_dir=options.task_dir,
+        name=options.name,
+        arms=2,
+        platform=options.common.platform,
+        report_out=options.report_out,
     )
     for label, arm in (("A", options.baseline), ("B", options.candidate)):
         print(f"# 臂 {label}（{arm.adapter}）")
@@ -1249,6 +1479,18 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         "--report-out",
         default=None,
         help="任务目录父目录（缺省 membench output_root()）；相对路径按调用方 cwd 解析",
+    )
+    parser.add_argument(
+        "--task-dir",
+        default=None,
+        help="复用已存在的任务目录（跳过 task init；eval 需 runs/，ab 需 A/ B/）；"
+        "--background 的父子进程共用它，也给续跑 / 接管留口子",
+    )
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        help="派生到后台执行：stdout 只打印任务目录一行并立即退出 0，"
+        "进度用 scripts/watch_task.py <任务目录> --until-done 定时查看；与 --dry-run 互斥",
     )
     parser.add_argument(
         "--dry-run",
@@ -1409,6 +1651,7 @@ def _eval_options(args: argparse.Namespace) -> EvalOptions:
         name=name,
         report_out=report_out,
         shards=args.shards,
+        task_dir=_resolve_caller_path(args.task_dir) if args.task_dir else None,
     )
 
 
@@ -1439,6 +1682,7 @@ def _ab_options(args: argparse.Namespace) -> AbOptions:
         name=name,
         report_out=report_out,
         shards=args.shards,
+        task_dir=_resolve_caller_path(args.task_dir) if args.task_dir else None,
     )
 
 
@@ -1469,33 +1713,8 @@ def _print_verification(result: Any) -> None:
     )
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    """CLI 入口，返回进程退出码。"""
-    parser = build_parser()
-    args = parser.parse_args(argv)
-
-    try:
-        if args.command == "eval":
-            options = _eval_options(args)
-        else:
-            options = _ab_options(args)
-    except UsageError as exc:
-        print(f"[run_task] 参数错误: {exc}", file=sys.stderr)
-        return EXIT_FLOW_FAIL
-
-    try:
-        root = find_membench_root()
-    except SystemExit as exc:
-        print(str(exc), file=sys.stderr)
-        return EXIT_FLOW_FAIL
-
-    if args.dry_run:
-        if isinstance(options, EvalOptions):
-            _print_dry_run_eval(options, root)
-        else:
-            _print_dry_run_ab(options, root)
-        return EXIT_OK
-
+def _run_flow(options: EvalOptions | AbOptions, root: Path) -> int:
+    """跑完整流程并自检，返回退出码（stdout 仍只打印任务目录）。"""
     if options.common.judge == "heuristic":
         print(f"[run_task] 提示: {_heuristic_smoke_note(options.common)}", file=sys.stderr)
 
@@ -1537,6 +1756,61 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if state.gate_fail:
         return EXIT_GATE_FAIL
     return EXIT_OK
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """CLI 入口，返回进程退出码。"""
+    parser = build_parser()
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(raw_argv)
+
+    try:
+        if args.command == "eval":
+            options = _eval_options(args)
+        else:
+            options = _ab_options(args)
+    except UsageError as exc:
+        print(f"[run_task] 参数错误: {exc}", file=sys.stderr)
+        return EXIT_FLOW_FAIL
+
+    try:
+        root = find_membench_root()
+    except SystemExit as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_FLOW_FAIL
+
+    if args.dry_run and args.background:
+        print("[run_task] 参数错误: --dry-run 与 --background 互斥", file=sys.stderr)
+        return EXIT_FLOW_FAIL
+
+    # 后台派生的子进程也会带 --task-dir；结束时必须把最终状态写回 orchestrator.json
+    orchestrator_child = os.environ.get(ORCHESTRATOR_ENV) == "1"
+    exit_code = EXIT_FLOW_FAIL
+    try:
+        if options.task_dir is not None:
+            _validate_task_dir(options.task_dir, 1 if isinstance(options, EvalOptions) else 2, root)
+        if args.dry_run:
+            if isinstance(options, EvalOptions):
+                _print_dry_run_eval(options, root)
+            else:
+                _print_dry_run_ab(options, root)
+            exit_code = EXIT_OK
+        elif args.background:
+            exit_code = _start_background(options, root, raw_argv)
+        else:
+            exit_code = _run_flow(options, root)
+    except UsageError as exc:
+        print(f"[run_task] 参数错误: {exc}", file=sys.stderr)
+        exit_code = EXIT_FLOW_FAIL
+    except FlowFailed as exc:
+        print(f"[run_task] 流程失败: {exc}", file=sys.stderr)
+        if exc.task_dir:
+            print(exc.task_dir)
+        exit_code = EXIT_FLOW_FAIL
+    finally:
+        if orchestrator_child and options.task_dir is not None:
+            _finish_orchestrator(options.task_dir, exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":

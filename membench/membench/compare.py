@@ -40,7 +40,7 @@ import os
 import shutil
 from typing import Any
 
-from membench import layout
+from membench import layout, runtime
 from membench.layout import resolve_dataset_dir
 from membench.paths import output_root
 from membench.report import _md_table, copy_report, render_compare_report
@@ -580,6 +580,8 @@ def compare_runs(
         )
         arm_a = _copy_arm(compare_dir, layout.DIR_ARM_A, dir_a, metrics_a)
         arm_b = _copy_arm(compare_dir, layout.DIR_ARM_B, dir_b, metrics_b)
+    # 对比实验目录已确定（新建的 compare_* 或就地任务目录）：运行时数据归它
+    runtime.set_dir(compare_dir)
     reports_dir = layout.task_report_dir(compare_dir)
     render_compare_report(
         reports_dir, metrics_a, metrics_b, diffs, gates, verdict, comparability=comparability

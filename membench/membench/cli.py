@@ -10,7 +10,8 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
     python -m membench.cli task status DIR
         # 进度视图：骨架 / 各臂各数据集的分片账本进度（status、题数、对话数、run_id）/
         # 数据集级产物齐备与否 / 快照目录数与体积（回放任务改为快照池：桶数、体积、
-        # 各臂复用/新写、两臂是否逐对话一致）/ 下一步该跑什么；
+        # 各臂复用/新写、两臂是否逐对话一致）/ 运行时（最近命令、非零退出条数、最近
+        # 日志；该臂/任务没有 runtime/ 时明确写「无运行时数据」）/ 下一步该跑什么；
         # DIR 是任务目录（含 A/ B/）或单臂实验目录
     python -m membench.cli run --adapter mock-strong \
         [--dataset membench/data/sample_dataset.jsonl] --judge heuristic \
@@ -67,10 +68,11 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
 产物一律落「一次实验一个自包含子目录」（见 :mod:`membench.layout`）::
 
     <report-out>/eval_<name>_<platform>_<ts>[_s<i>][_l<limit>]/   # 单臂任务目录，例 eval_mock-strong_default_20261024-193000（分片/冒烟带后缀，见 layout.experiment_tags）
+    ├── runtime/{commands.jsonl,logs/,env.json}  # 实验级运行时数据（命令 / 全量日志 / 环境快照）
     ├── runs/<dataset>/{report/,shards.json,<对话>/{report/,runtime/,memory_snapshot/}}
     └── reports/                                # 任务级（report.md / metrics.json / evaluate_summary.json / fig_dataset_overview.png）
-    <report-out>/compare_<name>_<platform>_<ts>/{A/,B/,reports/comparison.md}   # 双臂任务目录
-    <report-out>/matrix_<ts>/{reports/,runs/<label>/}
+    <report-out>/compare_<name>_<platform>_<ts>/{A/,B/,runtime/,reports/comparison.md}   # 双臂任务目录
+    <report-out>/matrix_<ts>/{runtime/,reports/,runs/<label>/}
 
 回放任务（``task init --replay``）在任务目录根多一个内容寻址快照池 ``snapshots/``：
 回放导出的状态按内容哈希去重成桶 ``snapshots/<sha256 前 12 位>/``，每个对话一个
@@ -116,7 +118,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from typing import Any, Optional, Sequence
 
-from membench import layout
+from membench import layout, runtime
 from membench.adapters import ADAPTERS
 from membench.compare import compare_runs
 from membench.matrix import compare_matrix
@@ -703,6 +705,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
             f"任务目录不存在: {args.task_dir}；"
             "请先运行 python -m membench.cli task init --name <NAME> 建任务目录"
         )
+    if args.task_dir is not None:
+        # 任务目录开跑前就已确定：先登记，参数 / 适配器错误等早期失败也能落进它的
+        # runtime（否则一条失败命令在任务目录里查不到任何痕迹）
+        runtime.set_dir(os.path.abspath(args.task_dir))
     adapter = _make_adapter(args.adapter, args.adapter_arg)
     judge = _make_judge(args)
     evidence_matcher = _make_evidence_matcher(args)
@@ -1065,11 +1071,42 @@ def _arm_consistency_lines(entries: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _format_duration(ms: Any) -> str:
+    """耗时的人类可读形式（毫秒 → 秒；非数字返回 ``-``）。"""
+    if not isinstance(ms, (int, float)):
+        return "-"
+    return f"{ms / 1000:.1f}s"
+
+
+def _print_runtime(exp_root: str, label: str = "") -> None:
+    """打印一个实验 / 臂目录的运行时概况（只读；没有 ``runtime/`` 时明确说明）。"""
+    title = f"运行时（{label}）" if label else "运行时"
+    summary = runtime.summarize(exp_root, limit=5)
+    if not summary["exists"]:
+        print(f"[membench] {title}: 无运行时数据")
+        return
+    print(
+        f"[membench] {title}: {summary['dir']}"
+        f"（最近 {len(summary['recent'])} 条命令，非零退出 {summary['n_failed']} 条）"
+    )
+    for record in summary["recent"]:
+        print(
+            f"[membench]   {record.get('started_at') or '-'} "
+            f"{record.get('command') or '-'} "
+            f"exit={record.get('exit_code')} "
+            f"{_format_duration(record.get('duration_ms'))}"
+        )
+    if summary["last_log"]:
+        print(f"[membench]   最近日志: {summary['last_log']}")
+
+
 def _cmd_task_init(args: argparse.Namespace) -> int:
     """task init：建任务目录骨架，stdout 只打印它的绝对路径（供 ``TASK=$(...)`` 接走）。"""
     task_dir = layout.init_task_dir(
         args.report_out, args.name, args.platform, args.arms, replay=args.replay
     )
+    # 任务目录从这一刻起就是本次命令的产物根：task init 自己也记一条命令与日志
+    runtime.set_dir(task_dir)
     shape = f"{layout.DIR_ARM_A}/ {layout.DIR_ARM_B}/" if args.arms == 2 else f"{layout.DIR_RUNS}/"
     if args.replay:
         shape += f" {layout.DIR_SNAPSHOTS}/"
@@ -1123,6 +1160,10 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
     is_replay_task = layout.has_snapshot_pool(layout.snapshot_task_root(target))
     for line in _snapshot_pool_lines(target):
         print(f"[membench] {line}")
+    if arm_labels:
+        # 任务根的 runtime 记的是 task init / evaluate / fuse / compare 等任务级命令；
+        # 各臂的 runtime 记写进该臂的 run（分片）命令
+        _print_runtime(target, "任务")
 
     next_steps: list[str] = []
     n_datasets = 0
@@ -1130,6 +1171,7 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
     for label, arm_root in arms:
         where = f"臂 {label}" if label else "单臂实验目录"
         print(f"[membench] {where}: {arm_root}")
+        _print_runtime(arm_root, f"臂 {label}" if label else "")
         datasets = _dataset_dirs_of(arm_root)
         if not datasets:
             print("[membench]   数据集: （尚无产物）")
@@ -1538,6 +1580,19 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if result["ok"] else 1
 
 
+#: 会写实验产物、因而需要记运行时数据的命令（``task status`` 等只读命令不记）。
+_RUNTIME_COMMANDS = frozenset(
+    {"run", "evaluate", "evaluate-compare", "compare", "fuse", "matrix"}
+)
+
+
+def _writes_runtime(args: argparse.Namespace) -> bool:
+    """该命令是否值得记运行时数据（task 只记 init，status 是只读视图）。"""
+    if args.command == "task":
+        return getattr(args, "task_command", None) == "init"
+    return args.command in _RUNTIME_COMMANDS
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI 入口，返回进程退出码。"""
     # 在任何子命令解析前加载外部适配器插件（MEMBENCH_ADAPTER_MODULES）。
@@ -1545,13 +1600,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     load_external_adapters()
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(raw_argv)
+    session = runtime.begin(args.command, raw_argv) if _writes_runtime(args) else None
+    exit_code = 0
     try:
-        return int(args.func(args))
-    except RuntimeError as exc:
-        # 如缺少可选依赖（matplotlib）等运行时错误：输出友好提示而非堆栈
-        print(f"[membench] {exc}", file=sys.stderr)
-        return 1
+        try:
+            exit_code = int(args.func(args))
+        except RuntimeError as exc:
+            # 如缺少可选依赖（matplotlib）等运行时错误：输出友好提示而非堆栈
+            print(f"[membench] {exc}", file=sys.stderr)
+            exit_code = 1
+        return exit_code
+    except BaseException as exc:
+        # 失败也要落一条带退出码的命令记录；SystemExit 的文案 / traceback 由解释器
+        # 在 main 返回后打印，先补进日志（终端输出不变）
+        exit_code = runtime.exit_code_of(exc)
+        if session is not None:
+            session.note_exception(exc)
+        raise
+    finally:
+        if session is not None:
+            runtime.finish(session, exit_code)
 
 
 if __name__ == "__main__":

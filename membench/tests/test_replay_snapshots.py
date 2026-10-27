@@ -256,7 +256,13 @@ def test_task_init_replay_builds_snapshots_dir(tmp_path: Path) -> None:
     lines = [line for line in out.strip().splitlines() if line.strip()]
     assert len(lines) == 1, f"stdout 只能有路径一行，实际: {lines}"
     task = Path(lines[0])
-    assert sorted(path.name for path in task.iterdir()) == ["A", "B", "reports", "snapshots"]
+    assert sorted(path.name for path in task.iterdir()) == [
+        "A",
+        "B",
+        "reports",
+        "runtime",
+        "snapshots",
+    ]
     assert "snapshots/" in err and "--replay" in err
 
     single = _init_task(base, "one", arms=1)
@@ -266,7 +272,7 @@ def test_task_init_replay_builds_snapshots_dir(tmp_path: Path) -> None:
 def test_task_init_without_replay_has_no_snapshots_dir(tmp_path: Path) -> None:
     """不带 --replay 时行为不变：不建 snapshots/（普通任务不落池）。"""
     task = _init_task(tmp_path / "out", "plain", arms=2, replay=False)
-    assert sorted(path.name for path in task.iterdir()) == ["A", "B", "reports"]
+    assert sorted(path.name for path in task.iterdir()) == ["A", "B", "reports", "runtime"]
 
 
 # ---------------------------------------------------------------------------

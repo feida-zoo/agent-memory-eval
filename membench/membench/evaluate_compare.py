@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Union
 
-from membench import layout
+from membench import layout, runtime
 from membench.compare import _diff_overall, _eval_gates, check_comparability
 from membench.data.schema import is_abstention
 from membench.evaluate import (
@@ -745,6 +745,8 @@ def evaluate_compare(
             ),
         )
         print(f"[membench] 对比实验目录: {compare_dir}")
+    # A/B 两侧落位之前登记：两侧补跑的 Runner 会把同一条命令的日志继续写在这里
+    runtime.set_dir(compare_dir)
 
     # A/B 两侧各摆成完整 eval 实验形态（产物齐备与身份预检已在上方做完，再复制 / 补跑）
     baseline_provided = _stage_side_dir(compare_dir, DIR_ARM_A, baseline_provided, baseline_runs)

@@ -9,7 +9,10 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +24,7 @@ if str(SCRIPTS) not in sys.path:
 
 import run_task  # noqa: E402
 import verify_artifacts  # noqa: E402
+import watch_task  # noqa: E402
 
 #: 仓库内置冒烟数据集（仅用于 dry-run 的参数解析，不会真跑）。
 SAMPLE_DATASET = (
@@ -242,9 +246,19 @@ def test_json_structure(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
     assert data["kind"] == "eval"
     assert data["ok"] is True
     assert data["errors"] == []
-    assert data["warnings"] == []
     assert data["datasets"][0]["dataset"] == "sample"
     assert data["datasets"][0]["n_questions"] == 2
+    # 测试树没有 runtime/：只给警告级提示（不影响 ok / 退出码）
+    assert [item["code"] for item in data["warnings"]] == ["missing_runtime"]
+
+
+def test_runtime_present_has_no_runtime_warning(tmp_path: Path) -> None:
+    """任务目录带 runtime/commands.jsonl 时不再提示"没有运行时数据"。"""
+    task = _eval_task(tmp_path)
+    _write(task / "runtime" / "commands.jsonl", "{}\n")
+    result = verify_artifacts.verify_task(str(task))
+    assert result.ok, [item.message for item in result.errors]
+    assert not [item for item in result.warnings if item.code == "missing_runtime"]
 
 
 def test_bad_tree_exit_code_and_fail_lines(
@@ -463,6 +477,34 @@ def test_recall_mode_maps_to_evidence_match(
     assert "--evidence-match llm" in out
 
 
+def test_dry_run_redacts_llm_api_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """dry-run / 后台日志里的命令展示不出现 API key（长期留存的日志不能带密钥）。"""
+    code = run_task.main(
+        [
+            "eval",
+            "--adapter",
+            "mock-strong",
+            "--dataset",
+            str(SAMPLE_DATASET),
+            "--judge",
+            "llm",
+            "--recall-mode",
+            "substring",
+            "--llm-api-key",
+            "sk-dry-run-secret",
+            "--report-out",
+            str(tmp_path),
+            "--dry-run",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "sk-dry-run-secret" not in out
+    assert "--llm-api-key" in out and "***" in out
+
+
 def test_eval_multi_dataset_uses_evaluate(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -532,3 +574,197 @@ def test_eval_multi_dataset_with_limit_uses_from_runs(
     assert "-m membench.cli evaluate --task-dir $TASK --from-runs" in out
     assert "sample_dataset=$TASK/runs/sample_dataset" in out
     assert "other=$TASK/runs/other" in out
+
+
+# ---------------------------------------------------------------------------
+# 后台执行 + 定时监控
+# ---------------------------------------------------------------------------
+
+
+def _background_eval_argv(tmp_path: Path, *extra: str) -> list[str]:
+    """一条最小的后台 eval 调用（mock 适配器 + 冒烟 limit）。"""
+    return [
+        "eval",
+        "--adapter",
+        "mock-strong",
+        "--dataset",
+        str(SAMPLE_DATASET),
+        "--judge",
+        "heuristic",
+        "--limit",
+        "2",
+        "--recall-mode",
+        "substring",
+        "--name",
+        "bg-smoke",
+        "--report-out",
+        str(tmp_path / "out"),
+        *extra,
+    ]
+
+
+def _orchestrator(task: Path, **overrides: object) -> Path:
+    """写一个 orchestrator.json（watch_task 用例构造各种状态）。"""
+    data = {
+        "schema": 1,
+        "pid": 999999,
+        "argv": ["eval"],
+        "command": "eval",
+        "started_at": "2026-01-01T00:00:00+08:00",
+        "log": "runtime/logs/orchestrator-20260101-000000.log",
+        "status": "running",
+        "exit_code": None,
+        "finished_at": None,
+    }
+    data.update(overrides)
+    path = task / "runtime" / "orchestrator.json"
+    _write_json(path, data)
+    return path
+
+
+def _fake_task(tmp_path: Path, *, with_dataset: bool = True) -> Path:
+    """最小任务目录（可选带一个完整数据集产物），用于 watch_task。"""
+    task = tmp_path / "eval_demo_default_20260101-000000"
+    (task / "reports").mkdir(parents=True, exist_ok=True)
+    if with_dataset:
+        _dataset_tree(task / "runs" / "sample")
+    else:
+        (task / "runs").mkdir(parents=True, exist_ok=True)
+    return task
+
+
+def test_run_task_background_returns_task_dir_and_completes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--background：stdout 只有任务目录一行，状态先 running，随后 exit_code=0。"""
+    # 开关放在参数中间（不是最后）：子进程参数重建不能吞掉它后面的选项
+    argv = _background_eval_argv(tmp_path)
+    argv.insert(1, "--background")
+    code = run_task.main(argv)
+    assert code == run_task.EXIT_OK
+    out_lines = [line for line in capsys.readouterr().out.strip().splitlines() if line.strip()]
+    assert len(out_lines) == 1, f"stdout 只能有任务目录一行，实际: {out_lines}"
+    task = Path(out_lines[0])
+    assert task.is_dir() and task.name.startswith("eval_bg-smoke_default_")
+
+    state_path = task / "runtime" / "orchestrator.json"
+    assert state_path.is_file()
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["pid"] > 0
+    assert state["status"] in ("running", "done")
+    assert state["log"].startswith("runtime/logs/orchestrator-")
+
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if state["status"] != "running":
+            break
+        time.sleep(0.2)
+    assert state["status"] == "done", f"后台编排未完成: {state}"
+    assert state["exit_code"] == 0
+    assert state["finished_at"]
+    assert (task / "runtime" / "commands.jsonl").is_file()
+    log_text = (task / state["log"]).read_text(encoding="utf-8")
+    assert "自检: OK" in log_text or "任务目录" in log_text
+
+    assert watch_task.main([str(task), "--until-done", "--interval", "0.2"]) == 0
+
+
+def test_run_task_background_rejects_dry_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--background 与 --dry-run 互斥（退出码 2，不建任何目录）。"""
+    code = run_task.main(_background_eval_argv(tmp_path, "--background", "--dry-run"))
+    assert code == run_task.EXIT_FLOW_FAIL
+    assert "互斥" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_run_task_task_dir_skips_task_init_in_dry_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--task-dir：dry-run 直接把它当 $TASK，不再打印 task init。"""
+    task = tmp_path / "existing"
+    (task / "runs").mkdir(parents=True)
+    (task / "reports").mkdir()
+    code = run_task.main(_background_eval_argv(tmp_path, "--task-dir", str(task), "--dry-run"))
+    assert code == run_task.EXIT_OK
+    out = capsys.readouterr().out
+    assert f"TASK={task}" in out
+    assert "task init" not in out
+
+
+def test_run_task_task_dir_requires_skeleton(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--task-dir 缺 runs/ 时拒绝（退出码 2），不会把产物写进一个随便的目录。"""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    code = run_task.main(_background_eval_argv(tmp_path, "--task-dir", str(empty), "--dry-run"))
+    assert code == run_task.EXIT_FLOW_FAIL
+    assert "不是 arms=1 的任务目录" in capsys.readouterr().err
+
+
+def test_watch_task_format_and_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """watch_task：单行紧凑进度 + --json 机器可读结构（数据集产物齐备）。"""
+    task = _fake_task(tmp_path)
+    _orchestrator(task, status="done", exit_code=0, finished_at="2026-01-01T00:00:05+08:00")
+
+    assert watch_task.main([str(task)]) == 0
+    line = capsys.readouterr().out.strip()
+    assert line.startswith("[watch] ")
+    assert "单臂: sample 1/1片·产物✓" in line
+    assert "orchestrator done exit=0" in line
+
+    assert watch_task.main([str(task), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["task"] == str(task)
+    assert payload["orchestrator"]["status"] == "done"
+    assert payload["arms"][0]["datasets"][0]["ready"] is True
+    assert payload["snapshot_pool"] is None
+    assert payload["done"] is True and payload["ok"] is True
+
+
+def _dead_pid() -> int:
+    """一个确定已经退出的 pid（避免硬编码在别的系统上撞到活进程）。"""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def test_watch_task_until_done_exit_codes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--until-done：成功 0 / 失败 1 / 超时 2；没有 orchestrator 也按 2 退出。"""
+    done = _fake_task(tmp_path / "done")
+    _orchestrator(done, status="done", exit_code=0)
+    assert watch_task.main([str(done), "--until-done", "--interval", "0.05"]) == 0
+
+    failed = _fake_task(tmp_path / "failed")
+    _orchestrator(failed, status="failed", exit_code=2)
+    assert watch_task.main([str(failed), "--until-done", "--interval", "0.05"]) == 1
+
+    # running 但 pid 已不在 -> stalled（失败），不会一直等下去
+    stalled = _fake_task(tmp_path / "stalled")
+    _orchestrator(stalled, status="running", pid=_dead_pid())
+    assert watch_task.main([str(stalled), "--until-done", "--interval", "0.05"]) == 1
+
+    # running 且进程活着（用当前测试进程）-> 等满 max-wait 后超时
+    running = _fake_task(tmp_path / "running")
+    _orchestrator(running, status="running", pid=os.getpid())
+    assert (
+        watch_task.main(
+            [str(running), "--until-done", "--interval", "0.05", "--max-wait", "0.2"]
+        )
+        == 2
+    )
+
+    # 非后台任务（没有 orchestrator.json）：无法判断完成
+    plain = _fake_task(tmp_path / "plain")
+    assert (
+        watch_task.main([str(plain), "--until-done", "--interval", "0.05", "--max-wait", "2"])
+        == 2
+    )
+    assert "没有 orchestrator.json" in capsys.readouterr().err

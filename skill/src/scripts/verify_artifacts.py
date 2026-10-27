@@ -21,6 +21,8 @@
    必须存在（跳过 ``http(s)://``、纯锚点，以及快照 / runtime 目录里的适配器文件）。
 6. ``compare_*`` 任务：``reports/comparison.md`` 存在且含门禁结论关键词；``A/``、``B/``
    各至少有一个数据集级报告。
+7. 运行时数据（**警告级**，不影响退出码）：任务目录缺 ``runtime/commands.jsonl`` 时
+   提示"没有运行时数据，无法回溯本次执行"。
 
 ``--json`` 输出机器可读结构（stdout 只有 JSON）；人类模式成功时 stdout 只有
 ``OK <task>``，失败时逐条 ``FAIL …``。本模块也被 ``run_task.py`` 直接 import 复用。
@@ -47,6 +49,8 @@ _TASK_PREFIXES: tuple[tuple[str, str], ...] = (
 DIR_REPORT = "report"
 DIR_REPORTS = "reports"
 DIR_RUNS = "runs"
+DIR_RUNTIME = "runtime"
+FILE_COMMANDS = "commands.jsonl"
 REPORT_FILES: tuple[str, ...] = ("metrics.json", "results.jsonl", "report.md")
 
 #: 门禁结论关键词（comparison.md 必须含其一）。
@@ -715,6 +719,16 @@ def verify_task(
 
     if not skeleton_ok:
         return result
+
+    # 7. 运行时数据（警告级）：没有它就不能回溯"这次评测是怎么跑出来的"
+    commands = os.path.join(task, DIR_RUNTIME, FILE_COMMANDS)
+    if not os.path.isfile(commands):
+        result.warn(
+            "runtime",
+            "missing_runtime",
+            "没有运行时数据（缺 runtime/commands.jsonl），无法回溯本次执行",
+            commands,
+        )
 
     # 2/3/4. 每个臂 / 实验目录下的数据集
     roots = _experiment_roots(task, kind)

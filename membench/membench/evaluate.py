@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Union
 
-from membench import layout
+from membench import layout, runtime
 from membench.data.info import get_dataset_info, resolve_available_path
 from membench.data.schema import load_dataset, question_capabilities
 from membench.layout import resolve_dataset_dir
@@ -1399,6 +1399,11 @@ def evaluate(
             snapshot=snapshot,
         ):
             provided_by_key[r.spec.key] = r
+
+    # 纯复用（无补跑）时没有 Runner 代劳：这里补登记。有补跑时首个 Runner 已在开跑
+    # 前登记过同一目录（place 幂等）；空数据集等"没产生任何产物"的失败路径到不了
+    # 这里，也就不会留下 runtime/ 把空实验目录变成"跑过"的样子。
+    runtime.set_dir(experiment_dir)
 
     # 按目标清单顺序组装；复用项套用目标 spec（保留统一的展示口径）
     results: list[DatasetResult] = []

@@ -154,8 +154,8 @@ def test_cli_run_report_out_subdir(tmp_path: Path) -> None:
     assert rc == 0
     exp_dir = _only_subdir(out)
     assert exp_dir.name.startswith("eval_mock-strong_default_")
-    # 实验目录根层只有 runs/ 与 reports/ 两个子目录，不散落任何文件
-    assert sorted(p.name for p in exp_dir.iterdir()) == ["reports", "runs"]
+    # 实验目录根层只有 runs/ / reports/ / runtime/ 三个子目录，不散落任何文件
+    assert sorted(p.name for p in exp_dir.iterdir()) == ["reports", "runs", "runtime"]
 
     dataset_dir = exp_dir / "runs" / "sample_dataset"
     for fname in (
@@ -217,7 +217,7 @@ def test_cli_compare_report_out_subdir(tmp_path: Path) -> None:
     assert rc == 0
     cmp_dir = _only_subdir(out)
     assert cmp_dir.name.startswith("compare_mock-strong_vs_mock-strong_default_")
-    assert sorted(p.name for p in cmp_dir.iterdir()) == ["A", "B", "reports"]
+    assert sorted(p.name for p in cmp_dir.iterdir()) == ["A", "B", "reports", "runtime"]
 
     reports_dir = cmp_dir / "reports"
     for fname in ("comparison.md", "fig_metric_diff.png", "fig_category_diff.png"):

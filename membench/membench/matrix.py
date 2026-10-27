@@ -25,7 +25,7 @@ import os
 import shutil
 from typing import Any
 
-from membench import layout
+from membench import layout, runtime
 from membench.compare import _eval_gates, _load_metrics, resolve_dataset_dir
 from membench.report import PALETTE, _md_table, _setup_fonts, metric_label
 from membench.ratings import format_metric_value
@@ -270,6 +270,8 @@ def compare_matrix(labeled_runs: list[tuple[str, str]], out_dir: str) -> dict[st
 
     # 4. 各 label 的数据集树副本：先复制再写报告，目标冲突 / 源缺失都在落报告前暴露
     label_dirs = _copy_label_trees(out_dir, labels, dataset_dirs)
+    # 复制成功、实验目录确实存在：本次矩阵命令的运行时数据归它
+    runtime.set_dir(os.path.abspath(out_dir))
 
     # 5. 报告与图表落 <exp>/reports/
     reports_dir = layout.task_report_dir(out_dir)

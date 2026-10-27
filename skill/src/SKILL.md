@@ -119,6 +119,17 @@ python -m membench.cli matrix --runs "wx@<shaA>=<产物目录>" "fs@<shaA>=<产�
 
 交付前必须运行 `python scripts/verify_artifacts.py <任务目录>`，**把输出贴给用户**；退出码非 0 时不得宣布完成，先按报告补齐或重跑。不做的后果：partial、死链、题数不一致的产物被当成交付，用户无法复核。自检覆盖：骨架与产物齐备、数据集级与逐对话题数一致、partial 不许冒充完整、报告内链无死链、compare 有无门禁结论。
 
+## 长跑：后台执行 + 定时监控
+
+```bash
+python scripts/run_task.py eval ... --background      # stdout 只一行任务目录
+python scripts/watch_task.py <任务目录> --until-done --interval 300
+```
+
+- 默认后台跑，**不要在同一轮里前台阻塞**等整场评测；每 5–10 分钟看一次进度。
+- 三个卡死/失败信号：`orchestrator.json` 的 pid 已不在且无 `exit_code`（stalled）；分片账本长时间无新增；`runtime/logs/` 最近日志出现 traceback。
+- `watch_task.py` 退出码：0 完成且成功、1 完成但失败、2 超时/无法判断；`--json` 出机器可读结构。
+
 ## 失败排查
 
 | 看到什么 | 怎么办 |
@@ -144,13 +155,15 @@ python -m membench.cli matrix --runs "wx@<shaA>=<产物目录>" "fs@<shaA>=<产�
 | `references/optimize_workflow.md` | 走优化闭环（诊断→建议→plan→执行→AB→报告）时读 |
 | `references/http_bridge_guide.md` | 被测系统非 Python、要写 HTTP bridge 时读 |
 | `references/user_dataset_guide.md` | 用户要求构造或删除专属测试集时读 |
-| `scripts/run_task.py` | 标准流程编排器（eval / ab），退出码 0/1/2/3 见上 |
+| `scripts/run_task.py` | 标准流程编排器（eval / ab），退出码 0/1/2/3 见上；`--background` 派生到后台 |
+| `scripts/watch_task.py` | 长跑进度轮询（后台任务配它），退出码 0/1/2；不要自己解析账本 |
 | `scripts/verify_artifacts.py` | 交付前自检：骨架、产物、题数一致、partial、内链、门禁结论 |
 | `scripts/eval_two_commits.sh` | 原生 CLI 的参考脚本（非默认路径），演示 worktree 双 commit |
 | `membench/examples/quickstart.py` | 写真实 adapter 的参考实现 |
 | `membench/examples/optimize_loop.md` | 优化闭环入门教程 |
 | `membench/examples/http_bridge_node/` | Node/Electron HTTP bridge 可复制模板 |
 | `user_dataset/` | 用户专属测试集（与内置集物理隔离，不打包） |
+| `runtime/`（实验 / 臂目录下） | 每次命令的 `commands.jsonl`、`logs/`、`env.json`；排查问题先看它（与对话级 runtime 不同） |
 | `output/` | 默认产物根（`MEMBENCH_OUTPUT_DIR` 可覆盖） |
 | `docs/` | 《Agent 记忆系统深度研究报告》与配图 |
 

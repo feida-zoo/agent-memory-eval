@@ -73,7 +73,7 @@ import shutil
 from datetime import datetime
 from typing import Any, Union
 
-from membench import layout
+from membench import layout, runtime
 from membench.data.schema import dataset_fingerprint, load_dataset
 from membench.evaluate import STALE_GATE_THRESHOLD
 from membench.metrics import aggregate
@@ -746,6 +746,8 @@ def fuse_runs(
     else:
         experiment_dir = out_path
         dataset_dir = layout.dataset_dir(experiment_dir, dataset_name)
+    # 校验全部通过、输出目录已确定：本次融合命令的运行时数据归这棵实验目录
+    runtime.set_dir(experiment_dir)
     # run_id 走 layout 的唯一组装入口：commit、分片与冒烟范围都进身份，另有 "fused"
     # 标出这是融合产物——融合结果（尤其 --limit 冒烟分片的融合）不得与全量结果撞身份。
     run_id = layout.run_id(
