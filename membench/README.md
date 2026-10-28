@@ -19,7 +19,7 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 │   ├── adapters/          # BaseMemoryAdapter + mock / transcript / http 适配器
 │   ├── data/              # 数据集 schema、JSONL 加载器、fetch（按需下载）、内置集
 │   ├── judges/            # HeuristicJudge / LLMJudge
-│   ├── metrics/           # token_f1 / bleu1 / recall@k + 六维汇总
+│   ├── metrics/           # token_f1 / bleu1（诊断）/ recall@k + 六维汇总
 │   ├── paths.py           # 产物根判定 output_root（MEMBENCH_OUTPUT_DIR > skill 的 output/ > 工程根 output/）
 │   ├── layout.py          # 任务目录 / 实验目录命名与落位（eval_* / compare_* / matrix_*、分片账本的公开 helper）
 │   ├── runtime.py         # 实验 / 任务级运行时数据（commands.jsonl + logs/ + env.json，argv 脱敏）
@@ -161,18 +161,18 @@ python -m membench.cli evaluate-compare \
     --report-out <实验目录父目录> --tag "优化前vs优化后"
 ```
 
-门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **逐数据集题型 diff** + **两组融合 diff 表** + **per-dataset 门禁明细**（单数据集 spike 不被融合平均抹平）+ **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）+ **「两侧可比性（逐数据集）」小节**（复用单数据集 `compare` 的维度表：两侧 `dataset_sha256 / judge / judge_model / driver_llm / platform` 不一致记「关键」、两侧都未标注记「关键缺失」、检索命中口径等次要维度记「次要」；两侧 `adapter / adapter_version` 与 `commit` 是被测变量，差异属预期不计入）；比率型指标以百分比呈现（如 `81.5%`），差值为百分点（如 `+2.3pt`）。指标"未计算"统一记 `null`，与真实 0 区分；诊断指标（检索召回率@5 / 过度拒答率）在 diff 与对照表中可见但不参与评级。旧版 run 的 capabilities 未落账时报告会按数据集/逐题记录自动推断并在头部标注来源。可比性问题在**两侧都复用的数据集对上会于开跑前**先打印到控制台——不必等跑完才发现两侧口径对不上。
+门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **逐数据集题型 diff** + **两组融合 diff 表** + **per-dataset 门禁明细**（单数据集 spike 不被融合平均抹平）+ **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）+ **「两侧可比性（逐数据集）」小节**（复用单数据集 `compare` 的维度表：两侧 `dataset_sha256 / judge / judge_model / driver_llm / platform` 不一致记「关键」、两侧都未标注记「关键缺失」、检索命中口径等次要维度记「次要」；两侧 `adapter / adapter_version` 与 `commit` 是被测变量，差异属预期不计入）；比率型指标以百分比呈现（如 `81.5%`），差值为百分点（如 `+2.3pt`）。指标"未计算"统一记 `null`，与真实 0 区分；诊断指标（token_f1 / bleu1 / 检索召回率@5 / 过度拒答率）在 diff 与对照表中可见但不参与评级（token_f1 / bleu1 只测字面重合，非语义正确性）。旧版 run 的 capabilities 未落账时报告会按数据集/逐题记录自动推断并在头部标注来源。可比性问题在**两侧都复用的数据集对上会于开跑前**先打印到控制台——不必等跑完才发现两侧口径对不上。
 
 融合口径（重要，读总分前必读）：
 
-- **宏平均**：六项质量指标（accuracy/token_f1/bleu1/evidence_recall/abstention_accuracy/stale_rate）先在各数据集内算分，再跨集等权平均；**指标只在具备对应标注能力的数据集上参与**——无 gold_stale 的集（locomo/longmemeval）不参与 stale_rate，无 evidence 标注的集（longmemeval/beam）不参与 evidence_recall，无 abstention 题的集不参与 abstention_accuracy。绝不用"记 0"稀释。此外**诊断指标**（检索召回率@5 需 has_evidence；过度拒答率全数据集参与）同样跨集融合展示，但不参与综合评级与门禁。
+- **宏平均**：六项质量指标（accuracy/token_f1/bleu1/evidence_recall/abstention_accuracy/stale_rate）先在各数据集内算分，再跨集等权平均；**指标只在具备对应标注能力的数据集上参与**——无 gold_stale 的集（locomo/longmemeval）不参与 stale_rate，无 evidence 标注的集（longmemeval/beam）不参与 evidence_recall，无 abstention 题的集不参与 abstention_accuracy。绝不用"记 0"稀释。其中 **accuracy / evidence_recall / abstention_accuracy / stale_rate 四项参与综合评级**；token_f1 / bleu1 只测字面重合（诊断指标），照常计算与展示但不参与评级。此外**诊断指标**（检索召回率@5 需 has_evidence；过度拒答率全数据集参与）同样跨集融合展示，但不参与综合评级与门禁。
 - **门禁一票否决独立于总分**：办公域槽位 stale_rate > 0.03 → 总评"不达标"，退出码 1（可接 CI），无论综合评级多高。
 - **按需下载的公开集必须先 fetch**：`locomo` / `longmemeval_oracle` / `gatemem_office` / `longmemeval_s` / `beam_1m`（或 `beam_10m`）都没有内置文件，`evaluate` 从 `~/.membench/datasets/` 解析可用路径，缺失时报错提示先 `python -m membench.cli dataset fetch <key>`（`--no-lme-s` 不检查 LongMemEval-S；`--no-beam` / `--quick` 不检查 BEAM 槽位）。judge=heuristic 跑 BEAM 会警告（rubric 型题目规则判分失真，建议 llm/client）。
 - **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**，缺省 `output_root()`）落 `DIR/eval_<adapter>_<platform>_<ts>/`：各数据集产物在 `runs/<dataset>/`（数据集级报告 `report/{report.md,metrics.json,results.jsonl,fig_*.png}`，逐对话目录 `<对话>/` 内含 `report/`、`runtime/`、`memory_snapshot/`），任务级报告在 `reports/`（`report.md` + `metrics.json` + `evaluate_summary.json` + `fig_dataset_overview.png`）。
 
 run 产物（`runs/<dataset>/report/`）：`results.jsonl`（逐题原始记录）、`metrics.json`、`report.md`、`fig_category_accuracy.png`、`fig_latency_hist.png`；逐对话产物落 `runs/<dataset>/<对话目录>/report/`（纯文字，不出图）。
 run 报告含 **「Token 消耗（全流程）」** 小节，取自 `metrics.json` 的 `token_usage` 块（被测系统上报口径的累计值：`ingest_input_tokens` / `query_input_tokens` / `query_output_tokens` / `ingest_llm_calls` / `query_llm_calls` + `n_dialogues` / `n_questions`）；`evaluate` 报告给出**分数据集消耗与合计**（`evaluate_summary.json` 的 `token_usage` 同步落账，含 `datasets_reported` 标明合计覆盖范围）。ingest 按每次 reset 后的真实写入累计——题目级分片下同一对话被多个分片各自 ingest 也如实各记一次；分片融合时逐片相加，任一分片未落账则整体不落账。适配器不填 token 时记 0 并显式提示"未上报"，不读成真实零消耗；这不是指标，不参与评级与门禁。
-report.md 中比率型指标以 **"评价（百分比）"** 呈现（如 `优秀（92.3%）`，四级：优秀/良好/中等/较差），开头附 **综合评级**（六项质量指标连续点数均值，1.0~4.0，档内随数值线性变化，阈值 3.5/2.5/1.5）；效率成本指标不参与评级（依赖部署环境）；**诊断指标**（检索召回率@5、过度拒答率）仅展示与归因，不参与评级——前者是前 5 条检索的证据覆盖率，后者是非拒答题的误拒比例，与 `evidence_recall` / `abstention_accuracy` 配合分诊（检索 vs 生成、漏拒 vs 误拒）。评级规则见 `membench/ratings.py` 的 `METRIC_THRESHOLDS` 表，可按团队标准调整。
+report.md 中比率型指标以 **"评价（百分比）"** 呈现（如 `优秀（92.3%）`，四级：优秀/良好/中等/较差），开头附 **综合评级**（四项质量指标——accuracy / evidence_recall / abstention_accuracy / stale_rate——连续点数均值，1.0~4.0，档内随数值线性变化，阈值 3.5/2.5/1.5）；效率成本指标不参与评级（依赖部署环境）；**诊断指标**（token_f1 / bleu1、检索召回率@5、过度拒答率）仅展示与归因，不参与评级——token_f1 / bleu1 只测字面重合，LLM 判分下 accuracy 已判语义正确性（如 gold「周五」答「项目截止日是周五」正确且完整，token_f1 仅 0.25，按字面重合会与答错一样落到"较差"）；检索召回率@5 是前 5 条检索的证据覆盖率，过度拒答率是非拒答题的误拒比例，与 `evidence_recall` / `abstention_accuracy` 配合分诊（检索 vs 生成、漏拒 vs 误拒）。评级规则见 `membench/ratings.py` 的 `METRIC_THRESHOLDS` 表（四项质量指标），可按团队标准调整。
 compare 产物（`compare_<name>_<platform>_<ts>/`，见「产物布局」）：`A/`、`B/` 各为完整评测产物（自带 `runs/` 与 `reports/`），对比结论 `reports/comparison.md` + `reports/fig_metric_diff.png`（质量指标高亮明显变化 + 效率成本）+ `reports/fig_category_diff.png`（分题型准确率对比）。两张图的图例写明 **A（基线）· 短名 / B（候选）· 短名**（短名取 `adapter@commit`，run_id 见报告头部），B 条的绿/红只表示"明显优化/劣化"，另有独立图例项说明——别把高亮色当身份色。
 
 使用 LLM 判分（可选）：
@@ -823,7 +823,7 @@ python -m membench.cli adapter remove my-office-adapter
 | 维度 | 指标 | 定义 | 目标基线 |
 |---|---|---|---|
 | 正确性 | accuracy | judge 判对比例（heuristic 或 LLM） | ≥ 0.85 |
-| 正确性 | token_f1 / bleu1 | 预测与 gold 的 token 级重合度 | 参考项，不门禁 |
+| 正确性 | token_f1 / bleu1（诊断） | 预测与 gold 的 token 级重合度（只测字面重合，非语义正确性） | 诊断项，不评级、不门禁 |
 | 检索质量 | evidence_recall | 非 abstention 题中，证据命中（任一检索条目支持该证据）的比例 | ≥ 0.90 |
 | 检索质量 | recall_at_5（诊断） | 非拒答题中，前 5 条检索的证据条目覆盖率（严格口径；仅 evidence 标注数据集参与） | 诊断项，不评级 |
 | 效率成本 | latency_p50 / p95 | query 延迟分位数（毫秒） | 按系统预算自定 |

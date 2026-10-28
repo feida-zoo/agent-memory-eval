@@ -15,6 +15,9 @@ import os
 import pytest
 
 from membench.ratings import (
+    DIAGNOSTIC_METRICS,
+    METRIC_THRESHOLDS,
+    RATE_METRICS,
     format_metric,
     format_metric_delta,
     format_metric_value,
@@ -48,33 +51,25 @@ def test_rate_accuracy_thresholds(value: float, expected: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        (0.90, "优秀"),
-        (0.899, "良好"),
-        (0.60, "中等"),
-        (0.599, "较差"),
-    ],
+    "key",
+    ["token_f1", "bleu1", "recall_at_5", "over_refusal_rate"],
 )
-def test_rate_token_f1_thresholds(value: float, expected: str) -> None:
-    """token_f1 与 accuracy 共用同一组阈值。"""
-    assert rate_metric("token_f1", value) == expected
+def test_rate_metric_diagnostic_keys(key: str) -> None:
+    """诊断指标不评级（含字面重合的 token_f1 / bleu1），返回 None。"""
+    assert rate_metric(key, 0.0) is None
+    assert rate_metric(key, 1.0) is None
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        (0.60, "优秀"),
-        (0.599, "良好"),
-        (0.45, "良好"),
-        (0.449, "中等"),
-        (0.30, "中等"),
-        (0.299, "较差"),
-    ],
-)
-def test_rate_bleu1_thresholds(value: float, expected: str) -> None:
-    """bleu1 阈值边界：0.60/0.45/0.30。"""
-    assert rate_metric("bleu1", value) == expected
+def test_metric_roles() -> None:
+    """评级 / 诊断 / 比率指标集合的口径固定。"""
+    assert frozenset(METRIC_THRESHOLDS) == frozenset(
+        {"accuracy", "evidence_recall", "abstention_accuracy", "stale_rate"}
+    )
+    assert DIAGNOSTIC_METRICS == frozenset(
+        {"token_f1", "bleu1", "recall_at_5", "over_refusal_rate"}
+    )
+    assert DIAGNOSTIC_METRICS.isdisjoint(METRIC_THRESHOLDS)
+    assert RATE_METRICS == frozenset(METRIC_THRESHOLDS) | DIAGNOSTIC_METRICS
 
 
 @pytest.mark.parametrize(
@@ -161,44 +156,61 @@ def test_rating_points_invalid_label() -> None:
 
 
 def test_overall_rating_mixed_metrics() -> None:
-    """混合指标：accuracy 0.92(4.0) + bleu1 0.35(2.33) -> 均值 3.17 -> 良好。"""
+    """四项均值：accuracy 0.92(4.0) + evidence_recall 0.85(3.0) -> 3.5。
+
+    诊断指标（token_f1 / bleu1）与效率成本指标都不参与均值。
+    """
     overall = {
         "accuracy": 0.92,
-        "bleu1": 0.35,
+        "evidence_recall": 0.85,
+        "token_f1": 0.0,
+        "bleu1": 0.0,
         "latency_p50_ms": 120.0,  # 不可评级，应被忽略
         "n_questions": 10,
     }
     result = overall_rating(overall)
     assert result is not None
     label, mean = result
-    # accuracy 0.92 >= 0.90 → 4.0；bleu1 0.35 在 [0.30,0.45) 档内 → 2.333
-    assert mean == pytest.approx((4.0 + 2.0 + 0.05 / 0.15) / 2)
-    assert label == "良好"
+    assert mean == pytest.approx(3.5)
+    assert label == "优秀"
 
 
-def test_overall_rating_full_six_metrics() -> None:
-    """六项质量指标全部优秀 -> 均值 4.0 -> 优秀。"""
+def test_overall_rating_four_quality_metrics() -> None:
+    """四项质量指标全部优秀 -> 均值 4.0 -> 优秀（诊断指标不稀释）。"""
     overall = {
         "accuracy": 0.95,
-        "token_f1": 0.93,
-        "bleu1": 0.70,
         "evidence_recall": 0.97,
         "abstention_accuracy": 0.92,
         "stale_rate": 0.01,
+        "token_f1": 0.0,
+        "bleu1": 0.0,
     }
     result = overall_rating(overall)
     assert result is not None
     assert result == ("优秀", pytest.approx(4.0))
 
 
+def test_overall_rating_ignores_diagnostic_metrics() -> None:
+    """诊断指标拉高或拉低都不改变综合评级（与评级口径解耦）。"""
+    base = {
+        "accuracy": 0.80,
+        "evidence_recall": 0.80,
+        "abstention_accuracy": 0.85,
+        "stale_rate": 0.05,
+    }
+    low = dict(base, token_f1=0.0, bleu1=0.0, recall_at_5=0.0, over_refusal_rate=1.0)
+    high = dict(base, token_f1=1.0, bleu1=1.0, recall_at_5=1.0, over_refusal_rate=0.0)
+    assert overall_rating(low) == overall_rating(high) == overall_rating(base)
+
+
 def test_overall_rating_threshold_boundaries() -> None:
     """综合评级均值阈值边界：3.5 优秀、2.5 良好、1.5 中等、其余较差。"""
-    # 均值 3.5：两项优秀 + 两项良好 -> (4+4+3+3)/4 = 3.5
-    assert overall_rating({"accuracy": 0.95, "token_f1": 0.95, "bleu1": 0.50, "evidence_recall": 0.90})[0] == "优秀"
-    # 均值 2.5：一项良好 + 一项中等 -> (3+2)/2 = 2.5
-    assert overall_rating({"accuracy": 0.80, "bleu1": 0.35})[0] == "良好"
-    # 均值 1.5：一项中等 + 一项较差 -> (2+1)/2 = 1.5
-    assert overall_rating({"accuracy": 0.65, "bleu1": 0.10})[0] == "中等"
+    # 均值 3.5：accuracy 0.90(4.0) + evidence_recall 0.85(3.0)
+    assert overall_rating({"accuracy": 0.90, "evidence_recall": 0.85})[0] == "优秀"
+    # 均值 2.5：accuracy 0.75(3.0) + evidence_recall 0.70(2.0)
+    assert overall_rating({"accuracy": 0.75, "evidence_recall": 0.70})[0] == "良好"
+    # 均值 1.5：accuracy 0.30（较差档中点）-> 1.5
+    assert overall_rating({"accuracy": 0.30})[0] == "中等"
     # 均值 1.0：仅一项较差
     assert overall_rating({"accuracy": 0.10})[0] == "较差"
 
@@ -207,13 +219,17 @@ def test_overall_rating_none_when_no_ratable() -> None:
     """overall 中没有任何可评级指标时返回 None。"""
     assert overall_rating({}) is None
     assert overall_rating({"latency_p50_ms": 120.0, "n_questions": 10}) is None
+    # 只有诊断指标（含 token_f1 / bleu1）不足以给出综合评级
+    assert overall_rating({"token_f1": 1.0, "bleu1": 1.0, "recall_at_5": 1.0}) is None
 
 
 def test_overall_rating_skips_non_numeric() -> None:
     """非数值的可评级键被跳过；全为非数值时返回 None。"""
     assert overall_rating({"accuracy": "n/a"}) is None
-    result = overall_rating({"accuracy": "n/a", "bleu1": 0.5})
-    assert result is not None and result[0] == "良好"
+    result = overall_rating({"accuracy": "n/a", "evidence_recall": 0.95})
+    assert result is not None and result[0] == "优秀"
+    # 诊断指标不因数值合法而让 overall 有评级
+    assert overall_rating({"accuracy": "n/a", "bleu1": 0.5}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -242,8 +258,10 @@ def test_overall_rating_skips_non_numeric() -> None:
         ("stale_rate", 0.065, 3.5),  # 良好档中点
         ("stale_rate", 0.15, 2.5),   # 中等档中点
         ("stale_rate", 0.60, 1.5),   # 较差档中点
-        # 不可评级指标
+        # 不可评级指标（诊断指标与效率成本）
         ("latency_p50_ms", 100.0, None),
+        ("token_f1", 0.25, None),
+        ("bleu1", 0.5, None),
     ],
 )
 def test_continuous_points(key: str, value: float, expected: float | None) -> None:
@@ -261,8 +279,8 @@ def test_overall_rating_sensitive_to_within_bucket_improvement() -> None:
     """回归：档内改进（不跨档）应反映到综合评级点数上。
 
     案例：accuracy 0.647→0.715（+6.8pt）、abstention 0.476→0.567（+9.1pt），
-    六项指标无一跨档，旧口径下综合评级同为"中等（1.7/4.0）"，看不出提升。
-    新口径（连续点数）下，综合评级分数应有可见上升。
+    四项质量指标无一跨档，离散评级下综合评级看不出提升。
+    连续点数口径下，综合评级分数应有可见上升。
     """
     before = {
         "accuracy": 0.647,
@@ -283,9 +301,9 @@ def test_overall_rating_sensitive_to_within_bucket_improvement() -> None:
     r_before = overall_rating(before)
     r_after = overall_rating(after)
     assert r_before is not None and r_after is not None
-    # 标签不变（都没跨档），但点数应上升
-    assert r_before[0] == r_after[0]
     assert r_after[1] > r_before[1]
+    # 四项均值下这次档内改进刚好跨过 2.5 阈值：中等 -> 良好
+    assert (r_before[0], r_after[0]) == ("中等", "良好")
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +316,9 @@ def test_format_metric_rated() -> None:
     assert format_metric("accuracy", 0.9234) == "优秀（92.3%）"
     assert format_metric("accuracy", 0.8) == "良好（80.0%）"
     assert format_metric("stale_rate", 0.05) == "良好（5.0%）"
-    # 诊断指标无评价标签，只给百分比
+    # 诊断指标无评价标签，只给百分比（token_f1 / bleu1 也一样）
+    assert format_metric("token_f1", 0.25) == "25.0%"
+    assert format_metric("bleu1", 0.5) == "50.0%"
     assert format_metric("recall_at_5", 0.429) == "42.9%"
     assert format_metric("over_refusal_rate", 0.1) == "10.0%"
 
@@ -377,8 +397,15 @@ def test_write_run_report_md_contains_ratings(tmp_path) -> None:
     assert "陈旧率（stale_rate）" in content
     assert "拒答准确率（abstention_accuracy）" in content
 
-    # 分题型表：正确率 + Token F1 双列，同样带评价
-    assert "| 单跳（single_hop） | 优秀（92.0%） | 较差（50.0%） | 1 |" in content
+    # token_f1 / bleu1 标为诊断指标：照常展示百分比，但没有评价标签
+    assert "| 正确性 | Token F1（token_f1）（诊断） | 80.0% |" in content
+    assert "| 正确性 | BLEU-1（bleu1）（诊断） | 50.0% |" in content
+    assert "token_f1 / bleu1（字面重合度，非语义正确性）" in content
+    assert "Token F1 / BLEU-1 为诊断指标" in content
+
+    # 分题型表：正确率 + Token F1 双列，Token F1 无评价标签
+    assert "| 单跳（single_hop） | 优秀（92.0%） | 50.0% | 1 |" in content
+    assert "较差（50.0%）" not in content
 
     # 验收基线对照表含 "评价" 列
     assert "| 指标 | 目标 | 实际 | 评价 | 结果 |" in content

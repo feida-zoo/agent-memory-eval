@@ -78,6 +78,7 @@ from membench.report import (
     category_display,
     dim_label,
     metric_label,
+    metric_label_with_role,
     metric_labels,
 )
 from membench.ratings import format_metric, format_metric_delta, format_metric_value, overall_rating
@@ -1273,7 +1274,7 @@ def _write_evaluate_compare_report(
             delta_str = format_metric_delta(metric, b_val - a_val)
         fused_full_rows.append(
             [
-                metric_label(metric),
+                metric_label_with_role(metric),
                 a_str,
                 b_str,
                 delta_str,
@@ -1289,8 +1290,8 @@ def _write_evaluate_compare_report(
     )
     lines.append("")
     lines.append(
-        "<sub>检索召回率@5 与过度拒答率为诊断指标（展示与归因用），"
-        "不参与综合评级与门禁。</sub>"
+        "<sub>token_f1 / bleu1（字面重合度，非语义正确性）与检索召回率@5 / "
+        "过度拒答率为诊断指标，仅展示与归因，不参与综合评级与门禁。</sub>"
     )
     lines.append("")
 
@@ -1356,10 +1357,11 @@ def _write_evaluate_compare_report(
         lines.append("（两组融合 overall 中无可评级指标）")
     lines.append("")
     lines.append(
-        "<sub>评级规则：取六项质量指标（accuracy / token_f1 / bleu1 / "
-        "evidence_recall / abstention_accuracy / stale_rate）的融合值连续点数"
-        "均值（1.0~4.0，阈值 3.5 / 2.5 / 1.5）；效率成本与两项诊断指标"
-        "（检索召回率@5 / 过度拒答率）不参与评级。</sub>"
+        "<sub>评级规则：取四项质量指标（accuracy / evidence_recall / "
+        "abstention_accuracy / stale_rate）的融合值连续点数"
+        "均值（1.0~4.0，阈值 3.5 / 2.5 / 1.5）；token_f1 / bleu1"
+        "（字面重合度，非语义正确性）与 recall_at_5 / over_refusal_rate"
+        "为诊断指标，仅展示不参与评级；效率成本指标同样不参与评级。</sub>"
     )
     lines.append("")
 

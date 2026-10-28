@@ -42,7 +42,7 @@ description: >
 | 回放任务 | 上述目录 + `snapshots/` | 条目 `entries/` 是真源，`index.json` 是派生视图 |
 | 默认根 | `output_root()` | `MEMBENCH_OUTPUT_DIR` > skill `output/` > 工程根 |
 
-报告解读：比率指标给四级评价与综合评级；办公域 `stale_rate ≤0.03` 一票否决、`abstention_accuracy` 目标 1.0；细节见 `membench/README.md`「指标说明」。
+报告解读：比率指标给四级评价与综合评级（综合评级取 accuracy / evidence_recall / abstention_accuracy / stale_rate 四项连续点数均值）；token_f1 / bleu1（字面重合，非语义正确性）/ recall_at_5 / over_refusal_rate 为诊断指标，仅展示不参与评级；办公域 `stale_rate ≤0.03` 一票否决、`abstention_accuracy` 目标 1.0；细节见 `membench/README.md`「指标说明」。
 
 ## 标准流程
 

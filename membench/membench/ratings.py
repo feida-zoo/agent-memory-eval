@@ -6,12 +6,18 @@
 四级评价及点数映射：
     优秀 = 4、良好 = 3、中等 = 2、较差 = 1。
 
-单指标阈值在模块内以数据表 :data:`METRIC_THRESHOLDS` 定义，便于后续调整。
-效率成本类指标（latency / tokens / llm_calls / n_questions）依赖部署环境，
-强制定性会误导，故不参与评级（:func:`rate_metric` 返回 ``None``）。
+单指标阈值在模块内以数据表 :data:`METRIC_THRESHOLDS` 定义，便于后续调整，
+覆盖四项质量指标：accuracy / evidence_recall / abstention_accuracy / stale_rate。
+
+token_f1 / bleu1 不参与评级（:data:`DIAGNOSTIC_METRICS`）：LLM 判分下 accuracy
+已判语义正确性，二者只测与参考答案的字面重合；实测"周五"→"项目截止日是周五"
+（正确且完整）token_f1=0.25，与答错一样落到"较差"，若纳入评级却各占 1/6 权重。
+它们与 recall_at_5 / over_refusal_rate 同为诊断指标：照常计算、照常以百分比
+展示具体值，但不参与综合评级。效率成本类指标（latency / tokens / llm_calls /
+n_questions）依赖部署环境，强制定性会误导，同样不参与评级。
 
 综合评级使用 :func:`continuous_points` 的连续点数（1.0~4.0），
-在阈值边界处与离散点数一致，但档内随数值线性变化，
+取四项质量指标的均值；在阈值边界处与离散点数一致，但档内随数值线性变化，
 使"档内改进"也能反映到综合评级上。
 """
 
@@ -20,6 +26,7 @@ from __future__ import annotations
 from typing import Any
 
 __all__ = [
+    "DIAGNOSTIC_METRICS",
     "LABELS",
     "LABEL_POINTS",
     "METRIC_THRESHOLDS",
@@ -45,26 +52,33 @@ LABEL_POINTS: dict[str, int] = {
     "较差": 1,
 }
 
-# 单指标阈值表：
+# 单指标阈值表（四项质量指标）：
 #   key -> (direction, [(阈值, 标签), ...])，阈值按从严到宽排列。
 #   direction == "higher" 表示越高越好（value >= 阈值 即命中）；
 #   direction == "lower"  表示越低越好（value <= 阈值 即命中）。
 # 未出现在表中的指标视为不可评级。
+#
+# token_f1 / bleu1 故意不在此表：它们只测字面重合，不判语义正确性——gold
+# "周五" 答成 "项目截止日是周五"（正确且完整）token_f1 仅 0.25，会与答错
+# 一样落到"较差"；LLM 判分下 accuracy 已经判了语义正确性，再按字面重合各占
+# 综合评级 1/6 权重会系统性压低评级。
 METRIC_THRESHOLDS: dict[str, tuple[str, list[tuple[float, str]]]] = {
     "accuracy": ("higher", [(0.90, "优秀"), (0.75, "良好"), (0.60, "中等")]),
-    "token_f1": ("higher", [(0.90, "优秀"), (0.75, "良好"), (0.60, "中等")]),
-    "bleu1": ("higher", [(0.60, "优秀"), (0.45, "良好"), (0.30, "中等")]),
     "evidence_recall": ("higher", [(0.95, "优秀"), (0.85, "良好"), (0.70, "中等")]),
     "abstention_accuracy": ("higher", [(0.90, "优秀"), (0.80, "良好"), (0.60, "中等")]),
     "stale_rate": ("lower", [(0.03, "优秀"), (0.10, "良好"), (0.20, "中等")]),
 }
 
-# 比率型指标（[0,1]，报告中以百分比展示具体值）：六项可评级质量指标 +
-# 两项诊断指标（严格检索召回率@5 / 过度拒答率——展示但不参与评级）。
-RATE_METRICS: frozenset[str] = frozenset(METRIC_THRESHOLDS) | {
-    "recall_at_5",
-    "over_refusal_rate",
-}
+# 诊断指标：照常计算、以百分比展示具体值，但不参与综合评级。
+# token_f1 / bleu1 是字面重合度；recall_at_5 / over_refusal_rate 用于
+# 检索与拒答的分诊归因。
+DIAGNOSTIC_METRICS: frozenset[str] = frozenset(
+    {"token_f1", "bleu1", "recall_at_5", "over_refusal_rate"}
+)
+
+# 比率型指标（[0,1]，报告中以百分比展示具体值）：四项可评级质量指标 +
+# 四项诊断指标。
+RATE_METRICS: frozenset[str] = frozenset(METRIC_THRESHOLDS) | DIAGNOSTIC_METRICS
 
 # 综合评级阈值：对可评级质量指标的点数取均值后按此映射为标签。
 OVERALL_THRESHOLDS: list[tuple[float, str]] = [
@@ -156,11 +170,11 @@ def continuous_points(key: str, value: float) -> float | None:
 def overall_rating(overall: dict[str, Any]) -> tuple[str, float] | None:
     """对 overall 汇总给出综合评级。
 
-    取 overall 中"存在且可评级"的质量指标
-    （accuracy / token_f1 / bleu1 / evidence_recall /
-    abstention_accuracy / stale_rate）各自的**连续点数**均值
-    （:func:`continuous_points`，档内随数值线性变化），
+    取 overall 中"存在且可评级"的四项质量指标
+    （accuracy / evidence_recall / abstention_accuracy / stale_rate）
+    各自的**连续点数**均值（:func:`continuous_points`，档内随数值线性变化），
     均值 >= 3.5 优秀、>= 2.5 良好、>= 1.5 中等，否则较差。
+    诊断指标（token_f1 / bleu1 / recall_at_5 / over_refusal_rate）不参与。
 
     Args:
         overall: 汇总指标字典（aggregate 输出的 ``metrics["overall"]``）。

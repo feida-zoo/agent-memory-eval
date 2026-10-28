@@ -7,7 +7,7 @@
     -> 每个数据集用 Runner 各跑一次写进它的 ``runs/<dataset>/``
        （adapter 实例复用，reset 由 Runner 内部负责；write_task_reports=False）
     -> 读取各数据集 ``report/metrics.json``
-    -> 宏平均融合六项质量指标（按能力标注决定参与集）
+    -> 宏平均融合六项质量指标（按能力标注决定参与集；其中四项参与综合评级）
     -> 办公域 stale 门禁（一票否决）
     -> 任务级报告写实验目录的 ``reports/``：report.md（全量评估报告）、
        metrics.json（任务级汇总）、evaluate_summary.json（机器可消费的清单）、
@@ -46,6 +46,7 @@ from membench.report import (
     _fmt_opt,
     fig_dataset_overview,
     metric_label,
+    metric_label_with_role,
     token_usage_totals,
 )
 from membench.runner import Runner
@@ -56,7 +57,8 @@ from membench.userdata import (
     resolve_dataset_arg,
 )
 
-#: 参与融合的六项质量指标（宏平均口径）。
+#: 参与融合的六项质量指标（宏平均口径；token_f1 / bleu1 为字面重合诊断，
+#: 不参与综合评级）。
 QUALITY_METRICS: tuple[str, ...] = (
     "accuracy",
     "token_f1",
@@ -66,10 +68,12 @@ QUALITY_METRICS: tuple[str, ...] = (
     "stale_rate",
 )
 
-#: 诊断指标（展示但不参与综合评级与门禁）：严格检索召回率@5 与过度拒答率。
+#: 「诊断指标（不参与评级）」小节的展示列：严格检索召回率@5 与过度拒答率。
+#: 评级口径的诊断指标另见 :data:`membench.ratings.DIAGNOSTIC_METRICS`
+#: （还含 token_f1 / bleu1——字面重合度）。
 DIAGNOSTIC_METRICS: tuple[str, ...] = ("recall_at_5", "over_refusal_rate")
 
-#: 融合指标集：六项质量指标 + 两项诊断指标（宏平均口径一致）。
+#: 融合指标集：六项质量指标 + 两项检索/拒答诊断指标（宏平均口径一致）。
 FUSED_METRICS: tuple[str, ...] = QUALITY_METRICS + DIAGNOSTIC_METRICS
 
 #: 办公域 stale 门禁阈值：办公域槽位数据集 stale_rate 超过该值即一票否决。
@@ -898,12 +902,13 @@ def _render_task_report_md(
         lines.append(f"**综合评级：{label}（{mean_points:.2f}/4.0）**")
         lines.append("")
         lines.append(
-            "<sub>评级规则：先对六项质量指标（accuracy / token_f1 / bleu1 / "
-            "evidence_recall / abstention_accuracy / stale_rate）做跨数据集宏平均融合"
-            "（指标仅在具备对应能力标注的数据集上参与），再取融合值的连续点数"
-            "（1.0~4.0，档内随数值线性变化）均值，阈值 3.5 / 2.5 / 1.5；"
-            "效率成本指标与两项诊断指标（检索召回率@5 / 过度拒答率）不参与评级。"
-            "门禁为一票否决，独立于本评级。</sub>"
+            "<sub>评级规则：先对六项质量指标做跨数据集宏平均融合"
+            "（指标仅在具备对应能力标注的数据集上参与），再取其中四项评级指标"
+            "（accuracy / evidence_recall / abstention_accuracy / stale_rate）"
+            "融合值的连续点数（1.0~4.0，档内随数值线性变化）均值，"
+            "阈值 3.5 / 2.5 / 1.5；token_f1 / bleu1（字面重合度，非语义正确性）"
+            "与 recall_at_5 / over_refusal_rate 为诊断指标，仅展示不参与评级；"
+            "效率成本指标同样不参与评级。门禁为一票否决，独立于本评级。</sub>"
         )
         lines.append("")
 
@@ -920,13 +925,13 @@ def _render_task_report_md(
             value_str = format_metric(metric, entry["value"])
             participants_str = "、".join(entry["participants"]) or "（无参与集）"
         fused_rows.append(
-            [metric_label(metric), value_str, participants_str]
+            [metric_label_with_role(metric), value_str, participants_str]
         )
     lines.append(_md_table(["指标", "融合值", "参与数据集"], fused_rows))
     lines.append("")
     lines.append(
-        "<sub>注：检索召回率@5 与过度拒答率为诊断指标（展示与归因用），"
-        "不参与综合评级与门禁。</sub>"
+        "<sub>注：token_f1 / bleu1（字面重合度，非语义正确性）与检索召回率@5 / "
+        "过度拒答率为诊断指标，仅展示与归因，不参与综合评级与门禁。</sub>"
     )
     lines.append("")
 

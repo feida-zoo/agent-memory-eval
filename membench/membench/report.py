@@ -47,6 +47,7 @@ def _require_plt() -> None:
         raise RuntimeError(_MPL_HINT)
 
 from .ratings import (
+    DIAGNOSTIC_METRICS,
     format_metric,
     format_metric_delta,
     format_metric_value,
@@ -148,6 +149,12 @@ def metric_label(key: str, with_key: bool = True) -> str:
 def metric_labels(keys: Iterable[str], with_key: bool = True) -> list[str]:
     """批量取指标的显示名（缺值过滤掉，但保留顺序）。"""
     return [metric_label(k, with_key=with_key) for k in keys if k]
+
+
+def metric_label_with_role(key: str) -> str:
+    """指标表显示名；诊断指标（不参与综合评级）追加「（诊断）」后缀。"""
+    label = metric_label(key)
+    return f"{label}（诊断）" if key in DIAGNOSTIC_METRICS else label
 
 
 #: ``metrics.json`` 的 ``token_usage`` 块字段 -> 中文显示名（报告与控制台共用）。
@@ -317,7 +324,7 @@ BASELINES: list[tuple[str, str, str, Any]] = [
     ("abstention_accuracy", metric_label("abstention_accuracy"), ">= 0.80", lambda v: v >= 0.80),
 ]
 
-#: 质量指标（参与评级）与诊断指标（不参与评级）的分组展示口径。
+#: 对比报告的指标展示顺序：四项评级质量指标 + 四项诊断指标。
 DIFF_METRICS: list[str] = [
     "accuracy",
     "token_f1",
@@ -959,19 +966,25 @@ def write_run_report_md(
     lines.append("")
     summary_rows = [
         ["正确性", metric_label("accuracy"), format_metric("accuracy", overall.get("accuracy", "n/a"))],
-        ["正确性", metric_label("token_f1"), format_metric("token_f1", overall.get("token_f1", "n/a"))],
-        ["正确性", metric_label("bleu1"), format_metric("bleu1", overall.get("bleu1", "n/a"))],
+        ["正确性", metric_label_with_role("token_f1"), format_metric("token_f1", overall.get("token_f1", "n/a"))],
+        ["正确性", metric_label_with_role("bleu1"), format_metric("bleu1", overall.get("bleu1", "n/a"))],
         ["检索质量", metric_label("evidence_recall"), format_metric("evidence_recall", overall.get("evidence_recall", "n/a"))],
-        ["检索质量", metric_label("recall_at_5"), format_metric("recall_at_5", overall.get("recall_at_5", "n/a"))],
+        ["检索质量", metric_label_with_role("recall_at_5"), format_metric("recall_at_5", overall.get("recall_at_5", "n/a"))],
         ["效率成本", metric_label("latency_p50_ms"), _fmt(overall.get("latency_p50_ms", "n/a"))],
         ["效率成本", metric_label("latency_p95_ms"), _fmt(overall.get("latency_p95_ms", "n/a"))],
         ["效率成本", metric_label("avg_input_tokens"), _fmt(overall.get("avg_input_tokens", "n/a"))],
         ["效率成本", metric_label("avg_llm_calls"), _fmt(overall.get("avg_llm_calls", "n/a"))],
         ["记忆动态", metric_label("stale_rate"), format_metric("stale_rate", overall.get("stale_rate", "n/a"))],
         ["拒答", metric_label("abstention_accuracy"), format_metric("abstention_accuracy", overall.get("abstention_accuracy", "n/a"))],
-        ["拒答", metric_label("over_refusal_rate"), format_metric("over_refusal_rate", overall.get("over_refusal_rate", "n/a"))],
+        ["拒答", metric_label_with_role("over_refusal_rate"), format_metric("over_refusal_rate", overall.get("over_refusal_rate", "n/a"))],
     ]
     lines.append(_md_table(["维度", "指标", "值"], summary_rows))
+    lines.append("")
+    lines.append(
+        "<sub>Token F1 / BLEU-1 为诊断指标：只测与参考答案的字面重合度，"
+        "不代表语义正确性——正确但表述更完整的回答也会因字面重合低而失分。"
+        "它们与检索召回率@5 / 过度拒答率一样照常展示具体值，但不参与综合评级。</sub>"
+    )
     lines.append("")
 
     # LLM judge 回退比例 >5% 时在指标表下方给出警示（判分质量可能退化）。
@@ -991,10 +1004,12 @@ def write_run_report_md(
         lines.append(f"**综合评级：{label}（{mean_points:.2f}/4.0）**")
         lines.append("")
         lines.append(
-            "<sub>评级规则：取六项质量指标（accuracy / token_f1 / bleu1 / "
-            "evidence_recall / abstention_accuracy / stale_rate）的连续点数"
+            "<sub>评级规则：取四项质量指标（accuracy / evidence_recall / "
+            "abstention_accuracy / stale_rate）的连续点数"
             "（1.0~4.0，档内随数值线性变化）均值，阈值 3.5 / 2.5 / 1.5；"
-            "效率成本指标与两项诊断指标（检索召回率@5 / 过度拒答率）不参与评级。</sub>"
+            "token_f1 / bleu1（字面重合度，非语义正确性）与 "
+            "recall_at_5 / over_refusal_rate 为诊断指标，仅展示不参与评级；"
+            "效率成本指标同样不参与评级。</sub>"
         )
         lines.append("")
 
@@ -1012,7 +1027,7 @@ def write_run_report_md(
     ]
     lines.append(
         _md_table(
-            ["题型", metric_label("accuracy"), metric_label("token_f1"), "题数"],
+            ["题型", metric_label("accuracy"), metric_label_with_role("token_f1"), "题数"],
             cat_rows or [["(无)", "", "", ""]],
         )
     )
@@ -1280,8 +1295,10 @@ def write_compare_report_md(
         lines.append(f"- B 综合评级：{rated_b[0]}（{rated_b[1]:.2f}/4.0）")
     lines.append("")
     lines.append(
-        "<sub>评级取六项质量指标连续点数均值；效率成本与两项诊断指标"
-        "（检索召回率@5 / 过度拒答率）不参与评级。</sub>"
+        "<sub>评级取四项质量指标（accuracy / evidence_recall / "
+        "abstention_accuracy / stale_rate）连续点数均值；token_f1 / bleu1"
+        "（字面重合度，非语义正确性）与 recall_at_5 / over_refusal_rate"
+        "为诊断指标，仅展示不参与评级；效率成本指标同样不参与评级。</sub>"
     )
     lines.append("")
 
