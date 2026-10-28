@@ -34,7 +34,7 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
         [--driver-llm gpt-4o] [--adapter-version a1b2c3] \
         [--report-out DIR | --task-dir DIR] [--adapter-arg KEY=VALUE]... \
         [--no-snapshot] \
-        [--quick | --beam-10m | --no-beam] [--no-lme-s] \
+        [--quick | --beam-10m | --no-beam] [--no-lme-s] [--common] \
         [--fusion weighted|equal]   # 基准集融合口径（默认 weighted：按题数加权、封顶 500）\
         [--evidence-match substring|overlap|llm] \
         [--dataset KEY|PATH]...   # 显式数据集清单（与预设开关互斥） \
@@ -46,7 +46,7 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
         [--adapter-arg-a KEY=VALUE]... [--adapter-arg-b KEY=VALUE]... \
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
         [--report-out DIR | --task-dir DIR] [--no-snapshot] [--tag <name>] \
-        [--quick | --beam-10m | --no-beam] \
+        [--quick | --beam-10m | --no-beam] [--common] \
         [--fusion weighted|equal]   # 两侧共用（默认 weighted）\
         [--no-lme-s] [--evidence-match substring|overlap|llm] \
         [--dataset KEY|PATH]...   # 两侧使用同一清单（与预设开关互斥） \
@@ -343,6 +343,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--no-beam", action="store_true", help="不评测 BEAM 槽位（与 --beam-10m 互斥）")
     p_ev.add_argument("--no-lme-s", action="store_true", help="剔除 LongMemEval-S 变体（默认包含；~268MB、高成本）")
     p_ev.add_argument(
+        "--common",
+        action="store_true",
+        help="公开基准常用集：locomo / longmemeval_oracle / gatemem_office / beam_1m，"
+        "不含办公域槽位（office / 用户测试集）与 LongMemEval-S；与 --quick 互斥，"
+        "--no-beam 跳过 BEAM、--beam-10m 换 BEAM 全集，--no-lme-s 在本预设下无效果",
+    )
+    p_ev.add_argument(
         "--fusion",
         choices=("weighted", "equal"),
         default="weighted",
@@ -444,6 +451,13 @@ def _build_parser() -> argparse.ArgumentParser:
     ev_cmp_group.add_argument("--beam-10m", action="store_true", help="BEAM 槽位使用 beam_10m.jsonl")
     p_ev_cmp.add_argument("--no-beam", action="store_true", help="不评测 BEAM 槽位（与 --beam-10m 互斥）")
     p_ev_cmp.add_argument("--no-lme-s", action="store_true", help="剔除 LongMemEval-S 变体（默认包含）")
+    p_ev_cmp.add_argument(
+        "--common",
+        action="store_true",
+        help="公开基准常用集：locomo / longmemeval_oracle / gatemem_office / beam_1m，"
+        "不含办公域槽位（office / 用户测试集）与 LongMemEval-S；与 --quick 互斥，"
+        "--no-beam 跳过 BEAM、--beam-10m 换 BEAM 全集，--no-lme-s 在本预设下无效果",
+    )
     p_ev_cmp.add_argument(
         "--fusion",
         choices=("weighted", "equal"),
@@ -1395,15 +1409,20 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
         raise SystemExit(f"--jobs 必须 >= 1，当前为 {args.jobs}")
     if args.beam_10m and args.no_beam:
         raise SystemExit("--beam-10m 与 --no-beam 互斥（BEAM 槽位状态冲突）")
-    preset_used = args.quick or args.beam_10m or args.no_beam or args.no_lme_s
+    if args.quick and args.common:
+        raise SystemExit(
+            "--common 与 --quick 互斥（公开基准常用集与快速模式的数据集清单不同）"
+        )
+    preset_used = args.quick or args.beam_10m or args.no_beam or args.no_lme_s or args.common
     if args.dataset and preset_used:
         raise SystemExit(
-            "--dataset 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）"
+            "--dataset 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s / --common）"
             "互斥：显式清单时请直接枚举全部数据集"
         )
     if args.from_runs and preset_used:
         raise SystemExit(
-            "--from-runs 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）互斥"
+            "--from-runs 与预设开关"
+            "（--quick / --beam-10m / --no-beam / --no-lme-s / --common）互斥"
         )
     specs = dataset_specs(args.dataset) if args.dataset else None
     from_runs = parse_run_kv(args.from_runs, "--from-runs")
@@ -1424,6 +1443,7 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
             beam_10m=args.beam_10m,
             no_beam=args.no_beam,
             no_lme_s=args.no_lme_s,
+            common=args.common,
             jobs=args.jobs,
             driver_llm=args.driver_llm,
             adapter_version=args.adapter_version,
@@ -1445,16 +1465,20 @@ def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
         raise SystemExit(f"--jobs 必须 >= 1，当前为 {args.jobs}")
     if args.beam_10m and args.no_beam:
         raise SystemExit("--beam-10m 与 --no-beam 互斥（BEAM 槽位状态冲突）")
-    preset_used = args.quick or args.beam_10m or args.no_beam or args.no_lme_s
+    if args.quick and args.common:
+        raise SystemExit(
+            "--common 与 --quick 互斥（公开基准常用集与快速模式的数据集清单不同）"
+        )
+    preset_used = args.quick or args.beam_10m or args.no_beam or args.no_lme_s or args.common
     if args.dataset and preset_used:
         raise SystemExit(
-            "--dataset 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）"
+            "--dataset 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s / --common）"
             "互斥：显式清单时请直接枚举全部数据集"
         )
     if (args.baseline_run or args.candidate_run) and preset_used:
         raise SystemExit(
             "--baseline-run / --candidate-run 与预设开关"
-            "（--quick / --beam-10m / --no-beam / --no-lme-s）互斥"
+            "（--quick / --beam-10m / --no-beam / --no-lme-s / --common）互斥"
         )
     specs = dataset_specs(args.dataset) if args.dataset else None
     baseline_runs = parse_run_kv(args.baseline_run, "--baseline-run")
@@ -1485,6 +1509,7 @@ def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
             beam_10m=args.beam_10m,
             no_beam=args.no_beam,
             no_lme_s=args.no_lme_s,
+            common=args.common,
             tag=args.tag,
             jobs=args.jobs,
             driver_llm_baseline=args.driver_llm_a,

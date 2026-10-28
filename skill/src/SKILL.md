@@ -22,6 +22,7 @@ description: >
 |---|---|---|
 | 跑一次评测（单集 / 多集） | `scripts/run_task.py eval` | `output/eval_<name>_<platform>_<ts>/` |
 | 全量评估（基准集加权宏平均 + 办公域单列） | 原生 `membench.cli evaluate` | 同上，任务级 `reports/evaluate_summary.json` |
+| 公开基准常用集（无 office / lme_s） | 原生 `membench.cli evaluate --common` | 同 `eval_*` |
 | 两个 commit 或两版系统 A/B | `scripts/run_task.py ab` | `output/compare_<name>_<platform>_<ts>/` |
 | 跨数据集 A/B（融合 diff） | 原生 `membench.cli evaluate-compare` | 同 `compare_*`（含 `fig_fused_diff.png`） |
 | 优化闭环（诊断→建议→plan→执行→AB→报告） | `scripts/run_task.py eval` / `ab` | 基线 `eval_*` + 对比 `compare_*` |

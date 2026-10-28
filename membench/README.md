@@ -109,6 +109,8 @@ python -m membench.cli evaluate --adapter <a> --no-lme-s    # 剔除 LongMemEval
 python -m membench.cli evaluate --adapter <a> --no-beam     # 不跑 BEAM
 python -m membench.cli evaluate --adapter <a> --beam-10m    # BEAM 换 10M 全集终验（与 --no-beam 互斥）
 python -m membench.cli evaluate --adapter <a> --quick       # 跳过 BEAM 与 LongMemEval-S（分钟级回归）
+python -m membench.cli evaluate --adapter <a> --common      # 公开基准常用集：locomo + longmemeval_oracle + gatemem_office + beam_1m
+                                                            # （无办公域槽位、无 LongMemEval-S；与 --quick 互斥）
 python -m membench.cli evaluate --adapter <a> --fusion equal  # 基准集内等权（对比旧口径时用）
 # 显式数据集清单（可重复 --dataset，key 与 JSONL 路径可混用；与预设开关互斥）
 python -m membench.cli evaluate --adapter <a> \
@@ -133,6 +135,13 @@ python -m membench.cli evaluate --adapter <a> \
 清单中**第一个数据集承担办公域槽位**（stale 门禁作用域；无可机检 stale 题时门禁自动
 SKIP）；未显式给出时默认清单的办公域槽位规则不变。
 
+三档预设是**由宽到窄**的三个口径（不是严格集合包含：`--quick` 保留办公域槽位，`--common` 不含）：
+**默认全量**（办公域槽位 + locomo + longmemeval_oracle + gatemem_office + LongMemEval-S + BEAM-1M）；
+**`--common`**（公开基准常用集：locomo + longmemeval_oracle + gatemem_office + beam_1m，
+**无办公域槽位、无 LongMemEval-S**）；**`--quick`**（办公域槽位 + locomo + longmemeval_oracle +
+gatemem_office，跳过 BEAM 与 LongMemEval-S，分钟级回归）。`--common` 与 `--quick` 互斥；
+`--no-beam` / `--beam-10m` 在 common 下照常生效，`--no-lme-s` 在 common 下无效果（该变体本就不在清单里）。
+
 ## A/B 两组多数据集融合对比
 
 `evaluate-compare` 一次跑两套 adapter × 多数据集，直接产出**逐数据集 diff + 跨数据集融合 diff + 门禁 + 对比图**，落 `<实验目录父目录>/compare_<name>_<platform>_<ts>/` 自包含结构（`A/`、`B/` 各为完整评测产物——含自身 `runs/` 与 `reports/`；对比结论 `reports/comparison.md` 与两张对比图 `reports/fig_per_dataset_diff.png`、`reports/fig_fused_diff.png` 落实验目录的 `reports/`）：
@@ -142,7 +151,7 @@ python -m membench.cli evaluate-compare \
     --baseline-adapter <adapter_A> --candidate-adapter <adapter_B> \
     --judge llm --report-out <实验目录父目录> --tag "优化前vs优化后"
 
-# 同样支持 --no-lme-s / --no-beam / --beam-10m / --quick 与 --dataset 显式清单；
+# 同样支持 --no-lme-s / --no-beam / --beam-10m / --quick / --common 与 --dataset 显式清单；
 # 两侧可分别指定 driver_llm / adapter_version
 python -m membench.cli evaluate-compare \
     --baseline-adapter A --candidate-adapter B \
@@ -172,7 +181,7 @@ python -m membench.cli evaluate-compare \
 - **参与条件不变**：指标只在具备对应标注能力的数据集上参与——没有可机检 stale 题的集（locomo/longmemeval，或只有 `gold_stale_note` 且用启发式判分的集）不参与 stale_rate，无 evidence 标注的集（longmemeval/beam）不参与 evidence_recall，无 abstention 题的集不参与 abstention_accuracy。绝不用"记 0"稀释。分母为 0 或取不到的集跳过该指标；旧 run 缺 `evidence_n` / `abstention_n` 时回退 `n_questions`。**accuracy / evidence_recall / abstention_accuracy / stale_rate 四项参与基准评级**；token_f1 / bleu1 只测字面重合（诊断指标），照常计算与展示但不参与评级。**诊断指标**（检索召回率@5 需 has_evidence；过度拒答率）同样融合展示，但不参与评级与门禁。
 - **门禁一票否决独立于基准评级**：办公域槽位 stale_rate > 0.03 → 总评"不达标"，退出码 1（可接 CI），无论基准评级多高；`evaluate-compare` 的顶层门禁同样包含办公域这一组红线（门禁名带「（办公域）」），office 移出融合不等于把红线移出结论。
 - **基准集为空**（只评测了 office）：基准评级显示 `n/a`，业务结论与门禁照常输出。
-- **按需下载的公开集必须先 fetch**：`locomo` / `longmemeval_oracle` / `gatemem_office` / `longmemeval_s` / `beam_1m`（或 `beam_10m`）都没有内置文件，`evaluate` 从 `~/.membench/datasets/` 解析可用路径，缺失时报错提示先 `python -m membench.cli dataset fetch <key>`（`--no-lme-s` 不检查 LongMemEval-S；`--no-beam` / `--quick` 不检查 BEAM 槽位）。judge=heuristic 跑 BEAM 会警告（rubric 型题目规则判分失真，建议 llm/client）。
+- **按需下载的公开集必须先 fetch**：`locomo` / `longmemeval_oracle` / `gatemem_office` / `longmemeval_s` / `beam_1m`（或 `beam_10m`）都没有内置文件，`evaluate` 从 `~/.membench/datasets/` 解析可用路径，缺失时报错提示先 `python -m membench.cli dataset fetch <key>`（`--no-lme-s` / `--common` 不检查 LongMemEval-S；`--no-beam` / `--quick` / `--common --no-beam` 不检查 BEAM 槽位）。judge=heuristic 跑 BEAM 会警告（rubric 型题目规则判分失真，建议 llm/client）。
 - **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**，缺省 `output_root()`）落 `DIR/eval_<adapter>_<platform>_<ts>/`：各数据集产物在 `runs/<dataset>/`（数据集级报告 `report/{report.md,metrics.json,results.jsonl,fig_*.png}`，逐对话目录 `<对话>/` 内含 `report/`、`runtime/`、`memory_snapshot/`），任务级报告在 `reports/`（`report.md` + `metrics.json` + `evaluate_summary.json` + `fig_dataset_overview.png`）。
 
 run 产物（`runs/<dataset>/report/`）：`results.jsonl`（逐题原始记录）、`metrics.json`、`report.md`、`fig_category_accuracy.png`、`fig_latency_hist.png`；逐对话产物落 `runs/<dataset>/<对话目录>/report/`（纯文字，不出图）。

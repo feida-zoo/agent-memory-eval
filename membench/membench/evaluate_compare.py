@@ -570,6 +570,7 @@ def evaluate_compare(
     beam_10m: bool = False,
     no_beam: bool = False,
     no_lme_s: bool = False,
+    common: bool = False,
     report_out: Union[str, None] = None,
     tag: Union[str, None] = None,
     specs: Union[list[DatasetSpec], None] = None,
@@ -605,10 +606,10 @@ def evaluate_compare(
             driver_llm / adapter_version 时启动即提示（严格可比性会判无法核验）。
         platform / commit: 平台与 commit 标签（写到两侧 run 元数据）。platform
             缺省取两侧产物的 platform；两侧不同时实验目录名用 ``p1-p2``（跨平台对比）。
-        quick / beam_10m / no_beam / no_lme_s: 同 :func:`membench.evaluate.evaluate`。
+        quick / beam_10m / no_beam / no_lme_s / common: 同 :func:`membench.evaluate.evaluate`。
         report_out: 对比实验目录父目录；缺省 :func:`membench.paths.output_root`。
         tag: 实验目录标签；缺省由两个 adapter 名拼成 ``<baseline>_vs_<candidate>``。
-        specs: 显式数据集清单（默认 None 时按 quick/beam_10m/no_beam/no_lme_s 调 plan_datasets）。
+        specs: 显式数据集清单（默认 None 时按 quick/beam_10m/no_beam/no_lme_s/common 调 plan_datasets）。
         jobs: 透传给 Runner 的题目级并发参数。
         driver_llm_baseline / driver_llm_candidate: 两侧各自的 driver LLM 标识。
         adapter_version_baseline / adapter_version_candidate: 两侧各自的 adapter 版本。
@@ -648,7 +649,7 @@ def evaluate_compare(
     if (
         (baseline_runs or candidate_runs)
         and specs is None
-        and (quick or beam_10m or no_beam or no_lme_s)
+        and (quick or beam_10m or no_beam or no_lme_s or common)
     ):
         raise SystemExit("--baseline-run/--candidate-run 与预设开关互斥")
 
@@ -669,7 +670,9 @@ def evaluate_compare(
                 (baseline_provided.get(k) or candidate_provided[k]).spec for k in keys
             ]
         else:
-            specs = plan_datasets(quick=quick, beam_10m=beam_10m, no_beam=no_beam, no_lme_s=no_lme_s)
+            specs = plan_datasets(
+                quick=quick, beam_10m=beam_10m, no_beam=no_beam, no_lme_s=no_lme_s, common=common
+            )
     else:
         target_keys = {s.key for s in specs}
         unknown = [k for k in {**baseline_provided, **candidate_provided} if k not in target_keys]

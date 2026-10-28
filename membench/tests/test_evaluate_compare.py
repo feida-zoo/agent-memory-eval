@@ -438,6 +438,52 @@ def test_cli_evaluate_compare_quick_and_beam10m_exclusive() -> None:
     assert exc_info.value.code == 2
 
 
+def test_cli_evaluate_compare_common_conflicts_and_pass_through(monkeypatch) -> None:
+    """CLI --common：与 --dataset / --quick 互斥；合法组合透传 common=True。"""
+    with pytest.raises(SystemExit, match="互斥"):
+        cli.main(
+            [
+                "evaluate-compare",
+                "--baseline-adapter", "mock-strong",
+                "--candidate-adapter", "mock-weak",
+                "--common",
+                "--dataset", "office",
+            ]
+        )
+    with pytest.raises(SystemExit, match="互斥"):
+        cli.main(
+            [
+                "evaluate-compare",
+                "--baseline-adapter", "mock-strong",
+                "--candidate-adapter", "mock-weak",
+                "--common",
+                "--quick",
+            ]
+        )
+
+    captured: dict[str, object] = {}
+
+    def _stub(baseline_adapter, candidate_adapter, judge, **kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return {"verdict": "PASS", "gates": [], "fused_diffs": {}, "fused_baseline": {}, "fused_candidate": {}, "per_dataset": [], "compare_dir": "/tmp/compare_x"}
+
+    import membench.evaluate_compare as ec_mod
+
+    monkeypatch.setattr(ec_mod, "evaluate_compare", _stub)
+    rc = cli.main(
+        [
+            "evaluate-compare",
+            "--baseline-adapter", "mock-strong",
+            "--candidate-adapter", "mock-weak",
+            "--common",
+            "--no-beam",
+        ]
+    )
+    assert rc == 0
+    assert captured["common"] is True
+    assert captured["no_beam"] is True
+
+
 def test_cli_evaluate_compare_pass_through(tmp_path, monkeypatch) -> None:
     """_cmd_evaluate_compare 透传到 evaluate_compare；失败时退出码 1。
 

@@ -745,6 +745,72 @@ def test_plan_datasets_default_and_switches(
         plan_datasets(beam_10m=True, no_beam=True)
 
 
+def test_plan_datasets_common_preset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--common 只留公开基准常用集：无办公域槽位、无 LongMemEval-S。"""
+    home = tmp_path / "home"
+    beam_dir = home / ".membench" / "datasets"
+    beam_dir.mkdir(parents=True)
+    (beam_dir / "beam_1m.jsonl").write_text("", encoding="utf-8")
+    (beam_dir / "beam_10m.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("MEMBENCH_USER_DATA_DIR", str(tmp_path / "no_user_data"))
+    _stub_fetched(monkeypatch, tmp_path)
+
+    specs = plan_datasets(common=True)
+    assert [s.key for s in specs] == [
+        "locomo",
+        "longmemeval_oracle",
+        "gatemem_office",
+        "beam_1m",
+    ]
+    assert all(not s.is_office_slot for s in specs)
+    assert "office" not in [s.key for s in specs]
+    assert "longmemeval_s" not in [s.key for s in specs]
+
+    assert [s.key for s in plan_datasets(common=True, no_beam=True)] == [
+        "locomo",
+        "longmemeval_oracle",
+        "gatemem_office",
+    ]
+    assert [s.key for s in plan_datasets(common=True, beam_10m=True)][-1] == "beam_10m"
+    # --no-lme-s 在 common 下无效果（LongMemEval-S 本就不在清单里）
+    assert [s.key for s in plan_datasets(common=True, no_lme_s=True)] == [
+        "locomo",
+        "longmemeval_oracle",
+        "gatemem_office",
+        "beam_1m",
+    ]
+
+    with pytest.raises(SystemExit, match="互斥"):
+        plan_datasets(common=True, quick=True)
+
+
+def test_cli_common_conflicts_and_pass_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLI --common：与 --dataset / --quick 互斥；合法组合透传 common=True。"""
+    with pytest.raises(SystemExit, match="互斥"):
+        cli.main(
+            ["evaluate", "--adapter", "mock-strong", "--common", "--dataset", "office"]
+        )
+    with pytest.raises(SystemExit, match="互斥"):
+        cli.main(["evaluate", "--adapter", "mock-strong", "--common", "--quick"])
+
+    captured: dict[str, object] = {}
+
+    def _stub_evaluate(adapter, judge, **kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return 0
+
+    import membench.evaluate as evaluate_mod
+
+    monkeypatch.setattr(evaluate_mod, "evaluate", _stub_evaluate)
+    rc = cli.main(["evaluate", "--adapter", "mock-strong", "--common", "--no-beam"])
+    assert rc == 0
+    assert captured["common"] is True
+    assert captured["no_beam"] is True
+
+
 def test_cli_no_lme_s_no_beam_pass_through(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

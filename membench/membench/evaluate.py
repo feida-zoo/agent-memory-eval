@@ -567,6 +567,7 @@ def plan_datasets(
     beam_10m: bool = False,
     no_beam: bool = False,
     no_lme_s: bool = False,
+    common: bool = False,
 ) -> list[DatasetSpec]:
     """规划全量评估的数据集清单。
 
@@ -577,6 +578,13 @@ def plan_datasets(
     ``quick=True`` 等价 ``no_beam=True + no_lme_s=True``：跳过 BEAM 与
     LongMemEval-S 两个重型数据集，适合分钟级日常回归。
 
+    ``common=True`` 是"公开基准常用集"：只留按需下载的公开基准集
+    （locomo / longmemeval_oracle / gatemem_office）与 BEAM，**不构造办公域
+    槽位**（office / 用户测试集）也**不含 LongMemEval-S**——公开基准口径不掺
+    业务集与检索压力变体。与 ``quick`` 互斥（两者清单口径不同）；
+    ``no_beam`` / ``beam_10m`` 照常作用，``no_lme_s`` 在 common 下无效果
+    （LongMemEval-S 本就不在其中）。
+
     所有按需下载公开集都没有内置文件，统一经 ``data.info.resolve_available_path``
     解析可用路径（内置文件优先，其次 dataset fetch 下载目录）；解析不到即
     报错提示先下载，避免拿"路径不存在"的空集当基准、污染可比性。
@@ -585,15 +593,23 @@ def plan_datasets(
         quick: True 时跳过 BEAM 与 LongMemEval-S 槽位（不检查对应文件）。
         beam_10m: True 时 BEAM 槽位使用 beam_10m.jsonl（与 no_beam/quick 互斥）。
         no_beam: True 时不评测 BEAM 槽位。
-        no_lme_s: True 时剔除 LongMemEval-S 变体。
+        no_lme_s: True 时剔除 LongMemEval-S 变体（common 下本就无此变体）。
+        common: True 时只评测公开基准常用集（locomo / longmemeval_oracle /
+            gatemem_office / BEAM），不含办公域槽位与 LongMemEval-S；
+            与 quick 互斥。
 
     Returns:
         DatasetSpec 列表。
 
     Raises:
-        SystemExit: beam_10m 与 no_beam/quick 同传；任一按需下载公开集解析
-            不到路径；未跳过 BEAM 时 BEAM 文件不存在（提示先 dataset fetch）。
+        SystemExit: common 与 quick 同传；beam_10m 与 no_beam/quick 同传；
+            任一按需下载公开集解析不到路径；未跳过 BEAM 时 BEAM 文件不存在
+            （提示先 dataset fetch）。
     """
+    if common and quick:
+        raise SystemExit(
+            "--common 与 --quick 互斥（公开基准常用集与快速模式的数据集清单不同）"
+        )
     if beam_10m and (no_beam or quick):
         raise SystemExit(
             "--beam-10m 与 --no-beam / --quick 互斥（BEAM 槽位状态冲突）"
@@ -601,24 +617,28 @@ def plan_datasets(
     specs: list[DatasetSpec] = []
 
     # 办公域槽位：复用 resolve_dataset 的优先级（用户集 > 内置 office）。
-    office_path, office_source = resolve_dataset(None)
-    office_name = "office（用户测试集）" if office_source == "user" else "office（内置办公黄金集）"
-    specs.append(
-        DatasetSpec(
-            key="office",
-            name=office_name,
-            path=office_path,
-            source=office_source,
-            is_office_slot=True,
+    # common 只面向公开基准集，不构造该槽位（报告的业务结论小节据此显示跳过）。
+    if not common:
+        office_path, office_source = resolve_dataset(None)
+        office_name = (
+            "office（用户测试集）" if office_source == "user" else "office（内置办公黄金集）"
         )
-    )
+        specs.append(
+            DatasetSpec(
+                key="office",
+                name=office_name,
+                path=office_path,
+                source=office_source,
+                is_office_slot=True,
+            )
+        )
 
     # 按需下载的公开集（缺失即报错，不静默跳过）。
     for key in _FETCH_DATASETS:
         specs.append(_fetch_spec(key))
 
-    # LongMemEval-S：默认包含（检索/精确率压力变体）；quick / no_lme_s 剔除。
-    if not (quick or no_lme_s):
+    # LongMemEval-S：默认包含（检索/精确率压力变体）；quick / no_lme_s / common 剔除。
+    if not (common or quick or no_lme_s):
         specs.append(_fetch_spec(_LME_S_KEY))
 
     # BEAM 槽位：默认 beam_1m；beam_10m 切换；no_beam / quick 跳过。
@@ -1469,6 +1489,7 @@ def evaluate(
     beam_10m: bool = False,
     no_beam: bool = False,
     no_lme_s: bool = False,
+    common: bool = False,
     report_out: Union[str, None] = None,
     specs: Union[list[DatasetSpec], None] = None,
     from_runs: Union[dict[str, str], None] = None,
@@ -1498,10 +1519,13 @@ def evaluate(
         quick: 跳过 BEAM 与 LongMemEval-S 槽位（等价 no_beam + no_lme_s）。
         beam_10m: BEAM 槽位用 10m 集。no_beam: 不评测 BEAM 槽位。
         no_lme_s: 剔除 LongMemEval-S 变体（默认包含）。
+        common: 只评测公开基准常用集（locomo / longmemeval_oracle /
+            gatemem_office / BEAM），不含办公域槽位与 LongMemEval-S；
+            与 quick 互斥（清单冲突由 :func:`plan_datasets` 拒绝）。
         report_out: 实验目录的父目录（缺省 :func:`membench.paths.output_root`）；
             实验目录名 ``eval_<adapter>_<platform>_<ts>``，各数据集落它的
             ``runs/<dataset>/``，任务级报告落它的 ``reports/``。
-        specs: 显式数据集清单（默认 None 时按 quick/beam_10m/no_beam/no_lme_s 调 plan_datasets）。
+        specs: 显式数据集清单（默认 None 时按 quick/beam_10m/no_beam/no_lme_s/common 调 plan_datasets）。
         driver_llm: 驱动被测系统的 LLM 标识，透传给每个 run 的元数据（默认 None）。
         adapter_version: 适配器实现版本标识，透传给每个 run 的元数据（默认 None）。
         evidence_matcher: 检索命中口径匹配器（默认 substring；CLI 以
@@ -1530,8 +1554,10 @@ def evaluate(
                 f"任务目录不存在: {task_dir}；"
                 "请先运行 python -m membench.cli task init --name <NAME> 建任务目录"
             )
-    if from_runs and specs is None and (quick or beam_10m or no_beam or no_lme_s):
-        raise SystemExit("--from-runs 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s）互斥")
+    if from_runs and specs is None and (quick or beam_10m or no_beam or no_lme_s or common):
+        raise SystemExit(
+            "--from-runs 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s / --common）互斥"
+        )
 
     provided: dict[str, DatasetResult] = {}
     for key, product_dir in (from_runs or {}).items():
@@ -1545,7 +1571,9 @@ def evaluate(
             specs = [r.spec for r in provided.values()]
             mark_office_slot(specs)
         else:
-            specs = plan_datasets(quick=quick, beam_10m=beam_10m, no_beam=no_beam, no_lme_s=no_lme_s)
+            specs = plan_datasets(
+                quick=quick, beam_10m=beam_10m, no_beam=no_beam, no_lme_s=no_lme_s, common=common
+            )
     else:
         target_keys = {s.key for s in specs}
         unknown = [k for k in provided if k not in target_keys]
