@@ -30,6 +30,7 @@ import re
 from typing import Any, Callable, Union
 
 from membench.data.schema import is_abstention
+from membench.data.stale import resolve_stale
 from membench.llm_ref import import_from_path
 
 from .base import Judge, JudgeResult
@@ -108,9 +109,10 @@ class ClientLLMJudge(Judge):
         # 也照算（不再恒 False），口径与 heuristic / llm judge 保持一致。
         abstained = contains_refusal(prediction or "")
         # 红线指标一律规则判定，不交给（可能与被测系统同源的）LLM：
-        # 有裸旧值才可机检；只有描述句时 stale 不可判，不进入分母。
+        # 旧值经 resolve_stale 解析——裸值直接用，旧缓存的整句描述先抽裸值，
+        # 抽不出即不可机检，不进入分母。
         stale = is_stale(gold_stale, gold, prediction or "")
-        stale_checkable = bool(gold_stale.strip())
+        _, stale_checkable = resolve_stale(gold_stale, gold)
         stale_annotated = bool(gold_stale.strip() or gold_stale_note.strip())
 
         if is_abstention(category, gold):

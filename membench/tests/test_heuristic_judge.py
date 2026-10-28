@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from membench.data.schema import ABSTAIN_SENTINEL, Question
 from membench.judges import HeuristicJudge, LLMJudge, get_judge
+from membench.metrics.summary import aggregate
+from membench.report import stale_rate_display
 
 
 def _q(
@@ -248,6 +250,83 @@ class TestHeuristicJudge:
         # question 传普通字符串时按无元信息处理，不应抛异常。
         result = self.judge.grade("任意问题", "杭州", "杭州")
         assert result.correct is True
+
+
+class TestLegacyProseGoldStale:
+    """旧缓存把整句 potential_confusion 写进 gold_stale：判定侧兜底抽取。
+
+    用户机器上的 ``~/.membench/datasets/beam_1m.jsonl`` 不会因转换器升级而
+    重新生成；判定侧必须能直接判对，而不是分母齐全却恒报 0.0%。
+    """
+
+    #: 用户实测的旧格式样例：gold_stale 是整句描述，gold_answer 是新值。
+    PROSE = (
+        "LLM might incorrectly recall the original 4 study sessions "
+        "instead of the updated 5 study sessions."
+    )
+
+    def setup_method(self) -> None:
+        self.judge = HeuristicJudge()
+
+    def test_prose_gold_stale_is_stale_without_reconversion(self) -> None:
+        # 主答案给旧值 4、括号里补新值 5 → stale；不需要重新转换数据集。
+        result = self.judge.grade(
+            _q(
+                category="knowledge_update",
+                gold_stale=self.PROSE,
+                gold_answer="5 study sessions",
+            ),
+            "5 study sessions",
+            "You did 4 study sessions this month (not 5).",
+        )
+        assert result.stale is True
+        assert result.stale_checkable is True
+        assert result.stale_annotated is True
+        # reason 用抽出的裸旧值，不把整句描述塞进报告。
+        assert "'4 study sessions'" in result.reason
+
+    def test_unextractable_prose_is_uncheckable_and_report_shows_na(self) -> None:
+        prose = "LLM might incorrectly recall the original March 15, 2024 deadline"
+        result = self.judge.grade(
+            _q(
+                category="knowledge_update",
+                gold_stale=prose,
+                gold_answer="March 18, 2024",
+            ),
+            "March 18, 2024",
+            "The deadline is March 15, 2024.",
+        )
+        assert result.stale is False
+        assert result.stale_checkable is False
+        assert result.stale_annotated is True
+
+        record = {
+            "category": "knowledge_update",
+            "gold_answer": "March 18, 2024",
+            "judge": {
+                "correct": result.correct,
+                "abstained_pred": result.abstained_pred,
+                "stale": result.stale,
+                "stale_checkable": result.stale_checkable,
+                "stale_annotated": result.stale_annotated,
+            },
+        }
+        metrics = aggregate(
+            [record],
+            capabilities={
+                "has_evidence": False,
+                "has_stale": True,
+                "has_abstention": False,
+            },
+        )
+        assert metrics["overall"]["stale_rate"] is None
+        assert metrics["overall"]["stale_n"] == 0
+        assert metrics["overall"]["stale_total"] == 1
+        assert metrics["has_stale"] is False
+        # 报告显示 n/a，而不是「优秀（0.0%）」。
+        display = stale_rate_display(metrics["overall"])
+        assert display.startswith("n/a")
+        assert "优秀" not in display
 
 
 class TestGetJudge:

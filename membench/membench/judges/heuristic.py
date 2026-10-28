@@ -8,8 +8,10 @@
   （新值）作为当前事实给出 → ``stale=True``。判定按位置序（见
   :func:`is_stale`）：新值逐字在前即豁免；新值只靠同义命中时用数字锚点
   定位；旧值命中却找不到新值锚点则判陈旧。
-- ``stale_checkable``：仅当题目有裸 ``gold_stale`` 时为真——stale_rate 的
-  分母只含这类题。
+- ``gold_stale`` 的解析统一走 :func:`membench.data.stale.resolve_stale`：
+  裸旧值原样使用，旧缓存里的整句描述先抽裸旧值再判。
+- ``stale_checkable``：仅当解析出可机检的裸旧值时为真——stale_rate 的
+  分母只含这类题；整句描述抽不出旧值时不进分母，报告显示 n/a。
 - ``stale_annotated``：题目是否有 stale 注解（``gold_stale`` 或
   ``gold_stale_note`` 非空），供报告计算覆盖率（可机检 / 全部注解题）。
 - abstention 题（gold 为 ``"<ABSTAIN>"`` 或 category 为 abstention）：
@@ -22,6 +24,7 @@ import re
 
 from membench.adapters.mock import content_tokens
 from membench.data.schema import ABSTAIN_SENTINEL
+from membench.data.stale import resolve_stale
 from membench.metrics.text import token_f1
 
 from .base import Judge, JudgeResult
@@ -152,33 +155,12 @@ def gold_recall_hit(gold: str, prediction: str, threshold: float = _GOLD_RECALL_
     return hit >= effective
 
 
-def is_stale(gold_stale: "str | None", gold: str, prediction: str) -> bool:
-    """陈旧判定：预测里旧值出现，且**没有先给出更新后的值**才算 stale。
-
-    只做「旧值出现即陈旧」会把"引用旧值作为变更上下文、同时给出新值"的正确
-    回答误判为陈旧；反过来只做「新值出现即豁免」又会被"主答案给旧值、括号里
-    顺带提一句新值"骗过（BEAM 的典型失败）。因此按**位置序**判定：
-
-    1. ``gold_stale`` 为空 / 未出现在预测中 → 非 stale。
-    2. 新值（``gold`` 归一后）逐字出现，且**首现早于**旧值 → 非 stale
-       （如 ``"5 sessions, not 4"``：新值在前，旧值只是对照）；旧值整段落在
-       新值内部（如旧值 ``4 sessions``、新值 ``4 sessions per week``）同样豁免。
-    3. 新值字面没有占先，但 ``gold_covered`` / ``gold_recall_hit`` 命中
-       （同义改写、被拆开）→ 再看 gold 的**数字型 token**（如 ``5``、``52``）
-       在预测里出现的位置：任一数字锚点早于旧值 → 非 stale；数字锚点全部
-       在旧值之后（如主答案 ``4 sessions``、括号里 ``5 sessions``）→ stale。
-       gold 没有数字锚点时，沿用"新值语义命中即豁免"（无法定位先后，不
-       凭空判陈旧）。
-    4. 旧值出现且找不到任何新值锚点 → stale（宁可判陈旧，让 LLM 判分纠正）。
-
-    已知边界：``"原来 4 个，现在 5 个"`` 这类"旧值在前、新值在后"的正确回答
-    会被判 stale（数字锚点在旧值之后）——规则只认位置序，不解析语义；这是
-    刻意的保守方向，由 stale_rate 的可机检口径与 LLM judge 兜底共同约束。
-    """
-    if not gold_stale:
+def _stale_hit(old_value: "str | None", gold: str, prediction: str) -> bool:
+    """已解析出裸旧值时的位置序陈旧判定（口径见 :func:`is_stale`）。"""
+    if not old_value:
         return False
     pred_n = normalize(prediction or "")
-    old_n = normalize(gold_stale)
+    old_n = normalize(old_value)
     if not old_n:
         return False
     old_pos = _find_value(pred_n, old_n)
@@ -206,6 +188,40 @@ def is_stale(gold_stale: "str | None", gold: str, prediction: str) -> bool:
     return True
 
 
+def is_stale(gold_stale: "str | None", gold: str, prediction: str) -> bool:
+    """陈旧判定：预测里旧值出现，且**没有先给出更新后的值**才算 stale。
+
+    ``gold_stale`` 先经 :func:`membench.data.stale.resolve_stale` 解析：
+    裸旧值原样使用；旧缓存里仍是整句描述（如 ``"LLM might incorrectly recall
+    the original 4 study sessions instead of the updated 5 study sessions."``）
+    时先抽裸旧值，抽不出则视为不可机检、直接非 stale（不伪造判定依据）。
+
+    只做「旧值出现即陈旧」会把"引用旧值作为变更上下文、同时给出新值"的正确
+    回答误判为陈旧；反过来只做「新值出现即豁免」又会被"主答案给旧值、括号里
+    顺带提一句新值"骗过（BEAM 的典型失败）。因此按**位置序**判定：
+
+    1. ``gold_stale`` 为空 / 解析不出裸旧值 / 未出现在预测中 → 非 stale。
+    2. 新值（``gold`` 归一后）逐字出现，且**首现早于**旧值 → 非 stale
+       （如 ``"5 sessions, not 4"``：新值在前，旧值只是对照）；旧值整段落在
+       新值内部（如旧值 ``4 sessions``、新值 ``4 sessions per week``）同样豁免。
+    3. 新值字面没有占先，但 ``gold_covered`` / ``gold_recall_hit`` 命中
+       （同义改写、被拆开）→ 再看 gold 的**数字型 token**（如 ``5``、``52``）
+       在预测里出现的位置：任一数字锚点早于旧值 → 非 stale；数字锚点全部
+       在旧值之后（如主答案 ``4 sessions``、括号里 ``5 sessions``）→ stale。
+       gold 没有数字锚点时，沿用"新值语义命中即豁免"（无法定位先后，不
+       凭空判陈旧）。
+    4. 旧值出现且找不到任何新值锚点 → stale（宁可判陈旧，让 LLM 判分纠正）。
+
+    已知边界：``"原来 4 个，现在 5 个"`` 这类"旧值在前、新值在后"的正确回答
+    会被判 stale（数字锚点在旧值之后）——规则只认位置序，不解析语义；这是
+    刻意的保守方向，由 stale_rate 的可机检口径与 LLM judge 兜底共同约束。
+    """
+    old_value, checkable = resolve_stale(gold_stale, gold)
+    if not checkable:
+        return False
+    return _stale_hit(old_value, gold, prediction)
+
+
 class HeuristicJudge(Judge):
     """启发式判分器：token 包含匹配 + 拒答检测 + 陈旧命中检测。"""
 
@@ -225,9 +241,10 @@ class HeuristicJudge(Judge):
         gold_stale_note = getattr(question, "gold_stale_note", None)
 
         abstained = contains_refusal(prediction or "")
-        stale = is_stale(gold_stale, gold, prediction or "")
-        # 有裸旧值才可机检：只有描述句（gold_stale_note）时启发式判不了 stale。
-        stale_checkable = bool((gold_stale or "").strip())
+        old_value, stale_checkable = resolve_stale(gold_stale, gold)
+        stale = _stale_hit(old_value, gold, prediction or "")
+        # 只有描述句（gold_stale_note）时启发式判不了 stale；整句写进
+        # gold_stale 的旧缓存则先抽裸旧值，抽不出同样不计入分母。
         stale_annotated = bool(
             (gold_stale or "").strip() or (gold_stale_note or "").strip()
         )
@@ -256,7 +273,7 @@ class HeuristicJudge(Judge):
         else:
             reason = f"token_f1={f1:.3f} < {self.f1_threshold} 且 gold 未覆盖"
         if stale:
-            reason += f"；命中过期事实 '{gold_stale}' 且未先给出更新值"
+            reason += f"；命中过期事实 '{old_value}' 且未先给出更新值"
         return JudgeResult(
             correct=correct,
             abstained_pred=abstained,

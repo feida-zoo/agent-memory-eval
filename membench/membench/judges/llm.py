@@ -5,7 +5,9 @@
 ``{"correct": true/false, "stale": true/false, "reason": "..."}``。
 stale 的语义是"回答把**旧值**当成当前事实"：题目给出 ``gold_stale``（裸旧值）
 或 ``gold_stale_note``（原始描述）时，prompt 一并传给模型；模型没给
-``stale`` 或输出解析失败时回退启发式 :func:`is_stale`。
+``stale`` 或输出解析失败时回退启发式 :func:`is_stale`。回退路径的
+``gold_stale`` 先经 :func:`membench.data.stale.resolve_stale` 解析——旧缓存
+里仍是整句描述时会先抽裸旧值，抽不出则按不可机检处理（不进 stale_rate 分母）。
 
 任何异常（网络、超时、解析失败等）都会回退到 HeuristicJudge，
 并把结果标记为 ``judge="llm-fallback"``，保证评测流程不中断。
@@ -25,6 +27,7 @@ import urllib.error
 import urllib.request
 
 from membench.data.schema import ABSTAIN_SENTINEL
+from membench.data.stale import resolve_stale
 
 from .base import Judge, JudgeResult
 from .heuristic import HeuristicJudge, contains_refusal, is_stale
@@ -225,7 +228,9 @@ class LLMJudge(Judge):
                 stale_checkable = True
             else:
                 stale = is_stale(gold_stale, gold, prediction or "")
-                stale_checkable = bool((gold_stale or "").strip())
+                # 回退规则时按 resolve_stale 的口径：旧缓存的整句描述会先
+                # 抽裸旧值，抽不出即不可机检（不进入 stale_rate 分母）。
+                _, stale_checkable = resolve_stale(gold_stale, gold)
             return JudgeResult(
                 correct=correct,
                 abstained_pred=abstained,

@@ -34,8 +34,10 @@ probing_questions.json 为 dict，key 为 10 种题型，value 为题目列表�
 
 gold_stale 的抽取口径与 office 集统一为"裸旧值"（如 ``9月20日`` /
 ``4 study sessions``），而不是描述句——schema 的 ``gold_stale`` 语义是"过期
-答案，命中即陈旧"，judge 对它做包含与位置判定。至少覆盖三种句式
-（大小写不敏感，捕获到句号 / 分号 / 结尾为止）::
+答案，命中即陈旧"，judge 对它做包含与位置判定。抽取规则见
+``membench.data.stale``（转换器与判定侧共用；判定侧还会从旧缓存的整句
+``gold_stale`` 里兜底抽取）。至少覆盖三种句式（大小写不敏感，捕获到句号 /
+分号 / 结尾为止）::
 
     original X instead of (the )?(updated )?Y      -> X
     previously X ... (but )?now Y                  -> X
@@ -71,10 +73,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
+from .stale import extract_stale_value
 from .timestamps import normalize_timestamp
 
 #: BEAM 题型 -> membench category（1:1 直传，不再合并）
@@ -105,100 +107,6 @@ _PQ_FILENAMES = ("probing_questions.json", "pq.json")
 
 #: role 归一化：assistant 侧关键词（子串匹配，均为小写）。
 _ASSISTANT_HINTS = ("assistant", "agent", "bot", "system", "ai")
-
-#: potential_confusion 的三种句式（大小写不敏感）；每条规则的第 1 捕获组是旧值。
-#: 第 2/3 种（previously … now / originally … now）共用同一条 ``now`` 规则。
-#: 允许标记词后的逗号（``Originally, …``）、值前的 ``the``、以及
-#: ``instead of`` 前的逗号；捕获到句号 / 分号 / 换行 / 结尾为止。
-_STALE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(
-        r"original(?:ly)?\b\s*[,;:，；：]?\s*(?:the\s+)?(.+?)"
-        r"\s*[,;，；—–]?\s*(?:instead\s+of|rather\s+than)\s+"
-        r"(?:the\s+)?(?:updated\s+|new\s+|current\s+)?(.+?)(?:[.;。；\n]|$)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?:previously|originally)\b\s*[,;:，；：]?\s*(?:the\s+)?(.+?)"
-        r"\s*[,;，；—–]?\s*(?:but\s+)?now\b\s*[,;:，；：]?\s*"
-        r"(?:the\s+)?(.+?)(?:[.;。；\n]|$)",
-        re.IGNORECASE,
-    ),
-)
-
-#: 裸旧值的最大长度：更长的多半是整句描述而非"值"，按解析失败处理。
-_MAX_STALE_LEN = 80
-
-#: 归一裸旧值时剥离的引号 / 反引号与首尾标点。
-_STALE_QUOTES = "\"'`“”‘’「」『』"
-_STALE_LEADING = " \t\r\n,;:，；：、—–"
-_STALE_TRAILING = " \t\r\n.,;:!?，。；：！？、"
-
-#: 描述句里的主语 / 系动词前缀（如 "the user had 4 study sessions"、
-#: "the deadline was March 15"）。反复剥离到不再命中，留下值本身。
-_STALE_CLAUSE_RE = re.compile(
-    r"^.*?\b(?:said|says|say|had|has|have|completed|planned|chose|used|"
-    r"was|were|is|are|stated|mentioned|reported|updated(?:\s+to)?|"
-    r"changed(?:\s+to)?|switched(?:\s+to)?)\b\s+",
-    re.IGNORECASE,
-)
-
-
-def _normalize_stale_value(value: str) -> str:
-    """归一裸旧值：去引号 / 反引号、首尾空白与首尾标点，并剥离主语 / 系动词前缀。"""
-    text = (value or "").strip()
-    while text and (text[0] in _STALE_QUOTES or text[0] in _STALE_LEADING):
-        text = text[1:]
-    while text and (text[-1] in _STALE_QUOTES or text[-1] in _STALE_TRAILING):
-        text = text[:-1]
-    text = text.strip()
-    # "the user had 4 study sessions" -> "4 study sessions"；
-    # 循环处理 "said the deadline was March 15" -> "March 15"。
-    while True:
-        trimmed = _STALE_CLAUSE_RE.sub("", text, count=1).strip()
-        if trimmed == text or not trimmed:
-            break
-        text = trimmed
-    return text
-
-
-def _same_value(a: str, b: str) -> bool:
-    """两个值归一后是否相同（忽略大小写、空白与常见标点）。"""
-    def _norm(text: str) -> str:
-        return re.sub(r"[\s，。！？、；：,.!?;:'\"“”‘’（）()]+", "", text.lower())
-
-    return bool(_norm(a)) and _norm(a) == _norm(b)
-
-
-def extract_stale_value(
-    confusion: "str | None", gold_answer: str
-) -> "str | None":
-    """从 potential_confusion 描述句中抽取裸旧值。
-
-    抽不到、旧值过长（> 80 字符）或与 gold_answer 相同（归一后）时返回
-    ``None``——调用方应保留原始描述到 ``gold_stale_note``，并把
-    ``gold_stale`` 留空（不可机检），而不是把描述句塞进值字段。
-
-    Args:
-        confusion: 原始描述句（BEAM 的 ``potential_confusion``）。
-        gold_answer: 该题的标准答案（新值），用于排除"旧值=新值"的误抽。
-
-    Returns:
-        归一后的裸旧值；解析失败返回 ``None``。
-    """
-    if not isinstance(confusion, str) or not confusion.strip():
-        return None
-    for pattern in _STALE_PATTERNS:
-        match = pattern.search(confusion)
-        if match is None:
-            continue
-        value = _normalize_stale_value(match.group(1))
-        if not value or len(value) > _MAX_STALE_LEN:
-            continue
-        if _same_value(value, gold_answer):
-            continue
-        return value
-    return None
-
 
 def _normalize_role(raw: object) -> str:
     """将原始 role 映射为 schema 允许的 user/assistant 中最接近者。"""

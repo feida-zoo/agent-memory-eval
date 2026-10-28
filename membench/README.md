@@ -514,7 +514,7 @@ python -m membench.cli run --adapter <你的适配器> --dataset <同一个数�
 
 - LLM judge 输出按三级解析：整体 JSON → 抠取首个 JSON 对象 → 回退启发式判分并打 `llm-fallback` 标记。
 - 使用 LLM 判分时，metrics.json 顶层记录 `judge_fallback: {count, ratio}`；报告头部展示回退比例，**ratio > 5% 时报告输出警示行**（判分质量可能退化，建议抽查复核）。
-- stale 红线判定：启发式按 `gold_stale` 裸旧值与**位置序**判定（旧值出现、且新值没有先在预测中给出才判 stale）；LLM judge 在同一次调用里按 `gold_stale` / `gold_stale_note` 判 stale，模型没给合法 `stale` 时回退启发式。只有裸 `gold_stale`（LLM 下含 `gold_stale_note`）的题才进入 `stale_rate` 分母。
+- stale 红线判定：启发式按 `gold_stale` 裸旧值与**位置序**判定（旧值出现、且新值没有先在预测中给出才判 stale）；LLM judge 在同一次调用里按 `gold_stale` / `gold_stale_note` 判 stale，模型没给合法 `stale` 时回退启发式。只有**解析出可机检裸旧值**的题才进入 `stale_rate` 分母：裸 `gold_stale` 直接可用，旧缓存里整句写进 `gold_stale` 的会自动抽取裸旧值（抽不出则排除出分母），LLM judge 下 `gold_stale_note` 也可作判定依据。
 
 ## 用户测试集管理
 
@@ -932,6 +932,7 @@ python -m membench.cli run --adapter mock-strong --dataset ~/.membench/datasets/
 - `gold_stale`：**可机检的裸旧值**（如 `4 study sessions`、`9月20日`），judge 对它做包含与位置序判定；手工构造数据集时应填值本身，不要填整句描述。
 - `gold_stale_note`：数据集给出的**原始自然语言描述**（如 BEAM 的 `potential_confusion`），供 LLM judge 判 stale 与人工审计。旧值抽不出时 `gold_stale` 留空、本字段保留原文——此时启发式 judge 对该题**不可机检**，不进入 `stale_rate` 分母；LLM judge 会读描述判定。
 - 旧数据没有 `gold_stale_note` 字段也能正常加载（缺省 `null`）。
+- **旧缓存兼容**：判定侧（`membench.data.stale.resolve_stale`）能识别"整句描述"形态的 `gold_stale`（含 `instead of` / `rather than` / `but now`，或以 `LLM might` / `previously` / `originally` 开头，或长度 > 80 字符）并自动抽取裸旧值，因此未重新转换的旧数据集（如旧版 `beam_1m.jsonl`）在 `--judge heuristic` 下也能正确判 stale。不过仍**推荐重新转换**，得到规范的 `gold_stale` + `gold_stale_note`（解析规则只在判定时兜底，数据集本身仍是旧口径）。抽不出旧值的题按"不可机检"排除出 `stale_rate` 分母，报告显示 `n/a（无可机检的 stale 注解）`，不会记成 0.0%。
 
 **BEAM 重新 fetch**：`gold_stale` 的抽取逻辑在转换器里，已下载的 `beam_1m.jsonl` 不会自动更新。要按新口径重跑，先删 `~/.membench/datasets/beam_1m.jsonl` 与同名 raw 缓存目录，再 `dataset fetch beam_1m`。重新生成会改变数据集指纹（`dataset_sha256`），**历史 BEAM 分数不能与新产物直接对比**（`compare` 会判数据集指纹不一致）。
 
