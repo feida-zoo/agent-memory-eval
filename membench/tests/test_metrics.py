@@ -190,6 +190,9 @@ class TestAggregate:
             "stale_rate",
             "stale_n",
             "stale_total",
+            # 融合权重分母：非拒答题数 / 拒答题数（见 evaluate.fuse_metrics）
+            "evidence_n",
+            "abstention_n",
             "latency_p50_ms",
             "latency_p95_ms",
             "avg_input_tokens",
@@ -225,6 +228,9 @@ class TestAggregate:
         assert overall["avg_ingest_latency_ms"] == pytest.approx(1.0)
         assert overall["avg_llm_calls"] == pytest.approx(0.0)
         assert overall["n_questions"] == 6
+        # 融合权重分母：非拒答题 4、拒答题 2（检索类 / 拒答类指标各自的分母）
+        assert overall["evidence_n"] == 4
+        assert overall["abstention_n"] == 2
 
         by_cat = metrics["by_category"]
         # by_category 附 token_f1 均值（_record 固定 0.5）。

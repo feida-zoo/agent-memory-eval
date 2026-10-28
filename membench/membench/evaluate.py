@@ -1,4 +1,4 @@
-"""evaluate：对多个数据集依次运行评测，跨数据集宏平均融合出综合评分报告。
+"""evaluate：对多个数据集依次运行评测，跨数据集加权融合出基准评级报告。
 
 流程：
     plan_datasets 规划数据集清单（办公域槽位 + 按需下载公开集 + BEAM 槽位）
@@ -7,19 +7,27 @@
     -> 每个数据集用 Runner 各跑一次写进它的 ``runs/<dataset>/``
        （adapter 实例复用，reset 由 Runner 内部负责；write_task_reports=False）
     -> 读取各数据集 ``report/metrics.json``
-    -> 宏平均融合六项质量指标（按能力标注决定参与集；其中四项参与综合评级）
+    -> 融合六项质量指标（按能力标注决定参与集，按参与题数加权；其中四项参与
+       基准评级）
     -> 办公域 stale 门禁（一票否决）
     -> 任务级报告写实验目录的 ``reports/``：report.md（全量评估报告）、
        metrics.json（任务级汇总）、evaluate_summary.json（机器可消费的清单）、
        fig_dataset_overview.png；报告内链接指向 ``runs/<dataset>/report/report.md``。
 
-融合口径（宏平均）：
-    - accuracy / token_f1 / bleu1：所有数据集参与；
-    - evidence_recall：仅 has_evidence（任一题目有 evidence 标注）的数据集参与；
-    - stale_rate：仅 stale_n > 0（本次有可机检的 stale 题）的数据集参与；
-    - abstention_accuracy：仅 has_abstention（任一题目为拒答题：category 为
-      abstention 或 gold 为拒答哨兵值）的数据集参与；
-    融合值 = 参与集该指标 overall 值的算术平均。
+融合口径（基准集按题数加权）：
+    - **办公域槽位（office）不参与融合评级**：它与基准集不同源，单列为
+      「业务结论（办公域槽位）」（准确率 + stale / abstention 红线 + 门禁状态）。
+      门禁照旧一票否决，独立于基准评级；
+    - 参与条件（能力标注）：accuracy / token_f1 / bleu1 所有基准集参与；
+      evidence_recall / recall_at_5 仅 has_evidence（任一题目有 evidence 标注）
+      的数据集；stale_rate 仅 stale_n > 0（本次有可机检的 stale 题）的数据集；
+      abstention_accuracy 仅 has_abstention（任一题目为拒答题：category 为
+      abstention 或 gold 为拒答哨兵值）的数据集；
+    - 权重 = ``min(该指标在该数据集的分母, FUSION_WEIGHT_CAP)``，分母按指标取
+      :data:`METRIC_DENOMINATOR_KEYS`（题数 / 非拒答题数 / 拒答题数 / 可机检
+      stale 题数）；旧 run 缺这些计数时回退 ``n_questions``。86 题的小集与 1986 题的大集
+      不再同权，小样本集也不会靠"每指标一票"抬高综合分；
+    - ``fusion="equal"``：基准集内等权（旧宏平均语义），仍排除办公域槽位。
 
 "产物目录"（``--from-runs`` 的 ``KEY=DIR``）统一经 :func:`membench.layout.resolve_dataset_dir`
 解析：入参可以是实验目录（含 ``runs/``）或数据集目录（``runs/<dataset>``），
@@ -58,8 +66,8 @@ from membench.userdata import (
     resolve_dataset_arg,
 )
 
-#: 参与融合的六项质量指标（宏平均口径；token_f1 / bleu1 为字面重合诊断，
-#: 不参与综合评级）。
+#: 参与融合的六项质量指标（同一套加权口径；token_f1 / bleu1 为字面重合诊断，
+#: 不参与基准评级）。
 QUALITY_METRICS: tuple[str, ...] = (
     "accuracy",
     "token_f1",
@@ -74,8 +82,36 @@ QUALITY_METRICS: tuple[str, ...] = (
 #: （还含 token_f1 / bleu1——字面重合度）。
 DIAGNOSTIC_METRICS: tuple[str, ...] = ("recall_at_5", "over_refusal_rate")
 
-#: 融合指标集：六项质量指标 + 两项检索/拒答诊断指标（宏平均口径一致）。
+#: 融合指标集：六项质量指标 + 两项检索/拒答诊断指标（同一套加权口径）。
 FUSED_METRICS: tuple[str, ...] = QUALITY_METRICS + DIAGNOSTIC_METRICS
+
+#: 融合口径：``weighted`` = 按参与题数加权（默认）；``equal`` = 基准集内等权
+#: （旧宏平均语义）。两种口径都排除办公域槽位，旧产物（缺 ``fusion``）归一为
+#: ``"legacy"``（等权且 office 参与），三者互不可比。
+FUSION_WEIGHTED = "weighted"
+FUSION_EQUAL = "equal"
+FUSION_CHOICES: tuple[str, ...] = (FUSION_WEIGHTED, FUSION_EQUAL)
+
+#: 加权融合的单数据集权重封顶（题数）：1986 题的基准集不应把 86 题的集压成
+#: 噪声，但也不该让一个巨型数据集独占权重。
+FUSION_WEIGHT_CAP: int = 500
+
+#: 指标 -> 权重分母在 ``overall`` 中的键。检索类看非拒答题数、拒答类看拒答题数、
+#: 陈旧率看可机检 stale 题数——各指标的分母数据集不同，按总题数加权会把
+#: 「只在 office 有 abstention」这类小样本放回高位。
+METRIC_DENOMINATOR_KEYS: dict[str, str] = {
+    "accuracy": "n_questions",
+    "token_f1": "n_questions",
+    "bleu1": "n_questions",
+    "evidence_recall": "evidence_n",
+    "recall_at_5": "evidence_n",
+    "over_refusal_rate": "evidence_n",
+    "abstention_accuracy": "abstention_n",
+    "stale_rate": "stale_n",
+}
+
+#: 旧 run 缺的分母键（本特性之前只落 n_questions）-> 回退用它。
+_DENOMINATOR_FALLBACK = "n_questions"
 
 #: 办公域 stale 门禁阈值：办公域槽位数据集 stale_rate 超过该值即一票否决。
 STALE_GATE_THRESHOLD: float = 0.03
@@ -634,28 +670,84 @@ _PARTICIPATION_RULES: dict[str, Union[str, None]] = {
 
 
 def participates(capabilities: dict[str, bool], metric: str) -> bool:
-    """判断某数据集是否参与某指标的宏平均融合。"""
+    """判断某数据集是否参与某指标的融合。"""
     rule = _PARTICIPATION_RULES[metric]
     if rule is None:
         return True
     return bool(capabilities.get(rule, False))
 
 
-def fuse_metrics(results: list[DatasetResult]) -> dict[str, dict[str, Any]]:
-    """跨数据集宏平均融合六项质量指标 + 两项诊断指标。
+def is_baseline_dataset(res: DatasetResult) -> bool:
+    """该数据集是否参与基准评级（办公域槽位不参与，单列业务结论）。"""
+    return not res.spec.is_office_slot
+
+
+def _as_count(value: Any) -> Union[int, None]:
+    """计数型字段 -> 正整数；缺省 / 0 / 非数字返回 None（= 不能用它当权重）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    n = int(value)
+    return n if n > 0 else None
+
+
+def metric_denominator(overall: dict[str, Any], metric: str) -> Union[int, None]:
+    """该数据集在该指标上的权重分母（参与题数）。
+
+    分母按指标取 :data:`METRIC_DENOMINATOR_KEYS`：题数 / 非拒答题数 /
+    拒答题数 / 可机检 stale 题数。旧 run 没有 ``evidence_n`` /
+    ``abstention_n``（本特性之前只落 ``n_questions``）时回退 ``n_questions``，
+    否则旧产物的检索/拒答指标会被判成"无权重"而整体退出融合。
+
+    Returns:
+        正整数；取不到（旧产物连 ``n_questions`` 都没有）或为 0 时返回 ``None``。
+    """
+    raw = _as_count(overall.get(METRIC_DENOMINATOR_KEYS[metric]))
+    if raw is None:
+        raw = _as_count(overall.get(_DENOMINATOR_FALLBACK))
+    return raw
+
+
+def fuse_metrics(
+    results: list[DatasetResult],
+    fusion: str = FUSION_WEIGHTED,
+    cap: int = FUSION_WEIGHT_CAP,
+) -> dict[str, dict[str, Any]]:
+    """跨数据集融合六项质量指标 + 两项诊断指标（默认按参与题数加权）。
+
+    办公域槽位（``spec.is_office_slot``）**不参与**：它的分数不是基准集的一部分，
+    单列在报告的「业务结论」里。其余数据集按能力标注决定是否参与该指标，
+    参与后：
+
+    - ``fusion="weighted"``：权重 = ``min(该指标分母, cap)``，融合值为加权平均。
+      分母为 0 / 取不到的集不参与该指标（没有参与题就没有权重）。
+    - ``fusion="equal"``：每个参与集一票（权重 1，旧的宏平均语义）。
 
     Args:
         results: 各数据集的评测结果。
+        fusion: 融合口径（``weighted`` / ``equal``）。
+        cap: 加权口径下单数据集的权重封顶（题数）。
 
     Returns:
-        ``{metric: {"value": 融合值, "participants": [参与数据集显示名, ...]}}``；
-        某指标无任何参与集时 value 为 None。
+        ``{metric: {"value", "participants", "weights", "total_weight"}}``：
+        ``participants`` 为参与集显示名，``weights`` 为逐集明细
+        ``[{"key", "name", "denominator", "weight"}, ...]``（等权口径下
+        ``weight`` 恒为 1、``denominator`` 仅作展示），``total_weight`` 为
+        权重之和。某指标无参与集时 ``value`` 为 None。
+
+    Raises:
+        SystemExit: ``fusion`` 不在 :data:`FUSION_CHOICES` 之内。
     """
+    if fusion not in FUSION_CHOICES:
+        raise SystemExit(
+            f"未知融合口径: {fusion!r}（可选 {' / '.join(FUSION_CHOICES)}）"
+        )
     fused: dict[str, dict[str, Any]] = {}
     for metric in FUSED_METRICS:
-        values: list[float] = []
-        names: list[str] = []
+        entries: list[dict[str, Any]] = []
+        weighted_sum = 0.0
         for res in results:
+            if not is_baseline_dataset(res):
+                continue
             if not participates(res.capabilities, metric):
                 continue
             overall = res.metrics.get("overall", {})
@@ -663,13 +755,49 @@ def fuse_metrics(results: list[DatasetResult]) -> dict[str, dict[str, Any]]:
             # None = 该数据集"未计算"该指标：跳过，不按 0 纳入融合。
             if v is None:
                 continue
-            values.append(float(v))
-            names.append(res.spec.name)
+            denominator = metric_denominator(overall, metric)
+            if fusion == FUSION_WEIGHTED:
+                if denominator is None:
+                    continue
+                weight = min(denominator, int(cap))
+            else:
+                weight = 1
+            entries.append(
+                {
+                    "key": res.spec.key,
+                    "name": res.spec.name,
+                    "denominator": denominator,
+                    "weight": weight,
+                }
+            )
+            weighted_sum += float(v) * weight
+        total_weight = sum(e["weight"] for e in entries)
         fused[metric] = {
-            "value": (sum(values) / len(values)) if values else None,
-            "participants": names,
+            "value": (weighted_sum / total_weight) if total_weight else None,
+            "participants": [e["name"] for e in entries],
+            "weights": entries,
+            "total_weight": total_weight,
         }
     return fused
+
+
+def stamp_fusion(results: list[DatasetResult], fusion: str) -> None:
+    """把当次融合口径写进各数据集的 ``report/metrics.json``（``fusion`` 字段）。
+
+    可比性校验读的正是数据集级 metrics（``compare`` 的入参就是数据集目录）；
+    口径只写在任务级报告里，"fusion 进关键维度"就是死维度。复用进来的产物也
+    一并改写成当次口径——它在本任务里确实按这个口径聚合。
+    """
+    for res in results:
+        res.metrics["fusion"] = fusion
+        path = os.path.join(res.run_dir, layout.DIR_REPORT, layout.FILE_METRICS)
+        with open(path, encoding="utf-8") as f:
+            disk = json.load(f)
+        if disk.get("fusion") == fusion:
+            continue
+        disk["fusion"] = fusion
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(disk, f, ensure_ascii=False, indent=2)
 
 
 def evaluate_gate(
@@ -832,6 +960,24 @@ def _token_usage_summary(results: list[DatasetResult]) -> dict[str, Any]:
     }
 
 
+def fusion_label(fusion: str) -> str:
+    """融合口径的中文说明（报告标题与小注共用）。"""
+    if fusion == FUSION_EQUAL:
+        return "基准集内等权"
+    return f"按参与题数加权，单集封顶 {FUSION_WEIGHT_CAP}"
+
+
+def participants_with_weight(entry: dict[str, Any], fusion: str) -> str:
+    """融合指标表的参与集单元格：``locomo（1986 题，权重 500）``。"""
+    cells: list[str] = []
+    for w in entry.get("weights", []):
+        if fusion == FUSION_EQUAL:
+            cells.append(f"{w['name']}（等权）")
+        else:
+            cells.append(f"{w['name']}（{w['denominator']} 题，权重 {w['weight']}）")
+    return "、".join(cells) or "（无参与集）"
+
+
 def _render_task_report_md(
     experiment_dir: str,
     reports_dir: str,
@@ -843,6 +989,7 @@ def _render_task_report_md(
     results: list[DatasetResult],
     fused: dict[str, dict[str, Any]],
     gate: dict[str, Any],
+    fusion: str = FUSION_WEIGHTED,
     extra_notes: Union[list[str], None] = None,
 ) -> str:
     """生成任务级 ``report.md``（中文，全量评估报告），返回报告路径。
@@ -851,6 +998,7 @@ def _render_task_report_md(
         experiment_dir: 实验目录——各数据集产物在其 ``runs/<dataset>/`` 下，报告内
             链接用相对它算出的 ``runs/<dataset>/report/report.md``。
         reports_dir: 任务级报告目录（``<实验目录>/reports``）。
+        fusion: 融合口径（决定标题、权重列与评级小注的措辞）。
         extra_notes: 报告顶部追加的提示行（Markdown，如汇总模式的元数据不一致告警）。
         results: 各数据集评测结果（spec 提供数据集范围、来源与路径）。
     """
@@ -871,7 +1019,7 @@ def _render_task_report_md(
     gate_icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️"}.get(gate_status, "")
     lines.append(f"**门禁结论： {gate_status} {gate_icon}** — {gate['detail']}")
     lines.append("")
-    lines.append(f"**总评结论： {verdict}**（门禁一票否决，独立于综合评级）")
+    lines.append(f"**总评结论： {verdict}**（门禁一票否决，独立于基准评级）")
     lines.append("")
     for note in extra_notes or []:
         lines.append(note)
@@ -915,45 +1063,128 @@ def _render_task_report_md(
     lines.append(_md_table(["数据集", "槽位", "来源", "路径", "指纹"], ds_rows))
     lines.append("")
 
-    # 综合评级
+    # 基准评级（不含办公域槽位）：没有基准集时明确显示 n/a，而不是空着
     if rated is not None:
         label, mean_points = rated
-        lines.append(f"**综合评级：{label}（{mean_points:.2f}/4.0）**")
+        lines.append(f"**基准评级（不含办公域槽位）：{label}（{mean_points:.2f}/4.0）**")
+    else:
+        lines.append("**基准评级（不含办公域槽位）：n/a**")
         lines.append("")
         lines.append(
-            "<sub>评级规则：先对六项质量指标做跨数据集宏平均融合"
-            "（指标仅在具备对应能力标注的数据集上参与），再取其中四项评级指标"
-            "（accuracy / evidence_recall / abstention_accuracy / stale_rate）"
-            "融合值的连续点数（1.0~4.0，档内随数值线性变化）均值，"
-            "阈值 3.5 / 2.5 / 1.5；token_f1 / bleu1（字面重合度，非语义正确性）"
-            "与 recall_at_5 / over_refusal_rate 为诊断指标，仅展示不参与评级；"
-            "stale_rate 的分母只含可机检的 stale 题（有裸 gold_stale；"
-            "LLM judge 下含 gold_stale_note）；"
-            "效率成本指标同样不参与评级。门禁为一票否决，独立于本评级。</sub>"
+            "<sub>无基准数据集（只剩办公域槽位）或基准集各项指标均不可评级，"
+            "不产出基准评级；办公域的业务口径见下方「业务结论」。</sub>"
         )
-        lines.append("")
+    lines.append("")
+    lines.append(
+        "<sub>评级规则：先按融合口径把六项质量指标融合成基准集的值"
+        f"（{fusion_label(fusion)}；指标仅在具备对应能力标注的基准数据集上参与；"
+        "办公域槽位不参与），再取其中四项评级指标"
+        "（accuracy / evidence_recall / abstention_accuracy / stale_rate）"
+        "融合值的连续点数（1.0~4.0，档内随数值线性变化）均值，"
+        "阈值 3.5 / 2.5 / 1.5；token_f1 / bleu1（字面重合度，非语义正确性）"
+        "与 recall_at_5 / over_refusal_rate 为诊断指标，仅展示不参与评级；"
+        "stale_rate 的分母只含可机检的 stale 题（有裸 gold_stale；"
+        "LLM judge 下含 gold_stale_note）；"
+        "效率成本指标同样不参与评级。门禁为一票否决，独立于本评级。</sub>"
+    )
+    lines.append("")
 
-    # 融合指标表
-    lines.append("## 融合指标（跨数据集宏平均）")
+    # 业务结论（办公域槽位）：它的分数与基准集不同源，单列而不是混进融合
+    office = next((r for r in results if r.spec.is_office_slot), None)
+    lines.append("## 业务结论（办公域槽位）")
+    lines.append("")
+    lines.append(
+        "<sub>办公域槽位不参与基准评级——它题量小、判分口径面向业务红线"
+        "（陈旧记忆 / 该拒答），与公开基准集不同源；混进融合会把综合分"
+        "变成两种标准的平均数。这里单列业务口径的结论，门禁仍一票否决。</sub>"
+    )
+    lines.append("")
+    if office is None:
+        lines.append("（本次数据集清单无办公域槽位，stale 门禁跳过。）")
+    else:
+        office_overall = office.metrics.get("overall", {})
+        office_rows = [
+            ["数据集", office.spec.name],
+            ["题数", str(office_overall.get("n_questions", "n/a"))],
+            ["准确率", format_metric("accuracy", office_overall.get("accuracy"))],
+            ["陈旧率（stale_rate）", stale_rate_display(office_overall)],
+            [
+                "拒答准确率",
+                (
+                    format_metric(
+                        "abstention_accuracy", office_overall.get("abstention_accuracy")
+                    )
+                    if office.capabilities.get("has_abstention")
+                    else "未定义（无拒答题标注）"
+                ),
+            ],
+            ["stale 门禁", f"{gate_status} — {gate['detail']}"],
+        ]
+        lines.append(_md_table(["项目", "值"], office_rows))
+    lines.append("")
+
+    # 融合指标表（参与集带题数与权重）
+    lines.append(f"## 融合指标（{fusion_label(fusion)}）")
     lines.append("")
     fused_rows = []
     for metric in FUSED_METRICS:
         entry = fused[metric]
         if entry["value"] is None:
             value_str = "未定义"
-            participants_str = "（无参与集）"
         else:
             value_str = format_metric(metric, entry["value"])
-            participants_str = "、".join(entry["participants"]) or "（无参与集）"
         fused_rows.append(
-            [metric_label_with_role(metric), value_str, participants_str]
+            [
+                metric_label_with_role(metric),
+                value_str,
+                participants_with_weight(entry, fusion),
+            ]
         )
-    lines.append(_md_table(["指标", "融合值", "参与数据集"], fused_rows))
+    lines.append(_md_table(["指标", "融合值", "参与数据集（题数 / 权重）"], fused_rows))
     lines.append("")
     lines.append(
         "<sub>注：token_f1 / bleu1（字面重合度，非语义正确性）与检索召回率@5 / "
-        "过度拒答率为诊断指标，仅展示与归因，不参与综合评级与门禁。</sub>"
+        "过度拒答率为诊断指标，仅展示与归因，不参与基准评级与门禁。</sub>"
     )
+    lines.append("")
+
+    # 融合权重明细：每个基准数据集在各指标上的分母与权重（可逐项复核融合值）
+    lines.append("## 融合权重")
+    lines.append("")
+    baseline_results = [r for r in results if is_baseline_dataset(r)]
+    if baseline_results:
+        weight_header = ["数据集", "题数"] + [metric_label(m, with_key=False) for m in FUSED_METRICS]
+        weight_rows: list[list[str]] = []
+        for r in baseline_results:
+            overall = r.metrics.get("overall", {})
+            cells = [r.spec.name, str(overall.get("n_questions", "n/a"))]
+            for metric in FUSED_METRICS:
+                denominator = metric_denominator(overall, metric)
+                if not participates(r.capabilities, metric) or overall.get(metric) is None:
+                    cells.append("—")
+                elif fusion == FUSION_EQUAL:
+                    cells.append(f"{denominator if denominator is not None else 'n/a'}（等权）")
+                elif denominator is None:
+                    cells.append("—")
+                else:
+                    cells.append(f"{denominator} → {min(denominator, FUSION_WEIGHT_CAP)}")
+            weight_rows.append(cells)
+        lines.append(_md_table(weight_header, weight_rows))
+        lines.append("")
+        if fusion == FUSION_EQUAL:
+            lines.append(
+                "<sub>单元格为「该指标分母（参与题数）」，--fusion equal 下每个基准集"
+                "一票（等权）；办公域槽位不参与。</sub>"
+            )
+        else:
+            lines.append(
+                "<sub>单元格为「分母 → 权重」：分母按指标取参与题数（accuracy / token_f1 / "
+                "bleu1 用总题数，检索类用非拒答题数，拒答类用拒答题数，stale_rate 用可机检 "
+                f"stale 题数），权重 = min(分母, {FUSION_WEIGHT_CAP})；「—」= 该集在该指标上"
+                "不参与（无对应能力标注或该指标未计算）；办公域槽位不参与。</sub>"
+            )
+    else:
+        lines.append("（无基准数据集：全部数据集都是办公域槽位，不参与融合。）")
     lines.append("")
 
     # 分数据集明细表（质量 + 效率成本）
@@ -1016,7 +1247,7 @@ def _render_task_report_md(
     )
     lines.append("")
     lines.append(
-        "<sub>诊断指标仅用于分诊与归因，不参与综合评级与门禁；「检索召回率@5」"
+        "<sub>诊断指标仅用于分诊与归因，不参与基准评级与门禁；「检索召回率@5」"
         "仅在有 evidence 标注的数据集上计算（前 5 条检索的证据条目覆盖率），"
         "「过度拒答率」为非拒答题上出现拒答信号的比例。</sub>"
     )
@@ -1165,14 +1396,15 @@ def write_task_reports(
     results: list[DatasetResult],
     fused: dict[str, dict[str, Any]],
     gate: dict[str, Any],
+    fusion: str = FUSION_WEIGHTED,
     extra_notes: Union[list[str], None] = None,
 ) -> dict[str, Any]:
     """写任务级报告到 ``<实验目录>/reports/``，返回 evaluate_summary.json 的内容。
 
     产物：``report.md``（全量评估报告，内链指向各数据集
-    ``runs/<dataset>/report/report.md``）、``metrics.json``（任务级汇总：融合值 +
-    门禁 + 身份 + token 消耗）、``evaluate_summary.json``（机器可消费的清单，额外
-    带各数据集相对路径）、``fig_dataset_overview.png``。
+    ``runs/<dataset>/report/report.md``）、``metrics.json``（任务级汇总：融合口径 +
+    融合值 + 门禁 + 身份 + token 消耗）、``evaluate_summary.json``（机器可消费的清单，
+    额外带各数据集相对路径）、``fig_dataset_overview.png``。
     """
     reports_dir = layout.task_report_dir(experiment_dir)
     os.makedirs(reports_dir, exist_ok=True)
@@ -1192,6 +1424,7 @@ def write_task_reports(
         results,
         fused,
         gate,
+        fusion=fusion,
         extra_notes=extra_notes,
     )
 
@@ -1205,6 +1438,7 @@ def write_task_reports(
         "timestamp": timestamp.isoformat(timespec="seconds"),
         "n_datasets": len(results),
         "datasets": [r.spec.key for r in results],
+        "fusion": fusion,
         "overall": {k: v["value"] for k, v in fused.items() if v["value"] is not None},
         "fused": fused,
         "gate": gate,
@@ -1244,8 +1478,9 @@ def evaluate(
     evidence_matcher: Any = None,
     task_dir: Union[str, None] = None,
     snapshot: Union[bool, None] = None,
+    fusion: str = FUSION_WEIGHTED,
 ) -> int:
-    """执行全量评估：一个实验目录承载全部数据集 + 宏平均融合 + 门禁 + 报告。
+    """执行全量评估：一个实验目录承载全部数据集 + 基准集融合 + 门禁 + 报告。
 
     Args:
         adapter: 适配器实例（跨数据集复用，Runner 内部负责 reset）；汇总模式下
@@ -1276,10 +1511,17 @@ def evaluate(
             不新建 ``eval_*`` 目录。与 ``report_out`` 互斥。
         snapshot: 是否导出对话状态快照。None（缺省）= 用 Runner 默认（导出）；
             False = 关闭（``--no-snapshot``），透传到每个数据集的 Runner。
+        fusion: 基准集融合口径（``weighted`` 默认 / ``equal``），见
+            :func:`fuse_metrics`；会写进任务级 metrics 与各数据集 metrics
+            （``fusion`` 可比性维度——旧产物缺该字段归一为 ``legacy``）。
 
     Returns:
         进程退出码：门禁 FAIL 为 1，否则 0（与 compare 一致）。
     """
+    if fusion not in FUSION_CHOICES:
+        raise SystemExit(
+            f"未知融合口径: {fusion!r}（可选 {' / '.join(FUSION_CHOICES)}）"
+        )
     if task_dir is not None:
         if report_out is not None:
             raise SystemExit("evaluate 的 task_dir 与 report_out 互斥：就地写进任务目录时不再给父目录")
@@ -1432,7 +1674,8 @@ def evaluate(
     for note in notes:
         print(f"[membench] ⚠️ 汇总模式：跨数据集元数据不一致 —— {note}")
 
-    fused = fuse_metrics(results)
+    stamp_fusion(results, fusion)
+    fused = fuse_metrics(results, fusion=fusion)
     gate = evaluate_gate(results)
 
     write_task_reports(
@@ -1445,6 +1688,7 @@ def evaluate(
         results=results,
         fused=fused,
         gate=gate,
+        fusion=fusion,
         extra_notes=[f"> ⚠️ **汇总模式**：{note}" for note in notes],
     )
 

@@ -4,7 +4,7 @@
 
 ## 这是什么
 
-membench 是 **Agent 记忆系统评测框架**（Python 包 + CLI）：对被测记忆系统跑多会话数据集，产出六维指标报告（run）、多数据集宏平均全量评估（evaluate）、A/B 回归门禁（compare）、平台×commit 矩阵（matrix）。仓库同时维护一个 **agent skill 包**（`skill/agent-memory-eval.skill`），把 membench 与工作流封装给 agent 使用。
+membench 是 **Agent 记忆系统评测框架**（Python 包 + CLI）：对被测记忆系统跑多会话数据集，产出六维指标报告（run）、多数据集全量评估（evaluate：基准集按题数加权宏平均、办公域槽位单列业务结论）、A/B 回归门禁（compare）、平台×commit 矩阵（matrix）。仓库同时维护一个 **agent skill 包**（`skill/agent-memory-eval.skill`），把 membench 与工作流封装给 agent 使用。
 
 ## 目录结构
 

@@ -12,10 +12,12 @@ A/B 没有现成入口——本模块补齐：逐数据集 diff + 跨数据集�
     -> 每个数据集分别用 baseline / candidate 两个 adapter 各跑一次 Runner
        （write_task_reports=False，直接落进该侧的 ``runs/<dataset>/``）
     -> 逐数据集 diff（精度复用 :mod:`membench.compare` 的 _diff_overall / 门禁）
-    -> 两组各自 fuse_metrics 得跨数据集宏平均融合值 + 各写该侧任务级 reports/
-    -> 融合 diff（b - a）+ 门禁（accuracy / stale_rate / latency_p95）
+    -> 两组各自 fuse_metrics 得**基准集**融合值（默认按题数加权、办公域槽位不参与）
+       + 各写该侧任务级 reports/
+    -> 基准集融合 diff（b - a）+ 办公域槽位的业务 red line 门禁 + 门禁
+       （accuracy / stale_rate / latency_p95）
     -> 对比产物落 ``reports/``：comparison.md + fig_per_dataset_diff.png
-       （各数据集关键指标 diff）+ fig_fused_diff.png（融合 diff）
+       （各数据集关键指标 diff）+ fig_fused_diff.png（基准集融合 diff）
 
 两侧复用的"产物目录"（``--baseline-run`` / ``--candidate-run`` 的 ``KEY=DIR``）
 统一经 :func:`membench.evaluate.resolve_dataset_dir` 解析（实验目录或数据集目录）；
@@ -48,6 +50,8 @@ from membench import layout, runtime
 from membench.compare import _diff_overall, _eval_gates, check_comparability
 from membench.data.schema import is_abstention
 from membench.evaluate import (
+    FUSION_CHOICES,
+    FUSION_WEIGHTED,
     DatasetResult,
     DatasetSpec,
     adopt_dataset_dir,
@@ -56,11 +60,14 @@ from membench.evaluate import (
     evaluate_gate,
     expected_fresh_metadata,
     fuse_metrics,
+    fusion_label,
     load_provided_result,
     metadata_inconsistencies,
+    participants_with_weight,
     plan_datasets,
     run_datasets,
     scan_capabilities,
+    stamp_fusion,
     write_task_reports,
 )
 from membench.layout import (
@@ -186,14 +193,17 @@ def _resolve_capabilities(
 
 def _side_fuse(
     results: list[DatasetResult],
+    fusion: str = FUSION_WEIGHTED,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
-    """对一侧（基线 / 候选）的各数据集结果做宏平均融合。
+    """对一侧（基线 / 候选）的各数据集结果做基准集融合。
 
     Args:
         results: 该侧各数据集的评测结果。
+        fusion: 融合口径（``weighted`` / ``equal``，两侧必须一致）。
 
     Returns:
-        ``(fused, sources)``：fused 为 ``{metric: {"value", "participants"}}``
+        ``(fused, sources)``：fused 为
+        ``{metric: {"value", "participants", "weights", "total_weight"}}``
         （结构与 :func:`membench.evaluate.fuse_metrics` 一致）；sources 为
         ``{数据集 key: capabilities 来源}``（metrics / dataset / results_jsonl /
         missing），供报告标注"未落账已自动推断"。
@@ -212,7 +222,7 @@ def _side_fuse(
                 capabilities=caps,
             )
         )
-    return fuse_metrics(resolved), sources
+    return fuse_metrics(resolved, fusion=fusion), sources
 
 
 def _single_source_experiment(raw_runs: Union[dict[str, str], None]) -> Union[str, None]:
@@ -576,6 +586,7 @@ def evaluate_compare(
     evidence_matcher: Any = None,
     task_dir: Union[str, None] = None,
     snapshot: Union[bool, None] = None,
+    fusion: str = FUSION_WEIGHTED,
 ) -> dict[str, Any]:
     """两组（baseline vs candidate）× 多数据集融合 A/B 对比。
 
@@ -610,13 +621,20 @@ def evaluate_compare(
             ``<task_dir>/reports/``，不新建 ``compare_*`` 目录。与 ``report_out`` 互斥。
         snapshot: 是否导出对话状态快照。None（缺省）= 用 Runner 默认（导出）；
             False = 关闭（``--no-snapshot``），逐侧透传到每个数据集的 Runner。
+        fusion: 两侧共用的基准集融合口径（``weighted`` 默认 / ``equal``）。
+            两侧必须同口径，否则 diff 不可归因——本函数只有一个参数，天然一致；
+            口径会写进两侧各数据集与任务级 metrics（可比性维度）。
 
     Returns:
         ``{"compare_dir", "verdict", "gates", "fused_diffs", "per_dataset",
-        "fused_baseline", "fused_candidate"}``；``compare_dir`` 指向本次输出容器
-        （新建的 ``compare_<name>_<platform>_<ts>`` 实验目录，或就地模式下的
+        "fused_baseline", "fused_candidate", "fusion"}``；``compare_dir`` 指向本次
+        输出容器（新建的 ``compare_<name>_<platform>_<ts>`` 实验目录，或就地模式下的
         ``task_dir``）。
     """
+    if fusion not in FUSION_CHOICES:
+        raise SystemExit(
+            f"未知融合口径: {fusion!r}（可选 {' / '.join(FUSION_CHOICES)}）"
+        )
     if task_dir is not None:
         if report_out is not None:
             raise SystemExit(
@@ -835,6 +853,11 @@ def evaluate_compare(
             )
         )
 
+    # 融合口径随产物走：两侧各数据集的 metrics.json 都写入当次口径，可比性
+    # 维度（fusion）才读得到；旧产物缺该字段时归一为 legacy。
+    stamp_fusion(baseline_results, fusion)
+    stamp_fusion(candidate_results, fusion)
+
     # 两侧可比性（逐数据集）：与单数据集 compare 同一套维度表；只测量差异、不进门禁结论
     comparability_findings = _cross_side_findings(
         [(arm.spec, arm.baseline, arm.candidate) for arm in arms]
@@ -860,12 +883,30 @@ def evaluate_compare(
     per_dataset = _per_dataset_diff(arms)
 
     # 两组融合（sources 记录 capabilities 来源，供报告标注）
-    fused_baseline, cap_sources_a = _side_fuse(baseline_results)
-    fused_candidate, cap_sources_b = _side_fuse(candidate_results)
+    fused_baseline, cap_sources_a = _side_fuse(baseline_results, fusion)
+    fused_candidate, cap_sources_b = _side_fuse(candidate_results, fusion)
     fused_diffs = _fused_diff(fused_baseline, fused_candidate)
     gates = _fused_gates(
         fused_baseline, fused_candidate, acc_threshold, stale_threshold, latency_warn
     )
+    # 办公域槽位不参与基准融合，但业务红线仍要进顶层门禁：把 office 移出融合
+    # 不等于把红线移出结论（否则陈旧率回归会因融合值为 None 而 SKIP）。
+    office_arm = next((arm for arm in arms if arm.spec.is_office_slot), None)
+    if office_arm is not None:
+        for gate in _eval_gates(
+            office_arm.baseline.get("overall", {}),
+            office_arm.candidate.get("overall", {}),
+            acc_threshold,
+            stale_threshold,
+            latency_warn,
+        ):
+            gates.append(
+                {
+                    **gate,
+                    "name": f"office_{gate['name']}",
+                    "detail": f"办公域槽位（{office_arm.spec.name}）：{gate['detail']}",
+                }
+            )
 
     # per-dataset 门禁：单数据集 spike 不被融合平均抹平
     per_dataset_gates = _per_dataset_gates(
@@ -907,6 +948,7 @@ def evaluate_compare(
             results=side_results,
             fused=side_fused,
             gate=evaluate_gate(side_results),
+            fusion=fusion,
         )
 
     reports_dir = layout.task_report_dir(compare_dir)
@@ -932,6 +974,7 @@ def evaluate_compare(
         per_dataset_verdict=per_dataset_verdict,
         comparability_findings=comparability_findings,
         cap_sources={"baseline": cap_sources_a, "candidate": cap_sources_b},
+        fusion=fusion,
         extra_notes=notes,
     )
 
@@ -948,6 +991,7 @@ def evaluate_compare(
         "fused_baseline": fused_baseline,
         "fused_candidate": fused_candidate,
         "per_dataset": per_dataset,
+        "fusion": fusion,
     }
 
 
@@ -969,6 +1013,7 @@ def _write_evaluate_compare_report(
     per_dataset_gates: list[dict[str, Any]] | None = None,
     per_dataset_verdict: str | None = None,
     cap_sources: dict[str, dict[str, str]] | None = None,
+    fusion: str = FUSION_WEIGHTED,
     extra_notes: list[str] | None = None,
     comparability_findings: list[dict[str, Any]] | None = None,
 ) -> str:
@@ -1009,6 +1054,9 @@ def _write_evaluate_compare_report(
             "  ⚠️ 两侧检索匹配口径不一致，检索类指标（证据召回率 / 检索召回率@5）"
             "不可直接比较。"
         )
+    lines.append(
+        f"- 融合口径: `{fusion}`（{fusion_label(fusion)}；办公域槽位不参与基准评级）"
+    )
     lines.append(f"- 时间戳: {timestamp.isoformat(timespec='seconds')}")
     findings = comparability_findings or []
     if findings:
@@ -1185,8 +1233,12 @@ def _write_evaluate_compare_report(
         lines.append(_md_table(["指标", "A", "B", "Δ"], rows_eff))
         lines.append("")
 
-    # 2. 融合 diff
-    lines.append("## 跨数据集融合 diff（B - A）")
+    # 2. 基准集融合 diff（主结论）：办公域槽位不参与
+    lines.append(f"## 基准集融合 diff（B - A，{fusion_label(fusion)}）")
+    lines.append("")
+    lines.append(
+        "<sub>办公域槽位不参与本节：它与基准集不同源，单列在下一节「业务结论 diff」。</sub>"
+    )
     lines.append("")
     fused_rows: list[list[str]] = []
     for k, d in fused_diffs.items():
@@ -1201,10 +1253,42 @@ def _write_evaluate_compare_report(
     if fused_rows:
         lines.append(_md_table(["指标", "A 融合值", "B 融合值", "diff"], fused_rows))
     else:
-        lines.append("（两组均无可参与融合的质量指标，跳过）")
+        lines.append("（两组均无可参与融合的基准集质量指标，跳过）")
     lines.append("")
     lines.append("![融合指标差值](fig_fused_diff.png)")
     lines.append("")
+
+    # 2.5 业务结论 diff（办公域槽位单独一段）：业务红线不混进基准评级
+    lines.append("## 业务结论 diff（办公域槽位，B - A）")
+    lines.append("")
+    office_arm = next((arm for arm in arms if arm.spec.is_office_slot), None)
+    if office_arm is None:
+        lines.append("（本次数据集清单无办公域槽位，业务结论与 stale 门禁跳过。）")
+        lines.append("")
+    else:
+        a_ov = office_arm.baseline.get("overall", {}) or {}
+        b_ov = office_arm.candidate.get("overall", {}) or {}
+        biz_rows: list[list[str]] = []
+        for key in ("accuracy", "stale_rate", "abstention_accuracy"):
+            a_val = a_ov.get(key)
+            b_val = b_ov.get(key)
+            a_str = format_metric(key, a_val) if a_val is not None else "未定义"
+            b_str = format_metric(key, b_val) if b_val is not None else "未定义"
+            if a_val is None or b_val is None:
+                delta_str = "—"
+            else:
+                delta_str = format_metric_delta(key, float(b_val) - float(a_val))
+            biz_rows.append([metric_label(key), a_str, b_str, delta_str])
+        lines.append(f"### {office_arm.spec.name}")
+        lines.append("")
+        lines.append(_md_table(["指标", "A", "B", "Δ（B - A）"], biz_rows))
+        lines.append("")
+        lines.append(
+            "<sub>陈旧率与拒答准确率是业务红线（陈旧率只看可机检的 stale 题，"
+            "覆盖率见各侧报告），不参与基准评级；门禁结论见上方「门禁明细」"
+            "（准确的逐数据集判定见「per-dataset 门禁明细」）。</sub>"
+        )
+        lines.append("")
 
     # 3. 门禁明细
     lines.append("## 门禁明细")
@@ -1248,8 +1332,8 @@ def _write_evaluate_compare_report(
         lines.append("（无：各数据集两侧关键与次要维度均一致且可核验）")
     lines.append("")
 
-    # 4. 两组融合指标完整表（含参与集与差值）
-    lines.append("## 两组融合指标对照")
+    # 4. 两组融合指标完整表（含参与集、权重与差值）
+    lines.append("## 两组融合指标对照（基准集）")
     lines.append("")
     fused_full_rows: list[list[str]] = []
     for metric in [
@@ -1278,20 +1362,21 @@ def _write_evaluate_compare_report(
                 a_str,
                 b_str,
                 delta_str,
-                "、".join(a_entry.get("participants", [])) or "（无）",
-                "、".join(b_entry.get("participants", [])) or "（无）",
+                participants_with_weight(a_entry, fusion),
+                participants_with_weight(b_entry, fusion),
             ]
         )
     lines.append(
         _md_table(
-            ["指标", "A 融合", "B 融合", "Δ（B - A）", "A 参与集", "B 参与集"],
+            ["指标", "A 融合", "B 融合", "Δ（B - A）", "A 参与集（题数 / 权重）", "B 参与集（题数 / 权重）"],
             fused_full_rows,
         )
     )
     lines.append("")
     lines.append(
         "<sub>token_f1 / bleu1（字面重合度，非语义正确性）与检索召回率@5 / "
-        "过度拒答率为诊断指标，仅展示与归因，不参与综合评级与门禁。</sub>"
+        "过度拒答率为诊断指标，仅展示与归因，不参与基准评级与门禁。"
+        f"融合口径：`{fusion}`（{fusion_label(fusion)}），办公域槽位不参与。</sub>"
     )
     lines.append("")
 
@@ -1341,27 +1426,29 @@ def _write_evaluate_compare_report(
     lines.append(_md_table(header_q, detail_rows))
     lines.append("")
 
-    # 6. 评级
-    lines.append("## 两组综合评级")
+    # 6. 基准评级（不含办公域槽位）
+    lines.append("## 两组基准评级（不含办公域槽位）")
     lines.append("")
-    # 评级基于两组各自的融合 overall（与 evaluate 报告口径一致）
+    # 评级基于两组各自的基准集融合 overall（与 evaluate 报告口径一致）
     fused_a_overall = {k: v["value"] for k, v in fused_baseline.items() if v.get("value") is not None}
     fused_b_overall = {k: v["value"] for k, v in fused_candidate.items() if v.get("value") is not None}
     rated_a = overall_rating(fused_a_overall) if fused_a_overall else None
     rated_b = overall_rating(fused_b_overall) if fused_b_overall else None
     if rated_a:
-        lines.append(f"- A 综合评级（融合）：{rated_a[0]}（{rated_a[1]:.2f}/4.0）")
+        lines.append(f"- A 基准评级（融合）：{rated_a[0]}（{rated_a[1]:.2f}/4.0）")
     if rated_b:
-        lines.append(f"- B 综合评级（融合）：{rated_b[0]}（{rated_b[1]:.2f}/4.0）")
+        lines.append(f"- B 基准评级（融合）：{rated_b[0]}（{rated_b[1]:.2f}/4.0）")
     if rated_a is None and rated_b is None:
-        lines.append("（两组融合 overall 中无可评级指标）")
+        lines.append("（两组基准集融合 overall 中无可评级指标：基准集为空或指标不可评级）")
     lines.append("")
     lines.append(
-        "<sub>评级规则：取四项质量指标（accuracy / evidence_recall / "
-        "abstention_accuracy / stale_rate）的融合值连续点数"
+        "<sub>评级规则：基准集融合值"
+        f"（{fusion_label(fusion)}；办公域槽位不参与）取四项质量指标"
+        "（accuracy / evidence_recall / abstention_accuracy / stale_rate）的连续点数"
         "均值（1.0~4.0，阈值 3.5 / 2.5 / 1.5）；token_f1 / bleu1"
         "（字面重合度，非语义正确性）与 recall_at_5 / over_refusal_rate"
-        "为诊断指标，仅展示不参与评级；效率成本指标同样不参与评级。</sub>"
+        "为诊断指标，仅展示不参与评级；效率成本指标同样不参与评级。"
+        "办公域槽位的业务口径见「业务结论 diff」。</sub>"
     )
     lines.append("")
 

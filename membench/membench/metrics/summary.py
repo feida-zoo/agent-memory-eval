@@ -72,10 +72,13 @@ def aggregate(
     Returns:
         ``{"overall": {...}, "by_category": {category: {"accuracy", "n"}},
         "has_evidence": bool, "has_stale": bool, "has_abstention": bool}``；
-        ``overall`` 另含 ``stale_n``（stale_rate 分母：可机检题数）与
-        ``stale_total``（有 stale 注解的题数），报告据此标注覆盖率；
-        无对应题型的指标返回 ``None``（区别于"真实 0"）；使用了 LLM judge 时
-        附加 ``"judge_fallback": {"count", "ratio"}``。
+        ``overall`` 另含 ``stale_n``（stale_rate 分母：可机检题数）、
+        ``stale_total``（有 stale 注解的题数）与 ``evidence_n`` / ``abstention_n``
+        （非拒答题数 / 拒答题数，分别是检索类与拒答类指标的分母）：报告据此
+        标注覆盖率，跨数据集加权融合据此取权重（见
+        :func:`membench.evaluate.fuse_metrics`）；无对应题型的指标返回 ``None``
+        （区别于"真实 0"）；使用了 LLM judge 时附加
+        ``"judge_fallback": {"count", "ratio"}``。
 
     指标口径：
         - accuracy: ``judge.correct`` 均值。
@@ -163,6 +166,10 @@ def aggregate(
         # 两者都落 overall，报告据此渲染 n/a 与覆盖率。
         "stale_n": stale_n,
         "stale_total": stale_total,
+        # 检索类（evidence_recall / recall_at_5 / over_refusal_rate）与拒答类的
+        # 分母：跨数据集加权融合按它取权重，不按总题数（见 fuse_metrics）。
+        "evidence_n": len(non_abstention),
+        "abstention_n": len(abstention),
         "latency_p50_ms": percentile((r.get("latency_ms", 0.0) for r in records), 50),
         "latency_p95_ms": percentile((r.get("latency_ms", 0.0) for r in records), 95),
         "avg_input_tokens": _mean(r.get("input_tokens", 0) for r in records),

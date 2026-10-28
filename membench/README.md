@@ -4,7 +4,7 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 
 1. **run**：我的记忆系统在一套多会话对话数据集上表现如何？（六维指标 + 中文报告 + 图表）
 2. **compare**：这次优化相比基线是进步还是回归？（可比性前置校验 + 逐指标 diff + PASS/FAIL 门禁）
-3. **evaluate**：跨数据集全量评测，宏平均融合出综合评级（办公域 stale 门禁一票否决）。
+3. **evaluate**：跨数据集全量评测，基准集按题数加权融合出**基准评级**（办公域槽位单列业务结论，stale 门禁一票否决）。
 
 设计要点：
 
@@ -30,7 +30,7 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 │   ├── fuse.py            # fuse: 分片产物融合为完整实验目录（就地 --task-dir 或跨目录，指标重算 + 门禁）
 │   ├── compare.py         # compare_runs: 可比性前置校验 + diff + 回归门禁（支持就地 --task-dir）
 │   ├── matrix.py          # compare_matrix: 多 run 矩阵对比（platform × commit）
-│   ├── evaluate.py        # evaluate: 多数据集宏平均融合 + 办公域 stale 门禁
+│   ├── evaluate.py        # evaluate: 基准集加权融合（办公域单列）+ stale 门禁
 │   ├── evaluate_compare.py # evaluate_compare: 两组 × 多数据集融合 A/B 对比
 │   ├── ratings.py         # 综合评级阈值表 METRIC_THRESHOLDS
 │   ├── userdata.py        # 用户测试集管理: install / status / delete / resolve
@@ -96,9 +96,9 @@ python -m membench.cli list-datasets
 
 > 第 3 步的两次 mock 评测没填 `--driver-llm / --adapter-version`，`--require-comparable` 会按「关键维度缺失、无法核验」判 FAIL（这是 strict 模式的既定口径，不是示例坏了）；想看到 PASS 就先在这些维度上补全元数据再跑（见「可复现性元数据」）。
 
-## 全量评估（多数据集融合总分）
+## 全量评估（多数据集融合基准评级）
 
-`evaluate` 对所有数据集全量测试，跨数据集**宏平均**融合出综合评级：
+`evaluate` 对所有数据集全量测试，基准集**按参与题数加权**融合出基准评级（办公域槽位不参与，单列业务结论）：
 
 ```bash
 # 默认全量 = 办公域槽位（用户集>内置office）+ locomo + longmemeval_oracle
@@ -109,6 +109,7 @@ python -m membench.cli evaluate --adapter <a> --no-lme-s    # 剔除 LongMemEval
 python -m membench.cli evaluate --adapter <a> --no-beam     # 不跑 BEAM
 python -m membench.cli evaluate --adapter <a> --beam-10m    # BEAM 换 10M 全集终验（与 --no-beam 互斥）
 python -m membench.cli evaluate --adapter <a> --quick       # 跳过 BEAM 与 LongMemEval-S（分钟级回归）
+python -m membench.cli evaluate --adapter <a> --fusion equal  # 基准集内等权（对比旧口径时用）
 # 显式数据集清单（可重复 --dataset，key 与 JSONL 路径可混用；与预设开关互斥）
 python -m membench.cli evaluate --adapter <a> \
     --dataset office --dataset locomo --dataset ~/data/my_set.jsonl
@@ -161,12 +162,16 @@ python -m membench.cli evaluate-compare \
     --report-out <实验目录父目录> --tag "优化前vs优化后"
 ```
 
-门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **逐数据集题型 diff** + **两组融合 diff 表** + **per-dataset 门禁明细**（单数据集 spike 不被融合平均抹平）+ **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）+ **「两侧可比性（逐数据集）」小节**（复用单数据集 `compare` 的维度表：两侧 `dataset_sha256 / judge / judge_model / driver_llm / platform` 不一致记「关键」、两侧都未标注记「关键缺失」、检索命中口径等次要维度记「次要」；两侧 `adapter / adapter_version` 与 `commit` 是被测变量，差异属预期不计入）；比率型指标以百分比呈现（如 `81.5%`），差值为百分点（如 `+2.3pt`）。指标"未计算"统一记 `null`，与真实 0 区分；诊断指标（token_f1 / bleu1 / 检索召回率@5 / 过度拒答率）在 diff 与对照表中可见但不参与评级（token_f1 / bleu1 只测字面重合，非语义正确性）。旧版 run 的 capabilities 未落账时报告会按数据集/逐题记录自动推断并在头部标注来源。可比性问题在**两侧都复用的数据集对上会于开跑前**先打印到控制台——不必等跑完才发现两侧口径对不上。
+门禁口径与 `compare` 一致：accuracy 下降 > `--acc-threshold`（默认 0.02）→ FAIL；stale_rate 上升 > `--stale-threshold`（默认 0.02）→ FAIL；latency_p95 相对上升 > `--latency-warn`（默认 30%）→ WARN。报告默认显示**逐数据集 diff 表** + **逐数据集题型 diff** + **基准集融合 diff 表**（办公域槽位不参与）+ **业务结论 diff（办公域槽位）** + **per-dataset 门禁明细**（单数据集 spike 不被融合平均抹平）+ **未定义指标标注**（避免把"数据集未标注 evidence"误读为"召回率为 0"）+ **「两侧可比性（逐数据集）」小节**（复用单数据集 `compare` 的维度表：两侧 `dataset_sha256 / judge / judge_model / driver_llm / platform` 不一致记「关键」、两侧都未标注记「关键缺失」、检索命中口径等次要维度记「次要」；两侧 `adapter / adapter_version` 与 `commit` 是被测变量，差异属预期不计入）；比率型指标以百分比呈现（如 `81.5%`），差值为百分点（如 `+2.3pt`）。指标"未计算"统一记 `null`，与真实 0 区分；诊断指标（token_f1 / bleu1 / 检索召回率@5 / 过度拒答率）在 diff 与对照表中可见但不参与评级（token_f1 / bleu1 只测字面重合，非语义正确性）。旧版 run 的 capabilities 未落账时报告会按数据集/逐题记录自动推断并在头部标注来源。可比性问题在**两侧都复用的数据集对上会于开跑前**先打印到控制台——不必等跑完才发现两侧口径对不上。
 
 融合口径（重要，读总分前必读）：
 
-- **宏平均**：六项质量指标（accuracy/token_f1/bleu1/evidence_recall/abstention_accuracy/stale_rate）先在各数据集内算分，再跨集等权平均；**指标只在具备对应标注能力的数据集上参与**——没有可机检 stale 题的集（locomo/longmemeval，或只有 `gold_stale_note` 且用启发式判分的集）不参与 stale_rate，无 evidence 标注的集（longmemeval/beam）不参与 evidence_recall，无 abstention 题的集不参与 abstention_accuracy。绝不用"记 0"稀释。其中 **accuracy / evidence_recall / abstention_accuracy / stale_rate 四项参与综合评级**；token_f1 / bleu1 只测字面重合（诊断指标），照常计算与展示但不参与评级。此外**诊断指标**（检索召回率@5 需 has_evidence；过度拒答率全数据集参与）同样跨集融合展示，但不参与综合评级与门禁。
-- **门禁一票否决独立于总分**：办公域槽位 stale_rate > 0.03 → 总评"不达标"，退出码 1（可接 CI），无论综合评级多高。
+- **办公域槽位不参与融合评级**：`office` 与基准集不同源（题量小、判分口径面向业务红线），单独出「业务结论（办公域槽位）」——准确率 / 陈旧率（含覆盖率）/ 拒答准确率 / stale 门禁状态。办公集左右综合分的路径就此封死。
+- **基准集按参与题数加权（`--fusion weighted`，默认）**：六项质量指标先在各数据集内算分，再按**该指标的参与题数**加权——`accuracy / token_f1 / bleu1` 用总题数，`evidence_recall / recall_at_5 / over_refusal_rate` 用非拒答题数（`evidence_n`），`abstention_accuracy` 用拒答题数（`abstention_n`），`stale_rate` 用可机检 stale 题数（`stale_n`）；**单数据集权重封顶 500**。86 题的集与 1986 题的集不再同权，小样本集也不能靠"每指标一票"抬高综合分。报告给出「融合指标」表的逐集题数 / 权重，以及「融合权重」表（行 = 基准集，单元格 = 该指标分母 → 权重）。
+- **`--fusion {weighted,equal}`**：`equal` = 基准集内等权（旧的宏平均语义，仍排除办公域槽位）。口径写进任务级 `metrics.json` 与各数据集 `metrics.json` 的 `fusion` 字段；`compare` / `evaluate-compare` 把它当**关键可比性维度**——旧产物缺该字段归一为 `legacy`（旧口径：等权且 office 参与），与 `weighted` / `equal` 都判不可比（口径变了本来就不能直接比）。
+- **参与条件不变**：指标只在具备对应标注能力的数据集上参与——没有可机检 stale 题的集（locomo/longmemeval，或只有 `gold_stale_note` 且用启发式判分的集）不参与 stale_rate，无 evidence 标注的集（longmemeval/beam）不参与 evidence_recall，无 abstention 题的集不参与 abstention_accuracy。绝不用"记 0"稀释。分母为 0 或取不到的集跳过该指标；旧 run 缺 `evidence_n` / `abstention_n` 时回退 `n_questions`。**accuracy / evidence_recall / abstention_accuracy / stale_rate 四项参与基准评级**；token_f1 / bleu1 只测字面重合（诊断指标），照常计算与展示但不参与评级。**诊断指标**（检索召回率@5 需 has_evidence；过度拒答率）同样融合展示，但不参与评级与门禁。
+- **门禁一票否决独立于基准评级**：办公域槽位 stale_rate > 0.03 → 总评"不达标"，退出码 1（可接 CI），无论基准评级多高；`evaluate-compare` 的顶层门禁同样包含办公域这一组红线（门禁名带「（办公域）」），office 移出融合不等于把红线移出结论。
+- **基准集为空**（只评测了 office）：基准评级显示 `n/a`，业务结论与门禁照常输出。
 - **按需下载的公开集必须先 fetch**：`locomo` / `longmemeval_oracle` / `gatemem_office` / `longmemeval_s` / `beam_1m`（或 `beam_10m`）都没有内置文件，`evaluate` 从 `~/.membench/datasets/` 解析可用路径，缺失时报错提示先 `python -m membench.cli dataset fetch <key>`（`--no-lme-s` 不检查 LongMemEval-S；`--no-beam` / `--quick` 不检查 BEAM 槽位）。judge=heuristic 跑 BEAM 会警告（rubric 型题目规则判分失真，建议 llm/client）。
 - **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**，缺省 `output_root()`）落 `DIR/eval_<adapter>_<platform>_<ts>/`：各数据集产物在 `runs/<dataset>/`（数据集级报告 `report/{report.md,metrics.json,results.jsonl,fig_*.png}`，逐对话目录 `<对话>/` 内含 `report/`、`runtime/`、`memory_snapshot/`），任务级报告在 `reports/`（`report.md` + `metrics.json` + `evaluate_summary.json` + `fig_dataset_overview.png`）。
 

@@ -283,20 +283,21 @@ def test_scan_capabilities_sentinel_reject_category(tmp_path: Path) -> None:
     }
 
 
-def test_fusion_macro_average(
+def test_fusion_weighted_participation(
     tmp_path: Path,
     mini_datasets: dict[str, Path],
     script: dict[str, tuple[str, list[str]]],
 ) -> None:
-    """宏平均融合：参与规则与手算均值核对。
+    """加权融合：办公域槽位（B）不参与，参与规则与手算均值核对。
 
     手算（heuristic judge + 脚本答案）：
-    - A: accuracy=2/3, evidence_recall=1.0, stale_rate=1.0, abstention_accuracy=1.0
-    - B: accuracy=0.5（无 evidence/stale/abstention 标注）
-    - C: accuracy=1.0, abstention_accuracy=1.0（无 evidence 标注）
-    融合 accuracy = (2/3 + 0.5 + 1.0) / 3 = 13/18。
+    - A: accuracy=2/3（3 题）, evidence_recall=1.0, stale_rate=1.0,
+      abstention_accuracy=1.0
+    - B: accuracy=0.5（2 题，办公域槽位 → 不参与）
+    - C: accuracy=1.0（2 题）, abstention_accuracy=1.0（无 evidence 标注）
+    融合 accuracy = (3×2/3 + 2×1.0) / (3+2) = 4/5。
     """
-    summary = _run_evaluate(tmp_path, mini_datasets, script)
+    summary = _run_evaluate(tmp_path, mini_datasets, script, office_key="B")
     fused = summary["fused"]
 
     assert fused["evidence_recall"]["participants"] == ["A"]
@@ -307,8 +308,11 @@ def test_fusion_macro_average(
     assert fused["abstention_accuracy"]["value"] == pytest.approx(1.0)
 
     for metric in ("accuracy", "token_f1", "bleu1"):
-        assert fused[metric]["participants"] == ["A", "B", "C"]
-    assert fused["accuracy"]["value"] == pytest.approx(13 / 18)
+        assert fused[metric]["participants"] == ["A", "C"]
+        assert fused[metric]["total_weight"] == 5
+    assert fused["accuracy"]["value"] == pytest.approx(4 / 5)
+    # 办公域槽位不参与任何指标的融合（评分与业务结论分家）
+    assert all("B" not in entry["participants"] for entry in fused.values())
 
 
 def test_gate_fail_exit_code(
@@ -383,14 +387,22 @@ def test_report_contents(
     mini_datasets: dict[str, Path],
     script: dict[str, tuple[str, list[str]]],
 ) -> None:
-    """报告含综合评级、"评价（百分比）"样式与"参与数据集"列。"""
+    """报告含基准评级、业务结论、"评价（百分比）"样式与权重列。"""
     summary = _run_evaluate(tmp_path, mini_datasets, script)
     eval_dir = Path(summary["_eval_dir"])
     reports_dir = eval_dir / "reports"
     report = (reports_dir / "report.md").read_text(encoding="utf-8")
 
-    assert "**综合评级：" in report
+    assert "**基准评级（不含办公域槽位）：" in report
     assert "/4.0）**" in report
+    # 业务结论（办公域槽位）单列：办公集参与的旧口径已删除
+    assert "## 业务结论（办公域槽位）" in report
+    assert "陈旧率（stale_rate）" in report
+    assert "## 融合权重" in report
+    # 融合表的参与集带题数与权重；办公域槽位（a）不在参与集里
+    fused_section = report.split("## 融合指标")[1].split("## 融合权重")[0]
+    assert "题，权重" in fused_section
+    assert "A（" not in fused_section  # 办公域槽位（A）不在基准参与集里
     # "评价（百分比）"样式，如 优秀（100.0%）
     for label in ("优秀（", "良好（", "中等（", "较差（"):
         if label in report:
@@ -407,8 +419,8 @@ def test_report_contents(
     assert "avg_ingest_latency_ms" in report
     assert (reports_dir / "fig_dataset_overview.png").is_file()
     assert "](fig_dataset_overview.png)" in report
-    # 综合评级保留两位小数（不强行截断到一位）
-    m = re.search(r"综合评级：\S+（(\d+\.\d+)/4.0）", report)
+    # 基准评级保留两位小数（不强行截断到一位）
+    m = re.search(r"基准评级（不含办公域槽位）：\S+（(\d+\.\d+)/4.0）", report)
     assert m is not None and len(m.group(1).split(".")[1]) == 2
     # 数据集范围行：先确认本次实际评测的数据集 key 与来源
     assert "数据集范围" in report
@@ -443,13 +455,14 @@ def test_fuse_metrics_empty_participants() -> None:
     res = DatasetResult(
         spec=DatasetSpec(key="b", name="B", path="x", source="builtin"),
         run_dir="x",
-        metrics={"overall": {"accuracy": 0.5, "evidence_recall": 0.0}},
+        metrics={"overall": {"accuracy": 0.5, "evidence_recall": 0.0, "n_questions": 4}},
         capabilities={"has_evidence": False, "has_stale": False, "has_abstention": False},
     )
     fused = fuse_metrics([res])
     assert fused["evidence_recall"]["value"] is None
     assert fused["evidence_recall"]["participants"] == []
     assert fused["accuracy"]["value"] == pytest.approx(0.5)
+    assert fused["accuracy"]["total_weight"] == 4
 
 
 # ---------------------------------------------------------------------------

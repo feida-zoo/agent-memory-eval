@@ -357,7 +357,7 @@ def test_evaluate_compare_writes_compare_layout(mini_datasets, scripts, tmp_path
 
     md = (reports / layout.FILE_COMPARISON_MD).read_text(encoding="utf-8")
     assert "**门禁结论：" in md
-    assert "跨数据集融合 diff" in md
+    assert "基准集融合 diff" in md
     assert "逐数据集关键指标 diff" in md
     # by_category diff 段按数据集分别渲染（数据集小标题 + 中文题型名，不跨集合并）
     assert "逐数据集题型 diff" in md
@@ -741,7 +741,7 @@ def test_evaluate_compare_task_dir_in_place(
     for name in (layout.FILE_COMPARISON_MD, FIG_PER_DATASET_DIFF, FIG_FUSED_DIFF):
         assert (reports / name).is_file(), f"缺少 reports/{name}"
     md = (reports / layout.FILE_COMPARISON_MD).read_text(encoding="utf-8")
-    assert "**门禁结论：" in md and "跨数据集融合 diff" in md
+    assert "**门禁结论：" in md and "基准集融合 diff" in md
     # 就地：没有另外新建 compare_* 实验目录
     assert [p.name for p in base.iterdir()] == [task.name]
 

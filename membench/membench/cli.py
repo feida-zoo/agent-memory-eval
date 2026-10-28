@@ -35,6 +35,7 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
         [--report-out DIR | --task-dir DIR] [--adapter-arg KEY=VALUE]... \
         [--no-snapshot] \
         [--quick | --beam-10m | --no-beam] [--no-lme-s] \
+        [--fusion weighted|equal]   # 基准集融合口径（默认 weighted：按题数加权、封顶 500）\
         [--evidence-match substring|overlap|llm] \
         [--dataset KEY|PATH]...   # 显式数据集清单（与预设开关互斥） \
         [--from-runs KEY=DIR]...   # 复用已有产物；缺失数据集用 --adapter 补跑
@@ -46,6 +47,7 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
         [--report-out DIR | --task-dir DIR] [--no-snapshot] [--tag <name>] \
         [--quick | --beam-10m | --no-beam] \
+        [--fusion weighted|equal]   # 两侧共用（默认 weighted）\
         [--no-lme-s] [--evidence-match substring|overlap|llm] \
         [--dataset KEY|PATH]...   # 两侧使用同一清单（与预设开关互斥） \
         [--baseline-run KEY=DIR]... [--candidate-run KEY=DIR]...  # 两侧复用+补跑
@@ -307,7 +309,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ud_delete.set_defaults(func=_cmd_user_data_delete)
 
     # --- evaluate ---
-    p_ev = sub.add_parser("evaluate", help="全量评估：多数据集依次评测 + 宏平均融合综合评分 + 办公域 stale 门禁")
+    p_ev = sub.add_parser("evaluate", help="全量评估：多数据集依次评测 + 基准集加权融合出基准评级 + 办公域 stale 门禁（office 单列业务结论）")
     p_ev.add_argument("--adapter", default=None, help="适配器名（见 list-datasets 提示 / ADAPTERS 注册表）；--from-runs 全复用时可省略")
     p_ev.add_argument(
         "--adapter-arg",
@@ -340,6 +342,14 @@ def _build_parser() -> argparse.ArgumentParser:
     ev_group.add_argument("--beam-10m", action="store_true", help="BEAM 槽位使用 beam_10m.jsonl（默认 beam_1m.jsonl）")
     p_ev.add_argument("--no-beam", action="store_true", help="不评测 BEAM 槽位（与 --beam-10m 互斥）")
     p_ev.add_argument("--no-lme-s", action="store_true", help="剔除 LongMemEval-S 变体（默认包含；~268MB、高成本）")
+    p_ev.add_argument(
+        "--fusion",
+        choices=("weighted", "equal"),
+        default="weighted",
+        help="基准集融合口径：weighted=按参与题数加权、单数据集封顶 500（默认）；"
+        "equal=基准集内等权（旧宏平均语义）。两种口径都不含办公域槽位（office 单列业务结论），"
+        "口径写入 metrics 并参与可比性校验（旧产物缺该字段归一为 legacy，与两者都不可比）",
+    )
     p_ev.add_argument(
         "--dataset",
         action="append",
@@ -434,6 +444,14 @@ def _build_parser() -> argparse.ArgumentParser:
     ev_cmp_group.add_argument("--beam-10m", action="store_true", help="BEAM 槽位使用 beam_10m.jsonl")
     p_ev_cmp.add_argument("--no-beam", action="store_true", help="不评测 BEAM 槽位（与 --beam-10m 互斥）")
     p_ev_cmp.add_argument("--no-lme-s", action="store_true", help="剔除 LongMemEval-S 变体（默认包含）")
+    p_ev_cmp.add_argument(
+        "--fusion",
+        choices=("weighted", "equal"),
+        default="weighted",
+        help="两侧共用的基准集融合口径：weighted=按参与题数加权、单数据集封顶 500（默认）；"
+        "equal=基准集内等权（旧宏平均语义）。两侧必须同口径；办公域槽位不参与基准评级，"
+        "单列业务 diff 与红线门禁",
+    )
     p_ev_cmp.add_argument(
         "--dataset",
         action="append",
@@ -1412,6 +1430,7 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
             evidence_matcher=_make_evidence_matcher(args),
             specs=specs,
             from_runs=from_runs or None,
+            fusion=args.fusion,
             **_out_kwargs(args),
             **_snapshot_kwarg(args),
         )
@@ -1479,6 +1498,7 @@ def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
             specs=specs,
             baseline_runs=baseline_runs or None,
             candidate_runs=candidate_runs or None,
+            fusion=args.fusion,
             **_out_kwargs(args),
             **_snapshot_kwarg(args),
         )

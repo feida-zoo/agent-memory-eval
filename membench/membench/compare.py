@@ -94,6 +94,11 @@ WARN_COMPARABILITY_DIMS: tuple[str, ...] = (
     # 检索命中口径（substring / overlap / llm）不同则分数不可直接对比，
     # 降级 WARN 提示；旧版 run 未落账该字段时两侧同缺，不判不一致。
     "retrieval_match",
+    # 融合口径：weighted（按题数加权、office 不参与）/ equal（基准集内等权）/
+    # legacy（旧产物：等权且 office 参与，缺省归一）。它只影响**多数据集融合**
+    # 的数值，单数据集的指标与它无关——因此不能当关键维度，否则"单集 run 产物
+    # vs evaluate 产物"这种常规对比会被误判不可比。降级 WARN，报告里照样列出。
+    "fusion",
 )
 
 #: 提示维度：仅记录（``same=False``），不影响结论与门禁。
@@ -229,6 +234,10 @@ def _comparability_value(metrics: dict[str, Any], dim: str) -> Any:
     ``run_mode`` 缺省归一为 ``"full"``：本特性之前的所有 run 都是全量跑，
     旧 run 不该因为"没落账这个字段"被记成无法核验。
 
+    ``fusion`` 缺省归一为 ``"legacy"``：旧产物的融合口径是"基准集内等权且
+    办公域槽位参与"，与 ``weighted`` / ``equal`` 都不可比——口径变了，分数
+    本来就不能直接比。
+
     ``n_questions`` 顶层没有——它由 :func:`membench.metrics.summary.aggregate`
     写在 ``overall`` 下，故取 ``overall`` 兜底；只读顶层会让该维度恒为
     ``None == None``（死维度，冒烟产物与全量产物因此被当成可比）。
@@ -238,6 +247,8 @@ def _comparability_value(metrics: dict[str, Any], dim: str) -> Any:
         return fingerprint.get("sha256") if isinstance(fingerprint, dict) else None
     if dim == "run_mode":
         return metrics.get("run_mode") or "full"
+    if dim == "fusion":
+        return metrics.get("fusion") or "legacy"
     if dim == "n_questions":
         value = metrics.get("n_questions")
         if value is not None:

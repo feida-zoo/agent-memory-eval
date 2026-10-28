@@ -21,7 +21,7 @@ description: >
 | 用户想干什么 | 用哪条命令（默认路径） | 产物在哪 |
 |---|---|---|
 | 跑一次评测（单集 / 多集） | `scripts/run_task.py eval` | `output/eval_<name>_<platform>_<ts>/` |
-| 全量评估（多数据集宏平均总分） | 原生 `membench.cli evaluate` | 同上，任务级 `reports/evaluate_summary.json` |
+| 全量评估（基准集加权宏平均 + 办公域单列） | 原生 `membench.cli evaluate` | 同上，任务级 `reports/evaluate_summary.json` |
 | 两个 commit 或两版系统 A/B | `scripts/run_task.py ab` | `output/compare_<name>_<platform>_<ts>/` |
 | 跨数据集 A/B（融合 diff） | 原生 `membench.cli evaluate-compare` | 同 `compare_*`（含 `fig_fused_diff.png`） |
 | 优化闭环（诊断→建议→plan→执行→AB→报告） | `scripts/run_task.py eval` / `ab` | 基线 `eval_*` + 对比 `compare_*` |
@@ -42,7 +42,7 @@ description: >
 | 回放任务 | 上述目录 + `snapshots/` | 条目 `entries/` 是真源，`index.json` 是派生视图 |
 | 默认根 | `output_root()` | `MEMBENCH_OUTPUT_DIR` > skill `output/` > 工程根 |
 
-报告解读：比率指标给四级评价与综合评级（综合评级取 accuracy / evidence_recall / abstention_accuracy / stale_rate 四项连续点数均值）；token_f1 / bleu1（字面重合，非语义正确性）/ recall_at_5 / over_refusal_rate 为诊断指标，仅展示不参与评级；办公域 `stale_rate ≤0.03` 一票否决、`abstention_accuracy` 目标 1.0；细节见 `membench/README.md`「指标说明」。
+报告解读：单集报告给四级评价与综合评级；多数据集 `evaluate` 给**基准评级**（不含办公域槽位，默认按题数加权、封顶 500）+ **业务结论单列**（office 的准确率与 stale 红线，`stale_rate ≤0.03` 一票否决）；token_f1 / bleu1（字面重合，非语义正确性）/ recall_at_5 / over_refusal_rate 为诊断指标，仅展示不参与评级；细节见 `membench/README.md`「指标说明」。
 
 ## 标准流程
 

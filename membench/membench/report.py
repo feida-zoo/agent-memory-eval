@@ -215,6 +215,10 @@ DIM_LABEL_ZH: dict[str, str] = {
     "accuracy_regression": "准确率回归",
     "stale_rate_regression": "陈旧率回归",
     "latency_p95_regression": "延迟 P95 回归",
+    # 办公域槽位的业务红线（不参与基准融合，但单独进门禁）
+    "office_accuracy_regression": "准确率回归（办公域）",
+    "office_stale_rate_regression": "陈旧率回归（办公域）",
+    "office_latency_p95_regression": "延迟 P95 回归（办公域）",
     # 可比性维度
     "adapter": "适配器",
     "adapter_version": "适配器版本",
@@ -226,6 +230,7 @@ DIM_LABEL_ZH: dict[str, str] = {
     "commit": "commit",
     "retrieval_match": "检索匹配口径",
     "run_mode": "运行模式",
+    "fusion": "融合口径",
     "limit": "题目上限",
     "shards": "分片数",
     "shard_index": "分片序号",
