@@ -4,16 +4,18 @@
 
 用法::
 
-    run_task.py eval --adapter NAME (--dataset KEY|PATH)... \
+    run_task.py eval --adapter NAME (--dataset KEY|PATH ... | --common) \
         --judge {llm,client,heuristic} --recall-mode {substring,overlap,llm} \
-        [--platform P] [--commit SHA] [--driver-llm M] [--adapter-version V] \
+        [--fusion {weighted,equal}] [--platform P] [--commit SHA] \
+        [--driver-llm M] [--adapter-version V] \
         [--shards N|max] [--jobs N] [--limit N] [--report-out DIR] [--no-snapshot] \
         [--name TAG] [--evidence-match-threshold X] [--llm-* ...] \
         [--adapter-arg KEY=VALUE]... [--task-dir DIR] [--background] [--dry-run]
 
     run_task.py ab --baseline-adapter NAME --candidate-adapter NAME \
-        (--dataset KEY|PATH)... --judge {...} --recall-mode {...} \
-        [--baseline-version V] [--candidate-version V] [--driver-llm-a/-b M] \
+        (--dataset KEY|PATH ... | --common) --judge {...} --recall-mode {...} \
+        [--fusion {weighted,equal}] [--baseline-version V] [--candidate-version V] \
+        [--driver-llm-a/-b M] \
         [--platform P] [--commit SHA] [--shards N|max] [--jobs N] [--limit N] \
         [--name TAG] [--report-out DIR] [--no-snapshot] \
         [--adapter-arg-a/-b KEY=VALUE]... [--task-dir DIR] [--background] [--dry-run]
@@ -52,6 +54,12 @@
   ``llm`` / ``client``。
 - ``--recall-mode`` 映射到 membench 的 ``--evidence-match``。摘要 / 改写式记忆请用
   ``llm``，否则 ``evidence_recall`` 会系统性偏低。
+- ``--dataset`` 与 ``--common`` 二选一：``--common`` 取公开基准常用集（locomo /
+  longmemeval_oracle / gatemem_office / beam_1m，清单由
+  ``membench.evaluate.plan_datasets`` 决定，不含办公域槽位与 LongMemEval-S），
+  缺文件时报错提示先 ``dataset fetch``；显式清单请逐项 ``--dataset``。
+- ``--fusion`` 透传给 ``evaluate`` / ``evaluate-compare``（默认 ``weighted`` 按
+  参与题数加权、单数据集封顶 500）；``ab`` 的逐数据集 ``compare`` 门禁不受它影响。
 - ``compare --require-comparable`` 是 strict 门禁：关键维度（``adapter`` /
   ``adapter_version`` / ``driver_llm`` / ``platform`` / ``judge`` 等）缺失或不同
   都会判 FAIL。A/B 只应让被测变量（通常是 ``commit``）不同；正式对比请显式给
@@ -186,6 +194,7 @@ class CommonArgs:
 
     judge: str
     recall_mode: str
+    fusion: str = "weighted"
     platform: Optional[str] = None
     commit: Optional[str] = None
     jobs: Optional[int] = None
@@ -363,6 +372,37 @@ def _collect_datasets(values: Sequence[str]) -> list[DatasetArg]:
         seen[dir_key] = text
         datasets.append(dataset)
     return datasets
+
+
+def _common_dataset_paths() -> list[str]:
+    """``--common`` 的数据集路径：直接取 membench 预设清单（不在此抄一份）。
+
+    ``plan_datasets`` 在按需下载集缺失时用 ``SystemExit`` 报错并提示先
+    ``dataset fetch``；本脚本统一转成 :class:`UsageError`（退出码 2）。
+    """
+    try:
+        root = find_membench_root()
+    except SystemExit as exc:
+        raise UsageError(str(exc)) from exc
+    evaluate = _membench_module(root, "evaluate")
+    try:
+        specs = evaluate.plan_datasets(common=True)
+    except SystemExit as exc:
+        raise UsageError(f"--common 的公开基准常用集不可用: {exc}") from exc
+    return [spec.path for spec in specs]
+
+
+def _select_datasets(args: argparse.Namespace) -> list[DatasetArg]:
+    """``--dataset`` 与 ``--common`` 二选一，返回解析后的数据集清单。"""
+    values = list(args.dataset or [])
+    if args.common and values:
+        raise UsageError(
+            "--common 与 --dataset 互斥：--common 用公开基准常用集，"
+            "或逐项给 --dataset 自选数据集，二者选一"
+        )
+    if not args.common and not values:
+        raise UsageError("必须给 --dataset（可重复）或 --common（公开基准常用集）")
+    return _collect_datasets(_common_dataset_paths() if args.common else values)
 
 
 def _heuristic_smoke_note(common: CommonArgs) -> str:
@@ -784,6 +824,8 @@ def _evaluate_argv(
         common.judge,
         "--evidence-match",
         common.recall_mode,
+        "--fusion",
+        common.fusion,
         "--task-dir",
         task_dir,
     ]
@@ -822,10 +864,10 @@ def _fuse_argv(dataset_dir: str) -> list[str]:
 
 
 def _evaluate_from_runs_argv(
-    task_dir: str, datasets: Sequence[ResolvedDataset]
+    task_dir: str, datasets: Sequence[ResolvedDataset], fusion: str
 ) -> list[str]:
     """``evaluate --task-dir --from-runs`` 汇总多数据集任务级报告。"""
-    argv = ["evaluate", "--task-dir", task_dir]
+    argv = ["evaluate", "--task-dir", task_dir, "--fusion", fusion]
     for item in datasets:
         argv += ["--from-runs", f"{item.dataset.key}={item.directory}"]
     return argv
@@ -845,10 +887,13 @@ def _compare_argv(
 
 
 def _evaluate_compare_argv(
-    task_dir: str, arm_datasets: dict[str, dict[str, ResolvedDataset]], datasets: Sequence[DatasetArg]
+    task_dir: str,
+    arm_datasets: dict[str, dict[str, ResolvedDataset]],
+    datasets: Sequence[DatasetArg],
+    fusion: str,
 ) -> list[str]:
     """``evaluate-compare --task-dir`` 复用两臂已有产物，写跨数据集对比报告。"""
-    argv = ["evaluate-compare", "--task-dir", task_dir]
+    argv = ["evaluate-compare", "--task-dir", task_dir, "--fusion", fusion]
     for dataset in datasets:
         baseline = arm_datasets["A"][dataset.key]
         candidate = arm_datasets["B"][dataset.key]
@@ -1147,7 +1192,9 @@ def _execute_eval(options: EvalOptions, root: Path) -> FlowState:
         )
         state.datasets.append(ResolvedDataset(dataset, directory))
     if len(options.datasets) > 1:
-        result = executor.run_capture(_evaluate_from_runs_argv(task_dir, state.datasets))
+        result = executor.run_capture(
+            _evaluate_from_runs_argv(task_dir, state.datasets, options.common.fusion)
+        )
         _handle_gate(result, "evaluate", state)
     return state
 
@@ -1210,7 +1257,9 @@ def _execute_ab(options: AbOptions, root: Path) -> FlowState:
         )
         _handle_gate(result, "compare", state)
     result = executor.run_capture(
-        _evaluate_compare_argv(task_dir, state.arm_datasets, options.datasets)
+        _evaluate_compare_argv(
+            task_dir, state.arm_datasets, options.datasets, options.common.fusion
+        )
     )
     _handle_gate(result, "evaluate-compare", state)
     return state
@@ -1360,7 +1409,7 @@ def _print_dry_run_eval(options: EvalOptions, root: Path) -> None:
         )
     if len(options.datasets) > 1:
         print("# 多数据集（分片 / limit）：逐数据集 run 后汇总任务级报告（--from-runs，不重跑）")
-        argv = ["evaluate", "--task-dir", "$TASK"]
+        argv = ["evaluate", "--task-dir", "$TASK", "--fusion", options.common.fusion]
         for dataset in options.datasets:
             argv += [
                 "--from-runs",
@@ -1410,7 +1459,7 @@ def _print_dry_run_ab(options: AbOptions, root: Path) -> None:
                 ),
             )
         )
-    argv = ["evaluate-compare", "--task-dir", "$TASK"]
+    argv = ["evaluate-compare", "--task-dir", "$TASK", "--fusion", options.common.fusion]
     for dataset in options.datasets:
         argv += [
             "--baseline-run",
@@ -1444,6 +1493,16 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
             "检索证据命中口径（映射为 membench --evidence-match）：substring=逐字子串，"
             "overlap=token 包含度，llm=逐题语义判定。摘要 / 改写式记忆请用 llm，"
             "否则 evidence_recall 会系统性偏低"
+        ),
+    )
+    parser.add_argument(
+        "--fusion",
+        choices=("weighted", "equal"),
+        default="weighted",
+        help=(
+            "基准集融合口径（透传 evaluate / evaluate-compare）：weighted=按参与题数加权、"
+            "单数据集封顶 500（默认）；equal=基准集内等权（旧宏平均语义）。"
+            "ab 下逐数据集 compare 门禁不受它影响"
         ),
     )
     parser.add_argument("--platform", default=None, help="平台标签（如 wx / fs），进目录名与元数据")
@@ -1501,13 +1560,22 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_dataset_argument(parser: argparse.ArgumentParser) -> None:
-    """``--dataset``（可重复）。"""
+    """数据集选择：``--dataset``（可重复）与 ``--common`` 二选一。"""
     parser.add_argument(
         "--dataset",
         action="append",
-        required=True,
+        default=None,
         metavar="KEY|PATH",
-        help="数据集 key 或 JSONL 路径（可重复；相对路径按调用方 cwd 解析）",
+        help="数据集 key 或 JSONL 路径（可重复；相对路径按调用方 cwd 解析）；与 --common 二选一",
+    )
+    parser.add_argument(
+        "--common",
+        action="store_true",
+        help=(
+            "公开基准常用集：locomo / longmemeval_oracle / gatemem_office / beam_1m"
+            "（不含办公域槽位与 LongMemEval-S），清单由 membench.evaluate.plan_datasets 决定；"
+            "缺文件时报错提示先 dataset fetch；与 --dataset 二选一"
+        ),
     )
 
 
@@ -1603,6 +1671,7 @@ def _common_from_args(args: argparse.Namespace) -> CommonArgs:
     return CommonArgs(
         judge=args.judge,
         recall_mode=args.recall_mode,
+        fusion=args.fusion,
         platform=args.platform,
         commit=args.commit,
         jobs=args.jobs,
@@ -1636,7 +1705,7 @@ def _eval_options(args: argparse.Namespace) -> EvalOptions:
     """校验并组装 eval 参数。"""
     common = _common_from_args(args)
     _validate_common(common)
-    datasets = _collect_datasets(args.dataset)
+    datasets = _select_datasets(args)
     report_out = _resolve_caller_path(args.report_out) if args.report_out else None
     arm = ArmArgs(
         adapter=args.adapter,
@@ -1660,7 +1729,7 @@ def _ab_options(args: argparse.Namespace) -> AbOptions:
     """校验并组装 ab 参数。"""
     common = _common_from_args(args)
     _validate_common(common)
-    datasets = _collect_datasets(args.dataset)
+    datasets = _select_datasets(args)
     report_out = _resolve_caller_path(args.report_out) if args.report_out else None
     baseline = ArmArgs(
         adapter=args.baseline_adapter,

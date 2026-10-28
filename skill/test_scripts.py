@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -596,9 +597,173 @@ def test_eval_multi_dataset_with_limit_uses_from_runs(
     assert code == 0
     out = capsys.readouterr().out
     assert out.count("-m membench.cli run ") == 2
-    assert "-m membench.cli evaluate --task-dir $TASK --from-runs" in out
+    assert "-m membench.cli evaluate --task-dir $TASK --fusion weighted --from-runs" in out
     assert "sample_dataset=$TASK/runs/sample_dataset" in out
     assert "other=$TASK/runs/other" in out
+
+
+#: ``--common`` 预设的四个公开基准集；``plan_datasets`` 只检查文件存在，占位内容够用。
+COMMON_DATASET_KEYS = ("locomo", "longmemeval_oracle", "gatemem_office", "beam_1m")
+
+
+def _common_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """把 HOME 指到临时目录并造齐 --common 需要的四个数据集文件。"""
+    home = tmp_path / "home"
+    datasets = home / ".membench" / "datasets"
+    datasets.mkdir(parents=True)
+    for key in COMMON_DATASET_KEYS:
+        (datasets / f"{key}.jsonl").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    return datasets
+
+
+def _eval_common_argv(tmp_path: Path, *extra: str) -> list[str]:
+    """一条最小的 ``eval --common --dry-run`` 调用。"""
+    return [
+        "eval",
+        "--adapter",
+        "mock-strong",
+        "--common",
+        "--judge",
+        "llm",
+        "--recall-mode",
+        "substring",
+        "--name",
+        "common",
+        "--report-out",
+        str(tmp_path / "out"),
+        "--dry-run",
+        *extra,
+    ]
+
+
+def test_eval_common_dry_run_uses_preset_datasets(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--common：数据集恰为公开基准常用集四个，且不含办公域槽位 office。"""
+    datasets = _common_home(tmp_path, monkeypatch)
+    assert run_task.main(_eval_common_argv(tmp_path)) == run_task.EXIT_OK
+    out = capsys.readouterr().out
+    line = next(line for line in out.splitlines() if "-m membench.cli evaluate" in line)
+    argv = shlex.split(line)
+    values = [argv[index + 1] for index, token in enumerate(argv) if token == "--dataset"]
+    expected = [
+        str((datasets / f"{key}.jsonl").resolve()) for key in COMMON_DATASET_KEYS
+    ]
+    assert values == expected
+    assert not any(Path(value).stem == "office" for value in values)
+    assert not (tmp_path / "out").exists()
+
+
+def test_common_and_dataset_are_mutually_exclusive(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--common 与 --dataset 互斥：同时给直接报参数错误，不解析预设。"""
+    code = run_task.main(
+        _eval_common_argv(tmp_path, "--dataset", str(SAMPLE_DATASET))
+    )
+    assert code == run_task.EXIT_FLOW_FAIL
+    err = capsys.readouterr().err
+    assert "互斥" in err
+    assert "--common" in err and "--dataset" in err
+
+
+def test_eval_without_dataset_is_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--dataset 与 --common 都不给：报参数错误并说明二选一。"""
+    argv = [token for token in _eval_common_argv(tmp_path) if token != "--common"]
+    assert run_task.main(argv) == run_task.EXIT_FLOW_FAIL
+    assert "必须给 --dataset" in capsys.readouterr().err
+
+
+def test_fusion_equal_is_forwarded_to_evaluate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--fusion equal：evaluate --dataset 与 evaluate --from-runs 都带同一口径。"""
+    other = tmp_path / "other.jsonl"
+    other.write_text("{}\n", encoding="utf-8")
+    base = [
+        "eval",
+        "--adapter",
+        "mock-strong",
+        "--dataset",
+        str(SAMPLE_DATASET),
+        "--dataset",
+        str(other),
+        "--recall-mode",
+        "substring",
+        "--fusion",
+        "equal",
+        "--report-out",
+        str(tmp_path / "out"),
+        "--dry-run",
+    ]
+    assert run_task.main([*base, "--judge", "llm"]) == run_task.EXIT_OK
+    out = capsys.readouterr().out
+    line = next(line for line in out.splitlines() if "-m membench.cli evaluate" in line)
+    assert "--fusion equal" in line
+
+    assert (
+        run_task.main([*base, "--judge", "heuristic", "--limit", "2"])
+        == run_task.EXIT_OK
+    )
+    out = capsys.readouterr().out
+    line = next(line for line in out.splitlines() if "-m membench.cli evaluate" in line)
+    assert "--from-runs" in line and "--fusion equal" in line
+
+
+def test_ab_common_dry_run_covers_both_arms(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ab --common：两臂各自跑同一批四个数据集，融合口径透传 evaluate-compare。"""
+    datasets = _common_home(tmp_path, monkeypatch)
+    code = run_task.main(
+        [
+            "ab",
+            "--baseline-adapter",
+            "mock-weak",
+            "--candidate-adapter",
+            "mock-strong",
+            "--common",
+            "--judge",
+            "llm",
+            "--recall-mode",
+            "substring",
+            "--fusion",
+            "equal",
+            "--name",
+            "ab-common",
+            "--baseline-version",
+            "v1",
+            "--candidate-version",
+            "v2",
+            "--driver-llm-a",
+            "none",
+            "--driver-llm-b",
+            "none",
+            "--report-out",
+            str(tmp_path / "out"),
+            "--dry-run",
+        ]
+    )
+    assert code == run_task.EXIT_OK
+    out = capsys.readouterr().out
+    run_lines = [line for line in out.splitlines() if "-m membench.cli run " in line]
+    for key in COMMON_DATASET_KEYS:
+        path = str((datasets / f"{key}.jsonl").resolve())
+        hits = [line for line in run_lines if f"--dataset {path}" in line]
+        assert len(hits) == 2, f"{key}: {hits}"
+        arms = {line.split("--task-dir ")[1].split()[0] for line in hits}
+        assert arms == {"$TASK/A", "$TASK/B"}
+    compare_line = next(
+        line for line in out.splitlines() if "-m membench.cli evaluate-compare" in line
+    )
+    assert "--fusion equal" in compare_line
 
 
 # ---------------------------------------------------------------------------
