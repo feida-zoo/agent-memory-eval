@@ -11,7 +11,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `bridge.mjs` | `node:http` 服务，暴露必需端点 `POST /reset\|/ingest\|/query` 与可选端点 `POST /snapshot-capabilities\|/snapshot\|/restore\|/rebuild\|/describe`；顶部「挂点」import 你的记忆模块 |
+| `bridge.mjs` | `node:http` 服务，暴露必需端点 `POST /reset\|/ingest\|/query` 与可选端点 `POST /snapshot-capabilities\|/snapshot\|/restore\|/rebuild\|/describe`；`/reset` 接收框架给的可选上下文（`run_dir` / `dialogue_id` / `dialogue_index`，模板只记日志）；顶部「挂点」import 你的记忆模块 |
 | `build.mjs` | esbuild 打包脚本：真实源码 → 单文件 CJS，处理 stub / external / define |
 | `stubs/electron.mjs` | `electron` 最小 stub（`app.getPath` / `ipcMain` / `BrowserWindow`） |
 | `stubs/i18n.mjs` | `i18n` 最小 stub（`t()` 原样回退，可注入真实文案） |
@@ -34,10 +34,9 @@ npm run build         # = node build.mjs，产物 dist/memory-entry.cjs
 # 3) 起服务
 npm start             # = node bridge.mjs，默认 http://127.0.0.1:8787
 #   可用环境变量覆盖：BRIDGE_HOST / BRIDGE_PORT / BRIDGE_DATA_DIR
-#   可选：清空前快照（调试/回溯用）——BRIDGE_RESET_BACKUP=run 时每次
-#   /reset 前把记忆目录快照到本次对话目录的 runtime/reset_backup/
-#   （目录名带 reset 序号与 dialogue_id，与 results.jsonl 对得上）；
-#   设成具体目录则快照到该目录。默认关闭（每个对话调一次 reset，长跑别开）。
+#   /reset 请求体另带框架给的可选上下文（run_dir = 本次对话目录 / dialogue_id /
+#   dialogue_index），模板只把它打进日志；框架不读不写记忆存储，也不内置
+#   reset 前备份——要回看记忆状态请用快照（默认导出，见下）。
 #   另有可选端点（无需环境变量）：POST /snapshot-capabilities|/snapshot|/restore|/rebuild|/describe，
 #   配合 membench run 的默认快照导出 / --replay 使用（改读取侧代码免重跑 ingest）。
 #   /restore 只接受当前格式版本；/rebuild 接受 compatible_from 列出的旧版本，读源数据重建
@@ -93,11 +92,11 @@ python -m membench.cli run --adapter http \
   同一个 `--report-out`（实验目录名末尾带分片序号 `_s<i>`，不会互相覆盖）。
 - **query 要真的走检索**：别把问题直接丢给底座模型。`retrieved` 填**实际注入 prompt 的
   记忆原文**，否则 `evidence_recall` 会暴露"没走记忆路径"。
-- **回溯记忆内部状态用 `BRIDGE_RESET_BACKUP`**：它把"清空"变成"先快照再清空"。框架本身
-  不读不写你的记忆存储（黑盒契约），只通过 `/reset` 请求体告诉你本次对话目录、对话 id
-  与序号；要不要快照、落到哪里，由桥决定（模板 `run` 模式落到 `<对话目录>/runtime/reset_backup/`）。
-  逐题 `retrieved` 已在 `results.jsonl` 里，快照只用来查"内部存储为什么这样"，
-  别在所有长跑里常开（每对话一份 = 磁盘翻倍）。
+- **回看记忆状态用快照，不要自己攒 reset 备份**：框架在 reset 时给出可选上下文（本次
+  对话目录 / 对话 id 与序号），**不读不写**记忆存储，也不内置 reset 前备份。要看
+  "这一刻记忆里有什么"就走快照（默认导出到 `<对话目录>/memory_snapshot/`，跑完 ingest
+  就能在对话级 `report.md` 里点开）；确实需要自定义回溯的，由接入侧自行在 `/reset`
+  里处理（每对话复制一份记忆库 = 磁盘翻倍，长跑别常开）。
 - **快照回放端点**：`/snapshot` 把记忆整体导出到 `target_dir`（模板布局 = `memory/` +
   `.membench-snapshot.json` 标记，框架还会在同目录写清单 `manifest.json`）；`/restore` 替换
   `DATA_DIR` 并**重建记忆实例**（真实系统若在内存缓存索引，必须在这里重新创建实例，

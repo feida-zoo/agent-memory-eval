@@ -19,7 +19,7 @@
     │   ├── report/                      # 数据集级聚合报告（md + metrics + 逐题明细 + 图）
     │   ├── shards.<i>.json, shards.json  # 分片账本：逐片条目（真源）+ 物化视图（分片评测才有）
     │   └── <dialogue_id>/
-    │       ├── runtime/                 # **对话级**运行时数据（如桥的 reset 前备份）
+    │       ├── runtime/                 # **对话级**运行时数据（归适配器使用的运行时文件）
     │       ├── memory_snapshot/         # 对话快照（默认导出，含 manifest.json）
     │       └── report/                  # 对话级报告（纯文字，不出图）
     └── reports/                         # 任务级报告（单数据集 run = 数据集级报告内容）
@@ -788,7 +788,7 @@ def dialogue_report_dir(experiment_dir: str, dataset: str, dialogue_id: str) -> 
 
 
 def dialogue_runtime_dir(experiment_dir: str, dataset: str, dialogue_id: str) -> str:
-    """对话级运行时数据目录（如桥的 reset 前备份落 ``runtime/reset_backup/``）。"""
+    """对话级运行时数据目录（归适配器使用的运行时文件，runner 每对话建出）。"""
     return os.path.join(dialogue_dir(experiment_dir, dataset, dialogue_id), DIR_RUNTIME)
 
 

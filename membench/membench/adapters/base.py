@@ -75,9 +75,9 @@ class BaseMemoryAdapter(ABC):
         """清空全部记忆状态。每个 dialogue 开始前调用。
 
         框架可能在调用前通过环境变量提供 reset 上下文（**可选提示**，可忽略）：
-        ``MEMBENCH_RUN_DIR`` / ``MEMBENCH_DIALOGUE_ID`` / ``MEMBENCH_DIALOGUE_INDEX``。
-        需要"清空前快照"这类回溯能力时（如调试 stale/误改记忆）自行把快照落盘；
-        框架不读也不写适配器的记忆存储。
+        ``MEMBENCH_RUN_DIR`` / ``MEMBENCH_DIALOGUE_ID`` / ``MEMBENCH_DIALOGUE_INDEX``，
+        供日志、追踪或自定义回溯使用；框架不读也不写适配器的记忆存储，
+        也不内置 reset 前备份（要回看状态请用快照导出）。
         """
         raise NotImplementedError
 

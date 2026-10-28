@@ -23,6 +23,8 @@
    各至少有一个数据集级报告。
 7. 运行时数据（**警告级**，不影响退出码）：任务目录缺 ``runtime/commands.jsonl`` 时
    提示"没有运行时数据，无法回溯本次执行"。
+8. 未登记条目（**警告级**，不影响退出码）：对话目录 / 数据集目录 / 实验根里出现框架
+   产物之外的条目（如历史上的 ``memory_snapshots/``）→ 提示疑似接入侧副产物。
 
 ``--json`` 输出机器可读结构（stdout 只有 JSON）；人类模式成功时 stdout 只有
 ``OK <task>``，失败时逐条 ``FAIL …``。本模块也被 ``run_task.py`` 直接 import 复用。
@@ -50,8 +52,16 @@ DIR_REPORT = "report"
 DIR_REPORTS = "reports"
 DIR_RUNS = "runs"
 DIR_RUNTIME = "runtime"
+DIR_SNAPSHOT = "memory_snapshot"
 FILE_COMMANDS = "commands.jsonl"
+FILE_SHARDS = "shards.json"
 REPORT_FILES: tuple[str, ...] = ("metrics.json", "results.jsonl", "report.md")
+
+#: 框架在对话目录 / 实验根自建或持有的条目；其余给「未登记」警告。
+_DIALOGUE_ENTRIES: frozenset[str] = frozenset({DIR_REPORT, DIR_RUNTIME, DIR_SNAPSHOT})
+_ROOT_ENTRIES: frozenset[str] = frozenset(
+    {DIR_RUNS, DIR_REPORTS, DIR_RUNTIME, "snapshots", "A", "B"}
+)
 
 #: 门禁结论关键词（comparison.md 必须含其一）。
 GATE_KEYWORDS: tuple[str, ...] = ("门禁", "verdict")
@@ -72,7 +82,7 @@ _SKIP_SCHEMES: tuple[str, ...] = (
 
 #: 链接检查时跳过的目录（适配器可能在快照里放任意文件）。
 _LINK_SKIP_DIRS: frozenset[str] = frozenset(
-    {"memory_snapshot", "snapshots", "runtime", "__pycache__", ".git"}
+    {DIR_SNAPSHOT, "snapshots", DIR_RUNTIME, "__pycache__", ".git"}
 )
 
 
@@ -270,6 +280,68 @@ def _dataset_dirs(exp_root: str) -> list[str]:
     ]
 
 
+def _entry_names(directory: str) -> list[str]:
+    """目录下的条目名（跳过隐藏条目与构建缓存）。"""
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    return [name for name in names if not name.startswith(".") and name != "__pycache__"]
+
+
+def _is_dialogue_dir(path: str) -> bool:
+    """对话目录判据：有 ``report/metrics.json``（数据集目录的 ``report/`` 是同级目录）。"""
+    return os.path.isfile(os.path.join(path, DIR_REPORT, "metrics.json"))
+
+
+def _warn_unknown_entry(
+    result: Verification, code: str, where: str, path: str
+) -> None:
+    """未登记条目：只警告（多半是接入侧副产物），不影响通过与否。"""
+    result.warn(
+        "unknown",
+        code,
+        f"{where}：未登记条目 {os.path.basename(path)!r} 不是框架产物，"
+        "疑似接入侧副产物（如历史上的 memory_snapshots/），确认后可删除",
+        path,
+    )
+
+
+def _check_dialogue_entries(
+    dialogue_dir: str, result: Verification, *, where: str
+) -> None:
+    """对话目录只应有 ``report/`` / ``runtime/`` / ``memory_snapshot/``（第 8 项）。"""
+    for name in _entry_names(dialogue_dir):
+        if name not in _DIALOGUE_ENTRIES:
+            _warn_unknown_entry(
+                result, "dialogue_entry", where, os.path.join(dialogue_dir, name)
+            )
+
+
+def _check_dataset_entries(
+    dataset_dir: str, result: Verification, *, where: str
+) -> None:
+    """数据集目录只应有 ``report/`` / 分片账本 / 对话目录（第 8 项）。"""
+    for name in _entry_names(dataset_dir):
+        path = os.path.join(dataset_dir, name)
+        if name in (DIR_REPORT, FILE_SHARDS):
+            continue
+        if name.startswith("shards.") and name.endswith(".json") and os.path.isfile(path):
+            continue
+        if os.path.isdir(path) and _is_dialogue_dir(path):
+            continue
+        _warn_unknown_entry(result, "dataset_entry", where, path)
+
+
+def _check_root_entries(root: str, result: Verification, *, where: str) -> None:
+    """实验 / 任务根只应有骨架目录（第 8 项）。"""
+    for name in _entry_names(root):
+        if name not in _ROOT_ENTRIES:
+            _warn_unknown_entry(
+                result, "root_entry", where, os.path.join(root, name)
+            )
+
+
 def _check_required_files(
     directory: str, result: Verification, *, check: str, where: str
 ) -> None:
@@ -371,6 +443,7 @@ def _check_dataset(
         dataset_qids.append(qid)
 
     dialogue_dirs = _dialogue_dirs(dataset_dir)
+    _check_dataset_entries(dataset_dir, result, where=where)
     if not dialogue_dirs:
         result.fail(
             "consistency",
@@ -388,6 +461,11 @@ def _check_dataset(
             dialogue_dir,
             result,
             check="dialogue_files",
+            where=f"对话 {dialogue_id}" + (f"（臂 {arm}）" if arm else ""),
+        )
+        _check_dialogue_entries(
+            dialogue_dir,
+            result,
             where=f"对话 {dialogue_id}" + (f"（臂 {arm}）" if arm else ""),
         )
         dialogue_metrics_path = os.path.join(dialogue_dir, DIR_REPORT, "metrics.json")
@@ -730,6 +808,9 @@ def verify_task(
             commands,
         )
 
+    # 8. 未登记条目（警告级）：框架产物之外的东西，多半是接入侧副产物
+    _check_root_entries(task, result, where="任务目录")
+
     # 2/3/4. 每个臂 / 实验目录下的数据集
     roots = _experiment_roots(task, kind)
     if not roots:
@@ -737,6 +818,8 @@ def verify_task(
         return result
     for exp_root, arm in roots:
         if kind in ("eval", "compare"):
+            if os.path.normpath(exp_root) != task:
+                _check_root_entries(exp_root, result, where=f"臂目录 {arm}")
             datasets = _dataset_dirs(exp_root)
             if not datasets:
                 result.fail(

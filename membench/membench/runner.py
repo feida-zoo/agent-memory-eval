@@ -898,8 +898,8 @@ class Runner:
         for di, dialogue in enumerate(dialogues, 1):
             dialogue_id = str(dialogue.dialogue_id)
             dialogue_path = layout.dialogue_dir(self.out_dir, dataset_name, dialogue_id)
-            # runtime/ 始终建出（哪怕没有写入者）：适配器 / 桥要把运行时数据
-            # （如 reset 前的记忆备份落 runtime/reset_backup/）时不必自己猜目录。
+            # runtime/ 始终建出（哪怕没有写入者）：适配器要把自己的运行时数据
+            # （日志、追踪、自定义回溯文件等）落进来时不必自己猜目录。
             os.makedirs(
                 layout.dialogue_runtime_dir(self.out_dir, dataset_name, dialogue_id),
                 exist_ok=True,
@@ -917,7 +917,7 @@ class Runner:
             else:
                 # reset 上下文：只作为「适配器可选提示」暴露（环境变量 + HTTP 桥透传），
                 # 框架不读不写适配器的记忆存储——MEMBENCH_RUN_DIR 指本对话目录，
-                # 要不要在清空前快照、落到哪里，由接入侧决定。
+                # 供日志 / 追踪 / 接入侧自定义回溯；框架不内置 reset 前备份。
                 os.environ["MEMBENCH_RUN_DIR"] = dialogue_path
                 os.environ["MEMBENCH_DIALOGUE_ID"] = dialogue_id
                 os.environ["MEMBENCH_DIALOGUE_INDEX"] = str(di)

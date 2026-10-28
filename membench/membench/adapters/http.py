@@ -3,8 +3,8 @@
 用于接入提供 HTTP 接口的在线记忆系统。**必需**三个端点：
 
 - ``POST {base_url}/reset``  ：清空记忆。请求体形如 ``{"run_dir": ...,
-  "dialogue_id": ..., "dialogue_index": ...}``——框架给的**可选提示**，供服务端在
-  清空前自行快照/归档（服务端不认识这些字段时忽略即可，不构成契约要求）。
+  "dialogue_id": ..., "dialogue_index": ...}``——框架给的**可选提示**，供服务端做
+  日志 / 追踪 / 自定义回溯（服务端不认识这些字段时忽略即可，不构成契约要求）。
 - ``POST {base_url}/ingest`` ：请求体 ``{"messages": [...]}``；
   响应可带 ``{"input_tokens": int, "llm_calls": int}``（缺省为 0）。
 - ``POST {base_url}/query``  ：请求体 ``{"question": "..."}``；
@@ -99,7 +99,7 @@ class HttpAdapter(BaseMemoryAdapter):
         """调用服务端 ``POST /reset`` 清空记忆。
 
         请求体带上框架侧的 reset 上下文（run 目录 / 对话 id 与序号，来自
-        ``MEMBENCH_*`` 环境变量）——服务端可用于「清空前快照」等回溯用途；
+        ``MEMBENCH_*`` 环境变量）——供服务端做日志、追踪或自定义回溯；
         不认识这些字段的服务端直接忽略，行为与历史版本一致。
         """
         context = {

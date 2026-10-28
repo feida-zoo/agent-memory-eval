@@ -11,7 +11,7 @@
         └── <YYYYmmdd-HHMMSS>-<command>-<pid>.log   # 本次命令的 stdout+stderr 全量
 
 **与对话级 runtime 的区别**：``<实验目录>/runs/<dataset>/<对话目录>/runtime/`` 是
-"该对话的运行时数据"（桥的 reset 前备份等，归适配器使用）；本模块写的是**实验 /
+"该对话的运行时数据"（归适配器使用的运行时文件）；本模块写的是**实验 /
 臂目录级**的 runtime，与 ``runs/`` / ``reports/`` 平级，记录的是评测命令本身。
 
 用法（只给 CLI 与编排脚本用）::

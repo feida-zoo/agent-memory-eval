@@ -16,7 +16,7 @@
 
 | 端点 | 请求体 | 响应（最少） | 说明 |
 |---|---|---|---|
-| `POST /reset` | `{}` 或 `{"run_dir","dialogue_id","dialogue_index"}`（可选提示；`run_dir` = **该对话的目录** `<实验目录>/runs/<dataset>/<对话目录>`） | 2xx 即可（体可空） | 真清空记忆库（向量 collection / 事实表 / 情景缓冲 / 图谱），测试库与生产库隔离；上下文只用于"清空前快照"等回溯能力，可忽略 |
+| `POST /reset` | `{}` 或 `{"run_dir","dialogue_id","dialogue_index"}`（可选提示；`run_dir` = **该对话的目录** `<实验目录>/runs/<dataset>/<对话目录>`） | 2xx 即可（体可空） | 真清空记忆库（向量 collection / 事实表 / 情景缓冲 / 图谱），测试库与生产库隔离；上下文供日志 / 追踪 / 接入侧自定义回溯，可忽略 |
 | `POST /ingest` | `{"messages":[{"role","content","timestamp"}]}` | `{"input_tokens":int,"llm_calls":int,"latency_ms":float}` | 走**记忆写入路径**；拿不到 token/调用数填 `0`（报告标「未上报」） |
 | `POST /query` | `{"question":str}` | `{"answer":str,"retrieved":[str],...}` | 走**记忆读取+回答**；`retrieved` 填实际注入 prompt 的**记忆原文**，注入即口径（优先级顺序、多轮检索先合并去重、报全量，见下方常见坑）；`input_tokens`/`output_tokens` 填了才会进「Token 消耗」账 |
 
@@ -151,4 +151,4 @@ result = check_target("http://127.0.0.1:8787", timeout=10.0, api_key=None)
   （stub 掉 `ipcMain`/`BrowserWindow` 即可），否则会因缺窗口上下文而失败。
 - 评测用独立数据目录（`BRIDGE_DATA_DIR`）与独立实例：`reset` 必须真清空，且**绝不能碰生产数据**。
 - **并行分片 = 每分片一个桥实例**：评测对每个 dialogue 调 `reset()`，两个分片共享一个实例会互相清库（跨片串扰）。N 分片并行就起 N 个桥（各自 `BRIDGE_PORT` + `BRIDGE_DATA_DIR`）；只有一个实例时请串行跑分片。被测系统若自带多命名空间隔离，可自行在桥上按命名空间路由——那是系统能力增强，不是本模板的默认行为。分片产物落位由 `--task-dir` / `--report-out` 与 `--shards` 编排，不要手拼目录名。
-- **清空前快照（可选，回溯用）**：框架在每次 `reset` 前把上下文放进请求体（`run_dir` / `dialogue_id` / `dialogue_index`），**不读不写**你的记忆存储。`run_dir` 现在指向**该对话的目录**（`<实验目录>/runs/<dataset>/<对话目录>`，框架已把它的 `runtime/` 建好）：要"清空前留一份"就在桥里自己做，约定落 `runtime/reset_backup/reset_<序号>_<dialogue_id>/`，**默认关闭**。逐题 `retrieved` 已在 `results.jsonl`，快照只用于查"内部存储为什么长这样"（stale / 误改记忆 / 该记没记）；reset 每对话一次，长跑常开等于每对话复制一份记忆目录。
+- **reset 上下文（可选，不内置备份）**：框架在每次 `reset` 时把上下文放进请求体（`run_dir` / `dialogue_id` / `dialogue_index`），**不读不写**你的记忆存储，也**不内置** reset 前备份。`run_dir` 指向**该对话的目录**（`<实验目录>/runs/<dataset>/<对话目录>`）：可用于日志、追踪或接入侧自定义回溯；需要回看记忆状态请用快照（默认导出到 `<对话目录>/memory_snapshot/`，跑完 ingest 就能翻）；确实要在清空前归档一份记忆库的，由接入侧自行在 `/reset` 里处理（每对话复制一份 = 磁盘翻倍，长跑别常开）。

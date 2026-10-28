@@ -261,6 +261,31 @@ def test_runtime_present_has_no_runtime_warning(tmp_path: Path) -> None:
     assert not [item for item in result.warnings if item.code == "missing_runtime"]
 
 
+def test_unknown_dialogue_entry_warns_only(tmp_path: Path) -> None:
+    """对话目录里的未登记目录（如历史上的 memory_snapshots/）：警告级，不影响 ok。"""
+    task = _eval_task(tmp_path)
+    _write(task / "runs" / "sample" / "d001" / "memory_snapshots" / "entry.json", "{}")
+    result = verify_artifacts.verify_task(str(task))
+    assert result.ok, [item.message for item in result.errors]
+    hits = [item for item in result.warnings if item.code == "dialogue_entry"]
+    assert hits, [item.message for item in result.warnings]
+    assert "memory_snapshots" in hits[0].message
+    assert hits[0].severity == "warning"
+
+
+def test_unknown_dataset_and_root_entries_warn_only(tmp_path: Path) -> None:
+    """数据集目录与任务根里的未登记条目同样只警告。"""
+    task = _eval_task(tmp_path)
+    _write(task / "runs" / "sample" / "debug.log", "x")
+    _write(task / "stray" / "note.txt", "x")
+    result = verify_artifacts.verify_task(str(task))
+    assert result.ok, [item.message for item in result.errors]
+    codes = {item.code for item in result.warnings}
+    assert {"dataset_entry", "root_entry"} <= codes
+    # 正常产物（report/、对话目录）不得被误报
+    assert not [item for item in result.warnings if item.code == "dialogue_entry"]
+
+
 def test_bad_tree_exit_code_and_fail_lines(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

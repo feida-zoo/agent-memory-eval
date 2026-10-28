@@ -600,7 +600,7 @@ DIR/eval_<adapter>_<platform>_<ts>[_s<i>][_l<limit>]/   # ts = YYYYMMDD-HHMMSS�
 │   ├── report/{report.md,metrics.json,results.jsonl,fig_category_accuracy.png,fig_latency_hist.png}
 │   ├── shards.<i>.json, shards.json     # 分片账本：逐片条目 + 物化视图（分片评测才有，见「冒烟与分片」）
 │   └── <对话目录>/                       # 对话 id 归一成安全目录名（非法字符换 `_`，空值回退 dialogue）
-│       ├── runtime/                     # **对话级**运行时数据（桥的 reset 前备份落 runtime/reset_backup/）
+│       ├── runtime/                     # **对话级**运行时数据（归适配器使用的运行时文件；空目录也建）
 │       ├── memory_snapshot/             # 默认导出的对话快照（含框架写的 manifest.json；--no-snapshot 关）
 │       └── report/{report.md,metrics.json,results.jsonl}   # 对话级，纯文字不出图
 └── reports/                             # 任务级报告：report.md + metrics.json + 报告引用的图
@@ -635,7 +635,7 @@ DIR/matrix_<ts>/
 - `runtime/commands.jsonl`：一行一次调用（`argv` / `cwd` / 起止时间 / 耗时 / `exit_code` / `python` / `platform` / `pid` / `log` / `env`；密钥参数已脱敏；`O_APPEND` 追加，多分片并发不丢条目）；
 - `runtime/env.json`：一次性环境快照（python / 平台 / membench 版本与 commit / `MEMBENCH_*`）。
 
-它与 `<实验目录>/runs/<dataset>/<对话目录>/runtime/` 不是一回事：后者是**该对话**的运行时数据（适配器 reset 备份等），前者记录的是**评测命令本身**。只读命令（`task status` / `doctor` / `dataset info` / `list-datasets` / `adapter list`）不写；以库方式直接调用 `Runner` / `evaluate` 也不写——只有 CLI 会话才落。`task status` 会展示最近命令、非零退出条数与最近日志路径；`verify_artifacts.py` 对缺 `runtime/commands.jsonl` 的任务给警告级提示。
+它与 `<实验目录>/runs/<dataset>/<对话目录>/runtime/` 不是一回事：后者是**该对话**的运行时数据（归适配器使用的运行时文件），前者记录的是**评测命令本身**。只读命令（`task status` / `doctor` / `dataset info` / `list-datasets` / `adapter list`）不写；以库方式直接调用 `Runner` / `evaluate` 也不写——只有 CLI 会话才落。`task status` 会展示最近命令、非零退出条数与最近日志路径；`verify_artifacts.py` 对缺 `runtime/commands.jsonl` 的任务给警告级提示。
 
 长跑：`skill/src/scripts/run_task.py ... --background` 派生到后台（stdout 只打印任务目录一行），用 `skill/src/scripts/watch_task.py <任务目录> --until-done` 定时查看进度；用法以 skill 的 `SKILL.md` 为准。
 
@@ -698,7 +698,7 @@ Runner(MyAdapter(), "membench/data/sample_dataset.jsonl", out_dir=exp_dir).run()
   `metrics.adapter_describe`，并在报告「适配器自描述」小节展示——**不参与评分，也不是
   可比性维度**。默认返回 `{}`（报告里整节不出现）；抛异常只警告一次，评测照常完成。
 
-完整可运行示例见 `examples/quickstart.py`。token / llm_calls 填不了就填 0（报告中视为 n/a /「未上报」）。`reset()` 里若要实现"清空前快照"这类回溯能力，可读框架给的可选提示环境变量 `MEMBENCH_RUN_DIR`（**本次对话目录**，即 `<实验目录>/runs/<dataset>/<对话目录>`，备份建议落它的 `runtime/reset_backup/`）/ `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`（框架不读也不写你的存储）。
+完整可运行示例见 `examples/quickstart.py`。token / llm_calls 填不了就填 0（报告中视为 n/a /「未上报」）。框架在 reset 时给出可选上下文（本次对话目录 / 对话 id 与序号）：Python 适配器读 `MEMBENCH_RUN_DIR`（**本次对话目录**，即 `<实验目录>/runs/<dataset>/<对话目录>`）/ `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`；框架**不读不写**你的记忆存储，也**不内置** reset 前备份——需要回看记忆状态请用快照（默认导出到 `<对话目录>/memory_snapshot/`）；确实要自定义回溯的，由接入侧自行在 `reset()` 里处理。
 
 `query` 返回的 `retrieved` 决定 `evidence_recall` / `recall@5` 是否成立，口径 = **注入即口径**：填实际拼进回答 prompt 的**记忆条目原文**，按注入优先级排序，多轮检索先合并去重再返回，报注入的那一份全量（框架不合并、不去重、不截断；空列表 = 静默按 0 召回计）。
 
@@ -706,7 +706,7 @@ Runner(MyAdapter(), "membench/data/sample_dataset.jsonl", out_dir=exp_dir).run()
 
 如果你的记忆系统已有 HTTP 服务，实现三个必需端点即可，无需写 Python：
 
-- `POST /reset`：清空全部记忆状态。请求体带**可选**上下文 `{"run_dir", "dialogue_id", "dialogue_index"}`（`run_dir` = 本次**对话目录**，备份建议落它的 `runtime/reset_backup/`）——供服务端在清空前自行快照/归档；不认识就忽略，不影响契约。
+- `POST /reset`：清空全部记忆状态。请求体带**可选**上下文 `{"run_dir", "dialogue_id", "dialogue_index"}`（`run_dir` = 本次**对话目录**）——可用于日志、追踪或接入侧自定义回溯；框架不读不写记忆存储、不内置 reset 前备份，不认识这些字段就忽略，不影响契约。
 - `POST /ingest`：body `{"messages": [{"role", "content", "timestamp"}]}`
 - `POST /query`：body `{"question": "..."}`，返回 `{"answer": str, "retrieved": [str], ...}`
 
@@ -939,7 +939,7 @@ A: 启发式是 token 包含匹配，表述差异大时会误判。先跑 `--jud
 A: 填 0 即可，报告中对应项视为 n/a /「未上报」，不影响 accuracy 等核心指标。注意这与"真实消耗为 0"是两回事：`token_usage` 块全为 0 时报告会显式标注"适配器未上报该字段"。适配器（或 HTTP 桥的 `/ingest`、`/query` 响应）能填多少填多少——填了才有"这次评测烧了多少 token"的账。
 
 **Q: 每个对话都 `reset()`，怎么回溯"清空前记忆里存了什么"？**
-A: 框架不读不写你的记忆存储（黑盒契约），但会把 reset 上下文（本次对话目录 / 对话 id 与序号）作为可选提示给出：Python 适配器读环境变量 `MEMBENCH_RUN_DIR`（= `<实验目录>/runs/<dataset>/<对话目录>`）/ `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`；HTTP 桥收 `POST /reset` 请求体里的 `run_dir` / `dialogue_id` / `dialogue_index`。要不要在清空前快照、落到哪里，由接入侧决定——约定是落该对话目录的 `runtime/reset_backup/`（参考模板的实现：`BRIDGE_RESET_BACKUP=run` 时即如此，见 `examples/http_bridge_node/README.md`）。逐题 `retrieved` 已在数据集级 `report/results.jsonl` 里，快照只用于查内部存储状态；reset 每对话一次，长跑请谨慎常开。
+A: 框架不读不写你的记忆存储（黑盒契约），但会把 reset 上下文（本次对话目录 / 对话 id 与序号）作为可选提示给出：Python 适配器读环境变量 `MEMBENCH_RUN_DIR`（= `<实验目录>/runs/<dataset>/<对话目录>`）/ `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`；HTTP 桥收 `POST /reset` 请求体里的 `run_dir` / `dialogue_id` / `dialogue_index`。框架与模板**不内置** reset 前备份——需要回看记忆状态请用快照（默认导出到 `<对话目录>/memory_snapshot/`，见「状态快照与回放」）；确实要自定义回溯的，由接入侧自行在 `reset()` 里处理（每对话复制一份记忆库 = 磁盘翻倍，长跑别常开）。
 
 **Q: 如何把门禁接入 CI？**
 A: `compare` 子命令在 verdict=FAIL 时以退出码 1 退出，直接放进流水线即可。

@@ -58,7 +58,7 @@ docs/                     # 深度研究报告 + 配图
    - `output/eval_<name>_<platform>_<ts>[_s<i>][_l<limit>]/`（`ts` = `YYYYMMDD-HHMMSS`；`_s<i>` = `--shards` 的分片序号、`_l<limit>` = `--limit`，无分片无 limit 时不带后缀，词表见 `layout.experiment_tags`）：
      - `runs/<dataset>/report/`：数据集级 `report.md`、`metrics.json`、`results.jsonl`、`fig_*.png`
      - `runs/<dataset>/shards.<i>.json`（逐片条目，真源）+ `runs/<dataset>/shards.json`（物化视图）：**分片账本**（分片评测才有；进度与归属的记录，读 / 写 / 校验见 `layout.read_shard_ledger` / `update_shard_ledger` / `check_shard_ledger`，`fuse` 与 `task status` 都经 `read_shard_ledger` 读合并结果）
-     - `runs/<dataset>/<dialogue_id>/`：对话级 `runtime/`（桥的 reset 前备份落 `runtime/reset_backup/`；`MEMBENCH_RUN_DIR` 指本对话目录）、`memory_snapshot/`（**默认导出**，含框架写的 `manifest.json`；适配器未声明快照能力时警告一次并跳过，`metrics["state_snapshot"]["role"] == "unsupported"`）、`report/`（`report.md`、`metrics.json`、`results.jsonl`，不出图；含 `../memory_snapshot/` 的可点击链接与清单条目数 / 体积）
+     - `runs/<dataset>/<dialogue_id>/`：对话级 `runtime/`（归适配器使用的运行时文件，空目录也建；`MEMBENCH_RUN_DIR` 指本对话目录；框架不内置 reset 前备份）、`memory_snapshot/`（**默认导出**，含框架写的 `manifest.json`；适配器未声明快照能力时警告一次并跳过，`metrics["state_snapshot"]["role"] == "unsupported"`）、`report/`（`report.md`、`metrics.json`、`results.jsonl`，不出图；含 `../memory_snapshot/` 的可点击链接与清单条目数 / 体积）
      - `reports/`：任务级报告（`report.md`、`metrics.json`、`evaluate_summary.json`、`fig_dataset_overview.png`——`evaluate_summary.json` **无条件产出**，不区分单/多数据集）
    - `output/compare_<name>_<platform>_<ts>/`：`A/`、`B/`（`layout.DIR_ARM_A` / `DIR_ARM_B`；各为完整 eval 实验形态，含自己的 `runs/` 与 `reports/`）+ `reports/{comparison.md,fig_*.png}`
    - `output/matrix_<ts>/`：`reports/{report.md,matrix_result.json,fig_matrix_accuracy.png}` + `runs/<label>/`

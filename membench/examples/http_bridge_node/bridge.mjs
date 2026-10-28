@@ -6,7 +6,8 @@
  *
  * 必需端点（三个）：
  *
- *   POST /reset   -> 清空记忆（可选：清空前把记忆目录快照一份，见 BRIDGE_RESET_BACKUP）
+ *   POST /reset   -> 清空记忆（请求体可带 run_dir / dialogue_id / dialogue_index
+ *                    等上下文提示，模板只用于日志，不读不写记忆存储）
  *   POST /ingest  -> 写入一段对话，返回 {"input_tokens","llm_calls","latency_ms"}
  *   POST /query   -> 查一个问题，返回 {"answer","retrieved",...}
  *
@@ -49,40 +50,8 @@ import { createMemorySystem } from "./memory-entry.mjs";
 const PORT = Number(process.env.BRIDGE_PORT || 8787);
 const HOST = process.env.BRIDGE_HOST || "127.0.0.1";
 const DATA_DIR = process.env.BRIDGE_DATA_DIR || "./.bridge-data";
-// 清空前快照（默认关闭）："" = 不做；"run" = 落到本次对话目录的
-// runtime/reset_backup/（对话目录由 membench 经 /reset 请求体的 run_dir 带过来）；
-// 其它值 = 固定目录。
-// 注意成本：reset 每个对话调一次，开启后等于每对话复制一份记忆目录——调试/复现时开，
-// 长跑批量评测建议关。
-const RESET_BACKUP = process.env.BRIDGE_RESET_BACKUP || "";
 
 let memory = createMemorySystem({ dataDir: DATA_DIR });
-
-/**
- * 清空前快照（BRIDGE_RESET_BACKUP，默认关闭，人类可读布局）：把当前记忆目录
- * 复制一份，便于评测后回溯"这一刻记忆里有什么"。目录名带 reset 序号与对话 id，
- * 与 results.jsonl 的 dialogue_id 直接对得上；`run` 模式落对话目录的
- * `runtime/reset_backup/`（请求体里 run_dir 就是该对话目录）。
- */
-function snapshotBeforeReset(body) {
-  if (!RESET_BACKUP) return null;
-  const base =
-    RESET_BACKUP === "run"
-      ? body.run_dir
-        ? path.join(String(body.run_dir), "runtime", "reset_backup")
-        : null
-      : RESET_BACKUP;
-  if (!base) return null;
-  const tag = body.dialogue_id ? String(body.dialogue_id) : "unknown";
-  const dest = path.join(base, `reset_${String(resetSeq).padStart(4, "0")}_${tag}`);
-  try {
-    copyDir(DATA_DIR, dest);
-    return dest;
-  } catch (err) {
-    console.error(`[bridge] 快照失败（不影响 reset）：${err?.message || err}`);
-    return null;
-  }
-}
 
 // 状态快照格式版本：改快照布局时递增。SNAPSHOT_COMPATIBLE_FROM 是**重建**窗口：
 // 列出的旧版本仍可用当前代码读源数据重建（/rebuild）；/restore 只接受当前版本
@@ -275,11 +244,12 @@ const routes = new Map([
     "/reset",
     async (body) => {
       resetSeq += 1;
-      const backup = snapshotBeforeReset(body);
+      // reset 上下文只是框架给的可选提示（本次对话目录 / 对话 id 与序号）：
+      // 模板用不上就忽略，打一行日志便于与 results.jsonl 对照。
+      const tag = body.dialogue_id ? `（dialogue_id=${body.dialogue_id}）` : "";
+      console.log(`[bridge] reset #${resetSeq}${tag}`);
       await memory.reset();
-      const payload = { reset_seq: resetSeq };
-      if (backup) payload.backup_path = backup;
-      return payload;
+      return { reset_seq: resetSeq };
     },
   ],
   [
