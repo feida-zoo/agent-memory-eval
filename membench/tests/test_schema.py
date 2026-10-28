@@ -102,6 +102,28 @@ class TestLoadDatasetValidation:
         assert len(dialogues) == 1
         assert dialogues[0].dialogue_id == "d1"
         assert dialogues[0].questions[0].gold_stale is None
+        # 旧数据集没有 gold_stale_note：缺省 None，照常加载。
+        assert dialogues[0].questions[0].gold_stale_note is None
+
+    def test_gold_stale_note_parsed(self, tmp_path: Path) -> None:
+        ds = self._valid_dialogue()
+        ds["questions"][0]["gold_stale"] = "4 study sessions"
+        ds["questions"][0]["gold_stale_note"] = (
+            "previously 4 study sessions, but now 5 study sessions"
+        )
+        path = self._write(tmp_path, [json.dumps(ds)])
+        q = load_dataset(path)[0].questions[0]
+        assert q.gold_stale == "4 study sessions"
+        assert q.gold_stale_note == (
+            "previously 4 study sessions, but now 5 study sessions"
+        )
+
+    def test_gold_stale_note_must_be_str_or_null(self, tmp_path: Path) -> None:
+        ds = self._valid_dialogue()
+        ds["questions"][0]["gold_stale_note"] = 123
+        path = self._write(tmp_path, [json.dumps(ds)])
+        with pytest.raises(ValueError, match=r":1:.*gold_stale_note"):
+            load_dataset(path)
 
     def test_missing_dialogue_field_reports_lineno(self, tmp_path: Path) -> None:
         bad = self._valid_dialogue()

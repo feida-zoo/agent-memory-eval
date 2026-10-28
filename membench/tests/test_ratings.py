@@ -448,3 +448,43 @@ def test_write_run_report_md_no_overall_rating(tmp_path) -> None:
     with open(out_path, encoding="utf-8") as f:
         content = f.read()
     assert "**综合评级：" not in content
+
+
+def test_stale_row_n_a_when_no_checkable_question(tmp_path) -> None:
+    """stale_n=0：显示 n/a（无可机检的 stale 注解），不得出现「优秀（0.0%）」。"""
+    metrics = _minimal_metrics()
+    metrics["overall"].update(
+        {
+            # 低分避免综合评级本身出现「优秀」，让断言能精确检查 stale 行。
+            "accuracy": 0.40,
+            "evidence_recall": 0.50,
+            "abstention_accuracy": 0.40,
+            "stale_rate": None,
+            "stale_n": 0,
+            "stale_total": 70,
+        }
+    )
+    records = [{"qid": "q1", "category": "single_hop", "judge": {"correct": False}}]
+    metrics["by_category"] = {"single_hop": {"accuracy": 0.40, "token_f1": 0.5, "n": 1}}
+    out_path = write_run_report_md(str(tmp_path), records, metrics)
+    content = open(out_path, encoding="utf-8").read()
+
+    assert "n/a（无可机检的 stale 注解）" in content
+    assert "优秀（0.0%）" not in content
+    assert "优秀" not in content
+    # 解释 n/a 的来源：有 70 道 stale 注解题但当前判分器不可机检。
+    assert "70 道 stale 注解题" in content
+
+
+def test_stale_row_marks_coverage_when_partial(tmp_path) -> None:
+    """0 < stale_n < stale_total：值后标注覆盖率。"""
+    metrics = _minimal_metrics()
+    metrics["overall"].update({"stale_rate": 0.0, "stale_n": 56, "stale_total": 70})
+    records = [{"qid": "q1", "category": "single_hop", "judge": {"correct": True}}]
+    out_path = write_run_report_md(str(tmp_path), records, metrics)
+    content = open(out_path, encoding="utf-8").read()
+
+    assert "（可机检 56/70）" in content
+    assert "0.0%（可机检 56/70）" in content
+    # 评级规则小注说明 stale_rate 的分母口径。
+    assert "stale_rate 的分母只含可机检的 stale 题" in content

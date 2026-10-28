@@ -651,6 +651,31 @@ def _fmt_opt(value: Any) -> str:
     return str(value)
 
 
+def stale_rate_display(overall: dict[str, Any]) -> str:
+    """陈旧率单元格：区分"没有可机检题"与"真实 0%"，有覆盖缺口时标注覆盖率。
+
+    - ``stale_n == 0``：本次没有任何可机检的 stale 题，显示
+      ``n/a（无可机检的 stale 注解）``——不能渲染成「优秀（0.0%）」；
+    - ``0 < stale_n < stale_total``：值后追加 ``（可机检 n/total）``，
+      且不给评价标签（分母不是全部注解题，标签会被读成全量结论）；
+    - 旧产物没有 ``stale_n`` 字段：沿用 `format_metric` 的旧渲染。
+    """
+    value = overall.get("stale_rate", "n/a")
+    stale_n = overall.get("stale_n")
+    if not isinstance(stale_n, int):
+        return format_metric("stale_rate", value)
+    if stale_n == 0:
+        return "n/a（无可机检的 stale 注解）"
+    stale_total = overall.get("stale_total")
+    if isinstance(stale_total, int) and stale_n < stale_total:
+        # 覆盖不全时不给评价标签：分母不是全部注解题，标签会被读成全量结论。
+        return (
+            f"{format_metric_value('stale_rate', value)}"
+            f"（可机检 {stale_n}/{stale_total}）"
+        )
+    return format_metric("stale_rate", value)
+
+
 def _md_cell(text: Any) -> str:
     """转义 markdown 表格单元格内容：换行折叠为 <br>，竖线转义。
 
@@ -937,7 +962,7 @@ def write_run_report_md(
     # has_abstention），直接读三个顶层字段。
     cap_items = [
         ("has_evidence", "evidence 标注"),
-        ("has_stale", "gold_stale 标注"),
+        ("has_stale", "可机检 stale 注解"),
         ("has_abstention", "abstention 题"),
     ]
     if any(key in metrics for key, _ in cap_items):
@@ -974,7 +999,7 @@ def write_run_report_md(
         ["效率成本", metric_label("latency_p95_ms"), _fmt(overall.get("latency_p95_ms", "n/a"))],
         ["效率成本", metric_label("avg_input_tokens"), _fmt(overall.get("avg_input_tokens", "n/a"))],
         ["效率成本", metric_label("avg_llm_calls"), _fmt(overall.get("avg_llm_calls", "n/a"))],
-        ["记忆动态", metric_label("stale_rate"), format_metric("stale_rate", overall.get("stale_rate", "n/a"))],
+        ["记忆动态", metric_label("stale_rate"), stale_rate_display(overall)],
         ["拒答", metric_label("abstention_accuracy"), format_metric("abstention_accuracy", overall.get("abstention_accuracy", "n/a"))],
         ["拒答", metric_label_with_role("over_refusal_rate"), format_metric("over_refusal_rate", overall.get("over_refusal_rate", "n/a"))],
     ]
@@ -986,6 +1011,21 @@ def write_run_report_md(
         "它们与检索召回率@5 / 过度拒答率一样照常展示具体值，但不参与综合评级。</sub>"
     )
     lines.append("")
+    # 有 stale 注解但没有任何可机检题：解释 n/a 的来源，避免被读成"零陈旧"。
+    stale_n = overall.get("stale_n")
+    stale_total = overall.get("stale_total")
+    if (
+        isinstance(stale_n, int)
+        and isinstance(stale_total, int)
+        and stale_n == 0
+        and stale_total > 0
+    ):
+        lines.append(
+            f"<sub>本数据集有 {stale_total} 道 stale 注解题，但当前判分器拿不到可机检的"
+            "裸旧值（`gold_stale` 为空，仅有 `gold_stale_note` 描述）；陈旧率不参与评级。"
+            "改用 LLM judge 可基于描述判定。</sub>"
+        )
+        lines.append("")
 
     # LLM judge 回退比例 >5% 时在指标表下方给出警示（判分质量可能退化）。
     if judge_fallback:
@@ -1009,6 +1049,8 @@ def write_run_report_md(
             "（1.0~4.0，档内随数值线性变化）均值，阈值 3.5 / 2.5 / 1.5；"
             "token_f1 / bleu1（字面重合度，非语义正确性）与 "
             "recall_at_5 / over_refusal_rate 为诊断指标，仅展示不参与评级；"
+            "stale_rate 的分母只含可机检的 stale 题（有裸 gold_stale；"
+            "LLM judge 下含 gold_stale_note）；"
             "效率成本指标同样不参与评级。</sub>"
         )
         lines.append("")
@@ -1298,7 +1340,9 @@ def write_compare_report_md(
         "<sub>评级取四项质量指标（accuracy / evidence_recall / "
         "abstention_accuracy / stale_rate）连续点数均值；token_f1 / bleu1"
         "（字面重合度，非语义正确性）与 recall_at_5 / over_refusal_rate"
-        "为诊断指标，仅展示不参与评级；效率成本指标同样不参与评级。</sub>"
+        "为诊断指标，仅展示不参与评级；stale_rate 的分母只含可机检的 stale 题"
+        "（有裸 gold_stale；LLM judge 下含 gold_stale_note）；"
+        "效率成本指标同样不参与评级。</sub>"
     )
     lines.append("")
 

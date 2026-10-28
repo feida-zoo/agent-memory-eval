@@ -28,9 +28,23 @@ probing_questions.json 为 dict，key 为 10 种题型，value 为题目列表�
     temporal_reasoning / knowledge_update / contradiction_resolution /
     instruction_following / preference_following / summarization / abstention
 
-其中 knowledge_update 题在 potential_confusion 非空字符串时填入 gold_stale；
-abstention 题 gold_answer 固定 "<ABSTAIN>"（忽略原始 answer/ideal_response
-字段）。
+其中 knowledge_update 题从 potential_confusion 抽取**裸旧值**填入 gold_stale，
+原始描述句保留在 gold_stale_note；abstention 题 gold_answer 固定 "<ABSTAIN>"
+（忽略原始 answer/ideal_response 字段）。
+
+gold_stale 的抽取口径与 office 集统一为"裸旧值"（如 ``9月20日`` /
+``4 study sessions``），而不是描述句——schema 的 ``gold_stale`` 语义是"过期
+答案，命中即陈旧"，judge 对它做包含与位置判定。至少覆盖三种句式
+（大小写不敏感，捕获到句号 / 分号 / 结尾为止）::
+
+    original X instead of (the )?(updated )?Y      -> X
+    previously X ... (but )?now Y                  -> X
+    originally X ... now Y                         -> X
+
+抽取结果归一（去引号 / 反引号、首尾空白与首尾标点，并剥离
+"the user had"/"the deadline was" 这类主语 / 系动词前缀）；为空、超过 80
+字符、或与 gold_answer 相同（归一后）视为解析失败——此时 gold_stale 留空、
+gold_stale_note 仍保留原句，交给 LLM judge 判 stale。
 
 不同题型的答案字段名不同，按优先级取第一个非空字段：
 ``answer`` -> ``ideal_answer`` -> ``ideal_response`` -> ``ideal_summary``
@@ -40,9 +54,9 @@ abstention 题 gold_answer 固定 "<ABSTAIN>"（忽略原始 answer/ideal_respon
 - evidence 一律为 []：conversation_references 是会话索引/摘要而非原文
   子串，无法作为检索证据。
 - rubric 字段（判分细则列表）未利用，judge 只能基于 gold_answer。
-- gold_stale 取自 potential_confusion 的自然语言描述（如 "LLM might
-  incorrectly recall the original March 15 ..."），是描述而非纯粹的过期
-  答案，stale 判定需做包含式匹配。
+- potential_confusion 的句式不固定：抽不出裸旧值时 gold_stale 留空，
+  只保留 gold_stale_note（原始描述），启发式 judge 对该题不可机检 stale，
+  需用 LLM judge（它读 note）。
 - 消息 timestamp 稀疏：仅每个 batch 首条 user 消息携带 time_anchor，
   其余消息回退到 batch 级 time_anchor（也可能为 null）。锚点原始形态为
   ``March-01-2024``（**只有日期**），经 ``normalize_timestamp`` 归一为
@@ -57,6 +71,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -90,6 +105,99 @@ _PQ_FILENAMES = ("probing_questions.json", "pq.json")
 
 #: role 归一化：assistant 侧关键词（子串匹配，均为小写）。
 _ASSISTANT_HINTS = ("assistant", "agent", "bot", "system", "ai")
+
+#: potential_confusion 的三种句式（大小写不敏感）；每条规则的第 1 捕获组是旧值。
+#: 第 2/3 种（previously … now / originally … now）共用同一条 ``now`` 规则。
+#: 允许标记词后的逗号（``Originally, …``）、值前的 ``the``、以及
+#: ``instead of`` 前的逗号；捕获到句号 / 分号 / 换行 / 结尾为止。
+_STALE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"original(?:ly)?\b\s*[,;:，；：]?\s*(?:the\s+)?(.+?)"
+        r"\s*[,;，；—–]?\s*(?:instead\s+of|rather\s+than)\s+"
+        r"(?:the\s+)?(?:updated\s+|new\s+|current\s+)?(.+?)(?:[.;。；\n]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:previously|originally)\b\s*[,;:，；：]?\s*(?:the\s+)?(.+?)"
+        r"\s*[,;，；—–]?\s*(?:but\s+)?now\b\s*[,;:，；：]?\s*"
+        r"(?:the\s+)?(.+?)(?:[.;。；\n]|$)",
+        re.IGNORECASE,
+    ),
+)
+
+#: 裸旧值的最大长度：更长的多半是整句描述而非"值"，按解析失败处理。
+_MAX_STALE_LEN = 80
+
+#: 归一裸旧值时剥离的引号 / 反引号与首尾标点。
+_STALE_QUOTES = "\"'`“”‘’「」『』"
+_STALE_LEADING = " \t\r\n,;:，；：、—–"
+_STALE_TRAILING = " \t\r\n.,;:!?，。；：！？、"
+
+#: 描述句里的主语 / 系动词前缀（如 "the user had 4 study sessions"、
+#: "the deadline was March 15"）。反复剥离到不再命中，留下值本身。
+_STALE_CLAUSE_RE = re.compile(
+    r"^.*?\b(?:said|says|say|had|has|have|completed|planned|chose|used|"
+    r"was|were|is|are|stated|mentioned|reported|updated(?:\s+to)?|"
+    r"changed(?:\s+to)?|switched(?:\s+to)?)\b\s+",
+    re.IGNORECASE,
+)
+
+
+def _normalize_stale_value(value: str) -> str:
+    """归一裸旧值：去引号 / 反引号、首尾空白与首尾标点，并剥离主语 / 系动词前缀。"""
+    text = (value or "").strip()
+    while text and (text[0] in _STALE_QUOTES or text[0] in _STALE_LEADING):
+        text = text[1:]
+    while text and (text[-1] in _STALE_QUOTES or text[-1] in _STALE_TRAILING):
+        text = text[:-1]
+    text = text.strip()
+    # "the user had 4 study sessions" -> "4 study sessions"；
+    # 循环处理 "said the deadline was March 15" -> "March 15"。
+    while True:
+        trimmed = _STALE_CLAUSE_RE.sub("", text, count=1).strip()
+        if trimmed == text or not trimmed:
+            break
+        text = trimmed
+    return text
+
+
+def _same_value(a: str, b: str) -> bool:
+    """两个值归一后是否相同（忽略大小写、空白与常见标点）。"""
+    def _norm(text: str) -> str:
+        return re.sub(r"[\s，。！？、；：,.!?;:'\"“”‘’（）()]+", "", text.lower())
+
+    return bool(_norm(a)) and _norm(a) == _norm(b)
+
+
+def extract_stale_value(
+    confusion: "str | None", gold_answer: str
+) -> "str | None":
+    """从 potential_confusion 描述句中抽取裸旧值。
+
+    抽不到、旧值过长（> 80 字符）或与 gold_answer 相同（归一后）时返回
+    ``None``——调用方应保留原始描述到 ``gold_stale_note``，并把
+    ``gold_stale`` 留空（不可机检），而不是把描述句塞进值字段。
+
+    Args:
+        confusion: 原始描述句（BEAM 的 ``potential_confusion``）。
+        gold_answer: 该题的标准答案（新值），用于排除"旧值=新值"的误抽。
+
+    Returns:
+        归一后的裸旧值；解析失败返回 ``None``。
+    """
+    if not isinstance(confusion, str) or not confusion.strip():
+        return None
+    for pattern in _STALE_PATTERNS:
+        match = pattern.search(confusion)
+        if match is None:
+            continue
+        value = _normalize_stale_value(match.group(1))
+        if not value or len(value) > _MAX_STALE_LEN:
+            continue
+        if _same_value(value, gold_answer):
+            continue
+        return value
+    return None
 
 
 def _normalize_role(raw: object) -> str:
@@ -174,7 +282,11 @@ def _convert_questions(pq: dict, id_prefix: str) -> list[dict]:
             if qtype == "knowledge_update":
                 confusion = item.get("potential_confusion")
                 if isinstance(confusion, str) and confusion.strip():
-                    question["gold_stale"] = confusion
+                    note = confusion.strip()
+                    old_value = extract_stale_value(note, question["gold_answer"])
+                    if old_value is not None:
+                        question["gold_stale"] = old_value
+                    question["gold_stale_note"] = note
             questions.append(question)
     return questions
 

@@ -20,8 +20,10 @@ import pytest
 from membench import cli, layout
 from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
 from membench.evaluate import (
+    DatasetResult,
     DatasetSpec,
     evaluate,
+    evaluate_gate,
     fuse_metrics,
     plan_datasets,
     scan_capabilities,
@@ -334,8 +336,46 @@ def test_gate_skip_without_stale_annotation(
     """办公域槽位无 gold_stale 标注（用 B 充当）-> 门禁 SKIP、退出码 0。"""
     summary = _run_evaluate(tmp_path, mini_datasets, script, office_key="B")
     assert summary["gate"]["status"] == "SKIP"
-    assert "无 gold_stale 标注" in summary["gate"]["detail"]
+    assert "无可机检的 stale 题" in summary["gate"]["detail"]
     assert summary["_rc"] == 0
+
+
+def _office_result(overall: dict, has_stale: bool = True) -> DatasetResult:
+    """构造办公域槽位的 DatasetResult（门禁单元测试用）。"""
+    return DatasetResult(
+        spec=DatasetSpec(
+            key="office", name="Office", path="x", source="builtin",
+            is_office_slot=True,
+        ),
+        run_dir="x",
+        metrics={"overall": overall},
+        capabilities={
+            "has_evidence": False,
+            "has_stale": has_stale,
+            "has_abstention": False,
+        },
+    )
+
+
+def test_gate_skips_when_no_checkable_stale() -> None:
+    """有 stale 注解但 stale_n=0（note-only）→ SKIP，不能当 PASS。"""
+    gate = evaluate_gate(
+        [_office_result(
+            {"stale_rate": None, "stale_n": 0, "stale_total": 70},
+            has_stale=True,
+        )]
+    )
+    assert gate["status"] == "SKIP"
+    assert "stale_n=0" in gate["detail"]
+
+
+def test_gate_pass_marks_coverage() -> None:
+    """stale_n>0 且未超阈值 → PASS，并给出覆盖率。"""
+    gate = evaluate_gate(
+        [_office_result({"stale_rate": 0.0, "stale_n": 56, "stale_total": 70})]
+    )
+    assert gate["status"] == "PASS"
+    assert "可机检 56/70" in gate["detail"]
 
 
 def test_report_contents(

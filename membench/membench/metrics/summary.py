@@ -63,12 +63,17 @@ def aggregate(
         capabilities: 可选，由 runner 从题目集扫描得到的能力标注
             （``has_evidence / has_stale / has_abstention``）；传 None 时
             ``aggregate`` 从 records 自身推断（仅以"是否有非 abstention
-            题 / abstention 题 / knowledge_update 题"为依据——这是
+            题 / abstention 题 / 带 stale 注解的题"为依据——这是
             fallback，主要路径是 runner 直接传 capabilities）。
+            ``has_stale`` 最终以 records 的 ``judge.stale_checkable`` 为准
+            （见 :func:`membench.judges.base.JudgeResult`）：传进来的静态
+            标注只说明数据集有注解，不保证本次判分真的能机检。
 
     Returns:
         ``{"overall": {...}, "by_category": {category: {"accuracy", "n"}},
         "has_evidence": bool, "has_stale": bool, "has_abstention": bool}``；
+        ``overall`` 另含 ``stale_n``（stale_rate 分母：可机检题数）与
+        ``stale_total``（有 stale 注解的题数），报告据此标注覆盖率；
         无对应题型的指标返回 ``None``（区别于"真实 0"）；使用了 LLM judge 时
         附加 ``"judge_fallback": {"count", "ratio"}``。
 
@@ -82,7 +87,8 @@ def aggregate(
           哨兵值，见 ``schema.is_abstention``）上 ``judge.abstained_pred`` 均值。
         - over_refusal_rate: 非拒答题上 ``judge.abstained_pred`` 均值
           （"不该拒答却拒答"的比例；诊断指标，不参与综合评级）。
-        - stale_rate: knowledge_update 题上 ``judge.stale`` 均值。
+        - stale_rate: ``judge.stale_checkable`` 为真的题上 ``judge.stale``
+          均值；无这类题时为 ``None``（不把"没有判定依据"记成 0）。
         - latency_p50_ms / latency_p95_ms: ``latency_ms`` 分位数（线性插值）。
         - avg_input_tokens / avg_output_tokens: 每题输入 / 输出 token 均值。
         - avg_ingest_latency_ms: 每题 ingest 侧耗时均值（"记记忆"本身的开销）。
@@ -102,7 +108,11 @@ def aggregate(
 
     non_abstention = [r for r in records if not _is_abstention_rec(r)]
     abstention = [r for r in records if _is_abstention_rec(r)]
-    knowledge_update = [r for r in records if r.get("category") == "knowledge_update"]
+    # stale 分母：本次判分确实拿到可用旧值的题（不是"有 gold_stale 注解"）。
+    stale_checkable_recs = [r for r in records if _judge(r).get("stale_checkable")]
+    stale_n = len(stale_checkable_recs)
+    # 覆盖率分母：有 stale 注解的题（裸旧值或原始描述），不依赖判分器。
+    stale_total = sum(1 for r in records if _judge(r).get("stale_annotated"))
 
     # capabilities：优先用 runner 传入的（基于题目集扫描，含被忽略题统计），
     # fallback 到从 records 推断（仅看 records 中出现过的 category / evidence_hit）。
@@ -111,7 +121,7 @@ def aggregate(
     else:
         caps = {
             "has_evidence": any(bool(r.get("evidence_hit")) for r in non_abstention),
-            "has_stale": bool(knowledge_update),
+            "has_stale": stale_total > 0,
             "has_abstention": bool(abstention),
         }
 
@@ -145,10 +155,14 @@ def aggregate(
             bool(_judge(r).get("abstained_pred")) for r in non_abstention
         ),
         "stale_rate": (
-            _mean(bool(_judge(r).get("stale")) for r in knowledge_update)
-            if caps.get("has_stale", False)
+            _mean(bool(_judge(r).get("stale")) for r in stale_checkable_recs)
+            if stale_n
             else None
         ),
+        # stale_n=分母（可机检）；stale_total=有 stale 注解的题数（含不可机检）。
+        # 两者都落 overall，报告据此渲染 n/a 与覆盖率。
+        "stale_n": stale_n,
+        "stale_total": stale_total,
         "latency_p50_ms": percentile((r.get("latency_ms", 0.0) for r in records), 50),
         "latency_p95_ms": percentile((r.get("latency_ms", 0.0) for r in records), 95),
         "avg_input_tokens": _mean(r.get("input_tokens", 0) for r in records),
@@ -180,6 +194,9 @@ def aggregate(
         # capabilities 落账到 metrics.json 顶层（has_evidence / has_stale /
         # has_abstention）：caller 直接读，不必再扫 results.jsonl 二次推断。
         **caps,
+        # has_stale 的口径是"本次至少有 1 道可机检的 stale 题"，而不是
+        # "数据集里出现过 gold_stale 字段"——没有判定依据的题不构成能力。
+        "has_stale": stale_n > 0,
     }
 
     # LLM judge 回退统计：任一记录由 llm / llm-fallback 判分时，

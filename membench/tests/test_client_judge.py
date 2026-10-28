@@ -77,8 +77,14 @@ class TestClientLLMJudge:
     def test_stale_detection_rules_based(self) -> None:
         judge = ClientLLMJudge(_EchoClient())
         q = _Q(category="knowledge_update", gold_stale="9月20日")
+        # 新值（9月28日）在前、旧值只作变更上下文 → 非 stale；
+        # 判定规则与 heuristic / llm judge 同口径（位置序）。
         r = judge.grade(q, "9月28日", "截止日是9月28日（之前是9月20日）")
-        assert r.stale is True  # 命中过期答案，无论 LLM 判分结果
+        assert r.stale is False
+        assert r.stale_checkable is True
+        # 只给旧值、没给新值 → stale。
+        r2 = judge.grade(q, "9月28日", "截止日是9月20日。")
+        assert r2.stale is True
 
     def test_abstention_rules_based(self) -> None:
         judge = ClientLLMJudge(_EchoClient())

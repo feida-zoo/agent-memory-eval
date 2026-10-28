@@ -5,7 +5,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from membench.data.convert_beam import ABSTAIN_SENTINEL, convert_beam, convert_beam_split
+import pytest
+
+from membench.data.convert_beam import (
+    ABSTAIN_SENTINEL,
+    convert_beam,
+    convert_beam_split,
+    extract_stale_value,
+)
 from membench.data.schema import load_dataset
 
 # ---------------------------------------------------------------------------
@@ -162,11 +169,120 @@ def test_convert_beam_abstention_and_gold_stale(tmp_path: Path) -> None:
     abst = by_qid["beam_1m_1_abstention_1"]
     assert abst["gold_answer"] == ABSTAIN_SENTINEL == "<ABSTAIN>"
 
-    # knowledge_update：potential_confusion 非空 -> gold_stale；空串 -> 不填
+    # knowledge_update：描述句没有 "instead of / now" 对照，抽不出裸旧值 →
+    # gold_stale 留空，原始描述保留在 gold_stale_note（交给 LLM judge）。
     ku1 = by_qid["beam_1m_1_knowledge_update_1"]
-    assert ku1["gold_stale"] == "LLM might incorrectly recall the original March 15, 2024 deadline"
+    assert ku1.get("gold_stale") is None
+    assert ku1["gold_stale_note"] == (
+        "LLM might incorrectly recall the original March 15, 2024 deadline"
+    )
+    # potential_confusion 为空 → 两个字段都不填
     ku2 = by_qid["beam_1m_1_knowledge_update_2"]
-    assert "gold_stale" not in ku2 or ku2["gold_stale"] is None
+    assert ku2.get("gold_stale") is None
+    assert ku2.get("gold_stale_note") is None
+
+
+@pytest.mark.parametrize(
+    ("confusion", "gold_answer", "expected"),
+    [
+        # 三种句式：original X instead of Y / previously X ... now Y /
+        # originally X ... now Y
+        (
+            "original 4 study sessions instead of 5 study sessions",
+            "5 study sessions",
+            "4 study sessions",
+        ),
+        (
+            "previously 4 study sessions, but now 5 study sessions",
+            "5 study sessions",
+            "4 study sessions",
+        ),
+        (
+            "originally 4 study sessions; now 5 study sessions",
+            "5 study sessions",
+            "4 study sessions",
+        ),
+        # 限定词 / 标点 / 引号 / 单复数 / 主语前缀
+        (
+            "The original '4 study sessions' instead of updated '5 study sessions'.",
+            "5 study sessions",
+            "4 study sessions",
+        ),
+        (
+            "Originally, 1 study session, now 2 study sessions.",
+            "2 study sessions",
+            "1 study session",
+        ),
+        (
+            "The user originally completed 4 study sessions instead of 5 study sessions.",
+            "5 study sessions",
+            "4 study sessions",
+        ),
+    ],
+)
+def test_extract_stale_value_patterns(
+    confusion: str, gold_answer: str, expected: str
+) -> None:
+    """三种句式及常见变体都抽出裸旧值（不含主语 / 系动词前缀）。"""
+    assert extract_stale_value(confusion, gold_answer) == expected
+
+
+@pytest.mark.parametrize(
+    ("confusion", "gold_answer"),
+    [
+        # 没有新旧对照，无法判断哪段是旧值 -> 交给 note + LLM
+        ("LLM might incorrectly recall the original March 15, 2024 deadline", "March 18, 2024"),
+        ("The user changed the deadline.", "March 18, 2024"),
+        # 抽取结果与 gold_answer 相同：不是"旧值"
+        ("original 5 study sessions instead of 5 study sessions", "5 study sessions"),
+        # 过长：多半是整句描述而不是值
+        ("original " + "x" * 81 + " instead of 5", "5"),
+        ("", "5"),
+    ],
+)
+def test_extract_stale_value_rejects(confusion: str, gold_answer: str) -> None:
+    assert extract_stale_value(confusion, gold_answer) is None
+
+
+def test_convert_beam_split_stale_value_and_note_roundtrip(tmp_path: Path) -> None:
+    """转换产物经 load_dataset 加载后：gold_stale 是裸旧值，note 是原句。"""
+    chat_dir = _write_chat(tmp_path, "1")
+    pq = {
+        "knowledge_update": [
+            {
+                "question": "完成了多少次学习？",
+                "answer": "5 study sessions",
+                "potential_confusion": (
+                    "previously 4 study sessions, but now 5 study sessions"
+                ),
+            },
+            {
+                "question": "截止日期是哪天？",
+                "answer": "March 18, 2024",
+                "potential_confusion": (
+                    "LLM might incorrectly recall the original March 15, 2024 deadline"
+                ),
+            },
+        ]
+    }
+    (chat_dir / "probing_questions.json").write_text(
+        json.dumps(pq, ensure_ascii=False), encoding="utf-8"
+    )
+    out = tmp_path / "out.jsonl"
+    convert_beam_split(tmp_path, "1m", out)
+    questions = {q.qid: q for q in load_dataset(out)[0].questions}
+
+    extracted = questions["beam_1m_1_knowledge_update_1"]
+    assert extracted.gold_stale == "4 study sessions"
+    assert extracted.gold_stale_note == (
+        "previously 4 study sessions, but now 5 study sessions"
+    )
+
+    failed = questions["beam_1m_1_knowledge_update_2"]
+    assert failed.gold_stale is None
+    assert failed.gold_stale_note == (
+        "LLM might incorrectly recall the original March 15, 2024 deadline"
+    )
 
 
 def test_convert_beam_pq_fallback_name(tmp_path: Path) -> None:

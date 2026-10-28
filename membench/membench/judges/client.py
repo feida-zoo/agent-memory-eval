@@ -33,9 +33,9 @@ from membench.data.schema import is_abstention
 from membench.llm_ref import import_from_path
 
 from .base import Judge, JudgeResult
-from .heuristic import HeuristicJudge, contains_refusal
+from .heuristic import HeuristicJudge, contains_refusal, is_stale
 
-#: 判分提示词（与 llm.py 的 _SYSTEM_PROMPT + _USER_TEMPLATE 同口径）。
+#: 判分提示词（与 llm.py 的 _SYSTEM_PROMPT + _user_prompt 同口径）。
 _SYSTEM_PROMPT = (
     "你是一个严格的记忆系统评测裁判。给定【问题】【标准答案】【系统回答】，"
     "判断系统回答是否正确。\n"
@@ -103,11 +103,16 @@ class ClientLLMJudge(Judge):
     def grade(self, question: Any, gold: str, prediction: str) -> JudgeResult:
         category = str(getattr(question, "category", "") or "")
         gold_stale = str(getattr(question, "gold_stale", "") or "")
+        gold_stale_note = str(getattr(question, "gold_stale_note", "") or "")
         # 拒答信号逐题判定：拒答红线指标与"过度拒答率"诊断都需要它；普通题
         # 也照算（不再恒 False），口径与 heuristic / llm judge 保持一致。
         abstained = contains_refusal(prediction or "")
+        # 红线指标一律规则判定，不交给（可能与被测系统同源的）LLM：
+        # 有裸旧值才可机检；只有描述句时 stale 不可判，不进入分母。
+        stale = is_stale(gold_stale, gold, prediction or "")
+        stale_checkable = bool(gold_stale.strip())
+        stale_annotated = bool(gold_stale.strip() or gold_stale_note.strip())
 
-        # 红线指标一律规则判定，不交给（可能与被测系统同源的）LLM
         if is_abstention(category, gold):
             return JudgeResult(
                 correct=abstained,
@@ -116,9 +121,9 @@ class ClientLLMJudge(Judge):
                 score=1.0 if abstained else 0.0,
                 judge=self.name,
                 reason="拒答题按规则判定（拒答信号词匹配）",
+                stale_checkable=stale_checkable,
+                stale_annotated=stale_annotated,
             )
-
-        stale = bool(gold_stale) and gold_stale in (prediction or "")
 
         try:
             raw = self._call(
@@ -138,6 +143,8 @@ class ClientLLMJudge(Judge):
                 score=1.0 if parsed["correct"] else 0.0,
                 judge=self.name,
                 reason=str(parsed.get("reason", ""))[:500],
+                stale_checkable=stale_checkable,
+                stale_annotated=stale_annotated,
             )
         except Exception as exc:  # noqa: BLE001 — 判分失败绝不能中断评测
             fb = self._fallback.grade(question, gold, prediction)

@@ -129,7 +129,7 @@ python -m membench.cli evaluate --adapter <a> \
 说明：默认全量**包含** LongMemEval-S（每题约 50 个干扰会话 / ~115k token 的检索压力
 变体，与 oracle 的分差反映检索/精确率损失）；未下载时默认全量会报错提示先
 `dataset fetch longmemeval_s`，不需要则用 `--no-lme-s` 剔除。显式 `--dataset`
-清单中**第一个数据集承担办公域槽位**（stale 门禁作用域；无 gold_stale 标注时门禁自动
+清单中**第一个数据集承担办公域槽位**（stale 门禁作用域；无可机检 stale 题时门禁自动
 SKIP）；未显式给出时默认清单的办公域槽位规则不变。
 
 ## A/B 两组多数据集融合对比
@@ -165,7 +165,7 @@ python -m membench.cli evaluate-compare \
 
 融合口径（重要，读总分前必读）：
 
-- **宏平均**：六项质量指标（accuracy/token_f1/bleu1/evidence_recall/abstention_accuracy/stale_rate）先在各数据集内算分，再跨集等权平均；**指标只在具备对应标注能力的数据集上参与**——无 gold_stale 的集（locomo/longmemeval）不参与 stale_rate，无 evidence 标注的集（longmemeval/beam）不参与 evidence_recall，无 abstention 题的集不参与 abstention_accuracy。绝不用"记 0"稀释。其中 **accuracy / evidence_recall / abstention_accuracy / stale_rate 四项参与综合评级**；token_f1 / bleu1 只测字面重合（诊断指标），照常计算与展示但不参与评级。此外**诊断指标**（检索召回率@5 需 has_evidence；过度拒答率全数据集参与）同样跨集融合展示，但不参与综合评级与门禁。
+- **宏平均**：六项质量指标（accuracy/token_f1/bleu1/evidence_recall/abstention_accuracy/stale_rate）先在各数据集内算分，再跨集等权平均；**指标只在具备对应标注能力的数据集上参与**——没有可机检 stale 题的集（locomo/longmemeval，或只有 `gold_stale_note` 且用启发式判分的集）不参与 stale_rate，无 evidence 标注的集（longmemeval/beam）不参与 evidence_recall，无 abstention 题的集不参与 abstention_accuracy。绝不用"记 0"稀释。其中 **accuracy / evidence_recall / abstention_accuracy / stale_rate 四项参与综合评级**；token_f1 / bleu1 只测字面重合（诊断指标），照常计算与展示但不参与评级。此外**诊断指标**（检索召回率@5 需 has_evidence；过度拒答率全数据集参与）同样跨集融合展示，但不参与综合评级与门禁。
 - **门禁一票否决独立于总分**：办公域槽位 stale_rate > 0.03 → 总评"不达标"，退出码 1（可接 CI），无论综合评级多高。
 - **按需下载的公开集必须先 fetch**：`locomo` / `longmemeval_oracle` / `gatemem_office` / `longmemeval_s` / `beam_1m`（或 `beam_10m`）都没有内置文件，`evaluate` 从 `~/.membench/datasets/` 解析可用路径，缺失时报错提示先 `python -m membench.cli dataset fetch <key>`（`--no-lme-s` 不检查 LongMemEval-S；`--no-beam` / `--quick` 不检查 BEAM 槽位）。judge=heuristic 跑 BEAM 会警告（rubric 型题目规则判分失真，建议 llm/client）。
 - **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**，缺省 `output_root()`）落 `DIR/eval_<adapter>_<platform>_<ts>/`：各数据集产物在 `runs/<dataset>/`（数据集级报告 `report/{report.md,metrics.json,results.jsonl,fig_*.png}`，逐对话目录 `<对话>/` 内含 `report/`、`runtime/`、`memory_snapshot/`），任务级报告在 `reports/`（`report.md` + `metrics.json` + `evaluate_summary.json` + `fig_dataset_overview.png`）。
@@ -514,7 +514,7 @@ python -m membench.cli run --adapter <你的适配器> --dataset <同一个数�
 
 - LLM judge 输出按三级解析：整体 JSON → 抠取首个 JSON 对象 → 回退启发式判分并打 `llm-fallback` 标记。
 - 使用 LLM 判分时，metrics.json 顶层记录 `judge_fallback: {count, ratio}`；报告头部展示回退比例，**ratio > 5% 时报告输出警示行**（判分质量可能退化，建议抽查复核）。
-- stale 红线判定为确定性规则：旧值命中且新值未命中才判 stale（回答中引用旧值作为变更上下文、同时给出新值的，不判陈旧）。
+- stale 红线判定：启发式按 `gold_stale` 裸旧值与**位置序**判定（旧值出现、且新值没有先在预测中给出才判 stale）；LLM judge 在同一次调用里按 `gold_stale` / `gold_stale_note` 判 stale，模型没给合法 `stale` 时回退启发式。只有裸 `gold_stale`（LLM 下含 `gold_stale_note`）的题才进入 `stale_rate` 分母。
 
 ## 用户测试集管理
 
@@ -828,11 +828,13 @@ python -m membench.cli adapter remove my-office-adapter
 | 检索质量 | recall_at_5（诊断） | 非拒答题中，前 5 条检索的证据条目覆盖率（严格口径；仅 evidence 标注数据集参与） | 诊断项，不评级 |
 | 效率成本 | latency_p50 / p95 | query 延迟分位数（毫秒） | 按系统预算自定 |
 | 效率成本 | avg_input_tokens / avg_llm_calls | 每题平均注入 token 与 LLM 调用数 | 越低越好 |
-| 记忆动态 | stale_rate | knowledge_update 题中命中过期事实且未包含更新值的比例 | ≤ 0.03 |
-
-> 注：stale 的"包含更新值"接受两种口径——gold 片段逐字覆盖，或 gold 内容 token 召回 ≥ 0.8（容忍同义改写，如"下周一下午"→"周一下午"）。旧值仅作为变更上下文被引用、且新值已正确给出时不计为 stale。
+| 记忆动态 | stale_rate | **可机检** stale 题中"把旧值当成当前事实、未先给出更新值"的比例（分母 = `stale_n`，不是全部注解题） | ≤ 0.03 |
 | 拒答 | abstention_accuracy | abstention 题中正确拒答的比例 | ≥ 0.80 |
 | 可扩展性 | （随数据规模观察上述指标的退化曲线） | 用更大数据集多跑几轮对比 | — |
+
+> 注：stale 的"未先给出更新值"按**位置序**判定——新值在预测中先出现（如 `5 study sessions, not 4`）即豁免；新值只靠同义改写命中时，用 gold 的数字锚点定位先后；主答案给旧值、括号里顺带提新值仍判 stale。旧值仅作为变更上下文被引用、且新值已正确给出时不计为 stale。
+>
+> `stale_rate` 的分母只含**可机检**的 stale 题（judge 的 `stale_checkable` 为真）。报告同时给出 `stale_n`（可机检题数）与 `stale_total`（有 stale 注解的题数）：`stale_n == 0` 显示 `n/a（无可机检的 stale 注解）`；`0 < stale_n < stale_total` 显示 `0.0%（可机检 56/70）`。办公域 stale 门禁在 `stale_n == 0` 时 SKIP，不把"没有判定依据"当 PASS。
 
 **检索命中口径**（`--evidence-match`，默认 `substring`）：`substring` 为逐字子串（要求适配器返回接近原文的检索片段）；`overlap` 用内容 token 包含度（`--evidence-match-threshold`，默认 0.6）容错标点/包裹/轻微改写；`llm` 复用 `--llm-*` 配置逐题做语义判定，覆盖摘要/改写式记忆存储（失败自动回退 substring 并记入 `retrieval_match_fallbacks`）。口径落账到 `metrics.json` 的 `retrieval_match` 字段；**不同口径的跑分不可直接对比**（`compare` 可比性校验会给出 WARN），换口径后 A/B 两侧都要重跑。报告中若出现"两项检索指标全为 0"的警示，通常是 evidence 原文不在检索结果里（如摘要式存储），请换口径或让适配器回填原文片段后再比对。
 
@@ -921,9 +923,17 @@ python -m membench.cli run --adapter mock-strong --dataset ~/.membench/datasets/
 | 基准 | 题型映射 | 已知限制 |
 |---|---|---|
 | LoCoMo | cat1→multi_hop, cat2→temporal, cat3→open_ended, cat4→single_hop, cat5→abstention（gold 为 `<ABSTAIN>` 哨兵） | evidence 自动从 dia_id 解析为原文；约 6% 标注质量争议是数据集本身已知问题 |
-| LongMemEval | user/assistant→single_hop, multi-session→multi_hop, temporal-reasoning→temporal, knowledge-update→knowledge_update, preference→preference | oracle 版无 per-turn 证据（recall 恒 0）；**S 版 evidence 已从 answer_session_ids 解析为 session 级原文**；无 gold_stale（stale_rate 恒 0）；cleaned 版无拒答题 |
-| BEAM | 10 类题型→membench 7 类（information_extraction→single_hop、multi_session_reasoning→multi_hop、event_ordering/temporal_reasoning→temporal、knowledge_update/contradiction_resolution→knowledge_update、instruction_following/preference_following→preference、summarization→open_ended、abstention→abstention） | evidence 为空；rubric 未利用；gold_stale 取 potential_confusion（描述性文本） |
+| LongMemEval | user/assistant→single_hop, multi-session→multi_hop, temporal-reasoning→temporal, knowledge-update→knowledge_update, preference→preference | oracle 版无 per-turn 证据（recall 恒 0）；**S 版 evidence 已从 answer_session_ids 解析为 session 级原文**；无 gold_stale（stale_rate 显示 n/a，不再记 0）；cleaned 版无拒答题 |
+| BEAM | 10 类题型按原始 key 直传（information_extraction / multi_session_reasoning / event_ordering / temporal_reasoning / knowledge_update / contradiction_resolution / instruction_following / preference_following / summarization / abstention），不做多对一归并 | evidence 为空；rubric 未利用；`gold_stale` 从 `potential_confusion` 抽**裸旧值**，抽不出时留空、原句存 `gold_stale_note`（启发式不可机检，LLM judge 可判） |
 | GateMem | (utility,answer)→single_hop、(privacy,refuse)→abstention、(privacy,answer_redacted)→single_hop、(safety,no_memory)→abstention | asker 身份、leak_targets、as_of_turn_id 截断语义未建模；内置集 140 道 privacy-refuse 题已标记 `ignore=true`（单用户场景跳过，见下节） |
+
+**`gold_stale` / `gold_stale_note` 字段口径**：
+
+- `gold_stale`：**可机检的裸旧值**（如 `4 study sessions`、`9月20日`），judge 对它做包含与位置序判定；手工构造数据集时应填值本身，不要填整句描述。
+- `gold_stale_note`：数据集给出的**原始自然语言描述**（如 BEAM 的 `potential_confusion`），供 LLM judge 判 stale 与人工审计。旧值抽不出时 `gold_stale` 留空、本字段保留原文——此时启发式 judge 对该题**不可机检**，不进入 `stale_rate` 分母；LLM judge 会读描述判定。
+- 旧数据没有 `gold_stale_note` 字段也能正常加载（缺省 `null`）。
+
+**BEAM 重新 fetch**：`gold_stale` 的抽取逻辑在转换器里，已下载的 `beam_1m.jsonl` 不会自动更新。要按新口径重跑，先删 `~/.membench/datasets/beam_1m.jsonl` 与同名 raw 缓存目录，再 `dataset fetch beam_1m`。重新生成会改变数据集指纹（`dataset_sha256`），**历史 BEAM 分数不能与新产物直接对比**（`compare` 会判数据集指纹不一致）。
 
 **使用建议**：公开基准做横向对比与回归仪表盘；但厂商公布的 LoCoMo/LongMemEval 分数可比性差（判分器、检索预算、作答模型不同即可造成 ±20 分以上摆动），最终验收仍以你自建的领域黄金集为准。两者结合：公开基准按周跑，黄金集按提交跑。
 

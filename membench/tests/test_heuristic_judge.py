@@ -10,6 +10,7 @@ def _q(
     category: str = "single_hop",
     gold_stale: str | None = None,
     gold_answer: str = "杭州",
+    gold_stale_note: str | None = None,
 ) -> Question:
     """构造一个测试用 Question。"""
     return Question(
@@ -19,6 +20,7 @@ def _q(
         category=category,
         evidence=[],
         gold_stale=gold_stale,
+        gold_stale_note=gold_stale_note,
     )
 
 
@@ -102,7 +104,88 @@ class TestHeuristicJudge:
             "之前在北京，现在搬到杭州了。",
         )
         assert result3.stale is True
-        assert "未包含更新值" in result3.reason
+        assert "未先给出更新值" in result3.reason
+
+    def test_stale_position_order_user_repro(self) -> None:
+        """用户报告的两条 BEAM 样例：主答案旧值、括号新值 → stale；
+        新值在前 → 非 stale。"""
+        q = _q(
+            category="knowledge_update",
+            gold_stale="4 study sessions",
+            gold_answer="5 study sessions",
+        )
+        # 例 1：主答案给 4（旧值），括号里出现 5 → 仍判陈旧。
+        r = self.judge.grade(
+            q, "5 study sessions", "You did 4 study sessions this month (not 5)."
+        )
+        assert r.stale is True
+        # 新值在前、旧值只是对照 → 非 stale。
+        r2 = self.judge.grade(
+            q, "5 study sessions", "5 study sessions, not 4."
+        )
+        assert r2.stale is False
+        # 旧值未出现 → 非 stale。
+        r3 = self.judge.grade(q, "5 study sessions", "You did 5 study sessions.")
+        assert r3.stale is False
+        # gold_stale 为空 → 非 stale（也不可机检）。
+        r4 = self.judge.grade(
+            _q(category="knowledge_update", gold_answer="5 study sessions"),
+            "5 study sessions",
+            "You did 4 study sessions.",
+        )
+        assert r4.stale is False
+        assert r4.stale_checkable is False
+
+    def test_stale_numeric_boundary_and_prefix(self) -> None:
+        """裸旧值的数字边界与"旧值是新值前缀"两类边界。"""
+        # 14 不应被当成旧值 4。
+        r = self.judge.grade(
+            _q(
+                category="knowledge_update",
+                gold_stale="4 study sessions",
+                gold_answer="5 study sessions",
+            ),
+            "5 study sessions",
+            "You did 14 study sessions.",
+        )
+        assert r.stale is False
+        # 旧值 "4 sessions" 整段落在新值 "4 sessions per week" 内 → 非 stale。
+        r2 = self.judge.grade(
+            _q(
+                category="knowledge_update",
+                gold_stale="4 sessions",
+                gold_answer="4 sessions per week",
+            ),
+            "4 sessions per week",
+            "The plan is 4 sessions per week.",
+        )
+        assert r2.stale is False
+
+    def test_stale_checkable_and_annotated(self) -> None:
+        """stale_checkable 只认裸 gold_stale；note-only 题可标注但不可机检。"""
+        bare = self.judge.grade(
+            _q(category="knowledge_update", gold_stale="北京"),
+            "杭州",
+            "之前在北京，现在在杭州。",
+        )
+        assert bare.stale_checkable is True
+        assert bare.stale_annotated is True
+
+        note_only = self.judge.grade(
+            _q(
+                category="knowledge_update",
+                gold_stale_note="LLM might recall the original Beijing.",
+            ),
+            "杭州",
+            "北京。",
+        )
+        assert note_only.stale is False
+        assert note_only.stale_checkable is False
+        assert note_only.stale_annotated is True
+
+        none = self.judge.grade(_q(), "杭州", "杭州")
+        assert none.stale_checkable is False
+        assert none.stale_annotated is False
 
     def test_stale_exempt_when_new_value_paraphrased(self) -> None:
         # office 集 knowledge_update 题：回答正确给出新值、但
@@ -219,3 +302,119 @@ class TestLLMJudgeFallback:
         )
         assert result.judge == "llm-fallback"
         assert result.stale is True
+
+
+class _FakeLLMResponse:
+    """urlopen 的最小替身：返回一个 chat completions 响应。"""
+
+    def __init__(self, content: str) -> None:
+        import json
+
+        self._body = json.dumps(
+            {"choices": [{"message": {"content": content}}]}, ensure_ascii=False
+        ).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeLLMResponse":
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+
+def _stub_llm(monkeypatch, content: str) -> LLMJudge:
+    """让 LLMJudge 的 HTTP 调用固定返回 content。"""
+    import urllib.request
+
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda req, timeout: _FakeLLMResponse(content)
+    )
+    return LLMJudge(base_url="http://stub", api_key="k", model="m")
+
+
+class TestLLMJudgeStale:
+    """LLM 的 stale 字段采用 / 回退口径。"""
+
+    def test_model_stale_adopted(self, monkeypatch) -> None:
+        # 模型判 False，即使启发式会判 True（旧值出现）也以模型为准。
+        judge = _stub_llm(
+            monkeypatch, '{"correct": true, "stale": false, "reason": "更新上下文"}'
+        )
+        result = judge.grade(
+            _q(
+                category="knowledge_update",
+                gold_stale="4 study sessions",
+                gold_answer="5 study sessions",
+            ),
+            "5 study sessions",
+            "4 study sessions, updated to 5 study sessions.",
+        )
+        assert result.judge == "llm"
+        assert result.stale is False
+        assert result.stale_checkable is True
+        assert result.stale_annotated is True
+
+    def test_model_stale_from_note(self, monkeypatch) -> None:
+        # 只有 gold_stale_note 时，模型仍可判 stale，且计入可机检分母。
+        judge = _stub_llm(
+            monkeypatch, '{"correct": false, "stale": true, "reason": "答了旧值"}'
+        )
+        result = judge.grade(
+            _q(
+                category="knowledge_update",
+                gold_stale_note="previously 4 study sessions, but now 5 study sessions",
+                gold_answer="5 study sessions",
+            ),
+            "5 study sessions",
+            "You did 4 study sessions.",
+        )
+        assert result.stale is True
+        assert result.stale_checkable is True
+        assert result.stale_annotated is True
+
+    def test_missing_stale_falls_back(self, monkeypatch) -> None:
+        judge = _stub_llm(monkeypatch, '{"correct": true, "reason": "ok"}')
+        q = _q(
+            category="knowledge_update",
+            gold_stale="4 study sessions",
+            gold_answer="5 study sessions",
+        )
+        result = judge.grade(q, "5 study sessions", "You did 4 study sessions.")
+        assert result.judge == "llm"
+        assert result.stale is True  # 启发式按裸旧值判定
+        assert result.stale_checkable is True
+
+        note_only = judge.grade(
+            _q(
+                category="knowledge_update",
+                gold_stale_note="previously 4, now 5",
+                gold_answer="5 study sessions",
+            ),
+            "5 study sessions",
+            "You did 4 study sessions.",
+        )
+        assert note_only.stale is False
+        assert note_only.stale_checkable is False
+        assert note_only.stale_annotated is True
+
+    def test_bad_json_falls_back(self, monkeypatch) -> None:
+        judge = _stub_llm(monkeypatch, "没有任何 JSON 的回答")
+        result = judge.grade(
+            _q(category="knowledge_update", gold_stale="北京"),
+            "杭州",
+            "之前在北京。",
+        )
+        assert result.judge == "llm-fallback"
+        assert result.stale is True  # 回退启发式：只给旧值、新值未出现
+        assert result.stale_checkable is True
+
+        note_only = judge.grade(
+            _q(category="knowledge_update", gold_stale_note="原来是北京"),
+            "杭州",
+            "北京。",
+        )
+        assert note_only.judge == "llm-fallback"
+        assert note_only.stale_checkable is False
+        assert note_only.stale_annotated is True

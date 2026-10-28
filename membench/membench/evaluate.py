@@ -16,7 +16,7 @@
 融合口径（宏平均）：
     - accuracy / token_f1 / bleu1：所有数据集参与；
     - evidence_recall：仅 has_evidence（任一题目有 evidence 标注）的数据集参与；
-    - stale_rate：仅 has_stale（任一题目有 gold_stale 标注）的数据集参与；
+    - stale_rate：仅 stale_n > 0（本次有可机检的 stale 题）的数据集参与；
     - abstention_accuracy：仅 has_abstention（任一题目为拒答题：category 为
       abstention 或 gold 为拒答哨兵值）的数据集参与；
     融合值 = 参与集该指标 overall 值的算术平均。
@@ -47,6 +47,7 @@ from membench.report import (
     fig_dataset_overview,
     metric_label,
     metric_label_with_role,
+    stale_rate_display,
     token_usage_totals,
 )
 from membench.runner import Runner
@@ -157,8 +158,8 @@ def dataset_specs(values: list[str]) -> list[DatasetSpec]:
       其次 ``dataset fetch`` 下载目录）；解析不到报错提示先 fetch；
     - 办公域槽位（stale 门禁作用域）按**数据集身份**标出：身份命中办公域
       （内置 office / 用户测试集）的条目承担槽位，否则沿用既有口径由列表中第一个
-      数据集承担（见 :func:`mark_office_slot`）。若该集无 gold_stale 标注，
-      门禁自动 SKIP。
+      数据集承担（见 :func:`mark_office_slot`）。若该集没有可机检的
+      stale 题，门禁自动 SKIP。
 
     Args:
         values: ``--dataset`` 原始字符串列表（key 或路径）。
@@ -257,7 +258,7 @@ def mark_office_slot(specs: list[DatasetSpec]) -> None:
     否则沿用既有口径——清单第一个数据集承担该槽位。
 
     槽位判定看数据集身份而非 key 字面量，显式 ``office``、指向 office 数据集的路径、
-    以及汇总模式复用的产物因此得到同一个结论；该集无 gold_stale 标注时门禁自动 SKIP。
+    以及汇总模式复用的产物因此得到同一个结论；该集没有可机检的 stale 题时门禁自动 SKIP。
     """
     for spec in specs:
         spec.is_office_slot = is_office_slot_dataset(spec.path)
@@ -677,8 +678,10 @@ def evaluate_gate(
 ) -> dict[str, Any]:
     """办公域 stale 门禁（一票否决，独立于总分）。
 
-    办公域槽位数据集若有 has_stale 标注：其 stale_rate > threshold
-    -> FAIL（总评不达标，退出码 1）；无 stale 标注 -> SKIP。
+    办公域槽位数据集有可机检的 stale 题（``stale_n > 0``）时：其
+    ``stale_rate > threshold`` -> FAIL（总评不达标，退出码 1）；
+    ``stale_n == 0``（本次判分没有拿到任何可机检的旧值）-> SKIP——
+    不能把"没有判定依据"当成 PASS。
 
     Returns:
         ``{"status": "PASS"|"FAIL"|"SKIP", "detail": 说明}``。
@@ -686,31 +689,47 @@ def evaluate_gate(
     office = next((r for r in results if r.spec.is_office_slot), None)
     if office is None:
         return {"status": "SKIP", "detail": "数据集清单中无办公域槽位，stale 门禁跳过。"}
-    if not office.capabilities.get("has_stale", False):
+    overall = office.metrics.get("overall", {})
+    stale_n = overall.get("stale_n")
+    if stale_n == 0:
+        return {
+            "status": "SKIP",
+            "detail": (
+                f"办公域槽位数据集（{office.spec.name}）无可机检的 stale 题"
+                "（stale_n=0），stale 门禁跳过。"
+            ),
+        }
+    if stale_n is None and not office.capabilities.get("has_stale", False):
         return {
             "status": "SKIP",
             "detail": f"办公域槽位数据集（{office.spec.name}）无 gold_stale 标注，stale 门禁跳过。",
         }
-    stale_raw = office.metrics.get("overall", {}).get("stale_rate")
+    stale_raw = overall.get("stale_rate")
     if stale_raw is None:
         return {
             "status": "SKIP",
             "detail": f"办公域槽位数据集（{office.spec.name}）stale_rate 未计算（None），stale 门禁跳过。",
         }
     stale_rate = float(stale_raw)
+    stale_total = overall.get("stale_total")
+    coverage = (
+        f"（可机检 {stale_n}/{stale_total}）"
+        if isinstance(stale_n, int) and isinstance(stale_total, int) and stale_n < stale_total
+        else ""
+    )
     if stale_rate > threshold:
         return {
             "status": "FAIL",
             "detail": (
-                f"办公域槽位数据集（{office.spec.name}）stale_rate={stale_rate:.3f} "
-                f"> 阈值 {threshold}，一票否决：总评不达标。"
+                f"办公域槽位数据集（{office.spec.name}）stale_rate={stale_rate:.3f}"
+                f"{coverage} > 阈值 {threshold}，一票否决：总评不达标。"
             ),
         }
     return {
         "status": "PASS",
         "detail": (
-            f"办公域槽位数据集（{office.spec.name}）stale_rate={stale_rate:.3f} "
-            f"<= 阈值 {threshold}。"
+            f"办公域槽位数据集（{office.spec.name}）stale_rate={stale_rate:.3f}"
+            f"{coverage} <= 阈值 {threshold}。"
         ),
     }
 
@@ -908,6 +927,8 @@ def _render_task_report_md(
             "融合值的连续点数（1.0~4.0，档内随数值线性变化）均值，"
             "阈值 3.5 / 2.5 / 1.5；token_f1 / bleu1（字面重合度，非语义正确性）"
             "与 recall_at_5 / over_refusal_rate 为诊断指标，仅展示不参与评级；"
+            "stale_rate 的分母只含可机检的 stale 题（有裸 gold_stale；"
+            "LLM judge 下含 gold_stale_note）；"
             "效率成本指标同样不参与评级。门禁为一票否决，独立于本评级。</sub>"
         )
         lines.append("")
@@ -944,7 +965,10 @@ def _render_task_report_md(
         overall = r.metrics.get("overall", {})
         row = [r.spec.name, str(overall.get("n_questions", "n/a"))]
         for metric in quality_cols:
-            if participates(r.capabilities, metric) and metric in overall and overall[metric] is not None:
+            if metric == "stale_rate":
+                # 与 run 报告同口径：无可用题显示 n/a，覆盖不全标注分子/分母。
+                row.append(stale_rate_display(overall))
+            elif participates(r.capabilities, metric) and metric in overall and overall[metric] is not None:
                 row.append(format_metric(metric, overall[metric]))
             else:
                 row.append("未定义")
@@ -959,7 +983,9 @@ def _render_task_report_md(
     # 列说明：避免业务方把「未定义」误读为「召回率为 0」
     lines.append(
         "<sub>表中「未定义」表示该数据集未标注对应能力（如 evidence / gold_stale / "
-        "abstention 题），不参与该指标计算；融合值也不会因 0 而被拉低。</sub>"
+        "abstention 题），不参与该指标计算；融合值也不会因 0 而被拉低。"
+        "stale_rate 的 `n/a（无可机检的 stale 注解）` 表示本次没有拿到可机检的裸旧值，"
+        "同样不当 0 参与融合。</sub>"
     )
     lines.append("")
 

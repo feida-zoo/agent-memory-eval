@@ -21,10 +21,19 @@ class JudgeResult:
     Attributes:
         correct: 是否判对。
         abstained_pred: 预测是否拒答。
-        stale: 是否命中过期事实（gold_stale 出现在 prediction 中）。
+        stale: 是否把过期旧值当成当前事实（口径见
+            :func:`membench.judges.heuristic.is_stale`）。
         score: [0,1] 分数；启发式 = f1 阈值化，LLM = 0/1。
         judge: 判分来源标识，"heuristic" | "llm" | "llm-fallback"。
         reason: 判分理由（可选）。
+        stale_checkable: 本题的 stale 是否**可机检**——即本次判分确实拿到了
+            可用的旧值（启发式：有裸 ``gold_stale``；LLM：有 ``gold_stale``
+            或 ``gold_stale_note``）。``stale_rate`` 的分母只含这类题；
+            不可机检的题不参与均值，避免把"没有判定依据"记成"不陈旧"。
+        stale_annotated: 本题是否有 stale 注解（``gold_stale`` 或
+            ``gold_stale_note`` 非空）。与 ``stale_checkable`` 不同，它只描述
+            数据标注、不依赖判分器：报告用 ``stale_annotated`` 的题数作覆盖率
+            分母，回答"多少道 stale 题可机检"。
     """
 
     correct: bool
@@ -33,6 +42,8 @@ class JudgeResult:
     score: float
     judge: str
     reason: str = ""
+    stale_checkable: bool = False
+    stale_annotated: bool = False
 
 
 class Judge(ABC):
@@ -45,7 +56,8 @@ class Judge(ABC):
         """给单条预测打分。
 
         Args:
-            question: Question 数据类对象（含 category / gold_stale 等字段）。
+            question: Question 数据类对象（含 category / gold_stale /
+                gold_stale_note 等字段）。
             gold: 标准答案字符串（question.gold_answer）。
             prediction: 被测系统的回答文本。
 

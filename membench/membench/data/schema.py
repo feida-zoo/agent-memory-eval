@@ -8,12 +8,19 @@
       "questions": [
         {"qid": "d001_q1", "question": "...", "gold_answer": "...",
          "category": "single_hop | ...", "evidence": ["..."], "gold_stale": "...",
-         "ignore": false, "ignore_reason": "..."}
+         "gold_stale_note": "...", "ignore": false, "ignore_reason": "..."}
       ]
     }
 
 其中 ``ignore`` / ``ignore_reason`` 为可选的题目级忽略标记：``ignore=true``
 的题在评测时被整条跳过（不查询、不计分），但数据保留在文件中可追溯。
+
+``gold_stale`` / ``gold_stale_note`` 是同一份"过期事实"标注的两个层次：
+``gold_stale`` 存**可机检的裸旧值**（如 ``"9月20日"``、``"4 study sessions"``），
+judge 直接做包含与位置判定；``gold_stale_note`` 存数据集给出的**原始自然语言
+描述**（如 BEAM 的 ``potential_confusion``），供 LLM 判 stale 与人工审计。
+旧值无法可靠抽取时 ``gold_stale`` 留空、只保留描述——此时启发式不可机检，
+但不影响数据加载。
 
 ``timestamp`` 约定为 **ISO 8601、精度可变**（``YYYY-MM-DD`` / ``YYYY-MM-DDTHH:MM`` /
 ``YYYY-MM-DDTHH:MM:SS``，可省缺）：加载器只保证它是字符串，不理解时间语义，
@@ -102,7 +109,11 @@ class Question:
         gold_answer: 标准答案；abstention 题固定为 ``"<ABSTAIN>"``。
         category: 题目类别，必须是 ``CATEGORIES`` 之一。
         evidence: 支持证据（对话原文子串），用于检索召回判定。
-        gold_stale: 仅 knowledge_update 题使用：过期答案，命中即陈旧。
+        gold_stale: 仅 knowledge_update 题使用：**可机检的裸旧值**（如
+            ``"9月20日"``），judge 据此判定回答是否把过期事实当成当前事实。
+        gold_stale_note: 过期事实的**原始自然语言描述**（如 BEAM 的
+            ``potential_confusion``），供 LLM 判 stale 与审计；无法抽出
+            裸旧值时 ``gold_stale`` 为空、本字段仍保留原文。
         ignore: 题目级忽略标记；True 时评测引擎整条跳过该题
             （不查询、不计分），数据仍保留在文件中可追溯。
         ignore_reason: 忽略原因（可选说明，供追溯）。
@@ -114,6 +125,7 @@ class Question:
     category: str
     evidence: list[str] = field(default_factory=list)
     gold_stale: str | None = None
+    gold_stale_note: str | None = None
     ignore: bool = False
     ignore_reason: str | None = None
 
@@ -176,6 +188,10 @@ def _parse_question(raw: object, path: Path, lineno: int) -> Question:
     gold_stale = raw.get("gold_stale")
     if gold_stale is not None and not isinstance(gold_stale, str):
         raise _err(path, lineno, "gold_stale 必须是字符串")
+    # 旧数据没有 gold_stale_note，缺省为 None 照常加载。
+    gold_stale_note = raw.get("gold_stale_note")
+    if gold_stale_note is not None and not isinstance(gold_stale_note, str):
+        raise _err(path, lineno, "gold_stale_note 必须是字符串或 null")
     # 可选的题目级忽略标记：缺省视为不忽略（向后兼容旧数据集）。
     ignore = raw.get("ignore", False)
     if not isinstance(ignore, bool):
@@ -190,6 +206,7 @@ def _parse_question(raw: object, path: Path, lineno: int) -> Question:
         category=category,
         evidence=list(evidence),
         gold_stale=gold_stale,
+        gold_stale_note=gold_stale_note,
         ignore=ignore,
         ignore_reason=ignore_reason,
     )

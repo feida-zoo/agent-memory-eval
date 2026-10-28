@@ -109,10 +109,19 @@ def _record(
     *,
     abstained: bool = False,
     stale: bool = False,
+    stale_checkable: bool | None = None,
+    stale_annotated: bool | None = None,
     evidence_hit: bool = True,
     latency_ms: float = 10.0,
 ) -> dict:
-    """构造一条 SPEC 3.4 风格的单条评测记录。"""
+    """构造一条 SPEC 3.4 风格的单条评测记录。
+
+    ``stale_checkable`` / ``stale_annotated`` 默认按 category 推断：
+    knowledge_update 题视为有裸旧值且可机检，其余题没有 stale 注解。
+    """
+    is_ku = category == "knowledge_update"
+    checkable = is_ku if stale_checkable is None else stale_checkable
+    annotated = is_ku if stale_annotated is None else stale_annotated
     return {
         "qid": f"q_{category}",
         "dialogue_id": "d0",
@@ -132,6 +141,8 @@ def _record(
             "score": 1.0 if correct else 0.0,
             "judge": "heuristic",
             "reason": "",
+            "stale_checkable": checkable,
+            "stale_annotated": annotated,
         },
         "latency_ms": latency_ms,
         "input_tokens": 10,
@@ -177,6 +188,8 @@ class TestAggregate:
             "abstention_accuracy",
             "over_refusal_rate",
             "stale_rate",
+            "stale_n",
+            "stale_total",
             "latency_p50_ms",
             "latency_p95_ms",
             "avg_input_tokens",
@@ -194,8 +207,10 @@ class TestAggregate:
         assert overall["evidence_recall"] == pytest.approx(3 / 4)
         # abstention 题上 abstained_pred 均值：1/2。
         assert overall["abstention_accuracy"] == pytest.approx(0.5)
-        # knowledge_update 题上 stale 均值：1/2。
+        # knowledge_update 题上 stale 均值：1/2；分母 = 可机检题数 2。
         assert overall["stale_rate"] == pytest.approx(0.5)
+        assert overall["stale_n"] == 2
+        assert overall["stale_total"] == 2
         # 诊断指标：非拒答题上 recall@5 均值 1.0；过度拒答率 0（无拒答信号）。
         assert overall["recall_at_5"] == pytest.approx(1.0)
         assert overall["over_refusal_rate"] == pytest.approx(0.0)
@@ -284,6 +299,8 @@ class TestAggregate:
         assert metrics["overall"]["evidence_recall"] == pytest.approx(1.0)
         # 该数据集没有 knowledge_update 题 → stale_rate 显式 None（不污染总分）
         assert metrics["overall"]["stale_rate"] is None
+        assert metrics["overall"]["stale_n"] == 0
+        assert metrics["overall"]["stale_total"] == 0
         # 该数据集没有 abstention 题 → abstention_accuracy 显式 None
         assert metrics["overall"]["abstention_accuracy"] is None
 
@@ -296,3 +313,46 @@ class TestAggregate:
         assert metrics["has_abstention"] is True
         assert metrics["has_evidence"] is False
         assert metrics["has_stale"] is False
+
+
+class TestStaleDenominator:
+    """stale_rate 分母 = 可机检题；stale_total 覆盖全部注解题。"""
+
+    def test_note_only_questions_do_not_enter_denominator(self) -> None:
+        recs = [
+            _record("knowledge_update", True, stale=True, stale_checkable=True,
+                    stale_annotated=True),
+            _record("knowledge_update", False, stale_checkable=False,
+                    stale_annotated=True),
+        ]
+        metrics = aggregate(recs)
+        overall = metrics["overall"]
+        assert overall["stale_n"] == 1
+        assert overall["stale_total"] == 2
+        assert overall["stale_rate"] == pytest.approx(1.0)
+        assert metrics["has_stale"] is True
+
+    def test_no_checkable_question_means_undefined_rate(self) -> None:
+        recs = [
+            _record("knowledge_update", False, stale=True,
+                    stale_checkable=False, stale_annotated=True),
+            _record("knowledge_update", False,
+                    stale_checkable=False, stale_annotated=True),
+        ]
+        metrics = aggregate(recs)
+        overall = metrics["overall"]
+        assert overall["stale_n"] == 0
+        assert overall["stale_total"] == 2
+        assert overall["stale_rate"] is None
+        # 没有可机检题 → 不构成 stale 能力（不参与融合、不触发门禁 PASS）。
+        assert metrics["has_stale"] is False
+
+    def test_checkable_without_annotation(self) -> None:
+        """自定义 judge 只给 stale_checkable 时，分母仍按它算。"""
+        rec = _record("knowledge_update", True, stale=True,
+                      stale_checkable=True, stale_annotated=False)
+        metrics = aggregate([rec])
+        assert metrics["overall"]["stale_n"] == 1
+        assert metrics["overall"]["stale_rate"] == pytest.approx(1.0)
+        assert metrics["overall"]["stale_total"] == 0
+        assert metrics["has_stale"] is True
