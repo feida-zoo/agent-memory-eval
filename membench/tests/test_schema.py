@@ -234,6 +234,41 @@ class TestIgnoreFields:
         with pytest.raises(ValueError, match=r":1:.*ignore_reason"):
             load_dataset(path)
 
+    def test_optional_annotations_default_none(self, tmp_path: Path) -> None:
+        """旧数据集没有 question_date / judge_spec：默认 None，照常加载。"""
+        q = load_dataset(self._write(tmp_path, {}))[0].questions[0]
+        assert q.question_date is None
+        assert q.judge_spec is None
+
+    def test_question_date_parsed(self, tmp_path: Path) -> None:
+        path = self._write(tmp_path, {"question_date": "2023-04-10T23:07"})
+        assert load_dataset(path)[0].questions[0].question_date == "2023-04-10T23:07"
+
+    def test_question_date_must_be_str_or_null(self, tmp_path: Path) -> None:
+        path = self._write(tmp_path, {"question_date": 20230101})
+        with pytest.raises(ValueError, match=r":1:.*question_date"):
+            load_dataset(path)
+
+    def test_judge_spec_parsed_and_sections_filled(self, tmp_path: Path) -> None:
+        """只给 include 时，not_include / leak_targets 补空列表。"""
+        path = self._write(tmp_path, {"judge_spec": {"include": ["no[- ]renewal"]}})
+        spec = load_dataset(path)[0].questions[0].judge_spec
+        assert spec == {
+            "include": ["no[- ]renewal"],
+            "not_include": [],
+            "leak_targets": [],
+        }
+
+    def test_judge_spec_must_be_dict(self, tmp_path: Path) -> None:
+        path = self._write(tmp_path, {"judge_spec": ["include"]})
+        with pytest.raises(ValueError, match=r":1:.*judge_spec"):
+            load_dataset(path)
+
+    def test_judge_spec_sections_must_be_str_lists(self, tmp_path: Path) -> None:
+        path = self._write(tmp_path, {"judge_spec": {"leak_targets": [1]}})
+        with pytest.raises(ValueError, match=r":1:.*judge_spec\.leak_targets"):
+            load_dataset(path)
+
 
 class TestDataclasses:
     """Dialogue / Question / Dataset 数据类基本行为。"""

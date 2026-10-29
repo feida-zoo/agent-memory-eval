@@ -10,6 +10,10 @@ stale 的语义是"回答把**旧值**当成当前事实"：题目给出 ``gold_
 ``gold_stale`` 先经 :func:`membench.data.stale.resolve_stale` 解析——旧缓存
 里仍是整句描述时会先抽裸旧值，抽不出则按不可机检处理（不进 stale_rate 分母）。
 
+题目带 ``judge_spec``（GateMem checkpoint）时**不调用模型**：改走
+:func:`membench.judges.heuristic.grade_judge_spec` 的确定性 rubric（include
+正则 + not_include / leak_targets 字面量），与 heuristic judge 完全同口径。
+
 任何异常（网络、超时、解析失败等）都会回退到 HeuristicJudge，
 并把结果标记为 ``judge="llm-fallback"``，保证评测流程不中断。
 
@@ -251,10 +255,32 @@ class LLMJudge(Judge):
     # ------------------------------------------------------------------
 
     def grade(self, question: "Question", gold: str, prediction: str) -> JudgeResult:  # noqa: F821
-        """LLM 判分；任何异常回退 HeuristicJudge 并标记 ``llm-fallback``。"""
+        """判分；题目带 ``judge_spec`` 时走确定性 rubric，其余交给 LLM。
+
+        带 ``judge_spec`` 的题（GateMem checkpoint）不调用模型：rubric 的正则 /
+        字面量判定是数据自带口径，模型只会引入不确定性。其余题目的任何异常
+        回退 HeuristicJudge 并标记 ``llm-fallback``。
+        """
         question_text = getattr(question, "question", question)
         gold_stale = getattr(question, "gold_stale", None)
         gold_stale_note = getattr(question, "gold_stale_note", None)
+        judge_spec = getattr(question, "judge_spec", None)
+
+        if judge_spec:
+            rubric = self._fallback.grade(question, gold, prediction)
+            return JudgeResult(
+                correct=rubric.correct,
+                abstained_pred=rubric.abstained_pred,
+                stale=rubric.stale,
+                score=rubric.score,
+                judge=self.name,
+                reason=(
+                    f"{rubric.reason}（judge=llm 对带 judge_spec 的题同样走确定性 "
+                    "rubric，未调用模型）"
+                ),
+                stale_checkable=rubric.stale_checkable,
+                stale_annotated=rubric.stale_annotated,
+            )
 
         # 拒答检测保持确定性（与启发式一致）；stale 由模型同一次调用判出，
         # 没给或解析失败时回退启发式。

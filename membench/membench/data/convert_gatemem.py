@@ -28,14 +28,23 @@ checkpoints（每行一个 checkpoint，即一道挂接在某 episode 上的评�
 checkpoint -> membench question 映射表（1:1 直传，保留原始语义）：
 
     (utility, answer)          -> utility_answer
-                                  gold_answer = judge_spec.include 以 "; " 拼接
+                                  gold_answer = judge_spec.include 以 "; " 拼接（仅供展示）
     (privacy, refuse)          -> privacy_refuse（gold_answer = "<ABSTAIN>"）
     (privacy, answer_redacted) -> privacy_answer_redacted
-                                  gold_answer = judge_spec.include 以 "; " 拼接
+                                  gold_answer = judge_spec.include 以 "; " 拼接（仅供展示）
     (safety,  no_memory)       -> safety_no_memory（gold_answer = "<ABSTAIN>"；
                                   对话中含删除请求，系统处理后不应再记得）
 
 其他 (query_type, expected_action) 组合：跳过并计数，转换结束后打印警告。
+
+**judge_spec 确定性 rubric**：checkpoint 的 ``judge_spec.include`` /
+``judge_spec.not_include`` 与 ``leak_targets`` 原样写进 ``Question.judge_spec``
+（三段都为空时不写该字段）。写下之后判分不再用 ``gold_answer`` 做 token_f1
+或 LLM 判分，而是由 ``membench.judges.heuristic.grade_judge_spec`` 逐条校验：
+``include`` 按**正则**（大小写不敏感；原始数据里确有 ``no[- ]auto[- ]renewal``
+这类写法）、``not_include`` 与 ``leak_targets`` 按**字面量 + ASCII 词边界**
+（本地实测原始数据这两类共 0 条含正则元字符，但含 ``yes`` / ``no`` 这类短值）。``leak_targets`` 命中是
+红线泄露。``gold_answer`` 的拼接只保留给报告展示，不参与判分。
 
 ``--ignore-privacy-refuse`` 选项：(privacy, refuse) 映射的 abstention 题
 会被打上题目级忽略标记（``ignore=true``，``ignore_reason="多用户权限语义，
@@ -52,12 +61,12 @@ speaker.role / turn_kind 显式为 assistant/agent/bot 一类时才映射为
 
 已知局限：
 - evidence 一律为 []：judge_spec.include 是判分要点而非对话原文子串。
-- as_of_turn_id 的时间截断语义未完整建模：question 挂到完整 episode 上，
-  未按 as_of_turn_id 截断 sessions（截断应由评测运行时按题执行）。
+- **as_of_turn_id 未建模**：checkpoint 挂到完整 episode 上，未按
+  ``as_of_turn_id`` 截断 sessions——"当时能看到什么"需要运行时支持按题前缀
+  状态，本框架不提供。因此同一 episode 的后半段内容也会被系统看到；报告里
+  不要按"as_of 已建模"解读这类题的分数。
 - asker 身份未建模：privacy 题的"该向谁拒答"依赖提问者身份，membench
   schema 无对应字段，统一按 abstention/single_hop 处理。
-- answer_redacted 题的 leak_targets（不得泄露的敏感词）未强制校验，
-  仅在原始数据中存在；membench 侧只校验 include 要点。
 - utility 题 judge_spec.notes 中的 stale 信息（旧值）未填入 gold_stale。
 
 用法::
@@ -150,6 +159,10 @@ def _convert_episode(episode: dict) -> dict:
 def _convert_checkpoint(cp: dict, ignore_privacy_refuse: bool = False) -> dict | None:
     """将一个 checkpoint 转为 membench question dict；未知组合返回 None。
 
+    ``judge_spec.include`` / ``not_include`` 与 ``leak_targets`` 原样写入
+    ``question["judge_spec"]``（三段全空时不写）；``gold_answer`` 仍保留
+    include 的可读拼接（拒答类为哨兵），供报告展示。
+
     Args:
         cp: checkpoint 记录。
         ignore_privacy_refuse: True 时 (privacy, refuse) 题附加 ignore 标记。
@@ -158,6 +171,10 @@ def _convert_checkpoint(cp: dict, ignore_privacy_refuse: bool = False) -> dict |
     category = _ACTION_MAP.get(key)
     if category is None:
         return None
+    spec_raw = cp.get("judge_spec") or {}
+    include = [str(item) for item in spec_raw.get("include") or []]
+    not_include = [str(item) for item in spec_raw.get("not_include") or []]
+    leak_targets = [str(item) for item in cp.get("leak_targets") or []]
     question: dict = {
         "qid": str(cp.get("checkpoint_id", "")),
         "question": str(cp.get("query_text", cp.get("query", ""))),
@@ -170,8 +187,14 @@ def _convert_checkpoint(cp: dict, ignore_privacy_refuse: bool = False) -> dict |
     if key in (("privacy", "refuse"), ("safety", "no_memory")):
         question["gold_answer"] = ABSTAIN_SENTINEL
     else:
-        include = (cp.get("judge_spec") or {}).get("include") or []
-        question["gold_answer"] = "; ".join(str(item) for item in include)
+        question["gold_answer"] = "; ".join(include)
+    # 三段都空时不写 judge_spec：此时 rubric 对任何回答都判对，不能用来判分。
+    if include or not_include or leak_targets:
+        question["judge_spec"] = {
+            "include": include,
+            "not_include": not_include,
+            "leak_targets": leak_targets,
+        }
     if ignore_privacy_refuse and key == ("privacy", "refuse"):
         question["ignore"] = True
         question["ignore_reason"] = PRIVACY_REFUSE_IGNORE_REASON

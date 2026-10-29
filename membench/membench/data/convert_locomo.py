@@ -12,6 +12,13 @@ LoCoMo 原始结构::
 
 turn = {"speaker": str, "dia_id": "D1:3", "text": str}
 
+**说话人身份**：LoCoMo 是两个人（``speaker_a`` / ``speaker_b``）的多轮对话。
+转换时 role 仍按历史口径映射（``speaker_a`` → user、其余 → assistant），
+但每条消息额外写 ``"name": <实际说话人名>``——两个人类都被压进 user/assistant
+后，抽取提示词无法区分"谁说的"，而 LoCoMo 的多跳题大量依赖这一点。
+``name`` 会经 ``agent_loop._render_messages`` 渲染成 ``[user:Caroline]``
+（schema 加载器不校验、也不丢弃消息的额外键），无需改适配器契约。
+
 题型映射（LoCoMo 论文章节 3.2）::
 
     1 -> multi_hop        多跳推理
@@ -93,14 +100,21 @@ def convert_locomo(input_path: str, output_path: str, max_dialogues: int | None 
                 conv.get(f"session_{sid}_date_time"),
                 where=f"{sample.get('sample_id', '?')} session_{sid}",
             )
-            turns = [
-                {
-                    "role": "user" if t.get("speaker") == speaker_a else "assistant",
+            turns: list[dict] = []
+            for t in conv[f"session_{sid}"]:
+                speaker = str(t.get("speaker", "")).strip()
+                turn = {
+                    # role 仍按 speaker_a -> user、其余 -> assistant 映射（历史口径不变）；
+                    # 两个人类都被映射进 user/assistant，真正的身份只在 name 里。
+                    "role": "user" if speaker == speaker_a else "assistant",
                     "content": str(t.get("text", "")),
                     "timestamp": ts,
                 }
-                for t in conv[f"session_{sid}"]
-            ]
+                if speaker:
+                    # name 不是 schema 必填项，但 _render_messages 会渲染成
+                    # ``[user:Caroline]``，抽取提示词因此能区分两个人类。
+                    turn["name"] = speaker
+                turns.append(turn)
             sessions.append(turns)
 
         questions: list[dict] = []

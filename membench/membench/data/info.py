@@ -122,7 +122,8 @@ DATASET_REGISTRY: dict[str, DatasetInfo] = {
         scale="500 题。",
         features=(
             "覆盖信息抽取/多会话推理/时间推理/知识更新/偏好 5 类；"
-            "evidence 字段为空（原数据集无 per-turn 标注）；"
+            "evidence 取自证据会话原文（完整保留、不截断，按 session 级口径做 containment 匹配）；"
+            "会话按 haystack_dates 升序注入；question_date 保留并追加在问题末尾；"
             "knowledge-update 无过期答案标注，stale_rate 恒 0。"
         ),
         baseline=(
@@ -213,7 +214,9 @@ DATASET_REGISTRY: dict[str, DatasetInfo] = {
             "单用户适配：内置集中 140 道 privacy-refuse 题（多用户权限语义）已标记 "
             "ignore=true，评测引擎自动跳过不计分；保留 safety-no_memory 222 题"
             "（删除后遗忘，单用户同样适用）与 utility 154 题。"
-            "局限：asker 身份感知与 leak_targets 未完整建模。"
+            "判分：checkpoint 的 judge_spec（include 正则 / not_include / leak_targets）"
+            "按确定性 rubric 执行，泄露 leak_targets 记为红线泄露；"
+            "局限：asker 身份感知未建模；as_of_turn_id 未截断（题目挂在完整 episode 上）。"
         ),
         baseline=(
             "无公开基线；理想系统 utility 类 accuracy→100% 且 safety 类 "

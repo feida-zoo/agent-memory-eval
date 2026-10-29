@@ -8,7 +8,10 @@
       "questions": [
         {"qid": "d001_q1", "question": "...", "gold_answer": "...",
          "category": "single_hop | ...", "evidence": ["..."], "gold_stale": "...",
-         "gold_stale_note": "...", "ignore": false, "ignore_reason": "..."}
+         "gold_stale_note": "...", "ignore": false, "ignore_reason": "...",
+         "question_date": "2023-04-10T23:07",
+         "judge_spec": {"include": ["..."], "not_include": ["..."],
+                        "leak_targets": ["..."]}}
       ]
     }
 
@@ -26,6 +29,20 @@ judge 直接做包含与位置判定；``gold_stale_note`` 存数据集给出的
 ``YYYY-MM-DDTHH:MM:SS``，可省缺）：加载器只保证它是字符串，不理解时间语义，
 原样透传给 ``ingest``；公开数据集的转换器统一按此约定输出（见
 ``membench/data/timestamps.py``），用户自建集请直接写 ISO。
+
+``question_date`` 是题目**提问时刻**的可选标注（LongMemEval 500/500 题都有）：
+时序题需要知道"现在是什么时候"才能判断"上个月""昨天"指哪一段。转换器把原始
+日期归一为 ISO 并原样写进问题文本（``（提问日期：…）``），本字段供审计与后续
+运行时使用；加载器不解释其语义。
+
+``judge_spec`` 是**确定性判分 rubric**（GateMem 的 checkpoint 原生提供）：
+``{"include": [...], "not_include": [...], "leak_targets": [...]}``。
+``include`` / ``not_include`` 是判分要点（``include`` 在原始数据中使用正则形态，
+如 ``no[- ]auto[- ]renewal``；``not_include`` 是不得出现的字面量），
+``leak_targets`` 是**不得泄露的敏感值**（命中即红线）。题目带该字段时，
+启发式与 LLM judge 都改走确定性 rubric，不再做 token_f1 / 模型判分
+（见 ``membench/judges/heuristic.py`` 的 ``grade_judge_spec``）。加载器只校验
+结构并把缺失的三段补成空列表，不解释正则语义。
 
 加载器做字段校验，缺字段 / 非法取值时报错并给出**行号**。
 """
@@ -117,6 +134,11 @@ class Question:
         ignore: 题目级忽略标记；True 时评测引擎整条跳过该题
             （不查询、不计分），数据仍保留在文件中可追溯。
         ignore_reason: 忽略原因（可选说明，供追溯）。
+        question_date: 提问时刻（ISO 8601 字符串，可缺）；时序题据此判断
+            "现在是什么时候"，语义由适配器/判分侧自行使用。
+        judge_spec: 确定性判分 rubric，``{"include": [...], "not_include": [...],
+            "leak_targets": [...]}``；非 None 时 judge 不再做 token_f1 / LLM
+            判分，改用正则与字面量校验（见 ``judges.heuristic.grade_judge_spec``）。
     """
 
     qid: str
@@ -128,6 +150,8 @@ class Question:
     gold_stale_note: str | None = None
     ignore: bool = False
     ignore_reason: str | None = None
+    question_date: str | None = None
+    judge_spec: dict | None = None
 
 
 @dataclass
@@ -137,7 +161,9 @@ class Dialogue:
     Attributes:
         dialogue_id: 对话唯一标识。
         sessions: session 列表，每个 session 是消息列表；
-            消息形如 ``{"role": str, "content": str, "timestamp": str|None}``。
+            消息形如 ``{"role": str, "content": str, "timestamp": str|None}``，
+            可选 ``"name": str``（真实说话人名，如 LoCoMo 的两位人类；
+            渲染时出现在 role 之后，见 ``agent_loop._render_messages``）。
         questions: 挂接在该对话上的评测题。
     """
 
@@ -199,6 +225,23 @@ def _parse_question(raw: object, path: Path, lineno: int) -> Question:
     ignore_reason = raw.get("ignore_reason")
     if ignore_reason is not None and not isinstance(ignore_reason, str):
         raise _err(path, lineno, "ignore_reason 必须是字符串或 null")
+    # 可选的提问时刻：缺省 None 照常加载（历史数据集没有该字段）。
+    question_date = raw.get("question_date")
+    if question_date is not None and not isinstance(question_date, str):
+        raise _err(path, lineno, "question_date 必须是字符串或 null")
+    # 可选的确定性 rubric：只认 include / not_include / leak_targets 三段，
+    # 缺失段补空列表；多余键（原始数据的 notes / attack_type 等）不进入数据集。
+    judge_spec_raw = raw.get("judge_spec")
+    judge_spec: dict | None = None
+    if judge_spec_raw is not None:
+        if not isinstance(judge_spec_raw, dict):
+            raise _err(path, lineno, "judge_spec 必须是对象或 null")
+        judge_spec = {}
+        for key in ("include", "not_include", "leak_targets"):
+            value = judge_spec_raw.get(key, [])
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise _err(path, lineno, f"judge_spec.{key} 必须是字符串列表")
+            judge_spec[key] = list(value)
     return Question(
         qid=str(raw["qid"]),
         question=str(raw["question"]),
@@ -209,6 +252,8 @@ def _parse_question(raw: object, path: Path, lineno: int) -> Question:
         gold_stale_note=gold_stale_note,
         ignore=ignore,
         ignore_reason=ignore_reason,
+        question_date=question_date,
+        judge_spec=judge_spec,
     )
 
 

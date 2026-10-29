@@ -90,10 +90,19 @@ def test_locomo_convert_and_load(tmp_path: Path) -> None:
     d = dialogues[0]
     assert d.dialogue_id == "conv-test"
     assert len(d.sessions) == 2
-    # 角色映射：speaker_a -> user
+    # 角色映射：speaker_a -> user（历史口径不变）
     assert d.sessions[0][0]["role"] == "user"
     assert d.sessions[0][1]["role"] == "assistant"
+    # 两个人类的真实身份保留在 name 里（schema 不校验、也不丢额外键）
+    assert d.sessions[0][0]["name"] == "Alice"
+    assert d.sessions[0][1]["name"] == "Bob"
     assert d.sessions[0][0]["timestamp"] == "2023-05-08T13:56"  # 归一为 ISO，精度仍是到分
+    # 渲染时 name 进入 role 前缀，抽取提示词因此能区分说话人
+    from membench.agent_loop import _render_messages
+
+    rendered = _render_messages(d.sessions[0])
+    assert "[user:Alice](2023-05-08T13:56) I adopted a dog named Rex." in rendered
+    assert "[assistant:Bob](2023-05-08T13:56) Nice! How old is he?" in rendered
 
     by_cat = {q.category: q for q in d.questions}
     assert by_cat["single_hop"].gold_answer == "Rex"

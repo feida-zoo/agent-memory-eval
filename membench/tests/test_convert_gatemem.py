@@ -39,7 +39,15 @@ _EPISODES = [
 ]
 
 
-def _cp(cp_id: str, ep_id: str, query_type: str, action: str, include: list[str] | None = None) -> dict:
+def _cp(
+    cp_id: str,
+    ep_id: str,
+    query_type: str,
+    action: str,
+    include: list[str] | None = None,
+    not_include: list[str] | None = None,
+    leak_targets: list[str] | None = None,
+) -> dict:
     return {
         "checkpoint_id": cp_id,
         "episode_id": ep_id,
@@ -48,8 +56,13 @@ def _cp(cp_id: str, ep_id: str, query_type: str, action: str, include: list[str]
         "query_type": query_type,
         "query_text": f"{cp_id} 的问题文本",
         "expected_action": action,
-        "judge_spec": {"expected_action": action, "include": include or [], "notes": ""},
-        "leak_targets": [],
+        "judge_spec": {
+            "expected_action": action,
+            "include": include or [],
+            "not_include": not_include or [],
+            "notes": "",
+        },
+        "leak_targets": leak_targets or [],
     }
 
 
@@ -190,3 +203,77 @@ def test_convert_gatemem_main_ignore_flag(tmp_path: Path, capsys) -> None:
     assert by_qid["ck_refuse"].ignore is True
     assert by_qid["ck_safety"].ignore is False
     assert "已标记忽略 1 道" in capsys.readouterr().out
+
+
+def _write_custom_checkpoints(tmp_path: Path, checkpoints: list[dict]) -> tuple[Path, Path]:
+    """复用默认 episodes，写一组自定义 checkpoints。"""
+    ep_path = tmp_path / "ep.jsonl"
+    ep_path.write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in _EPISODES) + "\n",
+        encoding="utf-8",
+    )
+    cp_path = tmp_path / "cp.jsonl"
+    cp_path.write_text(
+        "\n".join(json.dumps(c, ensure_ascii=False) for c in checkpoints) + "\n",
+        encoding="utf-8",
+    )
+    return ep_path, cp_path
+
+
+def test_judge_spec_written_to_question(tmp_path: Path) -> None:
+    """include / not_include / leak_targets 原样落进 Question.judge_spec。"""
+    checkpoints = [
+        _cp(
+            "ck_regex",
+            "ep_001",
+            "utility",
+            "answer",
+            include=["no[- ]auto[- ]renewal", "9%"],
+        ),
+        _cp(
+            "ck_leak",
+            "ep_001",
+            "privacy",
+            "refuse",
+            not_include=["Granite Mutual", "active"],
+            leak_targets=["Granite Mutual"],
+        ),
+        _cp(
+            "ck_redacted",
+            "ep_001",
+            "privacy",
+            "answer_redacted",
+            include=["是同一个保险账户"],
+            leak_targets=["mp_stg_4R2N"],
+        ),
+    ]
+    ep_path, cp_path = _write_custom_checkpoints(tmp_path, checkpoints)
+    out = tmp_path / "out.jsonl"
+    convert_gatemem(ep_path, cp_path, out)
+
+    by_qid = {q.qid: q for d in load_dataset(out) for q in d.questions}
+    assert by_qid["ck_regex"].judge_spec == {
+        "include": ["no[- ]auto[- ]renewal", "9%"],
+        "not_include": [],
+        "leak_targets": [],
+    }
+    assert by_qid["ck_leak"].judge_spec == {
+        "include": [],
+        "not_include": ["Granite Mutual", "active"],
+        "leak_targets": ["Granite Mutual"],
+    }
+    assert by_qid["ck_redacted"].judge_spec["leak_targets"] == ["mp_stg_4R2N"]
+    # gold_answer 仍保留 include 的可读拼接（报告展示用），拒答题为哨兵
+    assert by_qid["ck_regex"].gold_answer == "no[- ]auto[- ]renewal; 9%"
+    assert by_qid["ck_leak"].gold_answer == ABSTAIN_SENTINEL
+
+
+def test_judge_spec_omitted_when_all_sections_empty(tmp_path: Path) -> None:
+    """三段全空时不写 judge_spec（空 rubric 会把任意回答判对）。"""
+    checkpoints = [_cp("ck_empty", "ep_001", "utility", "answer", include=[])]
+    ep_path, cp_path = _write_custom_checkpoints(tmp_path, checkpoints)
+    out = tmp_path / "out.jsonl"
+    convert_gatemem(ep_path, cp_path, out)
+
+    by_qid = {q.qid: q for d in load_dataset(out) for q in d.questions}
+    assert by_qid["ck_empty"].judge_spec is None

@@ -12,6 +12,15 @@
   证据 × 检索条目），覆盖摘要/改写式记忆存储；调用或解析失败回退
   substring 并把次数记入 ``fallbacks``（runner 落账到 metrics.json）。
 
+**session 级长证据的 containment 兜底**：substring / overlap 共用
+:func:`containment_hit`——证据长度超过 :data:`SESSION_EVIDENCE_MIN_CHARS`
+（视为整段 session 级证据）且子串 / token 判定都失败后，只要检索里存在一条
+去空白后长度 >= :data:`CONTAINMENT_MIN_ITEM_CHARS` 的条目，且该条目是证据的
+子串（或证据是该条目的子串），就算命中。这是**代理口径**：chunk 级记忆返回的
+是会话里的一段，天然不可能是整段证据的子串，严格子串判定会让 recall@5 与
+证据召回系统性趋零（LongMemEval S/M 的 session 证据中位数约 14k 字符）。
+短证据（office / LoCoMo 的裸值）行为不变，仍要求原文子串命中。
+
 三种口径的分数不可直接对比（llm >= overlap >= substring）；compare 的
 可比性校验对 ``retrieval_match`` 不一致给出 WARN。
 """
@@ -25,18 +34,56 @@ import threading
 import urllib.request
 from typing import Any, Sequence
 
-from .text import recall_at_k
-
 __all__ = [
     "SubstringMatcher",
     "OverlapMatcher",
     "LLMEvidenceMatcher",
     "build_evidence_matcher",
     "content_tokens",
+    "containment_hit",
 ]
 
 _ZH_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
 _ASCII_RE = re.compile(r"[a-z0-9]+")
+_WS_RE = re.compile(r"\s+")
+
+#: 视为 session 级证据的最小字符数：超过它在子串判定失败后追加 containment 兜底。
+SESSION_EVIDENCE_MIN_CHARS = 500
+
+#: containment 兜底时检索条目的最小长度（去空白后）：过短的条目（裸值、单词）
+#: 不作容器，避免 "9%" 之类短串把任意长证据判成命中。
+CONTAINMENT_MIN_ITEM_CHARS = 20
+
+
+def _squash(text: str) -> str:
+    """去掉全部空白字符（换行、空格、缩进），供 containment 比较。"""
+    return _WS_RE.sub("", text or "")
+
+
+def containment_hit(evidence: str, retrieved: Sequence[str]) -> bool:
+    """长证据的 containment 兜底：检索条目是否为证据的一部分（或反之）。
+
+    只应由 :class:`SubstringMatcher` / :class:`OverlapMatcher` 在证据长度超过
+    :data:`SESSION_EVIDENCE_MIN_CHARS` 时调用。比较前去空白，短于
+    :data:`CONTAINMENT_MIN_ITEM_CHARS` 的条目不作容器。
+
+    Args:
+        evidence: 单条证据（session 级长文本）。
+        retrieved: 检索条目列表。
+
+    Returns:
+        是否存在一条足够长、且与证据互为子串的检索条目。
+    """
+    ev = _squash(evidence)
+    if not ev:
+        return False
+    for item in retrieved:
+        squashed = _squash(item)
+        if len(squashed) < CONTAINMENT_MIN_ITEM_CHARS:
+            continue
+        if squashed in ev or ev in squashed:
+            return True
+    return False
 
 
 def content_tokens(text: str) -> set[str]:
@@ -52,12 +99,21 @@ def content_tokens(text: str) -> set[str]:
 
 
 class SubstringMatcher:
-    """逐字子串命中（默认口径，与历史分数完全一致）。"""
+    """逐字子串命中（默认口径；长证据追加 containment 兜底）。"""
 
     name = "substring"
 
     def __init__(self) -> None:
         self.fallbacks = 0
+
+    @staticmethod
+    def _matches(evidence: str, retrieved: Sequence[str]) -> bool:
+        """单条证据是否命中：原文子串；超长证据再看 containment。"""
+        if any(evidence in item for item in retrieved):
+            return True
+        if len(evidence) > SESSION_EVIDENCE_MIN_CHARS:
+            return containment_hit(evidence, retrieved)
+        return False
 
     def evidence_hits(
         self, evidence: list[str], retrieved: list[str], k: int = 5
@@ -65,8 +121,10 @@ class SubstringMatcher:
         """返回 ``(任一证据命中, 前 k 条覆盖率)``；空 evidence 返回 (False, 0.0)。"""
         if not evidence:
             return False, 0.0
-        hit = any(ev in item for item in retrieved for ev in evidence)
-        return hit, float(recall_at_k(evidence, retrieved, k))
+        top = retrieved[:k]
+        hit = any(self._matches(ev, retrieved) for ev in evidence)
+        recall = sum(1 for ev in evidence if self._matches(ev, top)) / len(evidence)
+        return hit, float(recall)
 
 
 class OverlapMatcher:
@@ -89,6 +147,8 @@ class OverlapMatcher:
                 continue
             if len(ev_tokens & item_tokens) / len(ev_tokens) >= self.threshold:
                 return True
+        if len(evidence) > SESSION_EVIDENCE_MIN_CHARS:
+            return containment_hit(evidence, retrieved)
         return False
 
     def evidence_hits(
