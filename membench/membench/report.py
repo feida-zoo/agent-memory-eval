@@ -20,6 +20,7 @@ from typing import Any, Iterable
 
 from .layout import (
     DIR_SNAPSHOT,
+    DIR_TRACE_STATE,
     FIG_CATEGORY,
     FIG_CATEGORY_DIFF,
     FIG_LATENCY,
@@ -55,6 +56,7 @@ from .ratings import (
     overall_rating,
     rate_metric,
 )
+from .metrics.summary import ATTRIBUTION_BUCKETS
 
 # 统一低饱和配色（SPEC 第 7 节）
 PALETTE: list[str] = ["#3b6ea5", "#c9a86a", "#5e8c61", "#8f8f8f", "#b03a2e"]
@@ -231,6 +233,7 @@ DIM_LABEL_ZH: dict[str, str] = {
     "commit": "commit",
     "retrieval_match": "检索匹配口径",
     "run_mode": "运行模式",
+    "ingest_strategy": "摄入策略",
     "fusion": "融合口径",
     "limit": "题目上限",
     "shards": "分片数",
@@ -276,6 +279,8 @@ METADATA_FIELD_ZH: dict[str, str] = {
     "retrieval_match": "检索匹配口径",
     "retrieval_match_threshold": "检索匹配阈值",
     "retrieval_match_fallbacks": "检索匹配回退数",
+    "ingest_strategy": "摄入策略",
+    "as_of_questions": "带 as_of 的题数",
 }
 
 
@@ -298,6 +303,33 @@ def snapshot_role_display(role: Any) -> str:
     if role is None or role == "":
         return "n/a"
     return SNAPSHOT_ROLE_ZH.get(str(role), str(role))
+
+
+#: ``trace_state.role`` -> 显示文案（--trace-state 的逐 as_of 状态）。
+TRACE_ROLE_ZH: dict[str, str] = {
+    "exported": "已导出",
+    "unsupported": "不支持（适配器未声明快照能力）",
+    "not_applicable": "不适用（本 run 没有 interleaved 对话）",
+    "not_exported": "未导出",
+}
+
+#: 失败归因四桶 -> 中文显示名。
+ATTRIBUTION_BUCKET_ZH: dict[str, str] = {
+    "not_written": "未写入",
+    "not_retrieved": "未检索到",
+    "wrong_answer": "检索到但答错",
+    "unknown": "不可判定",
+}
+
+#: 失败归因样例里问题 / 回答的截断长度（完整原文在 results.jsonl）。
+ATTRIBUTION_SAMPLE_CHARS = 80
+
+
+def trace_role_display(role: Any) -> str:
+    """追踪状态角色的显示文案；未知角色原样返回，缺失显示 ``n/a``。"""
+    if role is None or role == "":
+        return "n/a"
+    return TRACE_ROLE_ZH.get(str(role), str(role))
 
 
 def shard_scope_text(metrics: dict[str, Any]) -> "str | None":
@@ -896,6 +928,23 @@ def dialogue_snapshot_rows(
     return rows
 
 
+def dialogue_trace_rows(
+    out_dir: str, state: "dict[str, Any] | None" = None
+) -> list[list[str]]:
+    """对话级报告里的逐 as_of 追踪状态链接（``--trace-state``）。
+
+    与 :func:`dialogue_snapshot_rows` 同一原则：磁盘上真存在才给可点击链接。
+    """
+    state = state or {}
+    if state.get("role") != "exported":
+        return []
+    trace_dir = os.path.normpath(os.path.join(out_dir, os.pardir, DIR_TRACE_STATE))
+    if not os.path.isdir(trace_dir):
+        return []
+    rel = f"../{DIR_TRACE_STATE}/"
+    return [["逐 as_of 追踪状态目录", f"[`{rel}`]({rel})"]]
+
+
 def _baseline_rows(overall: dict[str, Any]) -> list[list[str]]:
     rows = []
     for key, label, target, ok in BASELINES:
@@ -971,10 +1020,21 @@ def write_run_report_md(
         [metadata_label("adapter_version"), _fmt_opt(metrics.get("adapter_version"))],
         [metadata_label("dataset_fingerprint"), _fmt_opt(fp_sha)],
         [metadata_label("retrieval_match"), str(metrics.get("retrieval_match") or "substring")],
+        [metadata_label("ingest_strategy"), str(metrics.get("ingest_strategy") or "sequence")],
     ]
     if metrics.get("dialogue_id"):
         # 对话级报告：先声明这份报告只覆盖哪一段对话，避免被读成数据集级结论
         config_rows.insert(2, [metadata_label("dialogue_id"), f"`{metrics['dialogue_id']}`"])
+    as_of_questions = int(metrics.get("as_of_questions") or 0)
+    if as_of_questions:
+        config_rows.append(
+            [
+                metadata_label("as_of_questions"),
+                f"{as_of_questions}（"
+                + ("已强制" if metrics.get("as_of_enforced", True) else "未强制，时点错位")
+                + "）",
+            ]
+        )
     lines.append(_md_table(["项目", "值"], config_rows))
     lines.append("")
     # 非默认检索命中口径提示：与 substring 的历史跑分不可直接比较
@@ -1000,6 +1060,15 @@ def write_run_report_md(
             "疑似 evidence 与被检索文本格式不一致（如记忆以摘要/改写形式存储），"
             "并非真实零召回。可尝试 `--evidence-match overlap|llm` 调整命中口径，"
             "或让适配器返回可核对的原文片段后重跑。"
+        )
+        lines.append("")
+    # as_of 未强制：题目带时点标注却按整段 ingest 跑，问的是"结尾时才看得到"的状态
+    if as_of_questions and not metrics.get("as_of_enforced", True):
+        lines.append(
+            f"> ⚠️ 本 run 按 **{metrics.get('ingest_strategy') or 'sequence'}** 摄入："
+            f"{as_of_questions} 道题带 `as_of` 时点标注但**未强制**，题目看到的是整段"
+            "对话的全部消息（时点错位）——更新型事实可能被按新值判分。需要「当时能看到"
+            "什么」的口径，请用 `ingest_strategy=interleaved` 的数据集重跑。"
         )
         lines.append("")
 
@@ -1201,11 +1270,12 @@ def write_run_report_md(
     # 3.6 快照与回放（写入侧固定时必须在报告里说清，避免被当完整评测读）
     state = metrics.get("state_snapshot") or {}
     verify = metrics.get("replay_verify") or {}
+    trace = metrics.get("trace_state") or {}
     # 对话级报告额外给"去哪翻记忆文件"：磁盘上真实存在才给链接（见 dialogue_snapshot_rows）
     snap_rows = (
         dialogue_snapshot_rows(out_dir, state) if metrics.get("dialogue_id") else []
     )
-    if state or verify or snap_rows:
+    if state or verify or snap_rows or trace:
         lines.append("## 快照与回放")
         lines.append("")
         role = str(state.get("role") or "")
@@ -1233,7 +1303,13 @@ def write_run_report_md(
                     ]
                 )
             else:
-                snapshot_rows.append(["快照根目录（`--replay` 入参）", f"`{state.get('root', 'n/a')}`"])
+                replayable = str(metrics.get("ingest_strategy") or "sequence") == "sequence"
+                snapshot_rows.append(
+                    [
+                        "快照根目录" + ("（`--replay` 入参）" if replayable else ""),
+                        f"`{state.get('root', 'n/a')}`",
+                    ]
+                )
                 if state.get("format_version") is not None:
                     snapshot_rows.append(["格式版本", f"v{state['format_version']}"])
                 if state.get("manifest_sha256"):
@@ -1254,14 +1330,39 @@ def write_run_report_md(
                 snapshot_rows.append(
                     ["桶数（本 run 复用 / 新写）", f"{n_buckets}（复用 {reused} / 新写 {new}）"]
                 )
+        if trace.get("enabled"):
+            snapshot_rows.append(
+                [
+                    "逐 as_of 追踪状态（`--trace-state`）",
+                    f"{trace_role_display(trace.get('role'))}；"
+                    f"{int(trace.get('n_states') or 0)} 份",
+                ]
+            )
+        if metrics.get("dialogue_id"):
+            snapshot_rows.extend(dialogue_trace_rows(out_dir, trace))
         snapshot_rows.extend(snap_rows)
         lines.append(_md_table(["项目", "值"], snapshot_rows))
         lines.append("")
-        if role == "exported":
+        if trace.get("enabled"):
             lines.append(
-                "改**读取侧**代码后可用 `--replay <快照根目录>`（数据集目录，或含它的"
-                "实验目录）免重跑 ingest；改写入侧（抽取 / 更新 / 去重）则必须重新 ingest。"
+                "**失败归因**用的是「该题提问时点」的状态：interleaved 对话取 "
+                "`trace_state/t<as_of>/`，sequence 对话取对话末尾的 "
+                "`memory_snapshot/`。`trace_state.role=unsupported` 时没有逐时点状态，"
+                "归因记 `unknown`（不猜）。"
             )
+            lines.append("")
+        if role == "exported":
+            if str(metrics.get("ingest_strategy") or "sequence") == "sequence":
+                lines.append(
+                    "改**读取侧**代码后可用 `--replay <快照根目录>`（数据集目录，或含它的"
+                    "实验目录）免重跑 ingest；改写入侧（抽取 / 更新 / 去重）则必须重新 ingest。"
+                )
+            else:
+                lines.append(
+                    "本 run 的摄入策略是 **interleaved / mixed**：`--replay` 只有对话末尾"
+                    "一份快照，给不出每个 `as_of` 时点的状态，会被拒绝；改读取侧代码需要"
+                    "重新 ingest（`--trace-state` 的逐时点状态只用于失败归因，不是回放入口）。"
+                )
             lines.append("")
         if role == "replayed" and state.get("snapshots_dir"):
             lines.append(
@@ -1296,7 +1397,113 @@ def write_run_report_md(
                     lines.append(f"- 不一致示例：{'、'.join('`' + str(q) + '`' for q in mismatches)}")
             lines.append("")
 
-    # 4. 失败样例 Top10
+    # 4. 失败归因（只有存在判错题时出现）
+    attribution = metrics.get("attribution") or {}
+    if int(attribution.get("n_wrong") or 0) > 0:
+        lines.append("## 失败归因")
+        lines.append("")
+        lines.append(
+            "<sub>回答「为什么答错」：只有**判错**且带 evidence 标注的题进入四桶——"
+            "证据不在该题提问时点的状态里（`not_written`）→ 在状态里但没被检索进"
+            "回答上下文（`not_retrieved`）→ 两者都有仍答错（`wrong_answer`，推理 / 表述"
+            "问题）；状态读不到 / 没有快照记 `unknown`（不猜）。没有 evidence 标注的"
+            "判错题无法判断「证据是否已写入」，单独计数、不塞进任何桶。</sub>"
+        )
+        lines.append("")
+        lines.append(
+            f"- 判错 {int(attribution.get('n_wrong') or 0)} 题："
+            f"带 evidence {int(attribution.get('n_wrong_with_evidence') or 0)}、"
+            f"无 evidence（无法归因）{int(attribution.get('n_wrong_without_evidence') or 0)}；"
+            f"提问时点状态可读 {int(attribution.get('n_state_readable') or 0)} 题"
+        )
+        lines.append("")
+        by_category = attribution.get("by_category") or {}
+        samples = attribution.get("samples") or []
+        cat_rows = []
+        for cat in sorted(by_category):
+            info = by_category[cat]
+            sample_qids = [
+                f"`{s.get('qid')}`（{ATTRIBUTION_BUCKET_ZH.get(str(s.get('bucket')), str(s.get('bucket')))}）"
+                for s in samples
+                if str(s.get("category")) == str(cat)
+            ]
+            cat_rows.append(
+                [
+                    category_display(cat),
+                    str(info.get("n_wrong", 0)),
+                    str(info.get("n_wrong_with_evidence", 0)),
+                    *(str(info.get(bucket, 0)) for bucket in ATTRIBUTION_BUCKETS),
+                    "、".join(sample_qids) or "—",
+                ]
+            )
+        lines.append(
+            _md_table(
+                [
+                    "题型",
+                    "判错题",
+                    "带 evidence",
+                    *[ATTRIBUTION_BUCKET_ZH[b] for b in ATTRIBUTION_BUCKETS],
+                    "样例 qid（桶）",
+                ],
+                cat_rows or [["(无)", "0", "0", "0", "0", "0", "0", "—"]],
+            )
+        )
+        lines.append("")
+        if not int(attribution.get("n_wrong_with_evidence") or 0):
+            lines.append(
+                "（本次判错题都没有 evidence 标注：四桶全为 0 是「无法归因」，"
+                "不是「没有失败」。）"
+            )
+            lines.append("")
+        record_by_key = {
+            (str(r.get("dialogue_id", "")), str(r.get("qid", ""))): r for r in records
+        }
+
+        def _short(text: Any) -> str:
+            value = str(text or "")
+            if len(value) > ATTRIBUTION_SAMPLE_CHARS:
+                value = value[: ATTRIBUTION_SAMPLE_CHARS - 1] + "…"
+            return value
+
+        sample_rows = []
+        for sample in samples:
+            record = record_by_key.get(
+                (str(sample.get("dialogue_id", "")), str(sample.get("qid", "")))
+            )
+            if record is None:
+                continue
+            in_state = record.get("evidence_in_state")
+            sample_rows.append(
+                [
+                    ATTRIBUTION_BUCKET_ZH.get(
+                        str(sample.get("bucket")), str(sample.get("bucket"))
+                    ),
+                    f"`{sample.get('qid')}`",
+                    _short(record.get("question")),
+                    _short(record.get("prediction")),
+                    "null" if in_state is None else ("true" if in_state else "false"),
+                    "true" if record.get("evidence_hit") else "false",
+                ]
+            )
+        if sample_rows:
+            lines.append("### 归因样例")
+            lines.append("")
+            lines.append(
+                _md_table(
+                    [
+                        "归因",
+                        "qid",
+                        "问题",
+                        "回答摘要",
+                        "evidence_in_state",
+                        "evidence_hit",
+                    ],
+                    sample_rows,
+                )
+            )
+            lines.append("")
+
+    # 4.1 失败样例 Top10
     lines.append("## 失败样例 Top10")
     lines.append("")
     fails = [r for r in records if not r.get("judge", {}).get("correct", False)][:10]

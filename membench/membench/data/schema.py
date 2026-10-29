@@ -4,12 +4,13 @@
 
     {
       "dialogue_id": "d001",
+      "ingest_strategy": "sequence",
       "sessions": [[{"role": "user", "content": "...", "timestamp": "..."}], ...],
       "questions": [
         {"qid": "d001_q1", "question": "...", "gold_answer": "...",
          "category": "single_hop | ...", "evidence": ["..."], "gold_stale": "...",
          "gold_stale_note": "...", "ignore": false, "ignore_reason": "...",
-         "question_date": "2023-04-10T23:07",
+         "question_date": "2023-04-10T23:07", "as_of": 12,
          "judge_spec": {"include": ["..."], "not_include": ["..."],
                         "leak_targets": ["..."]}}
       ]
@@ -44,6 +45,16 @@ judge 直接做包含与位置判定；``gold_stale_note`` 存数据集给出的
 （见 ``membench/judges/heuristic.py`` 的 ``grade_judge_spec``）。加载器只校验
 结构并把缺失的三段补成空列表，不解释正则语义。
 
+**摄入策略**（``Dialogue.ingest_strategy``）与**提问时点**（``Question.as_of``）
+是一对绑定字段，用于"题目问的是当时能看到什么"的数据集（如 GateMem 的
+checkpoint 各带 ``as_of_turn_id``）：
+
+- ``ingest_strategy="sequence"``（默认，旧数据兼容）：整段对话先全部 ingest，
+  再一次性提问——``as_of`` 不强制，全部消息对每道题都可见；
+- ``ingest_strategy="interleaved"``：按 ``as_of`` 升序分组，每组 ingest 到该
+  消息条数后立刻提问（见 :mod:`membench.runner`）。``as_of`` 是**已 ingest 的
+  消息条数**（0..该对话消息总数），按 sessions 顺序展平后的前缀长度。
+
 加载器做字段校验，缺字段 / 非法取值时报错并给出**行号**。
 """
 
@@ -74,6 +85,11 @@ CATEGORIES: tuple[str, ...] = (
 
 #: abstention 题的 gold_answer 哨兵值：表示期望系统拒答。
 ABSTAIN_SENTINEL = "<ABSTAIN>"
+
+#: 对话的摄入策略取值：
+#: - ``sequence``：整段对话 ingest 完再提问（默认，历史口径）；
+#: - ``interleaved``：按题目 ``as_of`` 分组，ingest 到该时点后立刻提问。
+INGEST_STRATEGIES: tuple[str, ...] = ("sequence", "interleaved")
 
 
 def is_abstention(category: str, gold_answer: str) -> bool:
@@ -139,6 +155,10 @@ class Question:
         judge_spec: 确定性判分 rubric，``{"include": [...], "not_include": [...],
             "leak_targets": [...]}``；非 None 时 judge 不再做 token_f1 / LLM
             判分，改用正则与字面量校验（见 ``judges.heuristic.grade_judge_spec``）。
+        as_of: **已 ingest 的消息条数**（0..该对话消息总数），只在
+            ``Dialogue.ingest_strategy="interleaved"`` 下生效：表示这道题应在
+            该时点提问。None（缺省）表示"全部 ingest 完之后再问"——interleaved
+            对话里排在最后，sequence 对话里就是普通题。
     """
 
     qid: str
@@ -152,6 +172,7 @@ class Question:
     ignore_reason: str | None = None
     question_date: str | None = None
     judge_spec: dict | None = None
+    as_of: int | None = None
 
 
 @dataclass
@@ -165,11 +186,24 @@ class Dialogue:
             可选 ``"name": str``（真实说话人名，如 LoCoMo 的两位人类；
             渲染时出现在 role 之后，见 ``agent_loop._render_messages``）。
         questions: 挂接在该对话上的评测题。
+        ingest_strategy: 摄入策略（``INGEST_STRATEGIES`` 之一）：
+            ``sequence``（默认）整段 ingest 后统一提问；``interleaved`` 按题目
+            ``as_of`` 分组、边 ingest 边提问（中间不 reset）。
     """
 
     dialogue_id: str
     sessions: list[list[dict]]
     questions: list[Question] = field(default_factory=list)
+    ingest_strategy: str = "sequence"
+
+    @property
+    def n_messages(self) -> int:
+        """该对话按 sessions 顺序展平后的消息总数（``as_of`` 的上界）。"""
+        return sum(len(session) for session in self.sessions)
+
+    def messages(self) -> list[dict]:
+        """把 sessions 按顺序展平成消息列表（``as_of`` 切片的口径）。"""
+        return [msg for session in self.sessions for msg in session]
 
 
 @dataclass
@@ -242,6 +276,14 @@ def _parse_question(raw: object, path: Path, lineno: int) -> Question:
             if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
                 raise _err(path, lineno, f"judge_spec.{key} 必须是字符串列表")
             judge_spec[key] = list(value)
+    # 可选的提问时点：已 ingest 的消息条数；缺省 None（= 全部 ingest 后提问）。
+    # bool 是 int 的子类，必须显式拒绝，否则 true/false 会被当成 1/0。
+    as_of = raw.get("as_of")
+    if as_of is not None:
+        if isinstance(as_of, bool) or not isinstance(as_of, int):
+            raise _err(path, lineno, "as_of 必须是整数或 null")
+        if as_of < 0:
+            raise _err(path, lineno, f"as_of 必须 >= 0，当前为 {as_of}")
     return Question(
         qid=str(raw["qid"]),
         question=str(raw["question"]),
@@ -254,6 +296,7 @@ def _parse_question(raw: object, path: Path, lineno: int) -> Question:
         ignore_reason=ignore_reason,
         question_date=question_date,
         judge_spec=judge_spec,
+        as_of=as_of,
     )
 
 
@@ -295,10 +338,32 @@ def _parse_dialogue(raw: object, path: Path, lineno: int) -> Dialogue:
         raise _err(path, lineno, "questions 必须是列表")
     questions = [_parse_question(q, path, lineno) for q in questions_raw]
 
+    # 摄入策略缺省 sequence（旧数据集没有该字段）；非法值直接拒绝——拼错的策略
+    # 若被静默当成 sequence，整份数据的时点语义就悄悄变了。
+    ingest_strategy = raw.get("ingest_strategy", "sequence")
+    if ingest_strategy not in INGEST_STRATEGIES:
+        raise _err(
+            path,
+            lineno,
+            f"ingest_strategy 非法：{ingest_strategy!r}（合法取值 {list(INGEST_STRATEGIES)}）",
+        )
+
+    # as_of 的上界只有在这里才知道（要看该对话展平后的消息总数）。
+    n_messages = sum(len(session) for session in sessions)
+    for question in questions:
+        if question.as_of is not None and question.as_of > n_messages:
+            raise _err(
+                path,
+                lineno,
+                f"question {question.qid!r} 的 as_of={question.as_of} 超过该对话"
+                f"消息总数 {n_messages}（as_of 是已 ingest 的消息条数，取值 0..N）",
+            )
+
     return Dialogue(
         dialogue_id=str(raw["dialogue_id"]),
         sessions=sessions,
         questions=questions,
+        ingest_strategy=ingest_strategy,
     )
 
 

@@ -22,7 +22,11 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
         [--adapter-arg KEY=VALUE]...   # 适配器构造参数，如 base_url=http://127.0.0.1:8787 \
         [--shards N|max --shard-index I --shard-by question|dialogue] \
         [--evidence-match substring|overlap|llm] \
-        [--no-snapshot]   # 默认每对话 ingest 后导出状态快照（适配器不支持时警告一次并跳过）
+        [--no-snapshot] [--trace-state] \
+        # --no-snapshot：默认每对话 ingest 后导出状态快照（适配器不支持时警告一次并跳过）
+        # --trace-state：失败归因，interleaved 数据集在每个有提问的 as_of 导一份状态到
+        #   <对话目录>/trace_state/t<as_of>/（sequence 用末尾 memory_snapshot/）
+        # interleaved 数据集（如 gatemem_office）要求 --shard-by dialogue，且不支持 --replay
         # --dataset：key（office / sample / locomo…，按需下载集先 dataset fetch）或 JSONL 路径
     python -m membench.cli run --adapter mock-strong --dataset ... \
         --replay <实验目录|数据集目录|回放任务或它的臂目录> \
@@ -87,7 +91,7 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
 
     <report-out>/eval_<name>_<platform>_<ts>[_s<i>][_l<limit>]/   # 单臂任务目录，例 eval_mock-strong_default_20261024-193000（分片/冒烟带后缀，见 layout.experiment_tags）
     ├── runtime/{commands.jsonl,logs/,env.json}  # 实验级运行时数据（命令 / 全量日志 / 环境快照）
-    ├── runs/<dataset>/{report/,shards.json,<对话>/{report/,runtime/,memory_snapshot/}}
+    ├── runs/<dataset>/{report/,shards.json,<对话>/{report/,runtime/,memory_snapshot/,trace_state/}}
     └── reports/                                # 任务级（report.md / metrics.json / evaluate_summary.json / fig_dataset_overview.png）
     <report-out>/compare_<name>_<platform>_<ts>/{A/,B/,runtime/,reports/comparison.md}   # 双臂任务目录
     <report-out>/matrix_<ts>/{runtime/,reports/,runs/<label>/}
@@ -122,6 +126,16 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
 - ``compare --task-dir DIR``：就地读 ``DIR/A`` 与 ``DIR/B``，``comparison.md`` 落
   ``DIR/reports/``；
 - ``fuse --task-dir DIR``：就地补齐数据集级与任务级产物（各片本来就写在这一棵树里）。
+
+摄入策略与失败归因（与数据集绑定）：
+- ``sequence``（默认，旧数据兼容）：整段对话 ingest 完再提问，``Question.as_of``
+  不强制；
+- ``interleaved``（如 gatemem_office）：按 ``as_of``（已 ingest 的消息条数）升序
+  分组，边 ingest 边提问；要求 ``--shard-by dialogue``、不支持 ``--replay``；
+- ``run --trace-state`` 对 interleaved 的每个有提问 as_of 导出状态到
+  ``<对话目录>/trace_state/t<as_of>/``；``results.jsonl`` 每题记 ``as_of`` /
+  ``evidence_in_state``，metrics 与报告给出失败归因四桶
+  （not_written / not_retrieved / wrong_answer / unknown）。
 
 任务目录的共同形态是 ``arms`` 决定的前缀（``eval_*`` / ``compare_*``），骨架由
 :func:`membench.layout.init_task_dir` 唯一决定。
@@ -214,11 +228,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "适配器不支持快照时默认只警告一次并跳过）",
     )
     p_run.add_argument(
+        "--trace-state",
+        action="store_true",
+        help="失败归因：对 interleaved 数据集在每个有提问的 as_of ingest 完成后、query 之前"
+        "导出状态到 <对话目录>/trace_state/t<as_of>/（sequence 对话用末尾 memory_snapshot/）；"
+        "用于判断答错是「没写入 / 写入但没检索到 / 检索到但答错」",
+    )
+    p_run.add_argument(
         "--replay",
         default=None,
         help="回放源：实验目录、runs/<dataset> 数据集目录，或回放任务（含 snapshots/index.json 的任务目录 / 其臂目录 A/ B/）；"
         "跳过 reset+ingest，按对话恢复快照后只跑 query（写入侧固定，结论只覆盖读取/回答层）。"
-        "回放默认把恢复后的状态导出到任务级快照池 snapshots/（按内容去重，--no-snapshot 关闭）",
+        "回放默认把恢复后的状态导出到任务级快照池 snapshots/（按内容去重，--no-snapshot 关闭）；"
+        "interleaved（按 as_of 边 ingest 边提问）数据集不支持回放：只有末尾快照，给不出各时点状态",
     )
     p_run.add_argument(
         "--replay-mode",
@@ -874,6 +896,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 evidence_matcher=evidence_matcher,
                 shared=args.task_dir is not None,
                 snapshot=not args.no_snapshot,
+                trace_state=args.trace_state,
                 replay=args.replay,
                 replay_mode=args.replay_mode,
                 replay_verify_source=args.replay_verify_source,

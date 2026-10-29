@@ -79,6 +79,10 @@ CRITICAL_COMPARABILITY_DIMS: tuple[str, ...] = (
     # 运行模式：full / replay-restore / replay-rebuild。回放固定写入侧，
     # 与全量分**不可比**（缺省视为 full——本特性之前的所有 run 都是全量跑）。
     "run_mode",
+    # 摄入策略：sequence（整段 ingest 后提问）/ interleaved（按 as_of 边 ingest
+    # 边提问）。两者问的是不同的时间语义（"结尾时知道什么" vs "当时知道什么"），
+    # 分数不可直接比；缺省归一 sequence（本特性之前的所有 run 都是整段 ingest）。
+    "ingest_strategy",
     # 题目数：分数算在哪个题集上。两侧题目数不同说明分数来自不同题目总体
     # （典型如 --limit 冒烟 vs 全量、分片融合只覆盖一部分），diff 不可归因；
     # 与数据集指纹同级——数据集身份没变但题目集变了，同样不能当 A/B。
@@ -238,6 +242,9 @@ def _comparability_value(metrics: dict[str, Any], dim: str) -> Any:
     办公域槽位参与"，与 ``weighted`` / ``equal`` 都不可比——口径变了，分数
     本来就不能直接比。
 
+    ``ingest_strategy`` 缺省归一为 ``"sequence"``：本特性之前的所有 run 都是
+    整段对话 ingest 后统一提问，旧产物没有该字段不该被记成"无法核验"。
+
     ``n_questions`` 顶层没有——它由 :func:`membench.metrics.summary.aggregate`
     写在 ``overall`` 下，故取 ``overall`` 兜底；只读顶层会让该维度恒为
     ``None == None``（死维度，冒烟产物与全量产物因此被当成可比）。
@@ -247,6 +254,8 @@ def _comparability_value(metrics: dict[str, Any], dim: str) -> Any:
         return fingerprint.get("sha256") if isinstance(fingerprint, dict) else None
     if dim == "run_mode":
         return metrics.get("run_mode") or "full"
+    if dim == "ingest_strategy":
+        return metrics.get("ingest_strategy") or "sequence"
     if dim == "fusion":
         return metrics.get("fusion") or "legacy"
     if dim == "n_questions":

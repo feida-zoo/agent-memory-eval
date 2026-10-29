@@ -426,3 +426,52 @@ def test_in_place_compare_requires_existing_task_dir(tmp_path: Path) -> None:
     task, _base = _two_arm_task(tmp_path)
     with pytest.raises(SystemExit, match="互斥"):
         compare_runs(task_dir=str(task), out_dir=str(tmp_path / "elsewhere"))
+
+
+# ---------------------------------------------------------------------------
+# 摄入策略（ingest_strategy）是 A/B 的关键维度
+# ---------------------------------------------------------------------------
+
+
+def _ingest_strategy_check(result: dict) -> dict:
+    return next(
+        c for c in result["checks"] if c["dimension"] == "ingest_strategy"
+    )
+
+
+def test_ingest_strategy_is_critical_dimension() -> None:
+    """sequence vs interleaved：问的时间语义不同，分数不可直接比。"""
+    from membench.compare import check_comparability
+
+    result = check_comparability(
+        _metrics(ingest_strategy="sequence"),
+        _metrics(ingest_strategy="interleaved"),
+    )
+    check = _ingest_strategy_check(result)
+    assert check["severity"] == "critical"
+    assert check["same"] is False
+    assert result["comparable"] is False
+    assert any("ingest_strategy" in reason for reason in result["reasons"])
+
+
+def test_ingest_strategy_missing_normalizes_to_sequence() -> None:
+    """旧产物没有该字段：归一为 sequence，不误伤历史 A/B。"""
+    from membench.compare import check_comparability
+
+    result = check_comparability(_metrics(), _metrics())
+    check = _ingest_strategy_check(result)
+    assert check["same"] is True
+    assert check["a"] == check["b"] == "sequence"
+    assert result["comparable"] is True
+
+
+def test_ingest_strategy_mixed_is_incomparable() -> None:
+    """分片/拼接产物记 mixed：与单一策略同样不可比。"""
+    from membench.compare import check_comparability
+
+    result = check_comparability(
+        _metrics(ingest_strategy="interleaved"),
+        _metrics(ingest_strategy="mixed"),
+    )
+    assert _ingest_strategy_check(result)["same"] is False
+    assert result["comparable"] is False

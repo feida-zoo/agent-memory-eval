@@ -7,6 +7,22 @@
     -> 逐对话聚合写对话级 report/ -> 全对话聚合写数据集级 report/（含图）
     -> write_task_reports 时把数据集级报告复制到 <实验目录>/reports/
 
+**interleaved 摄入**（``Dialogue.ingest_strategy="interleaved"``，如 GateMem）：
+把 sessions 按顺序展平成消息列表，按 ``Question.as_of``（已 ingest 的消息条数）
+升序分组，同 as_of 一组、``as_of=None`` 的题排最后：逐组 ingest 到该时点（可跨
+session 边界）→ 组内并发 query → 下一组；中间**不 reset**，全部组完成后 ingest
+剩余消息。落盘顺序仍按原始题序（与 jobs=1 一致）；每题记录的 ``ingest_*`` 是
+截至该题提问时的累计写入成本。interleaved 与题目级分片、``--replay`` 互斥
+（开跑前硬拒绝：前者会让各片各自 reset，后者只有末尾快照、给不出每个 as_of 的
+状态）。``--snapshot`` 在 interleaved 下只导出**全部 ingest 完成后**的末尾态。
+
+**失败归因**（``--trace-state``）：interleaved 的每个有提问的 as_of 在 ingest
+完成后、query 之前导出一份状态到 ``<对话目录>/trace_state/t<as_of>/``（含
+``manifest.json``）；sequence 的提问时点就是末尾的 ``memory_snapshot/``。每题
+记录 ``evidence_in_state``（证据片段是否出现在该时点的可读文本状态文件里；
+无快照 / 无 evidence / 状态不可读记 null），数据集级 metrics 的 ``attribution``
+按四桶（not_written / not_retrieved / wrong_answer / unknown）汇总。
+
 分片（``shards>1``）只写本片负责的对话目录与分片账本，**不写**数据集级 ``report/`` 与
 任务级 ``reports/``——分片产物不再"看起来像完整实验"；数据集级与任务级产物一律由
 ``fuse`` 补齐。
@@ -28,6 +44,7 @@ results.jsonl（不浪费 LLM 调用，metrics 聚合分母口径自然正确）
     <实验目录>/runs/<dataset>/<对话目录>/report/{results.jsonl,metrics.json,report.md}
     <实验目录>/runs/<dataset>/<对话目录>/runtime/          # 运行时数据（reset 备份等）
     <实验目录>/runs/<dataset>/<对话目录>/memory_snapshot/  # 快照默认导出（含 manifest.json）
+    <实验目录>/runs/<dataset>/<对话目录>/trace_state/t<as_of>/  # --trace-state 的逐时点状态
     <实验目录>/runs/<dataset>/shards.json                  # 分片账本（分片评测时；读/写/校验见 layout）
     <实验目录>/reports/                                    # 任务级（数据集级报告副本）
 
@@ -79,6 +96,68 @@ from membench import snapshot as snapshot_mod
 
 #: 单份对话快照超过该字节数时告警一次（提示可用 --no-snapshot 关闭）。
 SNAPSHOT_WARN_BYTES = 100 * 1024 * 1024
+
+#: 单份逐 as_of 追踪状态（``--trace-state``）超过该字节数时告警一次。
+TRACE_STATE_WARN_BYTES = SNAPSHOT_WARN_BYTES
+
+#: 逐 as_of 追踪状态总份数超过该值时告警一次（磁盘占用随"有提问的时点数"增长）。
+TRACE_STATE_WARN_COUNT = 200
+
+#: evidence 片段超过该长度时只取前 N 字符作为扫描 needle（短证据用全文）。
+EVIDENCE_NEEDLE_CHARS = 200
+
+
+def _normalize_ws(text: str) -> str:
+    """折叠全部空白（含换行）为单个空格：状态文件与证据片段的比较口径。"""
+    return " ".join(str(text).split())
+
+
+def scan_state_for_evidence(
+    state_dir: Union[str, None], evidence: list[str]
+) -> Union[bool, None]:
+    """在提问时点的状态目录里查证据片段是否已写入。
+
+    只扫**可读文本文件**：UTF-8 可解码、不含 NUL 字节（二进制一律跳过），跳过
+    框架写的 ``manifest.json``。证据按归一化空白后的子串匹配；超过
+    :data:`EVIDENCE_NEEDLE_CHARS` 的片段取前 N 字符作 needle（长证据的后半段
+    常因改写而对不上，拿全量反而降低命中）。多条证据命中任意一条即算"已写入"。
+
+    Args:
+        state_dir: 该题提问时的状态目录（interleaved 的 ``trace_state/t<as_of>/``、
+            sequence 的 ``memory_snapshot/``，或回放的源快照桶）。
+        evidence: 题目证据片段。
+
+    Returns:
+        True / False；**无法判定返回 None**（没有 evidence 标注、没有状态目录、
+        或目录里没有任何可读文本文件）——不把"读不到"猜成"没写入"。
+    """
+    needles = [_normalize_ws(item)[:EVIDENCE_NEEDLE_CHARS] for item in evidence]
+    needles = [needle for needle in needles if needle]
+    if not needles or not state_dir or not os.path.isdir(state_dir):
+        return None
+    n_readable = 0
+    for root, dirs, files in os.walk(state_dir):
+        dirs.sort()
+        for name in sorted(files):
+            if name == snapshot_mod.MANIFEST_NAME:
+                continue
+            path = os.path.join(root, name)
+            try:
+                with open(path, "rb") as handle:
+                    data = handle.read()
+            except OSError:
+                continue
+            if b"\0" in data:
+                continue
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            n_readable += 1
+            haystack = _normalize_ws(text)
+            if any(needle in haystack for needle in needles):
+                return True
+    return False if n_readable else None
 
 
 def _write_run_artifacts(
@@ -386,6 +465,12 @@ class Runner:
         replay_verify_source: 给定源数据集目录时，回放结束与之逐题比对
             （answer / retrieved / 判分），结果写进 metrics 与报告——这就是
             "回放误差地板"，读取侧 A/B 的差值必须大于它才有意义。
+        trace_state: 默认 False。True 时对 **interleaved** 对话在每个有提问的
+            ``as_of`` ingest 完成后、query 之前导出状态到
+            ``<对话目录>/trace_state/t<as_of>/``（失败归因用：答错时证据有没有
+            写进当时的状态）。sequence 对话不需要它——提问时点就是对话末尾的
+            ``memory_snapshot/``。适配器不支持快照时警告一次并跳过（相关题记
+            ``evidence_in_state=null`` / 归因 ``unknown``）。与 ``replay`` 互斥。
     """
 
     def __init__(
@@ -414,6 +499,7 @@ class Runner:
         replay: Union[str, None] = None,
         replay_mode: str = "auto",
         replay_verify_source: Union[str, None] = None,
+        trace_state: bool = False,
     ) -> None:
         if jobs < 1:
             raise ValueError(f"jobs 必须 >= 1，当前为 {jobs}")
@@ -424,6 +510,7 @@ class Runner:
         # 回放也从恢复后的状态导出快照，但落任务级内容寻址池（同样的状态只存一份），
         # 因此 snapshot 开关在回放下同样生效（--no-snapshot 时不写任何桶与索引）
         self.snapshot = bool(snapshot)
+        self.trace_state = bool(trace_state)
         self.shared = bool(shared)
         self.replay = replay
         self.replay_mode = replay_mode
@@ -477,8 +564,14 @@ class Runner:
         ingest_latency_ms: float,
         ingest_llm_calls: int,
         ingest_input_tokens: int,
+        state_dir: Union[str, None] = None,
     ) -> dict[str, Any]:
-        """评测单题，返回 SPEC 3.4 的记录行。"""
+        """评测单题，返回 SPEC 3.4 的记录行。
+
+        ``state_dir`` 是**该题提问时点**的状态目录（interleaved 的 trace_state、
+        sequence 的 memory_snapshot、回放的源桶）：有它且题目带 evidence 时才判定
+        ``evidence_in_state``，否则记 None（不猜）。
+        """
         result = self.adapter.query(question.question)
 
         answer = str(getattr(result, "answer", "") or "")
@@ -503,6 +596,10 @@ class Runner:
             "prediction": answer,
             "retrieved": retrieved,
             "evidence_hit": evidence_hit,
+            # 归因输入：提问时点（已 ingest 的消息条数）与"证据是否已写入状态"。
+            # 后者为 None = 没有快照 / 状态不可读 / 题目没有 evidence 标注。
+            "as_of": getattr(question, "as_of", None),
+            "evidence_in_state": scan_state_for_evidence(state_dir, evidence),
             "token_f1": float(token_f1(gold_answer, answer)),
             "bleu1": float(bleu1(gold_answer, answer)),
             "recall@5": float(recall_at_5),
@@ -515,6 +612,42 @@ class Runner:
             "ingest_llm_calls": int(ingest_llm_calls),
             "ingest_input_tokens": int(ingest_input_tokens),
         }
+
+    # ------------------------------------------------------------------
+    def _evaluate_batch(
+        self,
+        dialogue_id: str,
+        indexed_questions: list[tuple[int, Any]],
+        ingest_latency_ms: float,
+        ingest_llm_calls: int,
+        ingest_input_tokens: int,
+        state_dirs: dict[int, str],
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """并发评测一批题（题目级 ``jobs``），返回 ``(原始序号, 记录)``（按序号排序）。
+
+        ``indexed_questions`` 是 ``(该题在对话内的原始序号, Question)``：interleaved
+        下这一批只是某个 as_of 分组，调用方再把各组按序号归位成原始题序；``state_dirs``
+        是 ``{序号: 该题提问时点的状态目录}``（没有就记 None，归因判"不可判定"）。
+        """
+        def _eval(item: tuple[int, Any]) -> tuple[int, dict[str, Any]]:
+            index, question = item
+            return index, self._eval_question(
+                dialogue_id,
+                question,
+                ingest_latency_ms,
+                ingest_llm_calls,
+                ingest_input_tokens,
+                state_dirs.get(index),
+            )
+
+        if self.jobs > 1 and len(indexed_questions) > 1:
+            # 题目级并发；map 保持提交顺序，输出与 jobs=1 一致。
+            with ThreadPoolExecutor(max_workers=self.jobs) as pool:
+                pairs = list(pool.map(_eval, indexed_questions))
+        else:
+            pairs = [_eval(item) for item in indexed_questions]
+        pairs.sort(key=lambda pair: pair[0])
+        return pairs
 
     # ------------------------------------------------------------------
     def run(self) -> Union[str, None]:
@@ -553,6 +686,37 @@ class Runner:
         if shards > 1 or self.limit is not None:
             dialogues = select_shard_questions(
                 dialogues, shards, self.shard_index, self.limit, self.shard_by
+            )
+
+        # interleaved 的两条硬约束：都必须在建目录 / 写账本之前拒绝（不留半成品）。
+        # 题目级分片会让同一对话被多个分片各自从 reset 开始 ingest，各片只看到
+        # 自己那部分题——as_of 的时点语义直接失效；回放快照只存末尾态，给不出
+        # 每个 as_of 的状态。二者都不是"警告一下继续跑"能补救的。
+        interleaved_ids = [
+            str(d.dialogue_id) for d in dialogues if d.ingest_strategy == "interleaved"
+        ]
+        if interleaved_ids and self.replay:
+            raise SystemExit(
+                "interleaved ingest 策略不支持 --replay：回放需要每个 as_of 时点的"
+                "状态，而当前快照模型只保存对话末尾的 memory_snapshot/"
+                f"（涉及对话：{'、'.join(interleaved_ids[:3])}"
+                + ("…" if len(interleaved_ids) > 3 else "")
+                + "）；请去掉 --replay 重新 ingest，或改用 ingest_strategy=sequence 的数据集"
+            )
+        if interleaved_ids and shards > 1 and self.shard_by != "dialogue":
+            raise SystemExit(
+                "interleaved ingest 策略不支持题目级分片：题目级分片会让每个分片各自"
+                "reset 并从第 0 条消息 ingest，as_of 的时点语义会失效"
+                f"（涉及对话：{'、'.join(interleaved_ids[:3])}"
+                + ("…" if len(interleaved_ids) > 3 else "")
+                + "）；请改用 --shard-by dialogue（整段对话归片、分片间不重复 ingest），"
+                "或去掉 --shards 全量跑"
+            )
+        if self.trace_state and self.replay:
+            raise SystemExit(
+                "--trace-state 与 --replay 互斥：回放不 ingest，没有 as_of 时点可追踪；"
+                "回放的状态来自源快照（--replay 的入参），归因直接读它即可，"
+                "请去掉 --trace-state"
             )
 
         adapter_name = str(getattr(self.adapter, "name", self.adapter.__class__.__name__))
@@ -654,8 +818,9 @@ class Runner:
                 )
         snapshot_caps: dict[str, Any] = {}
         # 快照默认导出；适配器没有这个能力就跳过（只打印一次警告，不中断评测），
-        # metrics 里如实记 state_snapshot.role="unsupported"
-        if self.snapshot:
+        # metrics 里如实记 state_snapshot.role="unsupported"。--trace-state 也依赖
+        # snapshot()，两者都请求时只警告一次。
+        if self.snapshot or self.trace_state:
             snapshot_caps = snapshot_mod.read_capabilities(self.adapter)
             if not snapshot_caps.get("supported"):
                 print(
@@ -758,11 +923,17 @@ class Runner:
         snapshot_dirs: dict[str, str] = dict(replay_plan["snapshots"]) if replay_plan else {}
         # 快照导出开关：请求了导出且适配器支持（回放同样导出，只是落任务级内容寻址池）
         export_snapshots = bool(self.snapshot and snapshot_caps.get("supported"))
+        # 逐 as_of 追踪状态（仅 interleaved 有意义；回放已在开跑前拒绝）
+        export_traces = bool(self.trace_state and snapshot_caps.get("supported"))
         # 回放任务的池写入器：out_dir 是臂目录时池在父任务目录（见 layout 的池 helper）
         snapshot_pool: Union[_SnapshotPoolWriter, None] = None
         if replay_plan is not None and export_snapshots:
             snapshot_pool = _SnapshotPoolWriter(self.out_dir, replay_plan, dataset_name)
         snapshot_oversize_warned = False
+        # 逐 as_of 追踪状态的磁盘告警：单份超限 / 总份数超限各提示一次
+        trace_oversize_warned = False
+        trace_count_warned = False
+        n_trace_states = 0
 
         def _retrieval_meta(fallbacks: int) -> dict[str, Any]:
             """检索命中口径落账（substring / overlap / llm；阈值与回退数按需）。"""
@@ -847,9 +1018,45 @@ class Runner:
             state: Union[dict, None],
             retrieval_meta: dict[str, Any],
             dialogue_id: Union[str, None] = None,
+            scope_dialogues: Union[list[Any], None] = None,
+            trace_n: int = 0,
         ) -> dict[str, Any]:
-            """组装某一层级的 metrics（数据集级 / 对话级同一套字段与口径）。"""
-            out = dict(aggregate(subset, capabilities=subset_caps))
+            """组装某一层级的 metrics（数据集级 / 对话级同一套字段与口径）。
+
+            ``scope_dialogues`` 是这一层级覆盖的对话（数据集级=全部、对话级=自己），
+            用于落 ``ingest_strategy`` / ``as_of_questions`` / ``as_of_enforced``
+            与归因的 evidence 题集；``trace_n`` 是该层级实际导出的追踪状态份数。
+            """
+            scope = scope_dialogues if scope_dialogues is not None else dialogues
+            if dialogue_id is not None:
+                scope = [
+                    d for d in scope if str(d.dialogue_id) == str(dialogue_id)
+                ]
+            # 摄入策略：单一口径记该值；混合（分片把不同策略的数据集拼在一起）记
+            # "mixed"——compare 据此判"时点语义不同、分数不可直接比"。
+            strategies = {str(d.ingest_strategy) for d in scope}
+            if not strategies:
+                ingest_strategy = "sequence"
+            elif len(strategies) == 1:
+                ingest_strategy = next(iter(strategies))
+            else:
+                ingest_strategy = "mixed"
+            as_of_questions = 0
+            as_of_unenforced = 0
+            evidence_keys: set[tuple[str, str]] = set()
+            for d in scope:
+                for q in d.questions:
+                    if getattr(q, "ignore", False):
+                        continue
+                    if q.evidence:
+                        evidence_keys.add((str(d.dialogue_id), str(q.qid)))
+                    if q.as_of is not None:
+                        as_of_questions += 1
+                        if d.ingest_strategy != "interleaved":
+                            as_of_unenforced += 1
+            out = dict(
+                aggregate(subset, capabilities=subset_caps, evidence_keys=evidence_keys)
+            )
             out.update(
                 {
                     "run_id": run_id,
@@ -873,6 +1080,12 @@ class Runner:
                     "judge_model": self.judge_model,
                     "adapter_version": self.adapter_version,
                     "dataset_fingerprint": dataset_fingerprint(self.dataset_path),
+                    # 摄入策略（sequence / interleaved / mixed）与 as_of 强制情况：
+                    # compare 把 ingest_strategy 当关键维度（缺省归一 sequence），
+                    # 报告据此提示"时点错位"。
+                    "ingest_strategy": ingest_strategy,
+                    "as_of_questions": as_of_questions,
+                    "as_of_enforced": as_of_unenforced == 0,
                     # 运行模式：full（默认）/ replay-restore / replay-rebuild；compare
                     # 把 run_mode 当关键维度——回放分不得与全量分被静默对比
                     "run_mode": replay_plan["run_mode"] if replay_plan else "full",
@@ -885,6 +1098,20 @@ class Runner:
                     "token_usage": usage,
                 }
             )
+            if self.trace_state:
+                # 追踪状态的角色：unsupported=适配器导不了；not_applicable=范围内没有
+                # interleaved 对话（sequence 用末尾 memory_snapshot 就够）
+                if not snapshot_caps.get("supported"):
+                    trace_role = "unsupported"
+                elif any(str(d.ingest_strategy) == "interleaved" for d in scope):
+                    trace_role = "exported" if trace_n else "not_exported"
+                else:
+                    trace_role = "not_applicable"
+                out["trace_state"] = {
+                    "enabled": True,
+                    "role": trace_role,
+                    "n_states": trace_n,
+                }
             if dialogue_id is not None:
                 out["dialogue_id"] = dialogue_id
             out.update(retrieval_meta)
@@ -895,6 +1122,8 @@ class Runner:
         records: list[dict[str, Any]] = []
         done = 0
         fallbacks_seen = match_fallbacks_start
+        # 逐对话追踪状态份数（--trace-state）：对话级与数据集级 metrics 都要落账
+        trace_states_by_dialogue: dict[str, int] = {}
         for di, dialogue in enumerate(dialogues, 1):
             dialogue_id = str(dialogue.dialogue_id)
             dialogue_path = layout.dialogue_dir(self.out_dir, dataset_name, dialogue_id)
@@ -904,48 +1133,30 @@ class Runner:
                 layout.dialogue_runtime_dir(self.out_dir, dataset_name, dialogue_id),
                 exist_ok=True,
             )
-            if replay_plan:
-                # 回放：恢复该对话的快照（restore 或 rebuild），不 reset、不 ingest
-                snapshot_mod.replay_dialogue(self.adapter, replay_plan, dialogue_id)
-                ingest_latency_ms = 0.0
-                ingest_llm_calls = 0
-                ingest_input_tokens = 0
-                print(
-                    f"[membench] dialogue {di}/{len(dialogues)} {dialogue_id}: "
-                    f"从快照恢复（{replay_plan['run_mode']}）"
-                )
-            else:
-                # reset 上下文：只作为「适配器可选提示」暴露（环境变量 + HTTP 桥透传），
-                # 框架不读不写适配器的记忆存储——MEMBENCH_RUN_DIR 指本对话目录，
-                # 供日志 / 追踪 / 接入侧自定义回溯；框架不内置 reset 前备份。
-                os.environ["MEMBENCH_RUN_DIR"] = dialogue_path
-                os.environ["MEMBENCH_DIALOGUE_ID"] = dialogue_id
-                os.environ["MEMBENCH_DIALOGUE_INDEX"] = str(di)
-                self.adapter.reset()
-                ingest_latency_ms = 0.0
-                ingest_llm_calls = 0
-                ingest_input_tokens = 0
-                for session in dialogue.sessions:
-                    stats = self.adapter.ingest(session)
-                    ingest_latency_ms += float(getattr(stats, "latency_ms", 0.0) or 0.0)
-                    ingest_llm_calls += int(getattr(stats, "llm_calls", 0) or 0)
-                    ingest_input_tokens += int(getattr(stats, "input_tokens", 0) or 0)
-            token_usage["ingest_input_tokens"] += ingest_input_tokens
-            token_usage["ingest_llm_calls"] += ingest_llm_calls
-
-            if not replay_plan:
-                print(
-                    f"[membench] dialogue {di}/{len(dialogues)} "
-                    f"{dialogue_id}: ingested {len(dialogue.sessions)} session(s), "
-                    f"{ingest_latency_ms:.0f} ms"
-                )
             active_questions = [
                 q for q in dialogue.questions if not getattr(q, "ignore", False)
             ]
+            indexed_questions = list(enumerate(active_questions))
+            interleaved = str(dialogue.ingest_strategy) == "interleaved"
+            # 逐题提问时点的状态目录（归因输入）：没有就是 None（不猜）
+            state_dirs: dict[int, str] = {}
+            # 该对话累计 ingest 记账（interleaved 下逐组累加；每题记录取"截至提问时"）
+            ingest_stats: dict[str, float] = {
+                "latency_ms": 0.0,
+                "llm_calls": 0,
+                "input_tokens": 0,
+            }
 
-            if export_snapshots:
-                # 快照打点：该对话 ingest / restore 完成后、第一道 query 之前（回放的入口
-                # 状态）。一个对话只导这一份：per-session 导出会得到用不上的中间态。
+            def _ingest(messages: list[dict]) -> None:
+                """ingest 一段消息并累计该对话的写入成本。"""
+                stats = self.adapter.ingest(messages)
+                ingest_stats["latency_ms"] += float(getattr(stats, "latency_ms", 0.0) or 0.0)
+                ingest_stats["llm_calls"] += int(getattr(stats, "llm_calls", 0) or 0)
+                ingest_stats["input_tokens"] += int(getattr(stats, "input_tokens", 0) or 0)
+
+            def _export_snapshot(n_questions: int) -> Union[str, None]:
+                """导出该对话的末尾快照（memory_snapshot/ 或回放池），返回状态目录。"""
+                nonlocal snapshot_oversize_warned
                 manifest = snapshot_mod.new_manifest(
                     run_id=run_id,
                     adapter=adapter_name,
@@ -963,7 +1174,7 @@ class Runner:
                         manifest,
                         dialogue_id=dialogue_id,
                         sessions=dialogue.sessions,
-                        n_questions=len(active_questions),
+                        n_questions=n_questions,
                     )
                     entry = exported["entry"]
                     print(
@@ -972,6 +1183,7 @@ class Runner:
                         f"{entry['bytes']} 字节，对话 {dialogue_id}）"
                     )
                     add_bytes = 0 if exported["reused"] else int(entry.get("bytes") or 0)
+                    path = os.path.join(snapshot_pool.pool_root, exported["bucket"])
                 else:
                     snapshot_path = layout.dialogue_snapshot_dir(
                         self.out_dir, dataset_name, dialogue_id
@@ -982,7 +1194,7 @@ class Runner:
                         manifest,
                         dialogue_id=dialogue_id,
                         sessions=dialogue.sessions,
-                        n_questions=len(active_questions),
+                        n_questions=n_questions,
                     )
                     snapshot_dirs[dialogue_id] = snapshot_path
                     print(
@@ -990,6 +1202,7 @@ class Runner:
                         f"sha256 {entry['sha256'][:12]}）"
                     )
                     add_bytes = int(entry.get("bytes") or 0)
+                    path = snapshot_path
                 if add_bytes > SNAPSHOT_WARN_BYTES and not snapshot_oversize_warned:
                     snapshot_oversize_warned = True
                     print(
@@ -997,23 +1210,205 @@ class Runner:
                         f"{SNAPSHOT_WARN_BYTES >> 20} MB：快照体积随对话数线性增长，"
                         "可用 CLI 的 --no-snapshot 关闭（关掉后改读取侧只能重跑 ingest）"
                     )
+                return path
 
-            def _eval(q: Any) -> dict[str, Any]:
-                # 单题内部计时：latency_ms 是该题 query 调用的墙钟时间，不受并发影响。
-                return self._eval_question(
-                    dialogue_id,
-                    q,
-                    ingest_latency_ms,
-                    ingest_llm_calls,
-                    ingest_input_tokens,
+            def _export_trace(as_of: int, n_questions: int) -> Union[str, None]:
+                """导出某个提问时点的追踪状态到 ``trace_state/t<as_of>/``。"""
+                nonlocal trace_oversize_warned, trace_count_warned, n_trace_states
+                trace_path = layout.dialogue_trace_state_path(
+                    self.out_dir, dataset_name, dialogue_id, as_of
                 )
+                manifest = snapshot_mod.new_manifest(
+                    run_id=run_id,
+                    adapter=adapter_name,
+                    adapter_version=self.adapter_version,
+                    platform=platform_tag,
+                    dataset=dataset_name,
+                    dataset_path=os.path.abspath(self.dataset_path),
+                    dataset_fingerprint=dataset_fingerprint(self.dataset_path),
+                    dialogue_id=dialogue_id,
+                    capabilities=snapshot_caps,
+                )
+                # 追踪状态记录"这个时点已 ingest 了多少"：清单里的 entry 统计按
+                # 前缀算（sessions=[已 ingest 的消息]），而不是整段对话。
+                manifest["trace"] = {"as_of": int(as_of), "n_messages": int(as_of)}
+                entry = snapshot_mod.write_snapshot(
+                    trace_path,
+                    self.adapter,
+                    manifest,
+                    dialogue_id=dialogue_id,
+                    sessions=[dialogue.messages()[: int(as_of)]],
+                    n_questions=n_questions,
+                )
+                n_trace_states += 1
+                trace_states_by_dialogue[dialogue_id] = (
+                    trace_states_by_dialogue.get(dialogue_id, 0) + 1
+                )
+                print(
+                    f"[membench] 追踪状态: {trace_path}（as_of={as_of}，"
+                    f"{entry['bytes']} 字节）"
+                )
+                if entry["bytes"] > TRACE_STATE_WARN_BYTES and not trace_oversize_warned:
+                    trace_oversize_warned = True
+                    print(
+                        f"[membench] ⚠️ 单份追踪状态 {entry['bytes'] / (1 << 20):.0f} MB 超过 "
+                        f"{TRACE_STATE_WARN_BYTES >> 20} MB：每个有提问的 as_of 都会导一份，"
+                        "磁盘占用随提问时点数增长；不需要逐时点归因可去掉 --trace-state"
+                    )
+                if n_trace_states > TRACE_STATE_WARN_COUNT and not trace_count_warned:
+                    trace_count_warned = True
+                    print(
+                        f"[membench] ⚠️ 追踪状态已导出 {n_trace_states} 份（超过 "
+                        f"{TRACE_STATE_WARN_COUNT}）：每份是当时记忆状态的全量拷贝，"
+                        "确认磁盘余量；只要末尾态可去掉 --trace-state"
+                    )
+                return trace_path
 
-            if self.jobs > 1 and len(active_questions) > 1:
-                # 题目级并发；map 保持提交顺序，输出与 jobs=1 一致。
-                with ThreadPoolExecutor(max_workers=self.jobs) as pool:
-                    dialogue_records = list(pool.map(_eval, active_questions))
+            if replay_plan:
+                # 回放：恢复该对话的快照（restore 或 rebuild），不 reset、不 ingest；
+                # 归因直接扫恢复用的源快照目录——它就是 query 时的真实状态
+                snapshot_mod.replay_dialogue(self.adapter, replay_plan, dialogue_id)
+                replayed_dir = replay_plan["snapshots"].get(dialogue_id)
+                if replayed_dir:
+                    state_dirs = {index: replayed_dir for index, _ in indexed_questions}
+                print(
+                    f"[membench] dialogue {di}/{len(dialogues)} {dialogue_id}: "
+                    f"从快照恢复（{replay_plan['run_mode']}）"
+                )
+                if export_snapshots:
+                    # 回放同样导出恢复后的状态，但落任务级内容寻址池
+                    _export_snapshot(len(active_questions))
+                dialogue_records = [
+                    record
+                    for _index, record in self._evaluate_batch(
+                        dialogue_id,
+                        indexed_questions,
+                        0.0,
+                        0,
+                        0,
+                        state_dirs,
+                    )
+                ]
             else:
-                dialogue_records = [_eval(q) for q in active_questions]
+                # reset 上下文：只作为「适配器可选提示」暴露（环境变量 + HTTP 桥透传），
+                # 框架不读不写适配器的记忆存储——MEMBENCH_RUN_DIR 指本对话目录，
+                # 供日志 / 追踪 / 接入侧自定义回溯；框架不内置 reset 前备份。
+                os.environ["MEMBENCH_RUN_DIR"] = dialogue_path
+                os.environ["MEMBENCH_DIALOGUE_ID"] = dialogue_id
+                os.environ["MEMBENCH_DIALOGUE_INDEX"] = str(di)
+                self.adapter.reset()
+
+                if interleaved:
+                    # 展平成消息列表；按 as_of 升序分组，同 as_of 一组，None 排最后
+                    # （= 全部 ingest 完之后再问）。中间**不 reset**：状态随 ingest
+                    # 单调增长，每道题看到的就是它提问时点之前写入的内容。
+                    flat = dialogue.messages()
+                    grouped: dict[int, list[tuple[int, Any]]] = {}
+                    tail: list[tuple[int, Any]] = []
+                    for index, question in indexed_questions:
+                        if question.as_of is None:
+                            tail.append((index, question))
+                        else:
+                            grouped.setdefault(int(question.as_of), []).append(
+                                (index, question)
+                            )
+                    groups: list[tuple[Union[int, None], list[tuple[int, Any]]]] = [
+                        (as_of, grouped[as_of]) for as_of in sorted(grouped)
+                    ]
+                    if tail:
+                        groups.append((None, tail))
+
+                    ingested = 0
+
+                    def _ingest_upto(target: int) -> None:
+                        """ingest 到消息前缀 target（可能跨 session 边界）。"""
+                        nonlocal ingested
+                        if target > ingested:
+                            _ingest(flat[ingested:target])
+                            ingested = target
+
+                    dialogue_records = []
+                    indexed_records: list[tuple[int, dict[str, Any]]] = []
+                    final_snapshot_done = False
+                    for as_of, group in groups:
+                        if as_of is None:
+                            # 全部消息 ingest 完才问的题：末尾快照在它们之前导出
+                            _ingest_upto(len(flat))
+                            snapshot_dir = (
+                                _export_snapshot(len(active_questions))
+                                if export_snapshots
+                                else None
+                            )
+                            final_snapshot_done = True
+                        else:
+                            _ingest_upto(int(as_of))
+                            snapshot_dir = (
+                                _export_trace(int(as_of), len(group))
+                                if export_traces
+                                else None
+                            )
+                        if snapshot_dir:
+                            for index, _question in group:
+                                state_dirs[index] = snapshot_dir
+                        indexed_records.extend(
+                            self._evaluate_batch(
+                                dialogue_id,
+                                group,
+                                ingest_stats["latency_ms"],
+                                int(ingest_stats["llm_calls"]),
+                                int(ingest_stats["input_tokens"]),
+                                state_dirs,
+                            )
+                        )
+                    # 分组提问顺序 ≠ 原始题序：按原始序号归位后再落盘（与 jobs=1 一致）
+                    dialogue_records = [
+                        record
+                        for _index, record in sorted(
+                            indexed_records, key=lambda pair: pair[0]
+                        )
+                    ]
+                    # 没有"全部 ingest 后"的题：剩余消息照常写完，末尾快照照常导出
+                    _ingest_upto(len(flat))
+                    if export_snapshots and not final_snapshot_done:
+                        _export_snapshot(len(active_questions))
+                    print(
+                        f"[membench] dialogue {di}/{len(dialogues)} {dialogue_id}: "
+                        f"interleaved，{len(groups)} 个提问时点，{len(flat)} 条消息，"
+                        f"{ingest_stats['latency_ms']:.0f} ms"
+                    )
+                else:
+                    for session in dialogue.sessions:
+                        _ingest(session)
+                    print(
+                        f"[membench] dialogue {di}/{len(dialogues)} "
+                        f"{dialogue_id}: ingested {len(dialogue.sessions)} session(s), "
+                        f"{ingest_stats['latency_ms']:.0f} ms"
+                    )
+                    if export_snapshots:
+                        # 快照打点：该对话 ingest 完成后、第一道 query 之前（回放的入口
+                        # 状态）。一个对话只导这一份：per-session 导出会得到用不上的中间态。
+                        snapshot_dir = _export_snapshot(len(active_questions))
+                        if snapshot_dir:
+                            state_dirs = {
+                                index: snapshot_dir for index, _ in indexed_questions
+                            }
+                    dialogue_records = [
+                        record
+                        for _index, record in self._evaluate_batch(
+                            dialogue_id,
+                            indexed_questions,
+                            ingest_stats["latency_ms"],
+                            int(ingest_stats["llm_calls"]),
+                            int(ingest_stats["input_tokens"]),
+                            state_dirs,
+                        )
+                    ]
+
+            ingest_latency_ms = float(ingest_stats["latency_ms"])
+            ingest_llm_calls = int(ingest_stats["llm_calls"])
+            ingest_input_tokens = int(ingest_stats["input_tokens"])
+            token_usage["ingest_input_tokens"] += ingest_input_tokens
+            token_usage["ingest_llm_calls"] += ingest_llm_calls
 
             records.extend(dialogue_records)
             for record in dialogue_records:
@@ -1056,6 +1451,8 @@ class Runner:
                 state=_snapshot_state(dialogue_id),
                 retrieval_meta=_retrieval_meta(fallbacks_now - fallbacks_seen),
                 dialogue_id=dialogue_id,
+                scope_dialogues=[dialogue],
+                trace_n=trace_states_by_dialogue.get(dialogue_id, 0),
             )
             fallbacks_seen = fallbacks_now
             dialogue_report_dir = layout.dialogue_report_dir(
@@ -1107,6 +1504,8 @@ class Runner:
                 int(getattr(self._evidence_matcher, "fallbacks", 0) or 0)
                 - match_fallbacks_start
             ),
+            scope_dialogues=dialogues,
+            trace_n=n_trace_states,
         )
         if replay_verify is not None:
             metrics["replay_verify"] = replay_verify
@@ -1160,9 +1559,14 @@ class Runner:
                 "继续回放（链式）"
             )
         elif export_snapshots:
+            replay_hint = (
+                "（--replay 传该数据集目录或实验目录即可免重跑 ingest）"
+                if all(str(d.ingest_strategy) == "sequence" for d in dialogues)
+                else "（interleaved 数据集不支持 --replay：只有末尾快照，给不出每个 as_of 的状态）"
+            )
             print(
                 f"[membench] 快照: {len(snapshot_dirs)} 个对话 → {dataset_dir}"
-                "（--replay 传该数据集目录或实验目录即可免重跑 ingest）"
+                + replay_hint
             )
 
         overall = metrics.get("overall", {})

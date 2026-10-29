@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from membench.data.convert_gatemem import ABSTAIN_SENTINEL, convert_gatemem
 from membench.data.schema import load_dataset
 
@@ -107,6 +109,44 @@ def test_convert_gatemem_dialogue_structure(tmp_path: Path) -> None:
     assert [m["content"] for m in ep1.sessions[0]] == ["Maple 项目预算 221,000 USD。", "收到，折扣上限 9%。"]
     assert ep1.sessions[0][0]["timestamp"] == "2026-04-06T09:00"
     assert all(m["role"] == "user" for m in ep1.sessions[0])
+    # 每个 episode 一段对话、整段标 interleaved（按 checkpoint 的 as_of 边 ingest 边问）
+    assert all(d.ingest_strategy == "interleaved" for d in dialogues)
+
+
+def test_convert_gatemem_as_of_from_turn_position(tmp_path: Path) -> None:
+    """``as_of`` = ``as_of_turn_id`` 在 turns 里的下标 + 1（已 ingest 的消息条数）。"""
+    ep_path, cp_path = _write_inputs(tmp_path)
+    out = tmp_path / "out.jsonl"
+    convert_gatemem(ep_path, cp_path, out)
+
+    by_qid = {q.qid: q for d in load_dataset(out) for q in d.questions}
+    # 夹具里所有 checkpoint 都挂 t001（每个 episode 的第一条消息）
+    assert by_qid["ck_utility"].as_of == 1
+    assert by_qid["ck_safety"].as_of == 1
+
+
+def test_convert_gatemem_as_of_uses_later_turn(tmp_path: Path) -> None:
+    """挂在第 2 个 turn 上的 checkpoint：as_of=2；找不到 turn 的直接跳过并计数。"""
+    checkpoints = [
+        {
+            **_cp("ck_t2", "ep_001", "utility", "answer", ["9%"]),
+            "as_of_turn_id": "t002",
+        },
+        {
+            **_cp("ck_missing_turn", "ep_001", "utility", "answer", ["x"]),
+            "as_of_turn_id": "t999",
+        },
+    ]
+    ep_path, cp_path = _write_custom_checkpoints(tmp_path, checkpoints)
+    out = tmp_path / "out.jsonl"
+    stats = convert_gatemem(ep_path, cp_path, out)
+
+    by_qid = {q.qid: q for d in load_dataset(out) for q in d.questions}
+    assert by_qid["ck_t2"].as_of == 2
+    assert "ck_missing_turn" not in by_qid
+    assert stats["as_of_missing"] == 1
+    assert stats["skipped"] == 1
+    assert (stats["as_of_min"], stats["as_of_max"]) == (2, 2)
 
 
 def test_convert_gatemem_category_mapping(tmp_path: Path) -> None:
@@ -277,3 +317,80 @@ def test_judge_spec_omitted_when_all_sections_empty(tmp_path: Path) -> None:
 
     by_qid = {q.qid: q for d in load_dataset(out) for q in d.questions}
     assert by_qid["ck_empty"].judge_spec is None
+
+
+# ---------------------------------------------------------------------------
+# 真实 GateMem 数据（按需下载；仓库不内置，缺失则跳过）
+# ---------------------------------------------------------------------------
+
+_GATEMEM_RAW = Path.home() / ".membench/datasets/.gatemem_office_raw"
+
+
+@pytest.mark.skipif(
+    not (_GATEMEM_RAW / "episodes.jsonl").is_file()
+    or not (_GATEMEM_RAW / "checkpoints.jsonl").is_file(),
+    reason="GateMem 原始数据未下载（dataset fetch gatemem_office）",
+)
+def test_convert_real_gatemem_as_of_and_counts(tmp_path: Path) -> None:
+    """真实数据：17 个 episode、547 个 checkpoint（忽略 140 privacy-refuse 后 407 有效），
+    as_of 全部落在各 episode 的 1..消息总数，ingest_strategy 统一 interleaved。"""
+    episodes = [
+        json.loads(line)
+        for line in (_GATEMEM_RAW / "episodes.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    checkpoints = [
+        json.loads(line)
+        for line in (_GATEMEM_RAW / "checkpoints.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    turns_by_episode = {
+        str(e["episode_id"]): [str(t.get("turn_id")) for t in e.get("turns") or []]
+        for e in episodes
+    }
+    expected_as_of = {
+        str(cp["checkpoint_id"]): turns_by_episode[str(cp["episode_id"])].index(
+            str(cp["as_of_turn_id"])
+        )
+        + 1
+        for cp in checkpoints
+        if str(cp.get("episode_id")) in turns_by_episode
+        and str(cp.get("as_of_turn_id")) in turns_by_episode[str(cp["episode_id"])]
+    }
+
+    out = tmp_path / "gatemem.jsonl"
+    stats = convert_gatemem(
+        _GATEMEM_RAW / "episodes.jsonl",
+        _GATEMEM_RAW / "checkpoints.jsonl",
+        out,
+        ignore_privacy_refuse=True,
+    )
+    dialogues = load_dataset(out)
+    questions = [q for d in dialogues for q in d.questions]
+
+    assert stats["dialogues"] == len(dialogues) == 17
+    assert stats["questions"] == len(questions) == 547
+    assert stats["ignored"] == 140
+    assert sum(1 for q in questions if not q.ignore) == 407
+    assert all(d.ingest_strategy == "interleaved" for d in dialogues)
+    assert all(len(d.sessions) == 1 for d in dialogues)
+    assert all(q.as_of is not None for q in questions)
+    for dialogue in dialogues:
+        assert dialogue.n_messages in (240, 260)
+        for question in dialogue.questions:
+            assert 1 <= question.as_of <= dialogue.n_messages
+    # as_of 与原始 as_of_turn_id 的下标 +1 逐题一致
+    assert {q.qid: q.as_of for q in questions} == expected_as_of
+    # judge_spec 仍按 checkpoint 原样落盘（include 正则 / not_include / leak_targets）
+    by_qid = {q.qid: q for q in questions}
+    utility = next(q for q in questions if q.category == "utility_answer")
+    assert utility.judge_spec is not None
+    assert utility.judge_spec["include"] == [
+        str(item)
+        for item in next(
+            cp for cp in checkpoints if str(cp["checkpoint_id"]) == utility.qid
+        )["judge_spec"]["include"]
+    ]
+    refuse = next(q for q in questions if q.category == "privacy_refuse")
+    assert refuse.gold_answer == ABSTAIN_SENTINEL
+    assert by_qid[refuse.qid].ignore is True

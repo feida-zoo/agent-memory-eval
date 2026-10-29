@@ -70,6 +70,9 @@ DIR_REPORT = "report"  # 对话级 / 数据集级报告目录
 DIR_REPORTS = "reports"  # 实验根层的任务级报告目录（与 runs/ 平级）
 DIR_RUNTIME = "runtime"  # 对话级运行时数据 / 实验根层运行时数据（后者见 membench.runtime）
 DIR_SNAPSHOT = "memory_snapshot"
+#: 逐 as_of 的追踪状态目录（``--trace-state``，interleaved 对话专用）：每个有提问的
+#: 时点一份 ``trace_state/t<as_of>/``，用于失败归因（"答错时证据写进状态没有"）。
+DIR_TRACE_STATE = "trace_state"
 #: 回放任务的内容寻址快照池（任务根层，与 runs/ 平级）：桶 = ``<池>/<sha256 前 12 位>``。
 DIR_SNAPSHOTS = "snapshots"
 #: 快照池里的逐对话条目树（``<池>/entries/<臂>/<数据集>/<对话>.json``，池的真源）。
@@ -836,6 +839,30 @@ def dialogue_runtime_dir(experiment_dir: str, dataset: str, dialogue_id: str) ->
 def dialogue_snapshot_dir(experiment_dir: str, dataset: str, dialogue_id: str) -> str:
     """对话级快照目录（默认导出，含框架写的 ``manifest.json``；``--no-snapshot`` 关闭）。"""
     return os.path.join(dialogue_dir(experiment_dir, dataset, dialogue_id), DIR_SNAPSHOT)
+
+
+def dialogue_trace_state_dir(
+    experiment_dir: str, dataset: str, dialogue_id: str
+) -> str:
+    """对话级逐 as_of 追踪状态根：``<对话目录>/trace_state/``（``--trace-state``）。
+
+    目录下每个有提问的时点一个子目录 ``t<as_of>/``（:func:`dialogue_trace_state_path`），
+    每份都有自己的 ``manifest.json``——与 ``memory_snapshot/`` 同构，只是时点不同。
+    """
+    return os.path.join(dialogue_dir(experiment_dir, dataset, dialogue_id), DIR_TRACE_STATE)
+
+
+def dialogue_trace_state_path(
+    experiment_dir: str, dataset: str, dialogue_id: str, as_of: int
+) -> str:
+    """某个提问时点的追踪状态目录：``<对话目录>/trace_state/t<as_of>/``。
+
+    ``as_of`` 是已 ingest 的消息条数（:attr:`membench.data.schema.Question.as_of`），
+    目录名原样写它：翻产物时能直接对上题目里的时点。
+    """
+    return os.path.join(
+        dialogue_trace_state_dir(experiment_dir, dataset, dialogue_id), f"t{int(as_of)}"
+    )
 
 
 def task_report_dir(experiment_dir: str) -> str:

@@ -185,6 +185,7 @@ python -m membench.cli evaluate-compare \
 - **门禁一票否决独立于基准评级**：办公域槽位 stale_rate > 0.03 → 总评"不达标"，退出码 1（可接 CI），无论基准评级多高；`evaluate-compare` 的顶层门禁同样包含办公域这一组红线（门禁名带「（办公域）」），office 移出融合不等于把红线移出结论。
 - **基准集为空**（只评测了 office）：基准评级显示 `n/a`，业务结论与门禁照常输出。
 - **按需下载的公开集必须先 fetch**：`locomo` / `longmemeval_oracle` / `gatemem_office` / `longmemeval_s` / `beam_1m`（或 `beam_10m`）都没有内置文件，`evaluate` 从 `~/.membench/datasets/` 解析可用路径，缺失时报错提示先 `python -m membench.cli dataset fetch <key>`（`--no-lme-s` / `--common` 不检查 LongMemEval-S；`--no-beam` / `--quick` / `--common --no-beam` 不检查 BEAM 槽位）。judge=heuristic 跑 BEAM 会警告（rubric 型题目规则判分失真，建议 llm/client）。
+  `gatemem_office` 的对话是 **interleaved**（按 checkpoint 的 as_of 边 ingest 边提问）：run 时必须 `--shard-by dialogue`，且不支持 `--replay`；加 `--trace-state` 可产出逐时点状态与失败归因（见「interleaved 摄入与失败归因」）。
 - **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**，缺省 `output_root()`）落 `DIR/eval_<adapter>_<platform>_<ts>/`：各数据集产物在 `runs/<dataset>/`（数据集级报告 `report/{report.md,metrics.json,results.jsonl,fig_*.png}`，逐对话目录 `<对话>/` 内含 `report/`、`runtime/`、`memory_snapshot/`），任务级报告在 `reports/`（`report.md` + `metrics.json` + `evaluate_summary.json` + `fig_dataset_overview.png`）。
 
 run 产物（`runs/<dataset>/report/`）：`results.jsonl`（逐题原始记录）、`metrics.json`、`report.md`、`fig_category_accuracy.png`、`fig_latency_hist.png`；逐对话产物落 `runs/<dataset>/<对话目录>/report/`（纯文字，不出图）。
@@ -208,6 +209,44 @@ python -m membench.cli run --adapter mock-strong \
 `results.jsonl` 的记录顺序与 `--jobs 1` 完全一致。`--jobs > 1` 要求你的
 `adapter.query` 与 judge 线程安全（内置 mock adapter 与 LLMJudge 均线程安全）。
 使用 `--evidence-match llm` 评测大规模数据集时建议配 `--jobs 8~16`。
+
+## interleaved 摄入与失败归因（时点 + 为什么答错）
+
+数据集可以给每道题标 `as_of`（**已 ingest 的消息条数**），并把对话标成
+`ingest_strategy="interleaved"`（GateMem 的 checkpoint 就是这样转换的）。此时
+runner 不再"整段 ingest 完再统一提问"，而是：sessions 按顺序展平 → 按 `as_of`
+升序分组（同 as_of 一组，`as_of` 缺省的题排最后）→ 逐组 ingest 到该时点后立刻
+提问 → 全部组完成后 ingest 剩余消息；中间**不 reset**，落盘顺序仍是原始题序
+（与 `--jobs 1` 一致）。`sequence`（默认）保持旧口径：整段 ingest 后统一提问，
+`as_of` 不强制；数据带 as_of 却按 sequence 跑时，报告会明确提示"时点错位"。
+
+约束（开跑前硬拒绝，不留半成品）：`interleaved` 不支持题目级分片（请用
+`--shard-by dialogue`），也不支持 `--replay`（回放只有末尾快照，给不出每个
+as_of 的状态）。`--snapshot` 仍可用：快照在**全部 ingest 完成后**导出（末尾态）。
+
+`run --trace-state` 在每个有提问的 as_of ingest 完成后、query 之前把状态导出到
+`<对话目录>/trace_state/t<as_of>/`（适配器需声明快照能力；不支持时警告一次并
+跳过，归因记 unknown）。sequence 对话不需要它——提问时点就是末尾的
+`memory_snapshot/`。`results.jsonl` 每题新增 `as_of` 与 `evidence_in_state`
+（证据片段是否出现在该题提问时点的**可读文本状态文件**里；无快照 / 无 evidence
+标注 / 状态不可读记 `null`，不猜），`metrics.json` 的 `attribution` 与报告
+「失败归因」小节给出四桶：`not_written`（没写进去）/ `not_retrieved`（写入但没
+检索到）/ `wrong_answer`（检索到仍答错）/ `unknown`（不可判定）。四桶只统计
+**判错且带 evidence 标注**的题——没有 evidence 就无从判断"证据是否写入"，另记
+`n_wrong_without_evidence`，不硬塞进 `unknown`。
+
+```bash
+# GateMem：interleaved 数据集；按对话分片（不能按题目分片），--trace-state 产出逐时点状态
+python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/gatemem_office.jsonl \
+    --shard-by dialogue --shards 4 --shard-index 0 --trace-state
+```
+
+状态扫描的代价与边界：只读 UTF-8 可解码、不含 NUL 的文本文件（跳过
+`manifest.json`），证据 >200 字符时取前 200 字符作 needle；每题扫一次状态目录，
+成本 ≈ 带 evidence 的题数 × 状态体积。适配器把记忆只存成二进制（向量库 /
+SQLite）时扫不到文本，`evidence_in_state` 记 `null`（归因 unknown）而不是
+"没写入"。`--trace-state` 的磁盘占用 = 有提问的 as_of 数 × 单份状态体积；单份
+>100MB 或总份数 >200 会提示（同快照告警风格）。
 
 ## 大数据集：冒烟与分片
 
@@ -321,6 +360,10 @@ fuse 的融合产物（`shard_index=None`）不带这个标注，它覆盖全部
 - `adapter_describe`：adapter 定义了可选 `describe() -> dict` 时自动调用记入（原样进 metrics，非空时报告渲染「适配器自描述」小节；抛错 / 返回非 dict / 不可 JSON 序列化时警告一次并记 null，不中断评测）；
 - `experiment_dir` / `dataset_dir`：本次实验目录与数据集产物目录（读取方据此定位，不必猜层级）；
 - `run_mode`：`full` / `replay-restore` / `replay-rebuild`（见「状态快照与回放」）；
+- `ingest_strategy`：`sequence` / `interleaved` / `mixed`（分片把不同策略拼在一起）；`compare` 的**关键可比性维度**，缺省归一 `sequence`（旧产物不误伤）；
+- `as_of_questions` / `as_of_enforced`：带 `as_of` 标注的题数与是否全部被强制；sequence 下 `as_of_enforced=false`，报告据此提示"时点错位"；
+- `trace_state`：`--trace-state` 的角色（`exported` / `unsupported` / `not_applicable`）与导出的状态份数；
+- `attribution`：失败归因四桶与 `n_wrong` / `n_wrong_with_evidence` / `n_state_readable`（只统计判错且带 evidence 的题；见「interleaved 摄入与失败归因」）；
 - `state_snapshot`：快照**默认导出**（适配器声明了快照能力时；`--no-snapshot` 关闭）或快照回放时记入；普通 run 的 `root` 指向**数据集目录**（即 `--replay` 可传的目录）；回放任务的 `root` 是快照源（数据集目录或回放任务路径），另给 `snapshots_dir`（本 run 的任务级池）与 `n_buckets` / `n_reused` / `n_new`（对话级给 `bucket` / `reused`）。适配器不支持快照时该块记 `role="unsupported"`（如实说明"没导"，读完可区分"这次没导"与"导不了"）。
 
 ```bash
@@ -339,12 +382,12 @@ python -m membench.cli run --adapter my-system --dataset membench/data/office_da
 
 | 级别 | 维度 | 不一致的后果 |
 |---|---|---|
-| 关键 | `adapter`、`adapter_version`、`dataset_sha256`（取 `dataset_fingerprint.sha256`）、`judge`、`judge_model`、`driver_llm`、`platform`、`run_mode`（全量 / 快照回放）、`n_questions`（分数算在哪个题集上：`--limit` 冒烟 vs 全量即走这里） | 非 strict 下门禁降级 WARN；`--require-comparable`（strict）下直接 FAIL |
-| 次要 | `limit`、`shards`、`shard_index`、`adapter_meta` | 降级 WARN，不 FAIL |
+| 关键 | `adapter`、`adapter_version`、`dataset_sha256`（取 `dataset_fingerprint.sha256`）、`judge`、`judge_model`、`driver_llm`、`platform`、`run_mode`（全量 / 快照回放）、`ingest_strategy`（sequence / interleaved：问的是"结尾时知道什么"还是"当时知道什么"）、`n_questions`（分数算在哪个题集上：`--limit` 冒烟 vs 全量即走这里） | 非 strict 下门禁降级 WARN；`--require-comparable`（strict）下直接 FAIL |
+| 次要 | `limit`、`shards`、`shard_index`、`adapter_meta`、`retrieval_match`、`fusion` | 降级 WARN，不 FAIL |
 | 提示 | `commit`、`dataset_path`、`dataset` | 仅记录（`same=false`），不影响结论 |
 
 - 关键维度**任一值缺失**（如旧 run 没有 `driver_llm`）记入 `unverifiable`：非 strict 下不判不可比，strict 下与不一致同等处理（判 FAIL）——没填就核验不了，strict 模式不允许"没填当通过"。`n_questions` 取自 `overall.n_questions`（`aggregate` 的落账位置，顶层没有该字段）。
-- `commit` 不同是 A/B 的被测变量本身，**不算**不可比；`run_mode` 缺省按 `full` 归一（本特性之前的所有 run 都是全量跑），故历史 run 不会因缺该字段被误判。
+- `commit` 不同是 A/B 的被测变量本身，**不算**不可比；`run_mode` 缺省按 `full` 归一、`ingest_strategy` 缺省按 `sequence` 归一（本特性之前的所有 run 都是全量 + 整段 ingest），故历史 run 不会因缺字段被误判。
 - **`--limit` 冒烟产物不得与全量产物对比**：`fuse` 把各分片一致的 `limit` 透传到融合产物，`run_id` 另带 `_fused` / `_shard<N>` / `_limitN` 标记；两侧题目数不同（关键维度）时 strict 直接判 FAIL——冒烟分部署到全量门槛上会被拦下。
 
 门禁语义：

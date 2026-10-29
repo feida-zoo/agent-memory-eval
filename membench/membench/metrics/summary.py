@@ -13,7 +13,145 @@ from typing import Any, Iterable
 
 from membench.data.schema import is_abstention
 
-__all__ = ["percentile", "aggregate"]
+__all__ = [
+    "percentile",
+    "aggregate",
+    "ATTRIBUTION_BUCKETS",
+    "attribution_bucket",
+    "attribution_summary",
+]
+
+#: 失败归因四桶（"为什么答错"）：
+#: - ``not_written``：证据不在该题提问时点的状态里（没写进去）；
+#: - ``not_retrieved``：证据在状态里，但没被检索进回答上下文；
+#: - ``wrong_answer``：证据既写进去了也被检索到了，仍然答错（推理/表述问题）；
+#: - ``unknown``：状态不可读 / 没有快照，无法判定（不猜）。
+ATTRIBUTION_BUCKETS: tuple[str, ...] = (
+    "not_written",
+    "not_retrieved",
+    "wrong_answer",
+    "unknown",
+)
+
+#: 每个桶在 ``attribution.samples`` 里最多取几条样例。
+_ATTRIBUTION_SAMPLES_PER_BUCKET = 2
+
+
+def attribution_bucket(record: dict[str, Any], has_evidence: bool) -> "str | None":
+    """单条判错记录的归因桶；判对或题目没有 evidence 标注时返回 None。
+
+    判定顺序（"不猜"是底线）：先看提问时点的状态可读性（``evidence_in_state``
+    为 None 即不可判定），再看证据是否真的被检索进回答上下文（``evidence_hit``）。
+
+    Args:
+        record: 一条 ``results.jsonl`` 记录（含 ``judge`` / ``evidence_hit`` /
+            ``evidence_in_state``）。
+        has_evidence: 该题是否带 evidence 标注。没有标注的题无法判定"证据是否
+            已写入"，不计入四桶（另由 ``n_wrong_without_evidence`` 记录）。
+    """
+    judge = record.get("judge") or {}
+    if bool(judge.get("correct")):
+        return None
+    if not has_evidence:
+        return None
+    in_state = record.get("evidence_in_state")
+    if in_state is None:
+        return "unknown"
+    if not in_state:
+        return "not_written"
+    return "wrong_answer" if bool(record.get("evidence_hit")) else "not_retrieved"
+
+
+def _empty_attribution_counts() -> dict[str, int]:
+    """四桶计数的零值。"""
+    return {bucket: 0 for bucket in ATTRIBUTION_BUCKETS}
+
+
+def attribution_summary(
+    records: list[dict[str, Any]],
+    evidence_keys: set[tuple[str, str]],
+) -> dict[str, Any]:
+    """按"为什么答错"统计四桶（数据集级 / 对话级同一套口径）。
+
+    口径（务必与报告里的说明一致）：
+
+    - 只统计**判错**的题；判对题不进入任何桶。
+    - 四桶只覆盖**带 evidence 标注**的判错题——没有 evidence 就无从判断"证据
+      是否已写入"，这些题另记 ``n_wrong_without_evidence``，不硬塞进
+      ``unknown``（``unknown`` 专指"有证据可查、但状态读不到或没快照"）。
+    - ``n_state_readable``：带 evidence 的判错题里，提问时点状态目录可读的题数
+      （``evidence_in_state`` 非 null）。它解释四桶覆盖率，也是扫描成本的规模。
+    - ``samples``：每桶最多 :data:`_ATTRIBUTION_SAMPLES_PER_BUCKET` 条
+      ``{"qid", "dialogue_id", "category", "bucket"}``，报告据此回查问题与
+      回答原文。
+
+    Args:
+        records: 逐题记录。
+        evidence_keys: 带 evidence 标注的题键集合 ``{(dialogue_id, qid)}``；
+            由 Runner 从题目对象扫描得到（``evidence`` 非空）。
+
+    Returns:
+        ``{"n_wrong", "n_wrong_with_evidence", "n_wrong_without_evidence",
+        "n_state_readable", "buckets": {...}, "by_category": {cat: {...}},
+        "samples": [...]}``。
+    """
+    buckets = _empty_attribution_counts()
+    by_category: dict[str, dict[str, Any]] = {}
+    samples: list[dict[str, str]] = []
+    n_wrong = 0
+    n_with_evidence = 0
+    n_state_readable = 0
+
+    for record in records:
+        if bool((record.get("judge") or {}).get("correct")):
+            continue
+        n_wrong += 1
+        cat = str(record.get("category", "unknown"))
+        category = by_category.setdefault(
+            cat,
+            {
+                "n_wrong": 0,
+                "n_wrong_with_evidence": 0,
+                "n_state_readable": 0,
+                **_empty_attribution_counts(),
+            },
+        )
+        category["n_wrong"] += 1
+        key = (str(record.get("dialogue_id", "")), str(record.get("qid", "")))
+        if key not in evidence_keys:
+            continue
+        n_with_evidence += 1
+        category["n_wrong_with_evidence"] += 1
+        if record.get("evidence_in_state") is not None:
+            n_state_readable += 1
+            category["n_state_readable"] += 1
+        bucket = attribution_bucket(record, True)
+        if bucket is None:  # 判错 + 有 evidence 不可能走到这里，防御性兜底
+            continue
+        buckets[bucket] += 1
+        category[bucket] += 1
+        if (
+            sum(1 for s in samples if s["bucket"] == bucket)
+            < _ATTRIBUTION_SAMPLES_PER_BUCKET
+        ):
+            samples.append(
+                {
+                    "qid": key[1],
+                    "dialogue_id": key[0],
+                    "category": cat,
+                    "bucket": bucket,
+                }
+            )
+
+    return {
+        "n_wrong": n_wrong,
+        "n_wrong_with_evidence": n_with_evidence,
+        "n_wrong_without_evidence": n_wrong - n_with_evidence,
+        "n_state_readable": n_state_readable,
+        "buckets": buckets,
+        "by_category": by_category,
+        "samples": samples,
+    }
 
 
 def percentile(values: Iterable[float], p: float) -> float:
@@ -52,6 +190,8 @@ def _mean(values: Iterable[float]) -> float | None:
 def aggregate(
     records: list[dict[str, Any]],
     capabilities: dict[str, bool] | None = None,
+    *,
+    evidence_keys: set[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """汇总单条评测记录为六维指标字典（SPEC 3.5）。
 
@@ -68,6 +208,12 @@ def aggregate(
             ``has_stale`` 最终以 records 的 ``judge.stale_checkable`` 为准
             （见 :func:`membench.judges.base.JudgeResult`）：传进来的静态
             标注只说明数据集有注解，不保证本次判分真的能机检。
+        evidence_keys: 可选，带 evidence 标注的题键集合 ``{(dialogue_id,
+            qid)}``。传了才产出 ``attribution`` 块（失败归因四桶），因为
+            "没有 evidence 标注"与"证据没写进状态"在记录里都表现为
+            ``evidence_in_state=null``，只有题目对象能区分。Runner 传题目集
+            扫描结果，fuse 从源数据集复算后传；evaluate 的汇总/融合不传
+            ⇒ 其汇总产物里不出现该块（融合口径不变）。
 
     Returns:
         ``{"overall": {...}, "by_category": {category: {"accuracy", "n"}},
@@ -78,7 +224,8 @@ def aggregate(
         标注覆盖率，跨数据集加权融合据此取权重（见
         :func:`membench.evaluate.fuse_metrics`）；无对应题型的指标返回 ``None``
         （区别于"真实 0"）；使用了 LLM judge 时附加
-        ``"judge_fallback": {"count", "ratio"}``。
+        ``"judge_fallback": {"count", "ratio"}``；传了 ``evidence_keys`` 时
+        附加 ``"attribution"``（见 :func:`attribution_summary`）。
 
     指标口径：
         - accuracy: ``judge.correct`` 均值。
@@ -219,5 +366,10 @@ def aggregate(
             "count": n_fallback,
             "ratio": (n_fallback / n) if n else 0.0,
         }
+
+    # 失败归因：只有调用方给了"哪些题带 evidence"才产出——evaluate 的汇总/融合
+    # 不传，它们的口径与历史产物保持逐字节一致；Runner / fuse 传。
+    if evidence_keys is not None:
+        result["attribution"] = attribution_summary(records, evidence_keys)
 
     return result

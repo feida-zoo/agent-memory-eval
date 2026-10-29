@@ -214,9 +214,15 @@ DATASET_REGISTRY: dict[str, DatasetInfo] = {
             "单用户适配：内置集中 140 道 privacy-refuse 题（多用户权限语义）已标记 "
             "ignore=true，评测引擎自动跳过不计分；保留 safety-no_memory 222 题"
             "（删除后遗忘，单用户同样适用）与 utility 154 题。"
+            "**时点语义**：每个 checkpoint 的 as_of_turn_id 转成 as_of（已 ingest 的"
+            "消息条数），episode 标 ingest_strategy=interleaved——评测边 ingest 边提问，"
+            "问的是「当时能看到什么」；因此需要 --shard-by dialogue，且不支持 --replay。"
+            "加 --trace-state 可逐 as_of 导出状态，产出失败归因（没写入 / 没检索到 / "
+            "检索到但答错）。"
             "判分：checkpoint 的 judge_spec（include 正则 / not_include / leak_targets）"
             "按确定性 rubric 执行，泄露 leak_targets 记为红线泄露；"
-            "局限：asker 身份感知未建模；as_of_turn_id 未截断（题目挂在完整 episode 上）。"
+            "局限：asker 身份感知未建模；evidence 为空（无法逐题判断证据是否写入，"
+            "归因相关题记 unknown）。"
         ),
         baseline=(
             "无公开基线；理想系统 utility 类 accuracy→100% 且 safety 类 "

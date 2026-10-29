@@ -482,6 +482,11 @@ def _dataset_truth(
 ) -> Union[dict[str, Any], None]:
     """源数据集给出的真值：对话 / 题目顺序 + 每片应有的对话与题集。
 
+    另复算融合产物需要的归因口径：``ingest_strategy`` / ``evidence_keys`` /
+    ``as_of_questions`` / ``as_of_enforced``（分片产物里的 as_of 题数只是该片的，
+    全量口径只有源数据集能给），以及逐对话的 ``dialogue_meta``（对话级产物
+    不能用数据集级汇总值）。
+
     数据集不可读（被移动 / 已清理）、或内容与各片记录的数据集指纹不一致时返回 None 并
     打印告警：融合退化为按账本校验覆盖（仍然拒绝少片 / 未跑完 / 账本与产物对不上），
     但无法与数据集逐项比对。
@@ -516,6 +521,38 @@ def _dataset_truth(
             }
             for dialogue in selected
         }
+    # 融合产物要复算的归因 / 摄入策略元数据：分片产物各记各的（题目级分片下
+    # as_of 题数按片不同），只有源数据集能给出全量口径。
+    strategies = {str(dialogue.ingest_strategy) for dialogue in dialogues}
+    if not strategies:
+        ingest_strategy = "sequence"
+    elif len(strategies) == 1:
+        ingest_strategy = next(iter(strategies))
+    else:
+        ingest_strategy = "mixed"
+    evidence_keys: set[tuple[str, str]] = set()
+    as_of_questions = 0
+    as_of_unenforced = 0
+    dialogue_meta: dict[str, dict[str, Any]] = {}
+    for dialogue in dialogues:
+        dialogue_as_of = 0
+        dialogue_unenforced = 0
+        for question in dialogue.questions:
+            if getattr(question, "ignore", False):
+                continue
+            if question.evidence:
+                evidence_keys.add((str(dialogue.dialogue_id), str(question.qid)))
+            if question.as_of is not None:
+                as_of_questions += 1
+                dialogue_as_of += 1
+                if dialogue.ingest_strategy != "interleaved":
+                    as_of_unenforced += 1
+                    dialogue_unenforced += 1
+        dialogue_meta[layout.tag_dir_name(str(dialogue.dialogue_id))] = {
+            "ingest_strategy": str(dialogue.ingest_strategy),
+            "as_of_questions": dialogue_as_of,
+            "as_of_enforced": dialogue_unenforced == 0,
+        }
     return {
         "expected": expected,
         "dialogue_order": {
@@ -527,6 +564,11 @@ def _dataset_truth(
             for dialogue in dialogues
             for position, question in enumerate(dialogue.questions)
         },
+        "ingest_strategy": ingest_strategy,
+        "evidence_keys": evidence_keys,
+        "as_of_questions": as_of_questions,
+        "as_of_enforced": as_of_unenforced == 0,
+        "dialogue_meta": dialogue_meta,
     }
 
 
@@ -716,6 +758,19 @@ def fuse_runs(
     )
     _check_coverage(by_index, truth)
 
+    # 融合产物的归因 / 摄入策略口径：源数据集可读时按全量复算；不可读时退回参考
+    # 分片的落账值（此时 as_of 题数只是那一片的，报告里不据此下结论）。
+    if truth is not None:
+        evidence_keys: Union[set[tuple[str, str]], None] = truth["evidence_keys"]
+        ingest_strategy = str(truth["ingest_strategy"])
+        as_of_questions = int(truth["as_of_questions"])
+        as_of_enforced = bool(truth["as_of_enforced"])
+    else:
+        evidence_keys = None
+        ingest_strategy = str(ref_metrics.get("ingest_strategy") or "sequence")
+        as_of_questions = int(ref_metrics.get("as_of_questions") or 0)
+        as_of_enforced = bool(ref_metrics.get("as_of_enforced", True))
+
     # 逐对话合并记录：question 分片下同一对话的记录来自多个分片，按片序拼接后
     # 再按源数据集的题目顺序重排（数据集不可读时保持拼接顺序）
     merged: dict[str, list[dict[str, Any]]] = {}
@@ -806,6 +861,11 @@ def fuse_runs(
         "adapter_version": ref_metrics.get("adapter_version"),
         "dataset_fingerprint": ref_metrics.get("dataset_fingerprint"),
         "retrieval_match": ref_metrics.get("retrieval_match"),
+        # 摄入策略 / as_of 口径 / 失败归因：数据集可读时按源数据集复算（全量口径），
+        # 不可读时退回参考分片的落账值（as_of 题数因此只是该片的，不作结论）。
+        "ingest_strategy": ingest_strategy,
+        "as_of_questions": as_of_questions,
+        "as_of_enforced": as_of_enforced,
         # 运行模式透传（前面已校验各片一致）
         "run_mode": ref_metrics.get("run_mode") or "full",
         "experiment_dir": experiment_dir,
@@ -832,6 +892,7 @@ def fuse_runs(
             capabilities=_caps_or(
                 [block for blocks in copies.values() for block in blocks]
             ),
+            evidence_keys=evidence_keys,
         )
     )
     metrics.update(base)
@@ -878,9 +939,21 @@ def fuse_runs(
             if os.path.abspath(source_dir) != os.path.abspath(target_dir):
                 _copy_dialogue_content(source_dir, target_dir)
             dialogue_metrics = dict(
-                aggregate(dialogue_records, capabilities=_caps_or(copies[name]))
+                aggregate(
+                    dialogue_records,
+                    capabilities=_caps_or(copies[name]),
+                    evidence_keys=(
+                        {key for key in evidence_keys if key[0] == dialogue_id}
+                        if evidence_keys is not None
+                        else None
+                    ),
+                )
             )
             dialogue_metrics.update(base)
+            if truth is not None:
+                # 逐对话的摄入 / as_of 口径：base 里是数据集级汇总值，对话报告
+                # 需要自己那一段的（mixed 数据集下尤其不能串）。
+                dialogue_metrics.update(truth["dialogue_meta"].get(name) or {})
             dialogue_metrics["dialogue_id"] = dialogue_id
             dialogue_metrics["n_ignored"] = sum(
                 int(block.get("n_ignored", 0) or 0) for block in copies[name]

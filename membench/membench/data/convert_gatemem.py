@@ -59,12 +59,17 @@ role 映射：episode 的 turns 全部是办公人员之间的 ``dialogue``（�
 speaker.role / turn_kind 显式为 assistant/agent/bot 一类时才映射为
 ``assistant``。一个 episode 整体作为一个 session（turn_kind 无分段语义）。
 
+**提问时点（as_of）**：checkpoint 的 ``as_of_turn_id`` 是该 episode ``turns``
+里的 turn id；转换器取它在 turns 中的下标 + 1 写成 ``Question.as_of``（=
+"该时点已 ingest 的消息条数"），并把整个 dialogue 标成
+``ingest_strategy="interleaved"``——评测时 runner 边 ingest 边提问，问的是
+"当时能看到什么"。``as_of_turn_id`` 在 turns 里找不到时该 checkpoint 跳过并
+计数（不猜时点）。注意：interleaved 与题目级分片 / ``--replay`` 不兼容，
+评测时需 ``--shard-by dialogue``（见 ``membench.runner``）。
+
 已知局限：
-- evidence 一律为 []：judge_spec.include 是判分要点而非对话原文子串。
-- **as_of_turn_id 未建模**：checkpoint 挂到完整 episode 上，未按
-  ``as_of_turn_id`` 截断 sessions——"当时能看到什么"需要运行时支持按题前缀
-  状态，本框架不提供。因此同一 episode 的后半段内容也会被系统看到；报告里
-  不要按"as_of 已建模"解读这类题的分数。
+- evidence 一律为 []：judge_spec.include 是判分要点而非对话原文子串。失败归因
+  因此无法逐题判定"证据是否已写入"，相关题会记 ``evidence_in_state=null``。
 - asker 身份未建模：privacy 题的"该向谁拒答"依赖提问者身份，membench
   schema 无对应字段，统一按 abstention/single_hop 处理。
 - utility 题 judge_spec.notes 中的 stale 信息（旧值）未填入 gold_stale。
@@ -133,9 +138,16 @@ def _read_jsonl(path: str | Path) -> list[dict]:
     return records
 
 
-def _convert_episode(episode: dict) -> dict:
-    """将一个 episode 转为不含 questions 的 dialogue dict。"""
+def _convert_episode(episode: dict) -> tuple[dict, dict[str, int]]:
+    """将一个 episode 转为不含 questions 的 dialogue dict。
+
+    Returns:
+        ``(dialogue, turn_positions)``：``turn_positions`` 是
+        ``turn_id -> 在 turns 里的下标 + 1``（= 该 turn 之后的已 ingest 消息
+        条数），供 checkpoint 写 ``as_of``。
+    """
     session: list[dict] = []
+    turn_positions: dict[str, int] = {}
     for turn in episode.get("turns") or []:
         if not isinstance(turn, dict):
             continue
@@ -149,14 +161,27 @@ def _convert_episode(episode: dict) -> dict:
                 ),
             }
         )
-    return {
-        "dialogue_id": str(episode.get("episode_id", "")),
-        "sessions": [session],
-        "questions": [],
-    }
+        turn_id = turn.get("turn_id")
+        if turn_id is not None:
+            # 已 ingest 的消息条数 = 该 turn 写入后的 session 长度（跳过非 dict
+            # turn 时序号不会错位）。
+            turn_positions[str(turn_id)] = len(session)
+    return (
+        {
+            "dialogue_id": str(episode.get("episode_id", "")),
+            "ingest_strategy": "interleaved",
+            "sessions": [session],
+            "questions": [],
+        },
+        turn_positions,
+    )
 
 
-def _convert_checkpoint(cp: dict, ignore_privacy_refuse: bool = False) -> dict | None:
+def _convert_checkpoint(
+    cp: dict,
+    as_of: int | None = None,
+    ignore_privacy_refuse: bool = False,
+) -> dict | None:
     """将一个 checkpoint 转为 membench question dict；未知组合返回 None。
 
     ``judge_spec.include`` / ``not_include`` 与 ``leak_targets`` 原样写入
@@ -165,6 +190,9 @@ def _convert_checkpoint(cp: dict, ignore_privacy_refuse: bool = False) -> dict |
 
     Args:
         cp: checkpoint 记录。
+        as_of: 该 checkpoint 时点已 ingest 的消息条数（调用方按
+            ``as_of_turn_id`` 在 turns 里的下标 + 1 算好）；None 表示该对话
+            无法定位时点——写入后 runner 会把它排到全部 ingest 之后。
         ignore_privacy_refuse: True 时 (privacy, refuse) 题附加 ignore 标记。
     """
     key = (str(cp.get("query_type", "")), str(cp.get("expected_action", "")))
@@ -181,6 +209,8 @@ def _convert_checkpoint(cp: dict, ignore_privacy_refuse: bool = False) -> dict |
         "category": category,
         "evidence": [],
     }
+    if as_of is not None:
+        question["as_of"] = int(as_of)
     # category 不再合并，"拒答类"题改为按 key 判定——
     # ``(privacy, refuse)`` 与 ``(safety, no_memory)`` 都期望系统拒答，
     # gold_answer 设为 abstention 哨兵。
@@ -223,15 +253,40 @@ def convert_gatemem(
     episodes = _read_jsonl(episodes_path)
     checkpoints = _read_jsonl(checkpoints_path)
 
-    dialogues = [_convert_episode(ep) for ep in episodes]
+    dialogues: list[dict] = []
+    turn_positions: dict[str, dict[str, int]] = {}
+    for ep in episodes:
+        dialogue, positions = _convert_episode(ep)
+        dialogues.append(dialogue)
+        turn_positions[dialogue["dialogue_id"]] = positions
     by_id = {d["dialogue_id"]: d for d in dialogues}
 
     n_questions = 0
     n_skipped = 0
     n_ignored = 0
+    n_as_of_missing = 0
+    as_of_positions: list[int] = []
     category_counts: dict[str, int] = {}
     for cp in checkpoints:
-        question = _convert_checkpoint(cp, ignore_privacy_refuse=ignore_privacy_refuse)
+        cp_id = repr(cp.get("checkpoint_id"))
+        episode_id = str(cp.get("episode_id", ""))
+        positions = turn_positions.get(episode_id)
+        as_of: int | None = None
+        if positions is not None:
+            as_of = positions.get(str(cp.get("as_of_turn_id", "")))
+            if as_of is None:
+                n_as_of_missing += 1
+                print(
+                    f"[convert_gatemem] 警告：checkpoint {cp_id} 的 as_of_turn_id="
+                    f"{cp.get('as_of_turn_id')!r} 不在 episode {episode_id!r} 的 turns 里，"
+                    "无法定位提问时点，跳过该 checkpoint",
+                    file=sys.stderr,
+                )
+                n_skipped += 1
+                continue
+        question = _convert_checkpoint(
+            cp, as_of=as_of, ignore_privacy_refuse=ignore_privacy_refuse
+        )
         if question is None:
             n_skipped += 1
             print(
@@ -242,17 +297,19 @@ def convert_gatemem(
                 file=sys.stderr,
             )
             continue
-        target = by_id.get(str(cp.get("episode_id", "")))
+        target = by_id.get(episode_id)
         if target is None:
             n_skipped += 1
             print(
-                f"[convert_gatemem] 警告：checkpoint {cp.get('checkpoint_id')!r} "
+                f"[convert_gatemem] 警告：checkpoint {cp_id} "
                 f"指向不存在的 episode {cp.get('episode_id')!r}，跳过",
                 file=sys.stderr,
             )
             continue
         target["questions"].append(question)
         n_questions += 1
+        if as_of is not None:
+            as_of_positions.append(as_of)
         if question.get("ignore"):
             n_ignored += 1
         category_counts[question["category"]] = category_counts.get(question["category"], 0) + 1
@@ -265,6 +322,9 @@ def convert_gatemem(
         "categories": category_counts,
         "skipped": n_skipped,
         "ignored": n_ignored,
+        "as_of_missing": n_as_of_missing,
+        "as_of_min": min(as_of_positions) if as_of_positions else None,
+        "as_of_max": max(as_of_positions) if as_of_positions else None,
         "output": str(output_path),
     }
 
@@ -287,7 +347,13 @@ def main(argv: list[str] | None = None) -> int:
         ignore_privacy_refuse=args.ignore_privacy_refuse,
     )
     print(f"[convert_gatemem] {stats['dialogues']} dialogues, {stats['questions']} questions"
-          f"（跳过 {stats['skipped']} 个未知组合 checkpoint）")
+          f"（跳过 {stats['skipped']} 个 checkpoint）")
+    if stats["as_of_min"] is not None:
+        print(
+            f"[convert_gatemem] 提问时点 as_of（已 ingest 消息条数）范围 "
+            f"{stats['as_of_min']}..{stats['as_of_max']}；"
+            "ingest_strategy=interleaved（评测时请用 --shard-by dialogue）"
+        )
     if stats["ignored"]:
         print(f"[convert_gatemem] 已标记忽略 {stats['ignored']} 道 (privacy, refuse) 题"
               f"（ignore=true，评测时跳过）")

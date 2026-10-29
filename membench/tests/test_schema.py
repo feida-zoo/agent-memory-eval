@@ -269,6 +269,74 @@ class TestIgnoreFields:
         with pytest.raises(ValueError, match=r":1:.*judge_spec\.leak_targets"):
             load_dataset(path)
 
+    def test_ingest_strategy_and_as_of_defaults(self, tmp_path: Path) -> None:
+        """旧数据集没有 ingest_strategy / as_of：默认 sequence / None。"""
+        dialogues = load_dataset(self._write(tmp_path, {}))
+        assert dialogues[0].ingest_strategy == "sequence"
+        assert dialogues[0].questions[0].as_of is None
+
+    def test_interleaved_strategy_and_as_of_parsed(self, tmp_path: Path) -> None:
+        path = tmp_path / "ds.jsonl"
+        path.write_text(
+            json.dumps(
+                {
+                    "dialogue_id": "d1",
+                    "ingest_strategy": "interleaved",
+                    "sessions": [
+                        [
+                            {"role": "user", "content": "m1", "timestamp": None},
+                            {"role": "user", "content": "m2", "timestamp": None},
+                        ]
+                    ],
+                    "questions": [
+                        {
+                            "qid": "d1_q1",
+                            "question": "问？",
+                            "gold_answer": "答",
+                            "category": "single_hop",
+                            "evidence": [],
+                            "as_of": 2,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        dialogue = load_dataset(path)[0]
+        assert dialogue.ingest_strategy == "interleaved"
+        assert dialogue.questions[0].as_of == 2
+        assert dialogue.n_messages == 2
+        assert [m["content"] for m in dialogue.messages()] == ["m1", "m2"]
+
+    def test_ingest_strategy_invalid_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / "ds.jsonl"
+        path.write_text(
+            json.dumps(
+                {
+                    "dialogue_id": "d1",
+                    "ingest_strategy": "streaming",
+                    "sessions": [],
+                    "questions": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match=r":1:.*ingest_strategy"):
+            load_dataset(path)
+
+    def test_as_of_must_be_non_negative_int(self, tmp_path: Path) -> None:
+        for value in ("1", True, -1):
+            path = self._write(tmp_path, {"as_of": value})
+            with pytest.raises(ValueError, match=r":1:.*as_of"):
+                load_dataset(path)
+
+    def test_as_of_beyond_message_count_rejected(self, tmp_path: Path) -> None:
+        """as_of 是已 ingest 的消息条数，超过该对话消息总数即数据错误。"""
+        path = self._write(tmp_path, {"as_of": 2})
+        with pytest.raises(ValueError, match=r":1:.*as_of.*消息总数 1"):
+            load_dataset(path)
+
 
 class TestDataclasses:
     """Dialogue / Question / Dataset 数据类基本行为。"""
