@@ -38,7 +38,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from typing import Any
+from typing import Any, Sequence
 
 from membench import layout, runtime
 from membench.layout import resolve_dataset_dir
@@ -285,8 +285,17 @@ def _check_reason(check: dict[str, Any]) -> str:
     return f"[{label}] {check['dimension']}: {check['detail']}"
 
 
-def check_comparability(metrics_a: dict[str, Any], metrics_b: dict[str, Any]) -> dict[str, Any]:
+def check_comparability(
+    metrics_a: dict[str, Any],
+    metrics_b: dict[str, Any],
+    *,
+    downgrade: Sequence[str] = (),
+) -> dict[str, Any]:
     """核对两个 run 的元数据是否可比。
+
+    ``downgrade`` 里的维度按 **info** 级比较：仍记录 ``same`` 与差异，但既不影响
+    ``comparable``、也不进门禁——多线对比用它把 ``adapter_version`` 降级（多线
+    场景里版本号正是被测变量，不能拿它判"不可比"）。
 
     取值规则：``dataset_sha256`` 取 ``metrics["dataset_fingerprint"]["sha256"]``，
     其余维度取 metrics 顶层字段。
@@ -308,7 +317,7 @@ def check_comparability(metrics_a: dict[str, Any], metrics_b: dict[str, Any]) ->
     unverifiable: list[dict[str, Any]] = []
 
     for dim in _COMPARABILITY_DIMS:
-        severity = _SEVERITY_BY_DIM[dim]
+        severity = "info" if dim in downgrade else _SEVERITY_BY_DIM[dim]
         a = _comparability_value(metrics_a, dim)
         b = _comparability_value(metrics_b, dim)
         if severity == "critical" and _is_not_applicable(dim, metrics_a, metrics_b):

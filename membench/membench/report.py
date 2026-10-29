@@ -6,6 +6,7 @@
 - :func:`render_dataset_report`   数据集级 report.md + fig_category_accuracy.png + fig_latency_hist.png
 - :func:`render_compare_report`   comparison.md + fig_metric_diff.png（质量+效率）+ fig_category_diff.png（分题型）
 - :func:`fig_dataset_overview`    evaluate 报告用：各数据集质量 + 效率分组条形图
+- :func:`fig_series_accuracy`     多线对比报告用：accuracy 随线序的走势（多数据集多条折线 + 融合粗线）
 - :func:`copy_report`             把带图报告连同引用图片与附带文件复制到目标目录
 """
 
@@ -630,6 +631,64 @@ def fig_dataset_overview(
     ax2.set_title("各数据集效率成本")
     ax2.legend(fontsize=8)
 
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
+
+
+def fig_series_accuracy(
+    names: list[str],
+    headline: list[Any],
+    out_path: str,
+    *,
+    dataset_series: "dict[str, list[Any]] | None" = None,
+    headline_label: str = "融合值",
+) -> str:
+    """多线对比用：accuracy 随线序的走势。
+
+    x 轴是各线的报告名（中文按顺序即时间顺序），y 轴是 accuracy。多数据集时每条
+    数据集各画一条细折线（同一套低饱和配色），融合值/单数据集汇总值画一条粗线；
+    ``None``（该线未计算该值）留缺口，不按 0 画——"没算"不是"分数为 0"。
+
+    Args:
+        names: 各线的报告名（顺序即 x 轴）。
+        headline: 各线的汇总 accuracy（多数据集为融合值，单数据集为该集的值）。
+        out_path: 输出 png 路径。
+        dataset_series: 多数据集时 ``{数据集名: [各线 accuracy]}``；单数据集传 None。
+        headline_label: 粗线的图例名（多数据集「融合值」/ 单数据集「accuracy」）。
+    """
+    _setup_fonts()
+    fig, ax = plt.subplots(figsize=(max(7.0, 1.5 * len(names)), 4.5))
+    x = list(range(len(names)))
+
+    def _ys(values: list[Any]) -> list[float]:
+        return [float(v) if v is not None else float("nan") for v in values]
+
+    if dataset_series:
+        for i, (label, values) in enumerate(dataset_series.items()):
+            ax.plot(
+                x,
+                _ys(values),
+                marker="o",
+                linewidth=1.2,
+                color=PALETTE[(i + 1) % len(PALETTE)],
+                label=label,
+            )
+    ax.plot(
+        x,
+        _ys(headline),
+        marker="o",
+        linewidth=2.8,
+        color=PALETTE[0],
+        label=headline_label,
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=20, ha="right")
+    ax.set_ylim(0, 1.0)
+    ax.set_ylabel("accuracy")
+    ax.set_title("多线 accuracy 走势")
+    ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)

@@ -5,6 +5,7 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 1. **run**：我的记忆系统在一套多会话对话数据集上表现如何？（六维指标 + 中文报告 + 图表）
 2. **compare**：这次优化相比基线是进步还是回归？（可比性前置校验 + 逐指标 diff + PASS/FAIL 门禁）
 3. **evaluate**：跨数据集全量评测，基准集按题数加权融合出**基准评级**（办公域槽位单列业务结论，stale 门禁一票否决）。
+4. **series**：多个优化点各一个 commit 时，**每一步**提升多少？（多线对比 + 线名从 commit 信息自动提取）
 
 设计要点：
 
@@ -21,7 +22,7 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 │   ├── judges/            # HeuristicJudge / LLMJudge
 │   ├── metrics/           # token_f1 / bleu1（诊断）/ recall@k + 六维汇总
 │   ├── paths.py           # 产物根判定 output_root（MEMBENCH_OUTPUT_DIR > skill 的 output/ > 工程根 output/）
-│   ├── layout.py          # 任务目录 / 实验目录命名与落位（eval_* / compare_* / matrix_*、分片账本的公开 helper）
+│   ├── layout.py          # 任务目录 / 实验目录命名与落位（eval_* / compare_* / matrix_* / series_*、分片账本的公开 helper）
 │   ├── runtime.py         # 实验 / 任务级运行时数据（commands.jsonl + logs/ + env.json，argv 脱敏）
 │   ├── runner.py          # Runner: 执行评测，直接写实验目录的 runs/<dataset>/…
 │   ├── snapshot.py        # 状态快照与回放：逐对话 manifest / 池源解析、跑前校验、保真比对
@@ -30,14 +31,15 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 │   ├── fuse.py            # fuse: 分片产物融合为完整实验目录（就地 --task-dir 或跨目录，指标重算 + 门禁）
 │   ├── compare.py         # compare_runs: 可比性前置校验 + diff + 回归门禁（支持就地 --task-dir）
 │   ├── matrix.py          # compare_matrix: 多 run 矩阵对比（platform × commit）
+│   ├── series.py          # run_series: 多线对比（N 个版本逐步对比，线名从 commit 提取）
 │   ├── evaluate.py        # evaluate: 基准集加权融合（办公域单列）+ stale 门禁
 │   ├── evaluate_compare.py # evaluate_compare: 两组 × 多数据集融合 A/B 对比
 │   ├── ratings.py         # 综合评级阈值表 METRIC_THRESHOLDS
 │   ├── userdata.py        # 用户测试集管理: install / status / delete / resolve
 │   ├── report.py          # report.md + 图表（matplotlib Agg，可选）+ 报告导出
 │   └── cli.py             # CLI: task init|status / run / evaluate / evaluate-compare /
-│                          #      fuse / compare / matrix / doctor / adapter / user-data /
-│                          #      list-datasets / dataset info|fetch
+│                          #      fuse / compare / matrix / series / doctor / adapter /
+│                          #      user-data / list-datasets / dataset info|fetch
 ├── tests/                 # pytest（含 mock-weak vs mock-strong 端到端）
 └── examples/
     ├── quickstart.py      # 最小接入示例
@@ -598,6 +600,50 @@ label 推荐 `platform@commit` 格式（也接受任意字符串）。实验目�
 3. 所有两两组合的门禁判定（复用 compare 的 PASS/WARN/FAIL 规则）；
 4. accuracy 分组条形图（x=commit、hue=platform，或反之取合理者）。
 
+## 多线对比（N 个版本逐步对比）
+
+做了多个优化点、每个优化点一个 commit 时，A/B 只能回答"最后一版比基线好多少"，
+`series` 回答"**每一步**提升多少"——按 `--line` 的给出顺序（即时间顺序）对比 N 条线：
+
+```bash
+# --line 每条线一项，顺序即时间顺序：
+#   左侧 = commit（7~40 位十六进制）或显式线名；右侧 = 实验目录或 runs/<dataset> 数据集目录
+python -m membench.cli series \
+  --repo /path/to/your/repo \
+  --line <sha_A>=output/eval_v1_<ts>/runs/<dataset> \
+  --line <sha_B>=output/eval_v2_<ts>/runs/<dataset> \
+  --line <sha_C>=output/eval_v3_<ts>/runs/<dataset> \
+  [--dataset NAME] [--report-out output/] \
+  [--require-comparable] [--fusion weighted|equal] [--fusion-cap 500]
+```
+
+- **线名从 commit 信息提取**，一眼看出优化点：`git -C <repo> log -1 --format=%s <commit>`
+  的 subject 去掉 conventional-commit 前缀（`feat(scope):` / `fix：` 等，中英文冒号都认）、
+  剥首尾标点与多余空白，再截断到 24 个字。**最早的版本（第一条）命名为「基线」**（左侧
+  给了显式名时用显式名；基线就是第一个 commit，它的 subject 不再重复展示）。
+- git 取不到（非 git 目录 / commit 不存在）或 subject 不含中文 → 线名回退短 sha 并在
+  stderr 告警一次，不中断；重名追加 `（<sha8>）` 区分（没有 sha 的显式名退 `（第N线）`）。
+  左侧不是 7~40 位十六进制就是**显式线名**，原样使用。
+- 每条线的产物目录可以是实验目录或 `runs/<dataset>` 数据集目录。**每条线必须在同一批
+  数据集上评测**（缺 / 多直接报错）；多数据集时报告同时给逐数据集表与加权融合值
+  （口径同 `evaluate`，办公域槽位不参与基准融合；`--fusion` / `--fusion-cap` 可调），
+  `--dataset` 只比其中一个数据集。
+- 报告 `reports/report.md`：**结论表**（线序 / 名称 / commit 短 sha / accuracy /
+  证据召回率 / ↑vs 基线 / ↑vs 上一步 / 门禁）+ **逐指标表**（行=指标，列=各线 +
+  每线 vs 基线的差值，始终保留基线一列）+ **逐数据集 accuracy 表**（多数据集时，
+  单元格为值 + (vs 基线)）+ 门禁明细 + 来源与产物表；配图
+  `reports/fig_series_accuracy.png`（accuracy 随线序的走势，多数据集为多条折线 + 融合粗线）。
+  各线的数据集树副本落 `runs/<线序>-<slug>/<dataset>/`（中文名经 `slug` 会退化成
+  `default`，所以目录名带线序前缀；报告里给可点击的相对链接）。
+- 门禁与 `compare` 同口径（accuracy 降 >0.02 / stale_rate 升 >0.02 判 FAIL，
+  latency_p95 升 >30% 记 WARN）；**任一线的门禁 FAIL → 退出码 1**。`--require-comparable`
+  时每条线 vs 基线跑可比性校验，关键维度不一致 / 无法核验计入 FAIL。多线对比里
+  `commit` 是被测变量（不在关键维度），但 `adapter` / `adapter_version` / 判分器 /
+  驱动模型 / 数据集指纹等关键维度要保持一致——按 commit 递增 `adapter_version` 会让
+  strict 模式判 FAIL。
+- **只读**：series 不改任何源产物（只读 `<数据集目录>/report/metrics.json` 并复制副本），
+  不改 `compare` / `evaluate` / `fuse` 的既有语义。
+
 ## 产物布局（一次实验一个自包含子目录）
 
 一次评测 = 一个**任务目录**：单臂任务就是 `eval_<name>_<platform>_<ts>`（自身即完整评测产物根），双臂 A/B 任务是 `compare_<name>_<platform>_<ts>`（`A/` 与 `B/` 是两个臂，**各为一个完整的单臂产物根**）。报告与其对应的逐题数据就近归属在同一个任务目录里，不再与全局 run 混放。任务目录的**父目录**由 `membench.paths.output_root()` 统一判定：`MEMBENCH_OUTPUT_DIR` > skill 包的 `output/` > 工程根 `output/`；目录名与层级的唯一来源是 `membench/layout.py`。
@@ -645,6 +691,12 @@ DIR/{eval_<name>_<platform>_<ts> | compare_<name>_<platform>_<ts>}/
 DIR/matrix_<ts>/
 ├── reports/{report.md,matrix_result.json,fig_matrix_accuracy.png}
 └── runs/<label>/                        # 各 label 的数据集树副本（内部同 eval 的 runs/<dataset>/…）
+
+# 多线对比（series：--report-out DIR 为父目录）
+DIR/series_<ts>/
+├── reports/{report.md,fig_series_accuracy.png}
+└── runs/<线序>-<slug>/<dataset>/        # 各线的数据集树副本（报告内相对链接可点）
+
 ```
 
 **实验级 `runtime/`（与对话级 runtime 区分）**：每次会写产物的命令在它自己的顶层输出容器（`eval_*`、`compare_*`、`matrix_*`、`fuse` 的目标目录、`task init` 的新任务目录）下建 `runtime/`；`run --task-dir <任务>/A` 这类命令的容器就是臂目录，runtime 落 `A/`（`evaluate-compare` 一条命令写两臂时，容器是 `compare_*` 根，runtime 记在那里）：
@@ -664,10 +716,10 @@ DIR/matrix_<ts>/
 - `compare --task-dir DIR`：就地读 `DIR/A`（基线）与 `DIR/B`（候选），`comparison.md` 落 `DIR/reports/`，不新建 `compare_*`、也不复制两臂；
 - `fuse --task-dir DIR`：就地补齐数据集级与任务级产物（各片本来就写在这一棵树里），与 `--runs/--out` 互斥。
 
-- 不传 `--report-out` / `--task-dir` / `--out` 时一律落 `output_root()`：`run` / `evaluate` 落 `output_root()/eval_<adapter>_<platform>_<ts>/`，`compare` / `evaluate-compare` 落 `output_root()/compare_<name>_<platform>_<ts>/`，`matrix` 落 `output_root()/matrix_<ts>/`。
+- 不传 `--report-out` / `--task-dir` / `--out` 时一律落 `output_root()`：`run` / `evaluate` 落 `output_root()/eval_<adapter>_<platform>_<ts>/`，`compare` / `evaluate-compare` 落 `output_root()/compare_<name>_<platform>_<ts>/`，`matrix` 落 `output_root()/matrix_<ts>/`，`series` 落 `output_root()/series_<ts>/`。
 - **分片账本** `runs/<dataset>/shards.<i>.json`（逐片条目）+ `runs/<dataset>/shards.json`（物化视图）：多片共用一个任务目录（或跨目录各落一棵）时那棵树"跑到哪了"的记录；口径（`shards` / `shard_by` / `limit` / 数据集指纹）与本次不一致会被拒绝，`fuse` 与 `task status` 都经 `layout.read_shard_ledger` 读合并结果（旧产物没有逐片条目时才读 `shards.json`）。分片只写各片负责的对话目录 + 账本，数据集级与任务级产物由 `fuse` 补齐（见「大数据集：冒烟与分片」）。
 - **对话级报告**除本对话指标外，还给该对话记忆快照的可点击相对链接（`../memory_snapshot/`）与清单条目数 / 体积——跑完 ingest 就能翻记忆文件；分片产物的对话级报告顶部另有「分片 i/N——仅覆盖部分题目」标注。
-- 命名与落位 helper 是**公开 API**（不必自己重写约定）：`membench.layout` 的 `task_subdir` / `init_task_dir` / `arm_dir` / `eval_subdir` / `compare_subdir` / `matrix_subdir` / `experiment_tags` / `run_id` / `run_id_tags` / `experiment_path` / `runs_root` / `dataset_dir` / `dataset_report_dir` / `dialogue_dir` / `dialogue_report_dir` / `dialogue_runtime_dir` / `dialogue_snapshot_dir` / `shard_ledger_path` / `read_shard_ledger` / `task_report_dir` / `resolve_dataset_dir`，以及回放任务快照池的 `snapshot_pool_root` / `snapshot_arm_key` / `snapshot_entry_path` / `snapshot_bucket_dir` / `snapshot_index_path` / `read_snapshot_entry` / `write_snapshot_entry` / `build_snapshot_index` / `materialize_snapshot_index` / `read_snapshot_index` / `write_snapshot_index`；产物根 `membench.paths.output_root()`。运行时数据的读取走 `membench.runtime` 的 `runtime_dir` / `commands_path` / `read_commands` / `summarize`，不要在调用方重解析 `commands.jsonl`。
+- 命名与落位 helper 是**公开 API**（不必自己重写约定）：`membench.layout` 的 `task_subdir` / `init_task_dir` / `arm_dir` / `eval_subdir` / `compare_subdir` / `matrix_subdir` / `series_subdir` / `experiment_tags` / `run_id` / `run_id_tags` / `experiment_path` / `runs_root` / `dataset_dir` / `dataset_report_dir` / `dataset_dirs` / `series_line_dir` / `dialogue_dir` / `dialogue_report_dir` / `dialogue_runtime_dir` / `dialogue_snapshot_dir` / `shard_ledger_path` / `read_shard_ledger` / `task_report_dir` / `resolve_dataset_dir`，以及回放任务快照池的 `snapshot_pool_root` / `snapshot_arm_key` / `snapshot_entry_path` / `snapshot_bucket_dir` / `snapshot_index_path` / `read_snapshot_entry` / `write_snapshot_entry` / `build_snapshot_index` / `materialize_snapshot_index` / `read_snapshot_index` / `write_snapshot_index`；产物根 `membench.paths.output_root()`。运行时数据的读取走 `membench.runtime` 的 `runtime_dir` / `commands_path` / `read_commands` / `summarize`，不要在调用方重解析 `commands.jsonl`。
 - **读取方的「产物目录」入参**（`compare --baseline/--candidate`、`evaluate --from-runs`、`evaluate-compare --baseline-run/--candidate-run`、`matrix --runs` 右值、`run --replay`、`run --replay-verify-source`、`fuse --runs`）统一经 `layout.resolve_dataset_dir` 解析：传**实验目录**（其下恰有一个数据集目录时自动定位；有多个则要求指向具体数据集目录）或**数据集目录**（`<实验目录>/runs/<dataset>`）都行；指标固定读 `<数据集目录>/report/metrics.json`。`run --replay` 另接受**回放任务**（带 `snapshots/` 的任务根或臂目录），按逐对话条目取桶而不是走数据集目录（见「回放任务的快照池」）。未融合的分片产物（数据集目录下只有账本与对话目录）会明确要求先 `fuse`——"没融合"与"没产物"是两回事。`--from-runs` 的 `KEY` 还会与实际产物身份核对：`office` ↔ `office_dataset`（或用户测试集的 `user_dataset`）这类"key 与目录名不同"的映射由数据集注册表反推，不会拿 key 与目录名直接比字符串；key 认错时直接报错，不把别的数据集的分数记到该 key 名下。
 - Runner API 使用者传 `Runner(..., out_dir=实验目录)`：Runner 直接写 `<实验目录>/runs/<dataset>/…`（数据集级报告 + 逐对话报告 + `runtime/`），任务级报告落 `<实验目录>/reports/`，并把 `experiment_dir` / `dataset_dir` 写回 `metrics.json`。
 - 旧版产物（平铺的 run 目录、缺 `report/` 层级）**不再兼容**：读取时统一报错「产物结构为旧版（缺少 report/ 层级），本版本不再兼容，请重新跑评测」。目录里**根本没有**数据集产物（空目录、跑到一半中断）另有独立报错文案——那是"没有产物"而不是"版本旧"，别去改代码兼容，换个目录或重跑即可。

@@ -4,7 +4,7 @@
 
 ## 这是什么
 
-membench 是 **Agent 记忆系统评测框架**（Python 包 + CLI）：对被测记忆系统跑多会话数据集，产出六维指标报告（run）、多数据集全量评估（evaluate：基准集按题数加权宏平均、办公域槽位单列业务结论）、A/B 回归门禁（compare）、平台×commit 矩阵（matrix）。仓库同时维护一个 **agent skill 包**（`skill/agent-memory-eval.skill`），把 membench 与工作流封装给 agent 使用。
+membench 是 **Agent 记忆系统评测框架**（Python 包 + CLI）：对被测记忆系统跑多会话数据集，产出六维指标报告（run）、多数据集全量评估（evaluate：基准集按题数加权宏平均、办公域槽位单列业务结论）、A/B 回归门禁（compare）、平台×commit 矩阵（matrix）、多线逐步对比（series：N 个版本按时间顺序对比，线名从 commit 信息提取）。仓库同时维护一个 **agent skill 包**（`skill/agent-memory-eval.skill`），把 membench 与工作流封装给 agent 使用。
 
 ## 目录结构
 
@@ -19,7 +19,7 @@ membench/                 # 评测工程（Python 包工程根）
 │   ├── layout.py         # 【唯一】任务目录 / 实验目录命名与路径 helper（task_subdir / init_task_dir / arm_dir / eval_* / compare_* / matrix_* / 分片账本 / resolve_dataset_dir）
 │   ├── agent_loop.py     # tool-call 循环复用（run_tool_loop / AgentLoopAdapter）
 │   ├── doctor.py         # 三端点连通性与契约校验
-│   ├── runner.py / evaluate.py / compare.py / matrix.py / fuse.py / report.py
+│   ├── runner.py / evaluate.py / compare.py / matrix.py / series.py / fuse.py / report.py
 │   ├── userdata.py       # 用户测试集 install / status / delete / resolve
 │   └── cli.py            # CLI 入口
 ├── tests/                # pytest
@@ -62,6 +62,7 @@ docs/                     # 深度研究报告 + 配图
      - `reports/`：任务级报告（`report.md`、`metrics.json`、`evaluate_summary.json`、`fig_dataset_overview.png`——`evaluate_summary.json` **无条件产出**，不区分单/多数据集）
    - `output/compare_<name>_<platform>_<ts>/`：`A/`、`B/`（`layout.DIR_ARM_A` / `DIR_ARM_B`；各为完整 eval 实验形态，含自己的 `runs/` 与 `reports/`）+ `reports/{comparison.md,fig_*.png}`
    - `output/matrix_<ts>/`：`reports/{report.md,matrix_result.json,fig_matrix_accuracy.png}` + `runs/<label>/`
+   - `output/series_<ts>/`：多线对比（`series`，只读产物）——`reports/{report.md,fig_series_accuracy.png}` + `runs/<线序>-<slug>/<dataset>/`（各线的数据集树副本）。`--line <commit-or-name>=<DIR>` 按时间顺序重复给出，第一条默认叫「基线」，其余线名从 `git -C <repo> log -1 --format=%s` 的 subject 提取（去 conventional 前缀、剥首尾标点、截断 24 字，取不到回退短 sha 并告警）；多数据集线按同一套融合口径（office 不参与）并给逐数据集表；任一线的门禁 FAIL → 退出码 1。
    - 分片（`shards>1`）**只写本片负责的对话目录 + 账本** `runs/<dataset>/shards.<i>.json`（逐片原子写；`shards.json` 是物化视图），不写数据集级 `report/` 与任务级 `reports/`（分片产物不是"完整实验"，一律由 `fuse` 补齐：`--task-dir DIR` 就地补齐，或 `--runs ... --out ...` 跨目录融合）；多片共用一个任务目录时**只允许 `--shard-by dialogue`**（题目级分片会让多片写同一对话目录互相覆盖），同一分片重复跑直接拒绝。
    - CLI `--report-out DIR` 一律指**实验目录的父目录**（缺省 `output_root()`）；`fuse --out` / `matrix --out` 指**完整实验目录**，`--task-dir` 指已存在的任务目录（或其臂目录）。
    - 「产物目录」入参（`--baseline` / `--candidate` / `--from-runs` / `--baseline-run` / `--candidate-run` / `fuse --runs` 各项 / `matrix --runs` 的 `=` 右值 / `--replay` / `--replay-verify-source`）统一接受**实验目录**或 `runs/<dataset>` 数据集目录，经 `layout.resolve_dataset_dir` 解析。`--from-runs` 的 `KEY` 另按数据集注册表核对身份（`office` ↔ `office_dataset` / `user_dataset`），key 认错直接报错——`resolve_dataset_dir` 的"提示不命中回退到唯一数据集目录"只服务真正的自定义 key。

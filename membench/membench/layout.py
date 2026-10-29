@@ -26,6 +26,7 @@
 
     <root>/compare_<name>_<platform>_<ts>/   A/ B/（各为完整评测产物根）+ runtime/ + reports/
     <root>/matrix_<ts>/                      runtime/ + reports/ + runs/<label>/（内部同 eval 树）
+    <root>/series_<ts>/                      runtime/ + reports/ + runs/<线序>-<slug>/（各线数据集树副本）
 
 **回放任务**（``task init --replay``）在任务目录根多一个内容寻址快照池 ``snapshots/``：
 回放导出的状态按内容哈希去重成桶 ``snapshots/<sha256 前 12 位>/``，**每个对话一个
@@ -103,6 +104,7 @@ FIG_DATASET_OVERVIEW = "fig_dataset_overview.png"
 FIG_MATRIX_ACCURACY = "fig_matrix_accuracy.png"
 FIG_PER_DATASET_DIFF = "fig_per_dataset_diff.png"
 FIG_FUSED_DIFF = "fig_fused_diff.png"
+FIG_SERIES_ACCURACY = "fig_series_accuracy.png"
 
 #: 实验目录名安全化：非字母数字与 ``._-`` 的字符替换为 ``-``。
 _UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -220,6 +222,11 @@ def compare_subdir(name: str, platform: str | None = None, ts: str | None = None
 def matrix_subdir(ts: str | None = None) -> str:
     """矩阵对比实验目录名：``matrix_<ts>``。"""
     return f"matrix_{ts or ts_now()}"
+
+
+def series_subdir(ts: str | None = None) -> str:
+    """多线对比实验目录名：``series_<ts>``（与 ``matrix_<ts>`` 同形，不带线数）。"""
+    return f"series_{ts or ts_now()}"
 
 
 def experiment_path(base: str | None, name: str) -> str:
@@ -764,6 +771,40 @@ def dataset_dir(experiment_dir: str, dataset: str) -> str:
 def dataset_report_dir(experiment_dir: str, dataset: str) -> str:
     """数据集级报告目录：``<exp>/runs/<dataset>/report``。"""
     return os.path.join(dataset_dir(experiment_dir, dataset), DIR_REPORT)
+
+
+def dataset_dirs(experiment_dir: str) -> list[str]:
+    """实验目录 ``runs/`` 下的全部数据集目录（按目录名排序）。
+
+    读取方需要"这份产物里有哪几个数据集"时用它（如多线对比的每条线）；只要一个
+    数据集的场景仍走 :func:`resolve_dataset_dir` 的唯一命中解析。``runs/`` 下的对话
+    目录（``report/metrics.json`` 里落了 ``dialogue_id``）与没有 ``report/`` 的
+    半成品目录都不算数据集目录。
+    """
+    runs = runs_root(experiment_dir)
+    if not os.path.isdir(runs):
+        return []
+    return sorted(
+        os.path.join(runs, name)
+        for name in os.listdir(runs)
+        if _is_dataset_dir(os.path.join(runs, name))
+    )
+
+
+def series_line_dir(
+    series_dir: str, index: int, name: str, commit: str | None = None
+) -> str:
+    """多线对比实验里一条线的副本目录：``<series>/runs/<线序>-<slug>``。
+
+    报告里的线名是中文（``slug`` 把整段中文替换掉、只剩 ``default``），只靠名字会
+    让所有线撞进同一个目录；线序前缀（``01-`` / ``02-``…）保证一条线一个目录。
+    名字里一个 ASCII 片段都没剩下时退回 commit 前 8 位（再退 ``line<i>``），目录名
+    至少能对应到一条可核对的来源。
+    """
+    stem = slug(name)
+    if stem == "default":
+        stem = str(commit)[:8] if commit else f"line{index + 1}"
+    return os.path.join(runs_root(series_dir), f"{index + 1:02d}-{stem}")
 
 
 def shard_ledger_path(experiment_dir: str, dataset: str) -> str:

@@ -1,5 +1,5 @@
 """membench 命令行入口：run / evaluate / evaluate-compare / fuse / compare /
-matrix / task / doctor / adapter / user-data / dataset / list-datasets。
+matrix / series / task / doctor / adapter / user-data / dataset / list-datasets。
 
 用法（SPEC 第 6 节）：
     python -m membench.cli task init --name NAME [--platform P] [--arms 1|2] \
@@ -62,6 +62,13 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
         # 也不复制两臂；不传 --task-dir 时两臂入参必填
     python -m membench.cli matrix --runs "wx@a1b2c3=<产物目录>" "fs@a1b2c3=<产物目录>" ... \
         [--out DIR] [--report-out DIR]
+    python -m membench.cli series --line <commit-or-name>=<产物目录> --line ... \
+        [--repo PATH] [--dataset NAME] [--report-out DIR] \
+        [--require-comparable] [--fusion weighted|equal] [--fusion-cap N]
+        # 多线对比：--line 顺序即时间顺序，第一条默认叫「基线」；左侧 7~40 位十六进制
+        # 视为 commit，用 git log -1 --format=%s 的 subject 自动命名（去
+        # feat(scope): / fix： 等前缀、剥首尾标点、截断 24 字），重名追加（sha8）；
+        # git 取不到或不含中文时回退短 sha 并 stderr 告警。任一线的门禁 FAIL → 退出码 1
     python -m membench.cli doctor --target http://127.0.0.1:8787 \
         [--timeout 10.0] [--api-key K]
     python -m membench.cli adapter install <adapter.py> | list | remove <name>
@@ -77,6 +84,7 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
     └── reports/                                # 任务级（report.md / metrics.json / evaluate_summary.json / fig_dataset_overview.png）
     <report-out>/compare_<name>_<platform>_<ts>/{A/,B/,runtime/,reports/comparison.md}   # 双臂任务目录
     <report-out>/matrix_<ts>/{runtime/,reports/,runs/<label>/}
+    <report-out>/series_<ts>/{runtime/,reports/,runs/<线序>-<slug>/<dataset>/}   # 多线对比
 
 回放任务（``task init --replay``）在任务目录根多一个内容寻址快照池 ``snapshots/``：
 回放导出的状态按内容哈希去重成桶 ``snapshots/<sha256 前 12 位>/``，每个对话一个
@@ -125,9 +133,11 @@ from typing import Any, Optional, Sequence
 from membench import layout, runtime
 from membench.adapters import ADAPTERS
 from membench.compare import compare_runs
+from membench.evaluate import FUSION_CHOICES, FUSION_WEIGHT_CAP
 from membench.matrix import compare_matrix
 from membench.paths import output_root
 from membench.runner import Runner
+from membench.series import run_series
 from membench.userdata import (
     delete_user_dataset,
     install_user_dataset,
@@ -267,6 +277,49 @@ def _build_parser() -> argparse.ArgumentParser:
     p_mtx.add_argument("--out", default=None, help="矩阵实验目录（完整实验目录）：报告落其 reports/，各 label 产物落其 runs/<label>/")
     p_mtx.add_argument("--report-out", default=None, help="实验目录父目录（缺省 output_root()）：产出 <DIR>/matrix_<ts>/（--out 优先于本参数）")
     p_mtx.set_defaults(func=_cmd_matrix)
+
+    # --- series ---
+    p_ser = sub.add_parser(
+        "series",
+        help="多线对比：N 个版本按时间顺序逐步对比（线名从 commit 信息提取，第一条为基线）",
+        description=(
+            "多线对比：做多个优化点、每个优化点一个 commit 时，看每一步提升多少。"
+            "--line 按时间顺序重复给出，每条线的名字从 commit subject 自动提取："
+            "左侧 7~40 位十六进制视为 commit（git log -1 --format=%s，第一条默认叫"
+            "「基线」），否则视为显式线名；subject 去掉 feat(scope): / fix： 等"
+            "conventional 前缀、剥首尾标点后截断到 24 字，git 取不到或不含中文时"
+            "回退短 sha 并在 stderr 告警（不中断）。"
+        ),
+    )
+    p_ser.add_argument(
+        "--line",
+        action="append",
+        required=True,
+        metavar="COMMIT-OR-NAME=DIR",
+        help="一条线，按时间顺序重复给出（至少两条）：左侧是 commit（7~40 位十六进制）或显式线名，"
+        "右侧是实验目录或 runs/<dataset> 数据集目录",
+    )
+    p_ser.add_argument("--repo", default=None, help="读取 commit subject 的 git 仓库路径（默认当前目录）")
+    p_ser.add_argument("--dataset", default=None, help="只比某个数据集（多数据集实验目录时用它指定）；缺省比全部数据集")
+    p_ser.add_argument("--report-out", default=None, help="实验目录父目录（缺省 output_root()）：产出 <DIR>/series_<ts>/")
+    p_ser.add_argument(
+        "--require-comparable",
+        action="store_true",
+        help="strict 可比性：每条线 vs 基线的关键维度不一致或无法核验时门禁 FAIL",
+    )
+    p_ser.add_argument(
+        "--fusion",
+        choices=list(FUSION_CHOICES),
+        default="weighted",
+        help="多数据集融合口径（默认 weighted：按参与题数加权、单集封顶 500；办公域槽位不参与）",
+    )
+    p_ser.add_argument(
+        "--fusion-cap",
+        type=int,
+        default=FUSION_WEIGHT_CAP,
+        help=f"加权融合的单数据集权重封顶（题数，默认 {FUSION_WEIGHT_CAP}）",
+    )
+    p_ser.set_defaults(func=_cmd_series)
 
     # --- task ---
     p_task = sub.add_parser("task", help="任务目录管理（init / status）：一次评测的产物根与进度视图")
@@ -926,6 +979,32 @@ def _cmd_matrix(args: argparse.Namespace) -> int:
     print(f"[membench] report: {result['report_path']}")
     # 任一两两组合判 FAIL 时以非零码退出（与 compare 同口径，可直接接 CI）
     return 1 if worst == "FAIL" else 0
+
+
+def _cmd_series(args: argparse.Namespace) -> int:
+    """series：多线对比；任一线的门禁 FAIL → 退出码 1（与 compare / matrix 同口径）。"""
+    if len(args.line) < 2:
+        raise SystemExit(
+            f"[membench] series 至少需要 2 条 --line（当前 {len(args.line)} 条）："
+            "--line <commit-or-name>=<产物目录> --line ..."
+        )
+    if args.fusion_cap < 1:
+        raise SystemExit(f"--fusion-cap 必须 >= 1，当前为 {args.fusion_cap}")
+    with _no_leftover_experiment(args.report_out):
+        try:
+            result = run_series(
+                args.line,
+                repo=args.repo,
+                dataset=args.dataset,
+                report_out=args.report_out,
+                require_comparable=args.require_comparable,
+                fusion=args.fusion,
+                fusion_cap=args.fusion_cap,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"[membench] {exc}")
+    print(f"[membench] series_dir: {result['series_dir']}")
+    return 1 if result["verdict"] == "FAIL" else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1635,7 +1714,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 #: 会写实验产物、因而需要记运行时数据的命令（``task status`` 等只读命令不记）。
 _RUNTIME_COMMANDS = frozenset(
-    {"run", "evaluate", "evaluate-compare", "compare", "fuse", "matrix"}
+    {"run", "evaluate", "evaluate-compare", "compare", "fuse", "matrix", "series"}
 )
 
 
