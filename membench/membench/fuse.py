@@ -61,8 +61,10 @@
 分片并行回放各写各的条目，索引只在收尾时由这里的 :func:`membench.layout.materialize_snapshot_index`
 物化，读者不会看到半成品。
 
-门禁判定（stale 一票否决）对融合结果同样生效：存在 knowledge_update 题且 stale_rate
-超过阈值（与 evaluate 的办公域门禁同阈值）即 FAIL。
+门禁判定（stale 一票否决）对融合结果同样生效，但**只作用于办公域槽位数据集**
+（身份口径与 evaluate 一致，见 :func:`membench.evaluate.is_office_slot_dataset`）：
+存在 knowledge_update 题且 stale_rate 超过阈值（与 evaluate 的办公域门禁同阈值）时
+办公域槽位判 FAIL；非办公域数据集超阈值只记 ``INFO``（诊断，不触发一票否决）。
 """
 
 from __future__ import annotations
@@ -75,7 +77,7 @@ from typing import Any, Union
 
 from membench import layout, runtime
 from membench.data.schema import dataset_fingerprint, load_dataset
-from membench.evaluate import STALE_GATE_THRESHOLD
+from membench.evaluate import STALE_GATE_THRESHOLD, is_office_slot_dataset
 from membench.metrics import aggregate
 from membench.report import copy_report, render_dataset_report, render_dialogue_report
 from membench.runner import select_shard_questions
@@ -160,14 +162,21 @@ def fuse_gate(
     metrics: dict[str, Any],
     threshold: float = STALE_GATE_THRESHOLD,
 ) -> dict[str, Any]:
-    """融合结果的 stale 门禁（一票否决，与 evaluate 办公域门禁同阈值）。
+    """融合结果的 stale 门禁（一票否决，**只作用于办公域槽位**）。
 
-    融合结果中存在 knowledge_update 题时：stale_rate > threshold -> FAIL
-    （退出码 1）；无 knowledge_update 题、或 stale_rate 未计算（``None``，
-    如数据集缺 gold_stale 标注）-> SKIP——不把"未计算"当 0 判 PASS。
+    stale 红线的业务含义是"办公域槽位不能答旧值"，不是所有数据集的通用指标：
+    数据集身份按 :func:`membench.evaluate.is_office_slot_dataset` 判定（取
+    ``metrics`` 里的 ``dataset_path``，缺失时退回 ``dataset`` 作目录名兜底），
+    与 evaluate 的槽位口径一致。
+
+    - 无 knowledge_update 题、或 stale_rate 未计算（``None``，如数据集缺
+      gold_stale 标注）-> SKIP——不把"未计算"当 0 判 PASS；
+    - 办公域槽位：stale_rate > threshold -> FAIL（一票否决，退出码 1），否则 PASS；
+    - 非办公域数据集：一律 INFO（仅诊断，不触发一票否决；不返回 PASS——
+      PASS 会被读成"红线通过"，而它不在门禁管辖内）。
 
     Returns:
-        ``{"status": "PASS"|"FAIL"|"SKIP", "detail": 说明}``。
+        ``{"status": "PASS"|"FAIL"|"INFO"|"SKIP", "detail": 说明}``。
     """
     if not any(r.get("category") == "knowledge_update" for r in records):
         return {"status": "SKIP", "detail": "融合结果中无 knowledge_update 题，stale 门禁跳过。"}
@@ -178,17 +187,31 @@ def fuse_gate(
             "detail": "融合结果 stale_rate 未计算（None，数据缺 stale 标注或分片未落账），stale 门禁跳过。",
         }
     stale_rate = float(stale_raw)
+    is_office = is_office_slot_dataset(
+        str(metrics.get("dataset_path") or ""), str(metrics.get("dataset") or "")
+    )
+    # 非办公域：无论是否超阈值都不是"门禁"，一律 INFO——返回 PASS 会被读成
+    # "这条红线通过了"，而它根本不在门禁的管辖范围内。
+    if not is_office:
+        comparator = ">" if stale_rate > threshold else "<="
+        return {
+            "status": "INFO",
+            "detail": (
+                f"非办公域数据集，stale_rate={stale_rate:.3f} {comparator} 阈值 "
+                f"{threshold}，仅诊断，不参与一票否决。"
+            ),
+        }
     if stale_rate > threshold:
         return {
             "status": "FAIL",
             "detail": (
-                f"融合结果 stale_rate={stale_rate:.3f} > 阈值 {threshold}，"
+                f"办公域槽位数据集 stale_rate={stale_rate:.3f} > 阈值 {threshold}，"
                 "一票否决：评测不达标。"
             ),
         }
     return {
         "status": "PASS",
-        "detail": f"融合结果 stale_rate={stale_rate:.3f} <= 阈值 {threshold}。",
+        "detail": f"办公域槽位数据集 stale_rate={stale_rate:.3f} <= 阈值 {threshold}。",
     }
 
 

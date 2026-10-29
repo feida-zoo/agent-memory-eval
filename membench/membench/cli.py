@@ -53,6 +53,7 @@ matrix / task / doctor / adapter / user-data / dataset / list-datasets。
         [--baseline-run KEY=DIR]... [--candidate-run KEY=DIR]...  # 两侧复用+补跑
     python -m membench.cli fuse --runs <分片产物目录>,... --out <完整实验目录> \
         | python -m membench.cli fuse --task-dir <任务目录>   # 就地融合（不新建目录）
+        # stale 门禁只对办公域槽位一票否决；非办公域数据集超阈值记 INFO（仅诊断）、退出码 0
     python -m membench.cli compare --baseline <产物目录> --candidate <产物目录> \
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
         [--require-comparable] [--tag <name>] [--report-out DIR | --task-dir DIR]
@@ -244,7 +245,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cmp.set_defaults(func=_cmd_compare)
 
     # --- fuse ---
-    p_fuse = sub.add_parser("fuse", help="融合同一评测的多个分片产物（跨目录合并或就地补齐）")
+    p_fuse = sub.add_parser("fuse", help="融合同一评测的多个分片产物（跨目录合并或就地补齐；stale 门禁只对办公域槽位一票否决，非办公域超阈值记 INFO）")
     p_fuse.add_argument("--runs", default=None, help="逗号分隔的分片产物目录列表（实验目录或 runs/<dataset> 数据集目录；需覆盖全部 shard_index）；与 --out 一起用，或用 --task-dir 就地融合")
     p_fuse.add_argument("--out", default=None, help="融合产物输出的完整实验目录：数据集产物落其 runs/<dataset>/，任务级报告落其 reports/")
     p_fuse.add_argument(
@@ -853,7 +854,11 @@ def _cmd_compare(args: argparse.Namespace) -> int:
 
 
 def _cmd_fuse(args: argparse.Namespace) -> int:
-    """fuse：融合多个分片产物（跨目录合并 / 就地补齐）；stale 门禁 FAIL 时非零码退出。"""
+    """fuse：融合多个分片产物（跨目录合并 / 就地补齐）。
+
+    退出码只看 stale 门禁的 ``FAIL``（办公域槽位一票否决）；``INFO``（非办公域
+    数据集 stale 超阈值，仅诊断）、``PASS``、``SKIP`` 都是 0。
+    """
     from membench.fuse import fuse_runs
 
     if args.task_dir is not None:

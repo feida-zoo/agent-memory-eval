@@ -9,9 +9,52 @@ import pytest
 
 from membench import cli, layout
 from membench.adapters import MockStrongAdapter, MockWeakAdapter
+from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
 from membench.data import SAMPLE_DATASET_PATH
 from membench.evaluate import DatasetSpec, evaluate, parse_run_kv
 from membench.evaluate_compare import evaluate_compare
+from membench.runner import Runner
+
+
+class _ScriptedAdapter(BaseMemoryAdapter):
+    """按问题文本查表回答的适配器：答案固定，融合值可手算。"""
+
+    name = "scripted"
+
+    def __init__(self, script: dict[str, str]) -> None:
+        self._script = script
+
+    def reset(self) -> None:
+        pass
+
+    def ingest(self, messages: list[dict]) -> IngestStats:
+        return IngestStats()
+
+    def query(self, question: str) -> QueryResult:
+        return QueryResult(answer=self._script[question], retrieved=[])
+
+
+def _questions_dataset(path: Path, dialogue_id: str, questions: list[dict]) -> Path:
+    """把一组题目写成单 dialogue 的 JSONL 数据集。"""
+    row = {
+        "dialogue_id": dialogue_id,
+        "sessions": [[{"role": "user", "content": "记一下。", "timestamp": None}]],
+        "questions": questions,
+    }
+    path.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
+def _run_product(dataset: Path, adapter: BaseMemoryAdapter, out_dir: Path) -> str:
+    """跑一份全量 run，返回其数据集目录。"""
+    return Runner(adapter, str(dataset), judge="heuristic", out_dir=str(out_dir)).run()
+
+
+def _summary_of(report_out: Path) -> dict:
+    eval_dir = next(report_out.glob("eval_*"))
+    return json.loads(
+        (eval_dir / "reports" / "evaluate_summary.json").read_text(encoding="utf-8")
+    )
 
 
 def _dataset_row(dialogue_id: str, qid: str) -> dict:
@@ -97,6 +140,98 @@ def test_evaluate_pure_aggregate_from_runs(tmp_path: Path) -> None:
     for key, rel in summary["runs"].items():
         assert rel == f"runs/{key}"
         assert (eval_dir / rel / "report" / "metrics.json").is_file()
+
+
+def test_from_runs_without_office_fuses_every_dataset(tmp_path: Path) -> None:
+    """纯汇总未含 office：没有办公域槽位，全部数据集参与基准融合、门禁 SKIP。
+
+    回归：位置兜底曾把清单第一个（locomo）当成办公域槽位——它被踢出基准融合，
+    它的 stale 被当成业务门禁，accuracy 只剩其余数据集的值。
+    """
+    locomo_qs = [
+        {
+            "qid": f"l_q{i}",
+            "question": f"locomo 问题 {i}？",
+            "gold_answer": f"答案{i}",
+            "category": "single_hop",
+            "evidence": [],
+        }
+        for i in range(1, 5)
+    ]
+    beam_qs = [
+        {
+            "qid": f"b_q{i}",
+            "question": f"beam 更新问题 {i}？",
+            "gold_answer": "周五",
+            "category": "knowledge_update",
+            "evidence": [],
+            "gold_stale": "周三",
+        }
+        for i in (1, 2)
+    ]
+    locomo = _questions_dataset(tmp_path / "locomo.jsonl", "loco_d1", locomo_qs)
+    beam = _questions_dataset(tmp_path / "beam_1m.jsonl", "beam_d1", beam_qs)
+    script = {q["question"]: q["gold_answer"] for q in locomo_qs}
+    script.update({q["question"]: "周三" for q in beam_qs})  # beam 两题都答旧值：stale 且错
+    adapter = _ScriptedAdapter(script)
+    locomo_run = _run_product(locomo, adapter, tmp_path / "r_locomo")
+    beam_run = _run_product(beam, adapter, tmp_path / "r_beam")
+    locomo_accuracy = json.loads(
+        (Path(locomo_run) / "report" / "metrics.json").read_text(encoding="utf-8")
+    )["overall"]["accuracy"]
+    assert locomo_accuracy == pytest.approx(1.0)
+
+    rc = evaluate(
+        None,
+        None,
+        report_out=str(tmp_path / "pure"),
+        from_runs={"locomo": locomo_run, "beam_1m": beam_run},
+    )
+    assert rc == 0
+    summary = _summary_of(tmp_path / "pure")
+    assert summary["datasets"] == ["locomo", "beam_1m"]
+    # 无办公域身份 -> 没有槽位 -> 门禁 SKIP（不是拿第一个数据集的 stale 判）
+    assert summary["gate"]["status"] == "SKIP"
+    acc = summary["fused"]["accuracy"]
+    assert acc["participants"] == ["locomo", "beam_1m"]
+    # 4 题全对 + 2 题全错，按题数加权：(4*1 + 2*0) / 6——locomo 没被剔除
+    assert acc["value"] == pytest.approx(4 / 6)
+    assert [w["key"] for w in acc["weights"]] == ["locomo", "beam_1m"]
+    assert [w["denominator"] for w in acc["weights"]] == [4, 2]
+    # stale 指标只有 beam 参与（locomo 无 gold_stale 标注）
+    assert summary["fused"]["stale_rate"]["participants"] == ["beam_1m"]
+
+
+def test_from_runs_with_office_marks_slot_and_gates_on_its_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """纯汇总含 office 产物：按数据集身份标为槽位——不参与基准融合，门禁看它的 stale。"""
+    from membench.userdata import builtin_office_dataset_path
+
+    monkeypatch.setenv("MEMBENCH_USER_DATA_DIR", str(tmp_path / "user_dataset"))
+    locomo = _write_dataset(tmp_path / "locomo.jsonl", "loco_d1", "l_q1")
+    adapter = MockWeakAdapter()
+    locomo_run = _run_product(locomo, adapter, tmp_path / "r_locomo")
+    office_run = _run_product(
+        builtin_office_dataset_path(), adapter, tmp_path / "r_office"
+    )
+    locomo_accuracy = json.loads(
+        (Path(locomo_run) / "report" / "metrics.json").read_text(encoding="utf-8")
+    )["overall"]["accuracy"]
+
+    rc = evaluate(
+        None,
+        None,
+        report_out=str(tmp_path / "pure"),
+        from_runs={"locomo": locomo_run, "office": office_run},
+    )
+    # mock-weak 在 office 上 stale_rate=0.1 > 阈值 0.03：门禁 FAIL、退出码 1
+    assert rc == 1
+    summary = _summary_of(tmp_path / "pure")
+    assert summary["fused"]["accuracy"]["participants"] == ["locomo"]
+    assert summary["fused"]["accuracy"]["value"] == pytest.approx(locomo_accuracy)
+    assert summary["gate"]["status"] == "FAIL"
+    assert "办公域槽位" in summary["gate"]["detail"]
 
 
 def test_evaluate_gap_fill_from_runs(tmp_path: Path) -> None:

@@ -127,13 +127,14 @@ python -m membench.cli evaluate --adapter <a> \
 
 结果落 `--report-out` 父目录下的 `eval_<adapter>_<platform>_<ts>/`：每个数据集一棵 `runs/<dataset>/`（数据集级报告在 `report/`，逐对话产物在 `<对话目录>/`），任务级报告在 `reports/`（含 `evaluate_summary.json`）。也可用 `--task-dir DIR` 写进已存在的任务目录（不新建目录，见「产物布局」）。
 
-**汇总模式（`--from-runs KEY=DIR`，可重复）**：目标数据集里已有产物的直接复用、缺失的补跑，最后统一出融合/评级/门禁报告；复用的数据集产物会并入本次实验目录的 `runs/<dataset>/`，整个实验目录可搬移。`DIR` 是**实验目录**（其下恰有一个数据集目录时自动选它，多数据集实验目录请直接指向数据集目录）或**数据集目录**（`<实验目录>/runs/<dataset>`，目录名 = 数据集文件名去扩展名，如 `office_dataset`、`locomo`、`beam_1m`）。**被测对象与评测口径（`adapter / adapter_version / driver_llm / judge / judge_model / 检索口径`）同一侧必须一致**——已有产物之间混用、或补跑参数与已有产物不一致，都在**开跑之前**直接拒绝（对比场景同理，每侧固定一个被测对象，差异变量只应发生在两侧之间），避免跑完才发现汇总不可归因。仅跨产物的 `platform` 差异保留：在控制台与报告顶部**显著标注**。全新评测缺 `--driver-llm / --adapter-version` 时启动即提示——严格可比性（`compare --require-comparable`）会判这些关键维度「无法核验」，且无法事后补记。
+**汇总模式（`--from-runs KEY=DIR`，可重复）**：目标数据集里已有产物的直接复用、缺失的补跑，最后统一出融合/评级/门禁报告；复用的数据集产物会并入本次实验目录的 `runs/<dataset>/`，整个实验目录可搬移。`DIR` 是**实验目录**（其下恰有一个数据集目录时自动选它，多数据集实验目录请直接指向数据集目录）或**数据集目录**（`<实验目录>/runs/<dataset>`，目录名 = 数据集文件名去扩展名，如 `office_dataset`、`locomo`、`beam_1m`）。**纯汇总（`--from-runs` 且未给 `--dataset`）不按位置指定办公域槽位**：只有数据集身份命中办公域（内置 office / 用户测试集）才算槽位——清单里没有 office 产物时门禁 SKIP、**全部数据集参与基准融合**（`--from-runs` 的顺序只是书写顺序，不代表谁是办公域）。**被测对象与评测口径（`adapter / adapter_version / driver_llm / judge / judge_model / 检索口径`）同一侧必须一致**——已有产物之间混用、或补跑参数与已有产物不一致，都在**开跑之前**直接拒绝（对比场景同理，每侧固定一个被测对象，差异变量只应发生在两侧之间），避免跑完才发现汇总不可归因。仅跨产物的 `platform` 差异保留：在控制台与报告顶部**显著标注**。全新评测缺 `--driver-llm / --adapter-version` 时启动即提示——严格可比性（`compare --require-comparable`）会判这些关键维度「无法核验」，且无法事后补记。
 
 说明：默认全量**包含** LongMemEval-S（每题约 50 个干扰会话 / ~115k token 的检索压力
 变体，与 oracle 的分差反映检索/精确率损失）；未下载时默认全量会报错提示先
 `dataset fetch longmemeval_s`，不需要则用 `--no-lme-s` 剔除。显式 `--dataset`
 清单中**第一个数据集承担办公域槽位**（stale 门禁作用域；无可机检 stale 题时门禁自动
-SKIP）；未显式给出时默认清单的办公域槽位规则不变。
+SKIP）；未显式给出时默认清单的办公域槽位规则不变。这条位置规则**只服务显式
+`--dataset` 清单**，纯汇总不适用（见上）。
 
 三档预设是**由宽到窄**的三个口径（不是严格集合包含：`--quick` 保留办公域槽位，`--common` 不含）：
 **默认全量**（办公域槽位 + locomo + longmemeval_oracle + gatemem_office + LongMemEval-S + BEAM-1M）；
@@ -244,10 +245,13 @@ python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/beam_
 python -m membench.cli task status "$TASK"
 
 # 4) 就地融合：校验分片齐全、口径一致、题目无重复，补齐 runs/<dataset>/report/ 与 reports/；
-#    指标重新计算，stale 门禁对融合结果同样生效，FAIL 时退出码 1。
+#    指标重新计算。stale 门禁**只对办公域槽位一票否决**（FAIL 时退出码 1）；
+#    其他数据集（如 beam_1m）stale 超阈值只记 INFO（诊断），不否决、退出码 0。
 #    （跨目录融合的写法见下；两种写法都不新建目录）
 python -m membench.cli fuse --task-dir "$TASK"
 ```
+
+**stale 门禁的作用域**：`fuse` 的 stale 一票否决**只作用于办公域槽位**（数据集身份口径与 `evaluate` 一致：内置 office / 用户测试集）；其他数据集（如 `beam_1m`）的 stale 仅诊断——超阈值时 `stale_gate.status` 记 **`INFO`**、退出码 0。没有 knowledge_update 题、或 stale_rate 未计算时记 `SKIP`（不把"未计算"当通过）。
 
 跨目录融合（各片本就落在各自实验目录，或要指定输出位置时）：
 

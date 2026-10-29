@@ -108,6 +108,27 @@ def _stale_dataset(path: Path) -> Path:
     return path
 
 
+def _plain_dataset(path: Path) -> Path:
+    """单 dialogue 两道 single_hop 题（无 knowledge_update / gold_stale）。"""
+    dialogue = {
+        "dialogue_id": "plain_d1",
+        "sessions": [[{"role": "user", "content": "截止日是周五。", "timestamp": None}]],
+        "questions": [
+            {
+                "qid": f"plain_q{i}",
+                "question": "项目截止日是哪天？",
+                "gold_answer": "周五",
+                "category": "single_hop",
+                "evidence": ["截止日是周五"],
+            }
+            for i in (1, 2)
+        ],
+    }
+    with path.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(dialogue, ensure_ascii=False) + "\n")
+    return path
+
+
 def _read_jsonl(path: Path) -> list[dict]:
     return [
         json.loads(line)
@@ -305,8 +326,10 @@ def test_fuse_two_shards_matches_full_run(tmp_path: Path) -> None:
     assert metrics["run_mode"] == "full" and metrics["limit"] is None
     # 落盘的数据集级 metrics 与返回值一致
     assert _read_metrics(result["dataset_dir"]) == metrics
-    assert result["gate"]["status"] == "PASS"
-    assert metrics["stale_gate"]["status"] == "PASS"
+    # sample_dataset 不是办公域身份：stale 只是诊断，既不是 PASS 也不是 FAIL
+    assert result["gate"]["status"] == "INFO"
+    assert "非办公域" in result["gate"]["detail"]
+    assert metrics["stale_gate"]["status"] == "INFO"
 
 
 def test_fuse_in_place_after_dialogue_shards_in_one_task_dir(tmp_path: Path) -> None:
@@ -570,9 +593,9 @@ def test_resolve_dataset_dir_reports_unfused_shard_product(tmp_path: Path) -> No
         resolve_dataset_dir(str(empty))
 
 
-def test_fuse_stale_gate_fail(tmp_path: Path) -> None:
-    """融合结果 stale_rate 超阈值 → 门禁 FAIL（一票否决，复用 evaluate 阈值）。"""
-    ds = _stale_dataset(tmp_path / "stale.jsonl")
+def test_fuse_stale_gate_fail_for_office_slot(tmp_path: Path) -> None:
+    """办公域槽位分片 stale_rate 超阈值 → 门禁 FAIL（一票否决，复用 evaluate 阈值）。"""
+    ds = _stale_dataset(tmp_path / "office_dataset.jsonl")
     s0 = _shard_run(tmp_path, "s0", _StaleAdapter(), 2, 0, dataset=ds)
     s1 = _shard_run(tmp_path, "s1", _StaleAdapter(), 2, 1, dataset=ds)
     result = fuse_runs([s0, s1], str(tmp_path / "fused"))
@@ -581,6 +604,44 @@ def test_fuse_stale_gate_fail(tmp_path: Path) -> None:
     assert result["metrics"]["stale_gate"]["status"] == "FAIL"
     # 门禁结论落盘：数据集级 metrics.json 里同样标 FAIL（读产物即可复核结论）
     assert _read_metrics(result["dataset_dir"])["stale_gate"]["status"] == "FAIL"
+
+    # CLI 退出码只看 FAIL：办公域超阈值 -> 1
+    from membench import cli
+
+    assert cli.main(["fuse", "--runs", f"{s0},{s1}", "--out", str(tmp_path / "fused_cli")]) == 1
+
+
+def test_fuse_stale_gate_info_for_non_office_dataset(tmp_path: Path) -> None:
+    """非办公域数据集 stale_rate 超阈值 → 仅诊断（INFO），不触发一票否决。
+
+    stale 红线是办公域槽位的业务口径；beam 这类公开基准集的 stale_rate 高只说明
+    旧值命中多，不能据此把整场评测判不达标（回归：run_task 多数据集流程里 beam 的
+    per-dataset fuse 曾因此退出码 1，产物本身并无问题）。
+    """
+    ds = _stale_dataset(tmp_path / "stale.jsonl")
+    s0 = _shard_run(tmp_path, "s0", _StaleAdapter(), 2, 0, dataset=ds)
+    s1 = _shard_run(tmp_path, "s1", _StaleAdapter(), 2, 1, dataset=ds)
+    result = fuse_runs([s0, s1], str(tmp_path / "fused"))
+    assert result["metrics"]["overall"]["stale_rate"] == pytest.approx(1.0)
+    assert result["gate"]["status"] == "INFO"
+    assert "非办公域" in result["gate"]["detail"]
+    assert result["metrics"]["stale_gate"]["status"] == "INFO"
+    assert _read_metrics(result["dataset_dir"])["stale_gate"]["status"] == "INFO"
+
+    # CLI 退出码 0：INFO 不是 FAIL
+    from membench import cli
+
+    assert cli.main(["fuse", "--runs", f"{s0},{s1}", "--out", str(tmp_path / "fused_cli")]) == 0
+
+
+def test_fuse_office_slot_without_stale_skips(tmp_path: Path) -> None:
+    """办公域槽位无 knowledge_update 题 → 门禁 SKIP（没有判定依据不等于 PASS）。"""
+    ds = _plain_dataset(tmp_path / "office_dataset.jsonl")
+    s0 = _shard_run(tmp_path, "s0", MockStrongAdapter(), 2, 0, dataset=ds)
+    s1 = _shard_run(tmp_path, "s1", MockStrongAdapter(), 2, 1, dataset=ds)
+    result = fuse_runs([s0, s1], str(tmp_path / "fused"))
+    assert result["gate"]["status"] == "SKIP"
+    assert "无 knowledge_update" in result["gate"]["detail"]
 
 
 def test_fuse_missing_input_or_incomplete_product_rejected(tmp_path: Path) -> None:

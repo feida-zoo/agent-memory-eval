@@ -17,7 +17,9 @@
 融合口径（基准集按题数加权）：
     - **办公域槽位（office）不参与融合评级**：它与基准集不同源，单列为
       「业务结论（办公域槽位）」（准确率 + stale / abstention 红线 + 门禁状态）。
-      门禁照旧一票否决，独立于基准评级；
+      门禁照旧一票否决，独立于基准评级。槽位按**数据集身份**判定（内置 office /
+      用户测试集）；纯汇总（``--from-runs`` 且未给 ``--dataset``）不按位置兜底——
+      未含 office 产物时没有槽位，全部数据集参与基准融合，门禁 SKIP；
     - 参与条件（能力标注）：accuracy / token_f1 / bleu1 所有基准集参与；
       evidence_recall / recall_at_5 仅 has_evidence（任一题目有 evidence 标注）
       的数据集；stale_rate 仅 stale_n > 0（本次有可机检的 stale 题）的数据集；
@@ -289,16 +291,31 @@ def is_office_slot_dataset(dataset_path: str, dataset_dir: str = "") -> bool:
     return _identity_name(dataset_path, dataset_dir) in office_slot_dataset_stems()
 
 
-def mark_office_slot(specs: list[DatasetSpec]) -> None:
-    """就地标出办公域槽位：数据集身份命中办公域（内置 office / 用户测试集）的优先，
-    否则沿用既有口径——清单第一个数据集承担该槽位。
+def mark_office_slot(
+    specs: list[DatasetSpec], *, positional_fallback: bool = True
+) -> None:
+    """就地标出办公域槽位：数据集身份命中办公域（内置 office / 用户测试集）的优先。
 
     槽位判定看数据集身份而非 key 字面量，显式 ``office``、指向 office 数据集的路径、
     以及汇总模式复用的产物因此得到同一个结论；该集没有可机检的 stale 题时门禁自动 SKIP。
+
+    身份不命中时是否由清单第一个数据集兜底，两条路径不同：
+
+    - ``positional_fallback=True``（:func:`dataset_specs`，即显式 ``--dataset`` 清单）：
+      保留"第一个数据集承担办公域槽位"的既有口径——用户给的清单顺序就是他的意图，
+      直接给自定义路径 / 公开集时仍按第一个承担槽位。
+    - ``positional_fallback=False``（:func:`evaluate` 的纯汇总分支）：清单由
+      ``--from-runs`` 的产物拼成，顺序只反映书写顺序，与"谁是办公域"无关；按位置兜底
+      会把第一个（如 locomo）当成槽位踢出基准融合、还把它的 stale 当业务门禁。没有
+      办公域身份就没有槽位：全部数据集参与基准融合，门禁走 SKIP。
+
+    Args:
+        specs: 待标注的数据集槽位清单（就地修改 ``is_office_slot``）。
+        positional_fallback: 身份全不命中时是否让第一个数据集承担槽位。
     """
     for spec in specs:
         spec.is_office_slot = is_office_slot_dataset(spec.path)
-    if specs and not any(spec.is_office_slot for spec in specs):
+    if positional_fallback and specs and not any(spec.is_office_slot for spec in specs):
         specs[0].is_office_slot = True
 
 
@@ -1511,6 +1528,9 @@ def evaluate(
         from_runs: 汇总模式：``{数据集 key: 产物目录}``（实验目录或数据集目录）。
             目标清单（``specs``）中有对应产物的复用其结果、缺失的**补跑**（要求
             adapter/judge 可用）；未给 ``specs`` 时目标清单即这些 key（纯汇总）。
+            **纯汇总不按位置指定办公域槽位**：只有数据集身份命中办公域（内置
+            office / 用户测试集）才算槽位；未含 office 时门禁 SKIP、全部数据集参与
+            基准融合（见 :func:`mark_office_slot`）。
             复用的产物会并入本次实验目录（自包含、可整体搬移）。被测对象与评测
             口径（:data:`_IDENTITY_KEYS`）在**开跑之前**校验：已有产物之间混用、或
             补跑参数与已有产物不一致，直接拒绝（避免结果不可归因）；全新 run 缺
@@ -1565,11 +1585,12 @@ def evaluate(
 
     if specs is None:
         if provided:
-            # 纯汇总：目标清单即提供的 key（保持输入顺序）；办公域槽位用与
-            # --dataset 路径同一套判定（见 mark_office_slot），否则同一份 office
-            # 产物在"纯汇总"下会漏掉 stale 门禁
+            # 纯汇总：目标清单即提供的 key（保持输入顺序）；办公域槽位按数据集身份
+            # 判定，**不**按位置兜底——顺序只反映 --from-runs 的书写顺序，把第一个
+            # 当成槽位会把它踢出基准融合、还拿它的 stale 当业务门禁。含 office 产物
+            # 时仍按同一套身份判定生效（见 mark_office_slot）。
             specs = [r.spec for r in provided.values()]
-            mark_office_slot(specs)
+            mark_office_slot(specs, positional_fallback=False)
         else:
             specs = plan_datasets(
                 quick=quick, beam_10m=beam_10m, no_beam=no_beam, no_lme_s=no_lme_s, common=common

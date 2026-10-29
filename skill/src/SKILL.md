@@ -142,6 +142,7 @@ python scripts/watch_task.py <任务目录> --until-done --interval 300
 | 共享任务目录报"只允许 dialogue 分片" | 加 `--shard-by dialogue`，或各片各落实验目录再 `fuse --runs` |
 | 回放报桶冲突 / 条目损坏 | 别手改 `snapshots/`；换新任务目录重跑回放 |
 | `compare` / `matrix` 退出码 1 | 门禁 FAIL，不是崩溃：看 `comparison.md` / `matrix_result.json` 的结论与逐指标 diff |
+| fuse / beam 报 stale 门禁 | 非办公域数据集超阈值只记 `INFO`（仅诊断、退出码 0），不是失败；真正否决看办公域槽位那条门禁（`FAIL`） |
 | 检索指标全 0 | 先查口径（摘要式存储必须 `llm`）与 `retrieved` 是否回填了注入原文 |
 
 `run_task.py` 的退出码：0 成功、1 A/B 门禁 FAIL、2 流程失败（看最后一条命令的报错）、3 交付自检不过。
