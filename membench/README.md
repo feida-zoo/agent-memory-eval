@@ -5,7 +5,7 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 1. **run**：我的记忆系统在一套多会话对话数据集上表现如何？（六维指标 + 中文报告 + 图表）
 2. **compare**：这次优化相比基线是进步还是回归？（可比性前置校验 + 逐指标 diff + PASS/FAIL 门禁）
 3. **evaluate**：跨数据集全量评测，基准集按题数加权融合出**基准评级**（办公域槽位单列业务结论，stale 门禁一票否决）。
-4. **series**：多个优化点各一个 commit 时，**每一步**提升多少？（多线对比 + 线名从 commit 信息自动提取）
+4. **series**：多个优化点各一个 commit 时，**每一步**提升多少？（多线对比 + 线名优先 LLM 从 commit 主题与改动抽取，失败降级代码抽取）
 
 设计要点：
 
@@ -31,7 +31,7 @@ membench 是一个面向 **agent 记忆系统** 的评测框架（Python 3.10+�
 │   ├── fuse.py            # fuse: 分片产物融合为完整实验目录（就地 --task-dir 或跨目录，指标重算 + 门禁）
 │   ├── compare.py         # compare_runs: 可比性前置校验 + diff + 回归门禁（支持就地 --task-dir）
 │   ├── matrix.py          # compare_matrix: 多 run 矩阵对比（platform × commit）
-│   ├── series.py          # run_series: 多线对比（N 个版本逐步对比，线名从 commit 提取）
+│   ├── series.py          # run_series: 多线对比（N 个版本逐步对比，线名 LLM 优先、代码抽取降级）
 │   ├── evaluate.py        # evaluate: 基准集加权融合（办公域单列）+ stale 门禁
 │   ├── evaluate_compare.py # evaluate_compare: 两组 × 多数据集融合 A/B 对比
 │   ├── ratings.py         # 综合评级阈值表 METRIC_THRESHOLDS
@@ -614,16 +614,30 @@ python -m membench.cli series \
   --line <sha_B>=output/eval_v2_<ts>/runs/<dataset> \
   --line <sha_C>=output/eval_v3_<ts>/runs/<dataset> \
   [--dataset NAME] [--report-out output/] \
-  [--require-comparable] [--fusion weighted|equal] [--fusion-cap 500]
+  [--require-comparable] [--fusion weighted|equal] [--fusion-cap 500] \
+  [--llm-base-url URL --llm-model M [--llm-api-key K] [--llm-timeout S]] \
+  [--no-llm-naming]
 ```
 
-- **线名从 commit 信息提取**，一眼看出优化点：`git -C <repo> log -1 --format=%s <commit>`
-  的 subject 去掉 conventional-commit 前缀（`feat(scope):` / `fix：` 等，中英文冒号都认）、
-  剥首尾标点与多余空白，再截断到 24 个字。**最早的版本（第一条）命名为「基线」**（左侧
-  给了显式名时用显式名；基线就是第一个 commit，它的 subject 不再重复展示）。
-- git 取不到（非 git 目录 / commit 不存在）或 subject 不含中文 → 线名回退短 sha 并在
-  stderr 告警一次，不中断；重名追加 `（<sha8>）` 区分（没有 sha 的显式名退 `（第N线）`）。
-  左侧不是 7~40 位十六进制就是**显式线名**，原样使用。
+- **线名命名优先级：LLM（commit + 改动）→ 代码抽取**。`--llm-base-url` 与
+  `--llm-model` **同时给出**时才启用 LLM（可选 `--llm-api-key` / `--llm-timeout`，
+  超时默认 90s）：对每条 commit 调一次 chat，输入 commit 主题 + 正文 +
+  `git show --stat` 改动摘要 + `--unified=0` 且截断到 2000 字符的 patch，要求输出
+  不超过 16 个汉字、无标点无英文的短名。模型输出还会校验（必须含中文、≤24 字、
+  不含标点），不合格按失败处理。没配置（或只给其中一个）直接代码抽取，不告警；
+  `--no-llm-naming` 强制代码抽取。LLM 失败（网络 / 超时 / 格式错）**只告警一次**
+  「LLM 命名失败，回退代码抽取」，不中断。
+- **代码抽取**（降级路径）：`git -C <repo> log -1 --format=%s <commit>` 的 subject
+  去掉 conventional-commit 前缀（`feat(scope):` / `fix：` 等，中英文冒号都认）、
+  剥首尾标点与多余空白，再截断到 24 个字。**最早的版本（第一条）命名为「基线」**，
+  不走命名也不调 LLM（左侧给了显式名时用显式名；基线就是第一个 commit，它的
+  subject 不再重复展示）。
+- 左侧不是 7~40 位十六进制就是**显式线名**，原样使用，永远优先且不调 LLM。
+- 降级后 git 取不到（非 git 目录 / commit 不存在）或 subject 不含中文 → 线名回退
+  短 sha 并在 stderr 告警一次，不中断；重名追加 `（<sha8>）` 区分（没有 sha 的
+  显式名退 `（第N线）`）。
+- 报告「来源与产物」表的**命名来源列**标出每条线名怎么来的：`llm`（LLM 抽取）/
+  `code`（commit 主题代码抽取）/ `显式名` / `基线` / `回退短 sha`。
 - 每条线的产物目录可以是实验目录或 `runs/<dataset>` 数据集目录。**每条线必须在同一批
   数据集上评测**（缺 / 多直接报错）；多数据集时报告同时给逐数据集表与加权融合值
   （口径同 `evaluate`，办公域槽位不参与基准融合；`--fusion` / `--fusion-cap` 可调），

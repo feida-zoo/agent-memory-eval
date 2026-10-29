@@ -14,15 +14,25 @@
 
 线名规则（:func:`line_name`）：
 
-- 左侧是 7~40 位十六进制 → 视为 commit，用 ``git -C <repo> log -1 --format=%s``
-  取 subject 自动命名；第一条（``index == 0``）默认叫「基线」；
-- 否则左侧就是显式线名，原样使用（用户自己起的名字优先，且不参与任何自动清洗）；
-- subject 先去掉 conventional-commit 前缀（``feat(scope):`` / ``fix：`` 等，中英文
-  冒号都认），再剥首尾标点、折叠空白，最后截断到 :data:`LINE_NAME_MAX` 个字；
-- git 取不到（非 git 目录 / commit 不存在 / git 不可用）或 subject 不含中文 →
+- 左侧是 7~40 位十六进制 → 视为 commit，按优先级命名：
+  1. **LLM 命名**（配置 :class:`LLMNaming` 时）：从 commit 主题 + 正文、
+     ``git show --stat`` 改动摘要与截断后的 patch 抽一个简短中文名；输出必须含
+     中文、长度 ≤ :data:`LINE_NAME_MAX` 个字且不含标点，否则视为失败；
+  2. **代码抽取**（:func:`extract_name_from_subject`）：去掉 conventional-commit
+     前缀（``feat(scope):`` / ``fix：`` 等，中英文冒号都认）、剥首尾标点、折叠
+     空白，最后截断到 :data:`LINE_NAME_MAX` 个字；
+  LLM 仅在 ``--llm-base-url`` 与 ``--llm-model`` 同时给出（且未开
+  ``--no-llm-naming``）时启用；没有配置直接走代码抽取（不告警），调用失败或输出
+  不合规时告警一次后降级代码抽取，**都不中断**；
+- 第一条（``index == 0``）默认叫「基线」，不走任何命名、也不调 LLM；
+- 左侧不是 commit 时就是显式线名，原样使用（永远优先，不调 LLM，且不参与任何
+  自动清洗）；
+- git 取不到（非 git 目录 / commit 不存在 / git 不可用）或降级后仍不含中文 →
   线名回退短 sha 并在 stderr 告警一次，**不中断**（评测已经跑完，命名失败不该让
   对比出不了报告）；
-- 重名时追加 ``（<sha8>）`` 区分（没有 sha 的显式名退 ``（第N线）``）。
+- 重名时追加 ``（<sha8>）`` 区分（没有 sha 的显式名退 ``（第N线）``）；
+- 报告「来源与产物」表的「命名来源」列标出 ``llm`` / ``code`` / ``显式名`` /
+  ``基线`` / ``回退短 sha``，便于追溯每条线名是怎么来的。
 
 产物写到 ``out_dir``（完整实验目录，见 :mod:`membench.layout`）::
 
@@ -60,6 +70,7 @@ from membench.evaluate import (
     fuse_metrics,
     is_office_slot_dataset,
 )
+from membench.judges.llm import chat_completion
 from membench.paths import output_root
 from membench.ratings import RATE_METRICS, format_metric_value
 from membench.report import _md_table, dim_label, fig_series_accuracy, metric_label
@@ -101,9 +112,9 @@ _CONVENTIONAL_RE = re.compile(
 
 #: 首尾要剥掉的标点 / 空白（中英文标点都认，含全角括号与常见符号）。
 _EDGE_PUNCT_RE = re.compile(
-    r"^[\s\-–—:：,，.。;；!！?？、·…()（）\[\]【】"
+    r"^[\s\-–—:：,，.。;；!！?？、·…()（）\[\]【】「」『』"
     r"\"'“”‘’<>《》|/\\~`#*_=+]+"
-    r"|[\s\-–—:：,，.。;；!！?？、·…()（）\[\]【】"
+    r"|[\s\-–—:：,，.。;；!！?？、·…()（）\[\]【】「」『』"
     r"\"'“”‘’<>《》|/\\~`#*_=+]+$"
 )
 
@@ -111,6 +122,30 @@ _WHITESPACE_RE = re.compile(r"\s+")
 
 #: 中文字符（线名必须含中文才有"一眼看出优化点"的价值，否则回退短 sha）。
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+#: 线名内部不允许出现的标点（prompt 要求"不要标点"；首尾标点先剥掉再查内部，
+#: 剩下的标点说明模型没按要求输出，宁可用回代码抽取的 commit 主题）。
+_INNER_PUNCT_RE = re.compile(
+    r"[-–—:：,，.。;；!！?？、·…()（）\[\]【】「」『』"
+    r"\"'“”‘’<>《》|/\\~`#*_=+]"
+)
+
+#: LLM 线名请求的 system prompt：只输出一个短语（输出仍由
+#: :func:`clean_llm_name` 严格校验，不信任模型自觉）。
+_LLM_NAME_PROMPT = (
+    "你是一个 git 提交命名助手。根据 commit 主题、正文与改动摘要，用不超过 16 个"
+    "汉字概括这次优化的可读名称；不要标点，不要英文，不要 feat / fix 这类前缀，"
+    "只输出这个名称本身，不要任何解释。"
+)
+
+#: LLM 命名失败 / 输出不合规时的统一告警（每次 series 运行最多一条）。
+_LLM_NAME_FALLBACK_WARN = "[membench] ⚠️ LLM 命名失败，回退代码抽取"
+
+#: 进 prompt 前的截断长度（字符）：正文与 stat 只留摘要，patch 用
+#: ``--unified=0`` 只留改动行——大 commit 的完整 patch 会把 prompt 撑到几万 token。
+_BODY_MAX = 1000
+_STAT_MAX = 1500
+_PATCH_MAX = 2000
 
 
 def is_commit_ref(text: str) -> bool:
@@ -132,24 +167,38 @@ def extract_name_from_subject(subject: str) -> str:
     return text
 
 
+def _git_output(
+    repo: str, args: Sequence[str], timeout: float = 10
+) -> Union[str, None]:
+    """跑一条 ``git -C <repo> ...`` 并返回 stdout；任何失败（含 git 不可用）返回 None。
+
+    命名只是报告展示，git 失败不该让一次已经跑完的对比失败——所有调用方都按
+    "取不到" 处理，不抛异常。
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
 def git_subject(repo: str, commit: str) -> Union[str, None]:
     """``git -C <repo> log -1 --format=%s <commit>`` 的 subject；取不到返回 None。
 
     非 git 目录 / commit 不存在 / git 不可用都走 None（调用方回退短 sha 并告警），
     不抛异常：命名失败只影响展示名，不该让一次已经跑完的对比失败。
     """
-    try:
-        proc = subprocess.run(
-            ["git", "-C", repo, "log", "-1", "--format=%s", str(commit)],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
+    output = _git_output(repo, ["log", "-1", "--format=%s", str(commit)])
+    if output is None:
         return None
-    if proc.returncode != 0:
-        return None
-    subject = proc.stdout.strip()
+    subject = output.strip()
     return subject or None
 
 
@@ -161,14 +210,133 @@ def _emit(warn: Union[Callable[[str], None], None], message: str) -> None:
         warn(message)
 
 
+@dataclass(frozen=True)
+class LLMNaming:
+    """series 线名的 LLM 配置；``base_url`` 与 ``model`` 都非空才启用。
+
+    没有配置（``enabled`` 为 False）时直接走代码抽取，不告警也不发请求。
+    """
+
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    timeout: float = 90.0
+
+    @property
+    def enabled(self) -> bool:
+        """``base_url`` 与 ``model`` 都给才尝试 LLM（缺一个就静默降级）。"""
+        return bool(self.base_url.strip() and self.model.strip())
+
+
+def _clip(text: str, limit: int) -> str:
+    """进 prompt 前截断超长文本，并标注已截断（避免大 commit 撑爆 token）。"""
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "…（已截断）"
+
+
+def _llm_name_prompt(subject: str, body: str, stat: str, patch: str) -> str:
+    """线名请求的 user 段：主题 / 正文 / 改动摘要 / 截断后的改动片段。"""
+    return (
+        f"【主题】{subject}\n"
+        f"【正文】{_clip(body, _BODY_MAX) or '（无）'}\n"
+        f"【改动摘要】\n{_clip(stat, _STAT_MAX) or '（无）'}\n"
+        f"【改动片段】\n{_clip(patch, _PATCH_MAX) or '（无）'}"
+    )
+
+
+def _request_llm_name(
+    repo: str, commit: str, subject: str, config: LLMNaming
+) -> str:
+    """对一条 commit 调一次 chat completion，返回模型原始输出（未校验）。
+
+    改动片段用 ``--unified=0`` 只留改动行，再按 :data:`_PATCH_MAX` 截断；git 取
+    不到正文 / stat / patch 时用「（无）」占位，仍给模型主题这一条线索。
+    """
+    body = (_git_output(repo, ["log", "-1", "--format=%b", str(commit)]) or "").strip()
+    stat = (
+        _git_output(repo, ["show", "--stat", "--format=", "-1", str(commit)]) or ""
+    ).strip()
+    patch = (
+        _git_output(repo, ["show", "--unified=0", "--format=", "-1", str(commit)]) or ""
+    ).strip()
+    return chat_completion(
+        config.base_url,
+        config.api_key,
+        config.model,
+        config.timeout,
+        [
+            {"role": "system", "content": _LLM_NAME_PROMPT},
+            {"role": "user", "content": _llm_name_prompt(subject, body, stat, patch)},
+        ],
+        temperature=0,
+    )
+
+
+def clean_llm_name(text: str) -> Union[str, None]:
+    """清洗并校验 LLM 输出的线名；不合规返回 ``None``（调用方回退代码抽取）。
+
+    依次：折叠空白 → 剥首尾空白 / 引号 / 标点；随后必须**含中文**、长度
+    ≤ :data:`LINE_NAME_MAX` 个字、内部不含标点（prompt 已要求"不要标点"，剩下
+    标点说明模型没按要求输出，宁可回代码抽取的 commit 主题）。
+    """
+    name = _WHITESPACE_RE.sub(" ", str(text or "")).strip()
+    name = _EDGE_PUNCT_RE.sub("", name).strip()
+    if not name or len(name) > LINE_NAME_MAX:
+        return None
+    if not _CJK_RE.search(name):
+        return None
+    if _INNER_PUNCT_RE.search(name):
+        return None
+    return name
+
+
+@dataclass
+class _NamingState:
+    """一次 series 运行的 LLM 命名状态（配置 + "失败只告警一次"的标记）。
+
+    ``disabled``：首次失败（异常或输出不合规）后整体短路——同一模型、同一 prompt
+    下逐线重试只会让每条线各等一次超时，换不来成功。
+    """
+
+    repo: str
+    config: Union[LLMNaming, None]
+    warn: Union[Callable[[str], None], None]
+    llm_warned: bool = False
+    disabled: bool = False
+
+    def llm_name(self, commit: str, subject: str) -> Union[str, None]:
+        """LLM 线名；未配置 / 已短路 / 调用失败 / 输出不合规都返回 None（由调用方降级）。"""
+        if self.config is None or not self.config.enabled or self.disabled:
+            return None
+        try:
+            raw = _request_llm_name(self.repo, commit, subject, self.config)
+        except Exception:  # noqa: BLE001 - 命名失败不能中断已跑完的对比
+            raw = None
+        name = clean_llm_name(raw or "")
+        if name:
+            return name
+        self.disabled = True
+        if not self.llm_warned:
+            self.llm_warned = True
+            _emit(self.warn, _LLM_NAME_FALLBACK_WARN)
+        return None
+
+
 def _resolve_name(
     commit_or_name: str,
     repo: str,
     index: int,
     explicit_first_name: Union[str, None],
     warn: Union[Callable[[str], None], None],
+    naming: Union[_NamingState, None] = None,
 ) -> tuple[str, str]:
-    """``line_name`` 的实现：返回 ``(线名, 命名来源)``（来源进报告的可追溯表）。"""
+    """``line_name`` 的实现：返回 ``(线名, 命名来源)``（来源进报告的可追溯表）。
+
+    命名优先级：基线 / 显式名（都不调 LLM）→ LLM（``naming`` 启用且调用成功）→
+    代码抽取（commit subject）→ 短 sha。``naming`` 为 None 时不尝试 LLM。
+    """
     text = str(commit_or_name or "").strip()
     if not text:
         raise SystemExit("--line 的左侧（commit 或线名）不能为空")
@@ -177,16 +345,26 @@ def _resolve_name(
     if index == 0:
         return explicit_first_name or BASELINE_NAME, "基线"
     subject = git_subject(repo, text)
-    if subject is not None:
-        name = extract_name_from_subject(subject)
-        if name and _CJK_RE.search(name):
-            return name, "commit subject"
-        reason = "commit subject 不含中文"
-    else:
-        name = ""
-        reason = "取不到 commit subject（非 git 目录 / commit 不存在）"
+    if subject is None:
+        sha8 = text[:8].lower()
+        _emit(
+            warn,
+            f"[membench] ⚠️ 取不到 commit subject（非 git 目录 / commit 不存在）："
+            f"{text} 的线名回退为短 sha {sha8}",
+        )
+        return sha8, "回退短 sha"
+    if naming is not None:
+        name = naming.llm_name(text, subject)
+        if name:
+            return name, "llm"
+    name = extract_name_from_subject(subject)
+    if name and _CJK_RE.search(name):
+        return name, "code"
     sha8 = text[:8].lower()
-    _emit(warn, f"[membench] ⚠️ {reason}：{text} 的线名回退为短 sha {sha8}")
+    _emit(
+        warn,
+        f"[membench] ⚠️ commit subject 不含中文：{text} 的线名回退为短 sha {sha8}",
+    )
     return sha8, "回退短 sha"
 
 
@@ -248,7 +426,7 @@ class SeriesLine:
         index: 线序（0 起，顺序即时间顺序）。
         ref: ``--line`` 左侧原文（commit 或显式线名）。
         name: 报告里的线名。
-        name_source: 命名来源（``基线`` / ``commit subject`` / ``显式名`` / ``回退短 sha``）。
+        name_source: 命名来源（``基线`` / ``llm`` / ``code`` / ``显式名`` / ``回退短 sha``）。
         commit: commit sha（显式线名时为 None）。
         target: ``--line`` 右侧产物目录（绝对路径）。
         datasets: ``{数据集目录名: 该集结果}``（跨线键集合必须一致）。
@@ -371,6 +549,7 @@ def load_lines(
     dataset: Union[str, None] = None,
     *,
     warn: Union[Callable[[str], None], None] = None,
+    llm: Union[LLMNaming, None] = None,
 ) -> list[SeriesLine]:
     """解析并加载全部线（顺序即时间顺序，第一条是基线）。
 
@@ -379,6 +558,8 @@ def load_lines(
         repo: git 仓库路径（缺省当前目录），用于取 commit subject。
         dataset: 只比某个数据集（多数据集实验目录时用）；缺省比全部数据集。
         warn: 命名回退的告警回调（缺省写 stderr；调用方传去重函数即"告警一次"）。
+        llm: 线名的 LLM 配置；缺省或 :attr:`LLMNaming.enabled` 为 False 时只用
+            代码抽取（不告警、不发请求）。
 
     Returns:
         :class:`SeriesLine` 列表（``index`` 从 0 起、``datasets`` 已加载）。
@@ -393,8 +574,9 @@ def load_lines(
         )
     repo_path = os.path.abspath(repo or os.getcwd())
     parsed = [_parse_spec(raw) for raw in specs]
+    naming = _NamingState(repo_path, llm, warn) if llm and llm.enabled else None
     resolved = [
-        _resolve_name(ref, repo_path, index, None, warn)
+        _resolve_name(ref, repo_path, index, None, warn, naming)
         for index, (ref, _target) in enumerate(parsed)
     ]
     names = _dedupe_names(
@@ -757,6 +939,8 @@ def run_series(
     require_comparable: bool = False,
     fusion: str = FUSION_WEIGHTED,
     fusion_cap: int = FUSION_WEIGHT_CAP,
+    *,
+    llm: Union[LLMNaming, None] = None,
 ) -> dict[str, Any]:
     """多线对比：读 N 条线的产物，写 ``series_<ts>/`` 并返回结果。
 
@@ -768,11 +952,13 @@ def run_series(
         require_comparable: strict 可比性；关键维度不一致 / 无法核验 → 该线门禁 FAIL。
         fusion: 多数据集融合口径（``weighted`` / ``equal``）。
         fusion_cap: 加权口径下的单集权重封顶（题数）。
+        llm: 线名的 LLM 配置（commit + 改动 → 简短中文名）；缺省或未同时给出
+            base_url / model 时只用代码抽取。显式线名与基线不调 LLM。
 
     Returns:
         ``{"series_dir", "report_path", "fig_path", "lines", "verdict", "fusion"}``；
-        ``lines`` 每项含线名 / commit / 目录 / 副本 / 汇总指标 / 逐线门禁 / 结论。
-        ``verdict`` 是各线结论里最差的一个（FAIL 时命令退出码应为 1）。
+        ``lines`` 每项含线名 / 命名来源 / commit / 目录 / 副本 / 汇总指标 /
+        逐线门禁 / 结论。``verdict`` 是各线结论里最差的一个（FAIL 时命令退出码应为 1）。
 
     Raises:
         SystemExit: 线数不足、入参 / 产物不完整、各线数据集不一致、融合口径非法。
@@ -793,7 +979,7 @@ def run_series(
             warned.add(message)
             print(message, file=sys.stderr)
 
-    lines = load_lines(specs, repo=repo, dataset=dataset, warn=_warn_once)
+    lines = load_lines(specs, repo=repo, dataset=dataset, warn=_warn_once, llm=llm)
     dataset_keys = list(lines[0].datasets)
     multi = len(dataset_keys) > 1
 

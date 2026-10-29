@@ -3,6 +3,7 @@
 调用 ``POST {base_url}/v1/chat/completions``（urllib 实现，超时默认 90s），
 要求模型在同一调用里同时判正确性与陈旧性，只输出 JSON：
 ``{"correct": true/false, "stale": true/false, "reason": "..."}``。
+HTTP 调用抽成公共函数 :func:`chat_completion`，series 的线名抽取复用同一实现。
 stale 的语义是"回答把**旧值**当成当前事实"：题目给出 ``gold_stale``（裸旧值）
 或 ``gold_stale_note``（原始描述）时，prompt 一并传给模型；模型没给
 ``stale`` 或输出解析失败时回退启发式 :func:`is_stale`。回退路径的
@@ -62,6 +63,58 @@ def _parse_stale_field(parsed: dict) -> "bool | None":
     value = parsed.get("stale")
     # bool 是 int 的子类：这里只接受真正的 JSON true/false。
     return value if isinstance(value, bool) else None
+
+
+def chat_completion(
+    base_url: str,
+    api_key: str,
+    model: str,
+    timeout: float,
+    messages: "list[dict[str, str]]",
+    *,
+    temperature: float = 0.0,
+) -> str:
+    """调用 OpenAI 兼容 ``POST {base_url}/v1/chat/completions``，返回首条回答文本。
+
+    判分（:class:`LLMJudge`）与 series 的线名抽取共用这一份 HTTP 实现；本函数只
+    负责发请求并取 ``choices[0].message.content``，JSON 解析与回退策略由调用方决定。
+
+    Args:
+        base_url: 服务根地址（不含 ``/v1/chat/completions``；尾部斜杠容忍）。
+        api_key: API Key；为空时仍发 ``Bearer``（兼容不校验鉴权的本地服务）。
+        model: 模型名。
+        timeout: 请求超时（秒）。
+        messages: OpenAI 格式的消息列表。
+        temperature: 采样温度（缺省 0：判分与命名都要确定性）。
+
+    Returns:
+        首条 choice 的 ``message.content``。
+
+    Raises:
+        ValueError: 未配置 base_url。
+        urllib.error.URLError / TimeoutError / json.JSONDecodeError:
+            网络、超时或响应不是合法 JSON，由调用方回退。
+        KeyError / IndexError / TypeError: 响应不符合 chat completions 契约。
+    """
+    if not base_url:
+        raise ValueError("未配置 LLM base_url")
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    return body["choices"][0]["message"]["content"]
 
 
 #: 判分 prompt：要求模型只输出 JSON（correct + stale 同一次判完）。
@@ -171,9 +224,12 @@ class LLMJudge(Judge):
         """
         if not self.base_url:
             raise ValueError("未配置 LLM judge 的 base_url")
-        payload = {
-            "model": self.model,
-            "messages": [
+        content = chat_completion(
+            self.base_url,
+            self.api_key,
+            self.model,
+            self.timeout,
+            [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {
                     "role": "user",
@@ -182,20 +238,8 @@ class LLMJudge(Judge):
                     ),
                 },
             ],
-            "temperature": 0,
-        }
-        req = urllib.request.Request(
-            f"{self.base_url}/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
+            temperature=0,
         )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        content = body["choices"][0]["message"]["content"]
         parsed = _parse_judge_output(content)
         correct = parsed["correct"]
         if not isinstance(correct, bool):

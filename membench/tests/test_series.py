@@ -220,6 +220,329 @@ def test_duplicate_names_get_sha_suffix() -> None:
 
 
 # ---------------------------------------------------------------------------
+# LLM 命名：优先 LLM，失败 / 不合规 / 未配置降级代码抽取
+# ---------------------------------------------------------------------------
+
+#: 测试里的 LLM 配置（假服务，不发真实请求）。
+_NAMING_LLM = series.LLMNaming(base_url="http://127.0.0.1:9/v1", model="fake")
+
+
+class _FakeNamingLLM:
+    """``chat_completion`` 的替身：按顺序返回预设输出，并记录每次请求。"""
+
+    def __init__(self, outputs: list[object]) -> None:
+        self.outputs = list(outputs)
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: float,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.0,
+    ) -> str:
+        self.calls.append(
+            {
+                "base_url": base_url,
+                "api_key": api_key,
+                "model": model,
+                "timeout": timeout,
+                "messages": messages,
+                "temperature": temperature,
+            }
+        )
+        result = self.outputs.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return str(result)
+
+
+def _fake_naming_llm(monkeypatch, outputs: list[object]) -> _FakeNamingLLM:
+    """把 series 的 chat_completion 换成按序返回 outputs 的替身。"""
+    fake = _FakeNamingLLM(outputs)
+    monkeypatch.setattr(series, "chat_completion", fake)
+    return fake
+
+
+def _counting_naming_llm(monkeypatch) -> list[dict[str, object]]:
+    """记录调用并立即报错的替身（用于断言"这条线不该调用 LLM"）。"""
+    calls: list[dict[str, object]] = []
+
+    def fake(*args: object, **kwargs: object) -> str:
+        calls.append({"args": args, "kwargs": kwargs})
+        raise AssertionError("这条线不该调用 LLM")
+
+    monkeypatch.setattr(series, "chat_completion", fake)
+    return calls
+
+
+def test_llm_naming_used_and_report_marks_llm_and_code(
+    tmp_path: Path, git_repo, monkeypatch, capsys
+) -> None:
+    """合法中文名采用并标 llm；模型不听话（英文）时回退代码抽取并标 code。"""
+    repo, shas = git_repo
+    runs = [_run(tmp_path, f"llm{i}", quality) for i, quality in enumerate((40, 60, 80))]
+    specs = [f"{sha}={run}" for sha, run in zip(shas, runs)]
+    # 基线不调 LLM，所以只有第 2、3 线两次请求
+    fake = _fake_naming_llm(monkeypatch, ["旧值覆盖修复", "improve retrieval"])
+
+    result = series.run_series(
+        specs, repo=repo, report_out=str(tmp_path / "out"), llm=_NAMING_LLM
+    )
+
+    assert [line["name"] for line in result["lines"]] == [
+        "基线",
+        "旧值覆盖修复",
+        "降低查询延迟",
+    ]
+    assert [line["name_source"] for line in result["lines"]] == ["基线", "llm", "code"]
+    assert len(fake.calls) == 2
+    first = fake.calls[0]
+    assert (first["base_url"], first["model"]) == (_NAMING_LLM.base_url, "fake")
+    assert first["temperature"] == 0
+    user_prompt = first["messages"][-1]["content"]  # type: ignore[index]
+    assert "修复旧记忆覆盖新值" in user_prompt
+    assert "【改动摘要】" in user_prompt and "【改动片段】" in user_prompt
+    # 英文输出走回退路径，只告警一次
+    assert capsys.readouterr().err.count("LLM 命名失败，回退代码抽取") == 1
+
+    report = Path(result["report_path"]).read_text(encoding="utf-8")
+    source_rows = _section_rows(report, "## 来源与产物")
+    assert [row[2] for row in source_rows] == ["基线", "llm", "code"]
+    conclusion = _section_rows(report, "## 结论表")
+    assert [row[1] for row in conclusion] == [
+        "基线",
+        "旧值覆盖修复",
+        "降低查询延迟",
+    ]
+
+
+@pytest.mark.parametrize(
+    "bad_output",
+    [
+        "improve retrieval",  # 全英文
+        "很长的优化说明" * 4,  # 超过 24 字
+        "「优化检索、排序」",  # 内部带标点（首尾引号会先剥掉）
+    ],
+)
+def test_llm_invalid_output_falls_back_to_code(
+    tmp_path: Path, git_repo, monkeypatch, bad_output: str
+) -> None:
+    """英文 / 超长 / 带标点 → 校验不通过，回退代码抽取并标 code。"""
+    repo, shas = git_repo
+    run = _run(tmp_path, "bad-name", 40)
+    fake = _fake_naming_llm(monkeypatch, [bad_output])
+    warned: list[str] = []
+
+    lines = series.load_lines(
+        [f"{shas[0]}={run}", f"{shas[1]}={run}"],
+        repo=repo,
+        warn=warned.append,
+        llm=_NAMING_LLM,
+    )
+
+    assert [line.name for line in lines] == ["基线", "修复旧记忆覆盖新值"]
+    assert [line.name_source for line in lines] == ["基线", "code"]
+    assert len(fake.calls) == 1
+    assert sum("LLM 命名失败，回退代码抽取" in message for message in warned) == 1
+
+
+def test_llm_failure_warns_once_and_falls_back(
+    tmp_path: Path, git_repo, monkeypatch
+) -> None:
+    """LLM 抛超时 / 异常：首次失败即短路——后续线不再请求、直接回退；告警只发一次。"""
+    repo, shas = git_repo
+    run = _run(tmp_path, "llm-error", 40)
+    fake = _fake_naming_llm(
+        monkeypatch, [TimeoutError("超时"), RuntimeError("服务 500")]
+    )
+    warned: list[str] = []
+
+    lines = series.load_lines(
+        [f"{sha}={run}" for sha in shas],
+        repo=repo,
+        warn=warned.append,
+        llm=_NAMING_LLM,
+    )
+
+    assert [line.name for line in lines] == [
+        "基线",
+        "修复旧记忆覆盖新值",
+        "降低查询延迟",
+    ]
+    assert [line.name_source for line in lines] == ["基线", "code", "code"]
+    # 首次失败后 disabled：第三条线不再等一次超时，也不再请求
+    assert len(fake.calls) == 1
+    assert sum("LLM 命名失败，回退代码抽取" in message for message in warned) == 1
+
+
+def test_llm_valid_name_strips_quotes_and_whitespace() -> None:
+    """首尾引号 / 空白 / 标点剥掉后合法；内部标点仍判不合法。"""
+    assert series.clean_llm_name("  “检索排序优化。”  ") == "检索排序优化"
+    assert series.clean_llm_name("「旧值覆盖修复」") == "旧值覆盖修复"
+    assert series.clean_llm_name("优化  检索") == "优化 检索"
+    assert series.clean_llm_name("优化、检索") is None
+    assert series.clean_llm_name("improve retrieval") is None
+    assert series.clean_llm_name("很长的优化说明" * 4) is None
+    assert series.clean_llm_name("") is None
+
+
+@pytest.mark.parametrize(
+    "llm",
+    [
+        None,
+        series.LLMNaming(base_url="http://127.0.0.1:9/v1", model=""),
+        series.LLMNaming(base_url="", model="fake"),
+        series.LLMNaming(),
+    ],
+)
+def test_no_llm_config_skips_llm(
+    tmp_path: Path, git_repo, monkeypatch, llm
+) -> None:
+    """未配置 / 只给 base_url 或 model 之一：不调 LLM，直接代码抽取（不告警）。"""
+    repo, shas = git_repo
+    run = _run(tmp_path, "no-llm", 40)
+    calls = _counting_naming_llm(monkeypatch)
+    warned: list[str] = []
+
+    lines = series.load_lines(
+        [f"{shas[0]}={run}", f"{shas[1]}={run}"],
+        repo=repo,
+        warn=warned.append,
+        llm=llm,
+    )
+
+    assert calls == []
+    assert [line.name_source for line in lines] == ["基线", "code"]
+    assert warned == []
+
+
+def test_explicit_names_and_baseline_never_call_llm(
+    tmp_path: Path, git_repo, monkeypatch
+) -> None:
+    """显式名永远优先、基线也不命名：只有第三条 commit 请求一次 LLM。"""
+    repo, shas = git_repo
+    run = _run(tmp_path, "explicit", 40)
+    fake = _fake_naming_llm(monkeypatch, ["检索优化"])
+
+    lines = series.load_lines(
+        [f"{shas[0]}={run}", f"我的优化版={run}", f"{shas[1]}={run}"],
+        repo=repo,
+        llm=_NAMING_LLM,
+    )
+
+    assert [line.name for line in lines] == ["基线", "我的优化版", "检索优化"]
+    assert [line.name_source for line in lines] == ["基线", "显式名", "llm"]
+    assert len(fake.calls) == 1
+    assert "修复旧记忆覆盖新值" in fake.calls[0]["messages"][-1]["content"]  # type: ignore[index]
+
+
+def test_llm_prompt_truncates_large_diff(tmp_path: Path, monkeypatch) -> None:
+    """大改动的 patch 按上限截断，prompt 不会随改动量线性膨胀。"""
+    repo = tmp_path / "big-repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "commit.gpgsign", "false")
+    big = repo / "big.txt"
+    big.write_text("旧内容\n" * 2000, encoding="utf-8")
+    _git(repo, "add", "big.txt")
+    _git(repo, "commit", "-q", "-m", "feat: 初始化大文件")
+    big.write_text("新内容\n" * 2000, encoding="utf-8")
+    _git(repo, "commit", "-q", "-am", "feat: 批量替换大文件")
+    sha = _git(repo, "rev-parse", "HEAD")
+    run = _run(tmp_path, "big-diff", 40)
+    fake = _fake_naming_llm(monkeypatch, ["批量替换大文件"])
+
+    series.load_lines(
+        [f"{sha}={run}", f"{sha}={run}"],
+        repo=str(repo),
+        llm=_NAMING_LLM,
+    )
+
+    user_prompt = fake.calls[0]["messages"][-1]["content"]  # type: ignore[index]
+    assert "…（已截断）" in user_prompt
+    assert len(user_prompt) < series._PATCH_MAX + series._STAT_MAX + series._BODY_MAX + 200
+
+
+def test_cli_series_llm_flags_wire_naming(monkeypatch, tmp_path: Path) -> None:
+    """--llm-* 透传为 LLMNaming；--no-llm-naming 强制 None（不构造 LLM 配置）。"""
+    captured: dict[str, object] = {}
+
+    def fake_run_series(specs, **kwargs):
+        captured.update(kwargs)
+        return {"series_dir": str(tmp_path / "series"), "verdict": "PASS"}
+
+    monkeypatch.setattr(cli, "run_series", fake_run_series)
+    base = [
+        "series",
+        "--line",
+        "aaaaaaaa=/tmp/a",
+        "--line",
+        "bbbbbbbb=/tmp/b",
+        "--report-out",
+        str(tmp_path / "out"),
+    ]
+
+    assert (
+        cli.main(
+            [
+                *base,
+                "--llm-base-url",
+                "http://127.0.0.1:9/v1",
+                "--llm-api-key",
+                "k",
+                "--llm-model",
+                "fake",
+                "--llm-timeout",
+                "12.5",
+            ]
+        )
+        == 0
+    )
+    llm = captured["llm"]
+    assert isinstance(llm, series.LLMNaming)
+    assert llm.enabled
+    assert (llm.base_url, llm.api_key, llm.model, llm.timeout) == (
+        "http://127.0.0.1:9/v1",
+        "k",
+        "fake",
+        12.5,
+    )
+
+    captured.clear()
+    assert (
+        cli.main(
+            [
+                *base,
+                "--llm-base-url",
+                "http://127.0.0.1:9/v1",
+                "--llm-model",
+                "fake",
+                "--no-llm-naming",
+            ]
+        )
+        == 0
+    )
+    assert captured["llm"] is None
+
+    # 不传 --llm-timeout 时与 evaluate 同口径：用默认 90s
+    captured.clear()
+    assert (
+        cli.main(
+            [*base, "--llm-base-url", "http://127.0.0.1:9/v1", "--llm-model", "fake"]
+        )
+        == 0
+    )
+    assert isinstance(captured["llm"], series.LLMNaming)
+    assert captured["llm"].timeout == 90.0
+
+
+# ---------------------------------------------------------------------------
 # 三线对比：数值、门禁、退出码
 # ---------------------------------------------------------------------------
 

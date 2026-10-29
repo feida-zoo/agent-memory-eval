@@ -64,11 +64,18 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
         [--out DIR] [--report-out DIR]
     python -m membench.cli series --line <commit-or-name>=<产物目录> --line ... \
         [--repo PATH] [--dataset NAME] [--report-out DIR] \
-        [--require-comparable] [--fusion weighted|equal] [--fusion-cap N]
-        # 多线对比：--line 顺序即时间顺序，第一条默认叫「基线」；左侧 7~40 位十六进制
-        # 视为 commit，用 git log -1 --format=%s 的 subject 自动命名（去
-        # feat(scope): / fix： 等前缀、剥首尾标点、截断 24 字），重名追加（sha8）；
-        # git 取不到或不含中文时回退短 sha 并 stderr 告警。任一线的门禁 FAIL → 退出码 1
+        [--require-comparable] [--fusion weighted|equal] [--fusion-cap N] \
+        [--llm-base-url URL --llm-model M [--llm-api-key K] [--llm-timeout S]] \
+        [--no-llm-naming]
+        # 多线对比：--line 顺序即时间顺序，第一条默认叫「基线」。线名优先级：
+        # 1) LLM（给了 --llm-base-url 与 --llm-model 时，从 commit 主题+正文+改动摘要
+        #    抽一个简短中文名；输出必须含中文、≤24 字、不含标点）；
+        # 2) 代码抽取（subject 去 feat(scope): / fix： 等前缀、剥首尾标点、截断 24 字）；
+        # 未配置 LLM 直接代码抽取；LLM 失败/输出不合规告警一次后回退代码抽取，
+        # git 取不到或不含中文回退短 sha（均不中断）。重名追加（sha8），
+        # 显式线名永远优先且不调 LLM；--no-llm-naming 强制代码抽取。
+        # 报告「来源与产物」表标出命名来源（llm / code / 显式名 / 基线 / 回退短 sha）。
+        # 任一线的门禁 FAIL → 退出码 1
     python -m membench.cli doctor --target http://127.0.0.1:8787 \
         [--timeout 10.0] [--api-key K]
     python -m membench.cli adapter install <adapter.py> | list | remove <name>
@@ -137,7 +144,7 @@ from membench.evaluate import FUSION_CHOICES, FUSION_WEIGHT_CAP
 from membench.matrix import compare_matrix
 from membench.paths import output_root
 from membench.runner import Runner
-from membench.series import run_series
+from membench.series import LLMNaming, run_series
 from membench.userdata import (
     delete_user_dataset,
     install_user_dataset,
@@ -281,14 +288,15 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- series ---
     p_ser = sub.add_parser(
         "series",
-        help="多线对比：N 个版本按时间顺序逐步对比（线名从 commit 信息提取，第一条为基线）",
+        help="多线对比：N 个版本按时间顺序逐步对比（线名优先 LLM 从 commit+改动抽取，第一条为基线）",
         description=(
             "多线对比：做多个优化点、每个优化点一个 commit 时，看每一步提升多少。"
-            "--line 按时间顺序重复给出，每条线的名字从 commit subject 自动提取："
-            "左侧 7~40 位十六进制视为 commit（git log -1 --format=%s，第一条默认叫"
-            "「基线」），否则视为显式线名；subject 去掉 feat(scope): / fix： 等"
-            "conventional 前缀、剥首尾标点后截断到 24 字，git 取不到或不含中文时"
-            "回退短 sha 并在 stderr 告警（不中断）。"
+            "--line 按时间顺序重复给出。线名优先级：LLM（给了 --llm-base-url 与 "
+            "--llm-model 时，从 commit 主题+正文+改动摘要抽一个简短中文名）→ 代码抽取"
+            "（左侧 7~40 位十六进制视为 commit，subject 去掉 feat(scope): / fix： 等 "
+            "conventional 前缀、剥首尾标点后截断到 24 字）；第一条默认叫「基线」，"
+            "显式线名永远优先。LLM 未配置直接代码抽取；失败或输出不合规时告警一次"
+            "并回退代码抽取；git 取不到或不含中文时回退短 sha（均不中断）。"
         ),
     )
     p_ser.add_argument(
@@ -318,6 +326,28 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=FUSION_WEIGHT_CAP,
         help=f"加权融合的单数据集权重封顶（题数，默认 {FUSION_WEIGHT_CAP}）",
+    )
+    p_ser.add_argument(
+        "--llm-base-url",
+        default=None,
+        help="线名 LLM 的 OpenAI 兼容 base_url（与 --llm-model 同时给出才启用）",
+    )
+    p_ser.add_argument("--llm-api-key", default=None, help="线名 LLM 的 API key")
+    p_ser.add_argument(
+        "--llm-model",
+        default=None,
+        help="线名 LLM 的模型名（与 --llm-base-url 同时给出才启用）",
+    )
+    p_ser.add_argument(
+        "--llm-timeout",
+        type=float,
+        default=None,
+        help="线名 LLM 的请求超时秒数（默认 90s）",
+    )
+    p_ser.add_argument(
+        "--no-llm-naming",
+        action="store_true",
+        help="强制用 commit 信息代码抽取命名，不调 LLM（即使给了 --llm-*）",
     )
     p_ser.set_defaults(func=_cmd_series)
 
@@ -990,6 +1020,15 @@ def _cmd_series(args: argparse.Namespace) -> int:
         )
     if args.fusion_cap < 1:
         raise SystemExit(f"--fusion-cap 必须 >= 1，当前为 {args.fusion_cap}")
+    # 只有 base_url 与 model 都给才尝试 LLM；未配置 / --no-llm-naming 时直接代码抽取
+    naming = None
+    if not args.no_llm_naming:
+        naming = LLMNaming(
+            base_url=args.llm_base_url or "",
+            api_key=args.llm_api_key or "",
+            model=args.llm_model or "",
+            timeout=args.llm_timeout or 90.0,
+        )
     with _no_leftover_experiment(args.report_out):
         try:
             result = run_series(
@@ -1000,6 +1039,7 @@ def _cmd_series(args: argparse.Namespace) -> int:
                 require_comparable=args.require_comparable,
                 fusion=args.fusion,
                 fusion_cap=args.fusion_cap,
+                llm=naming,
             )
         except ValueError as exc:
             raise SystemExit(f"[membench] {exc}")
