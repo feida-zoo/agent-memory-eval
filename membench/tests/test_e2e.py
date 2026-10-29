@@ -120,3 +120,112 @@ def test_e2e_strong_beats_weak(tmp_path: Path) -> None:
     assert strong_o["abstention_accuracy"] == pytest.approx(1.0)
     # mock-weak 从不拒答 → abstention 题全错。
     assert weak_o["abstention_accuracy"] == pytest.approx(0.0)
+
+
+def _write_judge_spec_dataset(path: Path, *, with_plain: bool) -> None:
+    """微型数据集：一道 judge_spec 题 +（可选）一道常规题。"""
+    questions = [
+        {
+            "qid": "q_spec",
+            "question": "What is the current budget?",
+            "gold_answer": "221,000 USD",
+            "category": "utility_answer",
+            "evidence": ["The budget is 221,000 USD."],
+            "judge_spec": {
+                "include": ["221,000 USD"],
+                "not_include": [],
+                "leak_targets": [],
+            },
+        }
+    ]
+    if with_plain:
+        questions.append(
+            {
+                "qid": "q_plain",
+                "question": "What is the dog's name?",
+                "gold_answer": "Rex",
+                "category": "single_hop",
+                "evidence": ["The dog is named Rex."],
+            }
+        )
+    dialogue = {
+        "dialogue_id": "d_spec",
+        "sessions": [
+            [
+                {
+                    "role": "user",
+                    "content": "The budget is 221,000 USD.",
+                    "timestamp": "2026-04-06T09:00",
+                },
+                {
+                    "role": "user",
+                    "content": "The dog is named Rex.",
+                    "timestamp": "2026-04-06T09:01",
+                },
+            ]
+        ],
+        "questions": questions,
+    }
+    path.write_text(json.dumps(dialogue, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _run_on_dataset(dataset_path: Path, experiment_dir: Path) -> Path:
+    """用 mock-strong 跑一次微型数据集，返回数据集产物目录。"""
+    runner = Runner(
+        adapter=MockStrongAdapter(),
+        dataset_path=str(dataset_path),
+        judge="heuristic",
+        out_dir=str(experiment_dir),
+    )
+    return Path(runner.run())
+
+
+def _read_records(dataset_dir: Path) -> dict[str, dict]:
+    path = dataset_dir / layout.DIR_REPORT / layout.FILE_RESULTS
+    return {
+        record["qid"]: record
+        for record in (
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    }
+
+
+def test_judge_spec_record_f1_is_null(tmp_path: Path) -> None:
+    """judge_spec 题的逐题 token_f1/bleu1 记 None（不是 0），均值跳过 None。"""
+    dataset_path = tmp_path / "judge_spec.jsonl"
+    _write_judge_spec_dataset(dataset_path, with_plain=True)
+    dataset_dir = _run_on_dataset(dataset_path, tmp_path / "eval_mixed")
+
+    records = _read_records(dataset_dir)
+    assert records["q_spec"]["token_f1"] is None
+    assert records["q_spec"]["bleu1"] is None
+    assert isinstance(records["q_plain"]["token_f1"], float)
+    assert isinstance(records["q_plain"]["bleu1"], float)
+
+    metrics_path = dataset_dir / layout.DIR_REPORT / layout.FILE_METRICS
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    # 混合数据集：均值只由常规题贡献（None 被跳过，不按 0 计入）
+    assert metrics["overall"]["token_f1"] == pytest.approx(records["q_plain"]["token_f1"])
+    assert metrics["overall"]["bleu1"] == pytest.approx(records["q_plain"]["bleu1"])
+
+
+def test_judge_spec_only_dataset_reports_undefined_f1(tmp_path: Path) -> None:
+    """全部是 judge_spec 题时 overall 的 token_f1/bleu1 为 None，报告显示未定义。"""
+    dataset_path = tmp_path / "judge_spec_only.jsonl"
+    _write_judge_spec_dataset(dataset_path, with_plain=False)
+    dataset_dir = _run_on_dataset(dataset_path, tmp_path / "eval_spec_only")
+
+    metrics_path = dataset_dir / layout.DIR_REPORT / layout.FILE_METRICS
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    assert metrics["overall"]["token_f1"] is None
+    assert metrics["overall"]["bleu1"] is None
+    assert metrics["by_category"]["utility_answer"]["token_f1"] is None
+
+    report = (dataset_dir / layout.DIR_REPORT / layout.FILE_REPORT_MD).read_text(
+        encoding="utf-8"
+    )
+    for label in ("Token F1", "BLEU-1"):
+        row = next(line for line in report.splitlines() if label in line)
+        assert "未定义" in row

@@ -723,3 +723,95 @@ def test_interleaved_jobs4_matches_jobs1(tmp_path: Path) -> None:
     assert [e for e in events_1 if e[0] != "query"] == [
         e for e in events_4 if e[0] != "query"
     ]
+
+
+# ---------------------------------------------------------------------------
+# 摄入块（ingest_blocks）与 interleaved 并发告警
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_blocks_match_ingest_calls(tmp_path: Path) -> None:
+    """块数 = ingest 调用次数（含补齐块），min / median / max 按消息条数算。"""
+    dataset = _order_dataset(tmp_path / "order.jsonl")
+    adapter = _RecordingAdapter()
+    dataset_dir = Path(
+        Runner(
+            adapter,
+            str(dataset),
+            judge="heuristic",
+            out_dir=str(tmp_path / "exp"),
+        ).run()
+    )
+    ingest_blocks = [len(event[1]) for event in adapter.events if event[0] == "ingest"]
+    assert ingest_blocks == [1, 2, 1]
+
+    metrics = _metrics(dataset_dir)
+    assert metrics["ingest_blocks"] == {"n": 3, "min": 1, "median": 1, "max": 2}
+    # 对话级 metrics 同样给该对话的摄入块
+    dialogue_metrics = _metrics(
+        dataset_dir / "d1"
+    )
+    assert dialogue_metrics["ingest_blocks"] == metrics["ingest_blocks"]
+    # 报告「评测配置」表出现「摄入块」一行
+    report = (dataset_dir / layout.DIR_REPORT / layout.FILE_REPORT_MD).read_text(
+        encoding="utf-8"
+    )
+    assert "| 摄入块 | 3 块（1~2 条/块，中位 1） |" in report
+
+
+def test_ingest_blocks_absent_for_sequence(tmp_path: Path) -> None:
+    """sequence 对话不产出 ingest_blocks：对话级与数据集级都没有该键。"""
+    dataset = _write_dataset(
+        tmp_path / "seq.jsonl",
+        [
+            {
+                "dialogue_id": "d1",
+                "ingest_strategy": "sequence",
+                "sessions": [
+                    [{"role": "user", "content": "m1", "timestamp": None}],
+                    [{"role": "user", "content": "m2", "timestamp": None}],
+                ],
+                "questions": [_question("q1", as_of=None)],
+            }
+        ],
+    )
+    dataset_dir = Path(
+        Runner(
+            _StateFileAdapter(),
+            str(dataset),
+            judge="heuristic",
+            out_dir=str(tmp_path / "exp"),
+        ).run()
+    )
+    assert "ingest_blocks" not in _metrics(dataset_dir)
+    assert "ingest_blocks" not in _metrics(dataset_dir / "d1")
+    report = (dataset_dir / layout.DIR_REPORT / layout.FILE_REPORT_MD).read_text(
+        encoding="utf-8"
+    )
+    assert "摄入块" not in report
+
+
+def test_interleaved_jobs_warning_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """interleaved + jobs>1 警告一次；jobs=1 不警告（也不强制降 jobs）。"""
+    dataset = _order_dataset(tmp_path / "order.jsonl")
+    Runner(
+        _StateFileAdapter(),
+        str(dataset),
+        judge="heuristic",
+        out_dir=str(tmp_path / "jobs2"),
+        jobs=2,
+    ).run()
+    out = capsys.readouterr().out
+    assert out.count("interleaved 下同组 query 并发执行") == 1
+    assert "--jobs 1" in out
+
+    Runner(
+        _StateFileAdapter(),
+        str(dataset),
+        judge="heuristic",
+        out_dir=str(tmp_path / "jobs1"),
+        jobs=1,
+    ).run()
+    assert "interleaved 下同组 query 并发执行" not in capsys.readouterr().out

@@ -368,6 +368,29 @@ def test_eval_dry_run_without_shards_has_no_fuse(
     assert "wait" not in out
 
 
+def test_eval_dry_run_passes_trace_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--trace-state 出现在 dry-run 的 run 命令里（单数据集路径）。"""
+    assert _eval_dry_run(tmp_path, "--trace-state") == 0
+    out = capsys.readouterr().out
+    run_line = next(line for line in out.splitlines() if "-m membench.cli run" in line)
+    assert "--trace-state" in shlex.split(run_line)
+
+
+def test_eval_common_dry_run_passes_trace_state(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--trace-state 出现在 dry-run 的 evaluate 命令里（多数据集路径）。"""
+    _common_home(tmp_path, monkeypatch)
+    assert run_task.main(_eval_common_argv(tmp_path, "--trace-state")) == run_task.EXIT_OK
+    out = capsys.readouterr().out
+    line = next(line for line in out.splitlines() if "-m membench.cli evaluate" in line)
+    assert "--trace-state" in shlex.split(line)
+
+
 def test_ab_dry_run_arm_and_compare_order(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

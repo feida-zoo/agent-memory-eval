@@ -37,7 +37,8 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
         [--judge heuristic] [--platform wx --commit a1b2c3] \
         [--driver-llm gpt-4o] [--adapter-version a1b2c3] \
         [--report-out DIR | --task-dir DIR] [--adapter-arg KEY=VALUE]... \
-        [--no-snapshot] \
+        [--no-snapshot] [--trace-state] \
+        # --trace-state：失败归因（仅 interleaved 对话生效；sequence 用末尾 memory_snapshot/）
         [--quick | --beam-10m | --no-beam] [--no-lme-s] [--common] \
         [--fusion weighted|equal]   # 基准集融合口径（默认 weighted：按题数加权、封顶 500）\
         [--evidence-match substring|overlap|llm] \
@@ -49,7 +50,7 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
         [--driver-llm-b gpt-4o-mini] [--adapter-version-b d4e5f6] \
         [--adapter-arg-a KEY=VALUE]... [--adapter-arg-b KEY=VALUE]... \
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
-        [--report-out DIR | --task-dir DIR] [--no-snapshot] [--tag <name>] \
+        [--report-out DIR | --task-dir DIR] [--no-snapshot] [--trace-state] [--tag <name>] \
         [--quick | --beam-10m | --no-beam] [--common] \
         [--fusion weighted|equal]   # 两侧共用（默认 weighted）\
         [--no-lme-s] [--evidence-match substring|overlap|llm] \
@@ -443,6 +444,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="不导出对话状态快照（默认导出：每个对话 ingest 完成后落到它的 memory_snapshot/；适配器不支持快照时默认只警告一次并跳过）",
     )
+    p_ev.add_argument(
+        "--trace-state",
+        action="store_true",
+        help="失败归因：透传给每个数据集的 run，仅 interleaved 对话生效"
+        "（在每个有提问的 as_of 导出 <对话目录>/trace_state/t<as_of>/）；"
+        "sequence 对话用末尾 memory_snapshot/，可通过 evidence_in_state 判定证据是否已写入",
+    )
     ev_group = p_ev.add_mutually_exclusive_group()
     ev_group.add_argument("--quick", action="store_true", help="快速模式：跳过 BEAM 与 LongMemEval-S（等价 --no-beam --no-lme-s，分钟级回归）")
     ev_group.add_argument("--beam-10m", action="store_true", help="BEAM 槽位使用 beam_10m.jsonl（默认 beam_1m.jsonl）")
@@ -551,6 +559,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-snapshot",
         action="store_true",
         help="不导出对话状态快照（默认导出：每个对话 ingest 完成后落到它的 memory_snapshot/；适配器不支持快照时默认只警告一次并跳过）",
+    )
+    p_ev_cmp.add_argument(
+        "--trace-state",
+        action="store_true",
+        help="失败归因：两侧逐数据集透传给 run，仅 interleaved 对话生效"
+        "（在每个有提问的 as_of 导出 <对话目录>/trace_state/t<as_of>/）；"
+        "sequence 对话用末尾 memory_snapshot/，可通过 evidence_in_state 判定证据是否已写入",
     )
     ev_cmp_group = p_ev_cmp.add_mutually_exclusive_group()
     ev_cmp_group.add_argument("--quick", action="store_true", help="快速模式：跳过 BEAM 与 LongMemEval-S（等价 --no-beam --no-lme-s）")
@@ -1600,6 +1615,7 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
             fusion=args.fusion,
             **_out_kwargs(args),
             **_snapshot_kwarg(args),
+            trace_state=args.trace_state,
         )
 
 
@@ -1673,6 +1689,7 @@ def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
             fusion=args.fusion,
             **_out_kwargs(args),
             **_snapshot_kwarg(args),
+            trace_state=args.trace_state,
         )
     return 1 if result["verdict"] == "FAIL" else 0
 

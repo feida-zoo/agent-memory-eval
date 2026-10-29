@@ -177,13 +177,16 @@ def percentile(values: Iterable[float], p: float) -> float:
     return xs[lo] + (xs[hi] - xs[lo]) * frac
 
 
-def _mean(values: Iterable[float]) -> float | None:
-    """算术均值；空序列返回 ``None``（显式区分"未计算"与"真实 0"）。
+def _mean(values: Iterable[float | None]) -> float | None:
+    """算术均值，**跳过 None**；没有可用值返回 ``None``（区分"未计算"与"真实 0"）。
 
-    返回 ``None`` 让 ``format_metric`` / ``fig_*`` / ``fuse_metrics`` 一律走
-    "未定义"路径，避免旧版把"数据集无 evidence"误算成"召回率为 0"。
+    跳过 None 是为 judge_spec 题服务的：这类题的 ``token_f1`` / ``bleu1``
+    记为 None（gold 是 rubric 正则拼接，没有字面可比对的参考答案），均值
+    只对存在的值求平均。返回 ``None`` 让 ``format_metric`` / ``fig_*`` /
+    ``fuse_metrics`` 一律走"未定义"路径，避免旧版把"数据集无 evidence"
+    误算成"召回率为 0"。
     """
-    xs = [float(v) for v in values]
+    xs = [float(v) for v in values if v is not None]
     return sum(xs) / len(xs) if xs else None
 
 
@@ -200,6 +203,8 @@ def aggregate(
             ``category / gold_answer / evidence_hit / token_f1 / bleu1 /
             latency_ms / input_tokens / llm_calls / ingest_llm_calls`` 以及
             ``judge``（含 correct / abstained_pred / stale）字段。
+            ``token_f1`` / ``bleu1`` 允许为 None（judge_spec 题没有字面参考
+            答案），均值只对存在的值计算。
         capabilities: 可选，由 runner 从题目集扫描得到的能力标注
             （``has_evidence / has_stale / has_abstention``）；传 None 时
             ``aggregate`` 从 records 自身推断（仅以"是否有非 abstention
@@ -244,7 +249,8 @@ def aggregate(
         - avg_ingest_latency_ms: 每题 ingest 侧耗时均值（"记记忆"本身的开销）。
         - avg_llm_calls: 每题 ``llm_calls + ingest_llm_calls`` 均值
           （ingest 成本按 runner 的记录归属口径计入）。
-        - by_category 除 accuracy 外附带 token_f1 均值（分题型质量）。
+        - by_category 除 accuracy 外附带 token_f1 均值（分题型质量）；该题型
+          没有任何可用 token_f1（全为 None，如 judge_spec 题）时为 None。
     """
     n = len(records)
 
@@ -277,8 +283,10 @@ def aggregate(
 
     overall = {
         "accuracy": _mean(bool(_judge(r).get("correct")) for r in records),
-        "token_f1": _mean(r.get("token_f1", 0.0) for r in records),
-        "bleu1": _mean(r.get("bleu1", 0.0) for r in records),
+        # judge_spec 题的这两项记为 None（无字面参考答案），_mean 跳过 None；
+        # 全部为 None 时 overall 也是 None（报告显示"未定义"）。
+        "token_f1": _mean(r.get("token_f1") for r in records),
+        "bleu1": _mean(r.get("bleu1") for r in records),
         # capabilities 为 False 时显式 None（"未计算"），而非把"无该题型"
         # 误算成 0（污染总分/评级）。
         "evidence_recall": (
@@ -332,15 +340,24 @@ def aggregate(
     by_category: dict[str, dict[str, Any]] = {}
     for rec in records:
         cat = str(rec.get("category", "unknown"))
-        bucket = by_category.setdefault(cat, {"_correct": 0.0, "_f1": 0.0, "n": 0})
+        bucket = by_category.setdefault(
+            cat, {"_correct": 0.0, "_f1": 0.0, "_f1_n": 0, "n": 0}
+        )
         bucket["_correct"] += 1.0 if _judge(rec).get("correct") else 0.0
-        bucket["_f1"] += float(rec.get("token_f1", 0.0))
+        # 与 overall 同口径：judge_spec 题的 token_f1 为 None，不进分子分母。
+        f1 = rec.get("token_f1")
+        if f1 is not None:
+            bucket["_f1"] += float(f1)
+            bucket["_f1_n"] += 1
         bucket["n"] += 1
     for cat, bucket in by_category.items():
         bucket["accuracy"] = bucket["_correct"] / bucket["n"] if bucket["n"] else 0.0
-        bucket["token_f1"] = bucket["_f1"] / bucket["n"] if bucket["n"] else 0.0
+        bucket["token_f1"] = (
+            bucket["_f1"] / bucket["_f1_n"] if bucket["_f1_n"] else None
+        )
         del bucket["_correct"]
         del bucket["_f1"]
+        del bucket["_f1_n"]
 
     result: dict[str, Any] = {
         "overall": overall,

@@ -20,8 +20,16 @@ session 边界）→ 组内并发 query → 下一组；中间**不 reset**，�
 完成后、query 之前导出一份状态到 ``<对话目录>/trace_state/t<as_of>/``（含
 ``manifest.json``）；sequence 的提问时点就是末尾的 ``memory_snapshot/``。每题
 记录 ``evidence_in_state``（证据片段是否出现在该时点的可读文本状态文件里；
-无快照 / 无 evidence / 状态不可读记 null），数据集级 metrics 的 ``attribution``
-按四桶（not_written / not_retrieved / wrong_answer / unknown）汇总。
+无快照 / 无 evidence / 状态不可读 / 状态超扫描上限记 null），数据集级 metrics 的
+``attribution`` 按四桶（not_written / not_retrieved / wrong_answer / unknown）汇总。
+长证据按句拆成多个 needle（最长至多 5 句 + 前 200 字符），任一命中即算写入；
+同一状态目录的归一化文本按目录指纹缓存（进程内 LRU，见
+:func:`scan_state_for_evidence`）。
+
+**摄入块**（``ingest_blocks``）：interleaved 对话每次 ingest 的消息条数汇总成
+``{"n", "min", "median", "max"}`` 落进 metrics（含最后的补齐块）。sequence 对话
+不产出该字段，数据集级没有 interleaved 对话时同样不落该字段。interleaved + ``jobs>1``
+只警告一次、不降并发——组内 query 并发的前提是 query 不写入记忆状态。
 
 分片（``shards>1``）只写本片负责的对话目录与分片账本，**不写**数据集级 ``report/`` 与
 任务级 ``reports/``——分片产物不再"看起来像完整实验"；数据集级与任务级产物一律由
@@ -69,9 +77,14 @@ results.jsonl（不浪费 LLM 调用，metrics 聚合分母口径自然正确）
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
+import re
 import shutil
+import statistics
+import sys
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Union
@@ -103,8 +116,32 @@ TRACE_STATE_WARN_BYTES = SNAPSHOT_WARN_BYTES
 #: 逐 as_of 追踪状态总份数超过该值时告警一次（磁盘占用随"有提问的时点数"增长）。
 TRACE_STATE_WARN_COUNT = 200
 
-#: evidence 片段超过该长度时只取前 N 字符作为扫描 needle（短证据用全文）。
+#: evidence 片段超过该长度时按句拆成多个 needle（短证据用全文）。
 EVIDENCE_NEEDLE_CHARS = 200
+
+#: 长证据切句后的最短句长（字符）：太短的句子（"好的。"）命中噪声大，不配当 needle。
+EVIDENCE_MIN_SENTENCE_CHARS = 20
+
+#: 长证据最多取几句当 needle（最长优先）。
+EVIDENCE_MAX_SENTENCES = 5
+
+#: 长证据的切句边界：中英文句号 / 问号 / 叹号 / 换行。
+EVIDENCE_SENTENCE_SPLIT_RE = re.compile(r"[。.！!？?\n]+")
+
+#: 状态扫描的单文件读取上限：超过即判"不可判定"，避免巨大状态把内存打爆。
+STATE_SCAN_MAX_FILE_BYTES = 20 * 1024 * 1024
+
+#: 状态扫描的单目录读取总量上限（同上）。
+STATE_SCAN_MAX_TOTAL_BYTES = 200 * 1024 * 1024
+
+#: 状态目录归一化文本的进程内缓存份数（LRU；不跨进程共享）。
+STATE_SCAN_CACHE_SIZE = 8
+
+#: 状态目录扫描结果缓存：``(目录绝对路径, 文件指纹)`` -> 归一化文本元组。
+_STATE_TEXT_CACHE: "OrderedDict[tuple[str, str], tuple[str, ...]]" = OrderedDict()
+
+#: 状态目录超过读取上限的告警只打一次（同一进程内反复扫同一个巨大目录没有新信息）。
+_STATE_SCAN_OVERSIZE_WARNED = False
 
 
 def _normalize_ws(text: str) -> str:
@@ -112,15 +149,147 @@ def _normalize_ws(text: str) -> str:
     return " ".join(str(text).split())
 
 
+def evidence_needles(text: str) -> list[str]:
+    """把一条证据片段转成 needle 列表（均已归一化空白）。
+
+    短证据（≤ :data:`EVIDENCE_NEEDLE_CHARS`）整段作为 needle。长证据只取开头
+    200 字符等于只检查"开场白"——事实常出现在中段，因此按句切分后取**最长且
+    不同的至多 :data:`EVIDENCE_MAX_SENTENCES` 句**（每句 ≥
+    :data:`EVIDENCE_MIN_SENTENCE_CHARS` 字符，纯标点 / 空白句跳过），再补上
+    "前 200 字符"这一条；**任一** needle 命中即算证据已写入。一句可用都没有
+    （长文本全是短句）时退回前 200 字符。
+    """
+    normalized = _normalize_ws(text)
+    if not normalized:
+        return []
+    head = normalized[:EVIDENCE_NEEDLE_CHARS]
+    if len(normalized) <= EVIDENCE_NEEDLE_CHARS:
+        return [head]
+    sentences: list[str] = []
+    for chunk in EVIDENCE_SENTENCE_SPLIT_RE.split(str(text)):
+        sentence = _normalize_ws(chunk)
+        if len(sentence) < EVIDENCE_MIN_SENTENCE_CHARS:
+            continue
+        if not any(char.isalnum() for char in sentence):
+            continue
+        sentences.append(sentence)
+    # 最长优先；dict.fromkeys 保序去重（同长度的句子按出现顺序取，结果确定）
+    picked = sorted(dict.fromkeys(sentences), key=len, reverse=True)[
+        :EVIDENCE_MAX_SENTENCES
+    ]
+    if head and head not in picked:
+        picked.append(head)
+    return picked
+
+
+def _state_dir_fingerprint(state_dir: str) -> str:
+    """目录内文件的 ``(相对路径, mtime_ns, 大小)`` 指纹（不读文件内容）。
+
+    缓存靠它失效：同一个路径被改写（fuse / 回放复用路径）后指纹变化，
+    缓存条目自然不会再被命中。
+    """
+    hasher = hashlib.sha1()
+    for root, dirs, files in os.walk(state_dir):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            rel = os.path.relpath(path, state_dir)
+            hasher.update(
+                f"{rel}\x00{stat.st_mtime_ns}\x00{stat.st_size}\n".encode("utf-8")
+            )
+    return hasher.hexdigest()
+
+
+def _read_state_texts(state_dir: str) -> Union[tuple[str, ...], None]:
+    """读取状态目录里的可读文本并归一化空白；超过读取上限返回 None（不可判定）。
+
+    只读 UTF-8 可解码、不含 NUL 的文件（二进制一律跳过），跳过框架写的
+    ``manifest.json``。超限时在 stderr 告警**一次**并返回 None——没读完整个目录
+    就不能声称"证据没写入"，归因记 unknown 而不是 false。
+    """
+    global _STATE_SCAN_OVERSIZE_WARNED
+    paths: list[tuple[str, int]] = []
+    total_bytes = 0
+    for root, dirs, files in os.walk(state_dir):
+        dirs.sort()
+        for name in sorted(files):
+            if name == snapshot_mod.MANIFEST_NAME:
+                continue
+            path = os.path.join(root, name)
+            try:
+                size = os.stat(path).st_size
+            except OSError:
+                continue
+            total_bytes += size
+            paths.append((path, size))
+    oversize = total_bytes > STATE_SCAN_MAX_TOTAL_BYTES or any(
+        size > STATE_SCAN_MAX_FILE_BYTES for _path, size in paths
+    )
+    if oversize:
+        if not _STATE_SCAN_OVERSIZE_WARNED:
+            _STATE_SCAN_OVERSIZE_WARNED = True
+            print(
+                f"[membench] ⚠️ 状态目录 {state_dir} 超过扫描上限（单文件 "
+                f"{STATE_SCAN_MAX_FILE_BYTES >> 20} MB / 合计 "
+                f"{STATE_SCAN_MAX_TOTAL_BYTES >> 20} MB）：本题记 "
+                "evidence_in_state=null（归因 unknown），不猜",
+                file=sys.stderr,
+            )
+        return None
+    texts: list[str] = []
+    for path, _size in paths:
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            continue
+        if b"\0" in data:
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        texts.append(_normalize_ws(text))
+    return tuple(texts)
+
+
+def _state_texts_cached(state_dir: str) -> Union[tuple[str, ...], None]:
+    """同一状态目录的归一化文本只构建一次（进程内 LRU，按文件指纹失效）。
+
+    同一状态目录通常被一组题共享（interleaved 的同 as_of 组、sequence 的整个
+    对话、回放的源快照），逐题重读文件纯属浪费；缓存上限
+    :data:`STATE_SCAN_CACHE_SIZE` 份，超出按 LRU 淘汰。超限目录不缓存（下次照样
+    只做 stat，不读内容），告警仍只打一次。
+
+    ``jobs>1`` 时本题扫描在多个线程里并发执行：命中用 ``pop`` + 重新插入刷新
+    LRU 位置（单次 ``pop`` 在 GIL 下是原子的），避免 ``get`` 与 ``move_to_end``
+    之间被别的线程淘汰掉而抛 ``KeyError``。
+    """
+    key = (os.path.abspath(state_dir), _state_dir_fingerprint(state_dir))
+    cached = _STATE_TEXT_CACHE.pop(key, None)
+    if cached is not None:
+        _STATE_TEXT_CACHE[key] = cached
+        return cached
+    texts = _read_state_texts(state_dir)
+    if texts is None:
+        return None
+    _STATE_TEXT_CACHE[key] = texts
+    if len(_STATE_TEXT_CACHE) > STATE_SCAN_CACHE_SIZE:
+        _STATE_TEXT_CACHE.popitem(last=False)
+    return texts
+
+
 def scan_state_for_evidence(
     state_dir: Union[str, None], evidence: list[str]
 ) -> Union[bool, None]:
     """在提问时点的状态目录里查证据片段是否已写入。
 
-    只扫**可读文本文件**：UTF-8 可解码、不含 NUL 字节（二进制一律跳过），跳过
-    框架写的 ``manifest.json``。证据按归一化空白后的子串匹配；超过
-    :data:`EVIDENCE_NEEDLE_CHARS` 的片段取前 N 字符作 needle（长证据的后半段
-    常因改写而对不上，拿全量反而降低命中）。多条证据命中任意一条即算"已写入"。
+    needle 由 :func:`evidence_needles` 生成（长证据多句匹配）；目录文本按
+    :func:`_state_texts_cached` 缓存。多条证据命中任意一条即算"已写入"。
 
     Args:
         state_dir: 该题提问时的状态目录（interleaved 的 ``trace_state/t<as_of>/``、
@@ -129,35 +298,33 @@ def scan_state_for_evidence(
 
     Returns:
         True / False；**无法判定返回 None**（没有 evidence 标注、没有状态目录、
-        或目录里没有任何可读文本文件）——不把"读不到"猜成"没写入"。
+        目录里没有任何可读文本文件、或状态体积超过扫描上限）——不把"读不到"
+        猜成"没写入"。
     """
-    needles = [_normalize_ws(item)[:EVIDENCE_NEEDLE_CHARS] for item in evidence]
-    needles = [needle for needle in needles if needle]
+    needles = [needle for item in evidence for needle in evidence_needles(item)]
     if not needles or not state_dir or not os.path.isdir(state_dir):
         return None
-    n_readable = 0
-    for root, dirs, files in os.walk(state_dir):
-        dirs.sort()
-        for name in sorted(files):
-            if name == snapshot_mod.MANIFEST_NAME:
-                continue
-            path = os.path.join(root, name)
-            try:
-                with open(path, "rb") as handle:
-                    data = handle.read()
-            except OSError:
-                continue
-            if b"\0" in data:
-                continue
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-            n_readable += 1
-            haystack = _normalize_ws(text)
-            if any(needle in haystack for needle in needles):
-                return True
-    return False if n_readable else None
+    texts = _state_texts_cached(state_dir)
+    if not texts:
+        return None
+    return any(needle in text for text in texts for needle in needles)
+
+
+def summarize_ingest_blocks(sizes: list[int]) -> Union[dict[str, Any], None]:
+    """摄入块汇总：``{"n", "min", "median", "max"}``（块 = 一次 ingest 的消息条数）。
+
+    没有块（sequence 对话 / 范围内没有 interleaved 对话）返回 None——报告据此
+    决定是否显示「摄入块」一行。中位数按偶数个取中间两数均值。
+    """
+    if not sizes:
+        return None
+    ordered = sorted(sizes)
+    return {
+        "n": len(ordered),
+        "min": ordered[0],
+        "median": statistics.median(ordered),
+        "max": ordered[-1],
+    }
 
 
 def _write_run_artifacts(
@@ -587,6 +754,11 @@ class Runner:
 
         judge_result = self.judge.grade(question, gold_answer, answer)
 
+        # judge_spec 题（GateMem checkpoint）的 gold_answer 是 rubric 要点的
+        # 正则拼接，不是可比对的参考答案——字面重合度没有意义，记 None
+        # （不是 0，避免污染均值；aggregate 跳过 None）。
+        has_judge_spec = bool(getattr(question, "judge_spec", None))
+
         return {
             "qid": str(getattr(question, "qid", "")),
             "dialogue_id": dialogue_id,
@@ -600,8 +772,8 @@ class Runner:
             # 后者为 None = 没有快照 / 状态不可读 / 题目没有 evidence 标注。
             "as_of": getattr(question, "as_of", None),
             "evidence_in_state": scan_state_for_evidence(state_dir, evidence),
-            "token_f1": float(token_f1(gold_answer, answer)),
-            "bleu1": float(bleu1(gold_answer, answer)),
+            "token_f1": None if has_judge_spec else float(token_f1(gold_answer, answer)),
+            "bleu1": None if has_judge_spec else float(bleu1(gold_answer, answer)),
             "recall@5": float(recall_at_5),
             "judge": _judge_result_to_dict(judge_result),
             "latency_ms": float(getattr(result, "latency_ms", 0.0) or 0.0),
@@ -717,6 +889,13 @@ class Runner:
                 "--trace-state 与 --replay 互斥：回放不 ingest，没有 as_of 时点可追踪；"
                 "回放的状态来自源快照（--replay 的入参），归因直接读它即可，"
                 "请去掉 --trace-state"
+            )
+        # 组内并发的前提：query 只读。适配器若把 query 当写入入口（顺手存一条
+        # 对话），同组并发会让状态顺序不确定——提醒但不降 jobs（用户可能明知故犯）。
+        if interleaved_ids and self.jobs > 1:
+            print(
+                "[membench] ⚠️ interleaved 下同组 query 并发执行，要求 query "
+                "不写入记忆状态；否则请 --jobs 1"
             )
 
         adapter_name = str(getattr(self.adapter, "name", self.adapter.__class__.__name__))
@@ -1020,12 +1199,15 @@ class Runner:
             dialogue_id: Union[str, None] = None,
             scope_dialogues: Union[list[Any], None] = None,
             trace_n: int = 0,
+            ingest_blocks: Union[dict[str, Any], None] = None,
         ) -> dict[str, Any]:
             """组装某一层级的 metrics（数据集级 / 对话级同一套字段与口径）。
 
             ``scope_dialogues`` 是这一层级覆盖的对话（数据集级=全部、对话级=自己），
             用于落 ``ingest_strategy`` / ``as_of_questions`` / ``as_of_enforced``
             与归因的 evidence 题集；``trace_n`` 是该层级实际导出的追踪状态份数。
+            ``ingest_blocks`` 是该层级的摄入块汇总（:func:`summarize_ingest_blocks`）：
+            对话级只有 interleaved 才给，数据集级没有 interleaved 对话时不给。
             """
             scope = scope_dialogues if scope_dialogues is not None else dialogues
             if dialogue_id is not None:
@@ -1114,6 +1296,10 @@ class Runner:
                 }
             if dialogue_id is not None:
                 out["dialogue_id"] = dialogue_id
+            # 摄入块：对话级只在 interleaved 下出现；数据集级没有 interleaved 对话时
+            # 不产出该字段（与 fuse 重建的 metrics 字段集保持一致）。
+            if ingest_blocks is not None:
+                out["ingest_blocks"] = ingest_blocks
             out.update(retrieval_meta)
             if state is not None:
                 out["state_snapshot"] = state
@@ -1124,6 +1310,8 @@ class Runner:
         fallbacks_seen = match_fallbacks_start
         # 逐对话追踪状态份数（--trace-state）：对话级与数据集级 metrics 都要落账
         trace_states_by_dialogue: dict[str, int] = {}
+        # 本 run 全部 interleaved 对话的摄入块（数据集级汇总用；sequence 不进来）
+        interleaved_blocks: list[int] = []
         for di, dialogue in enumerate(dialogues, 1):
             dialogue_id = str(dialogue.dialogue_id)
             dialogue_path = layout.dialogue_dir(self.out_dir, dataset_name, dialogue_id)
@@ -1146,10 +1334,12 @@ class Runner:
                 "llm_calls": 0,
                 "input_tokens": 0,
             }
+            block_sizes: list[int] = []
 
             def _ingest(messages: list[dict]) -> None:
                 """ingest 一段消息并累计该对话的写入成本。"""
                 stats = self.adapter.ingest(messages)
+                block_sizes.append(len(messages))
                 ingest_stats["latency_ms"] += float(getattr(stats, "latency_ms", 0.0) or 0.0)
                 ingest_stats["llm_calls"] += int(getattr(stats, "llm_calls", 0) or 0)
                 ingest_stats["input_tokens"] += int(getattr(stats, "input_tokens", 0) or 0)
@@ -1409,6 +1599,9 @@ class Runner:
             ingest_input_tokens = int(ingest_stats["input_tokens"])
             token_usage["ingest_input_tokens"] += ingest_input_tokens
             token_usage["ingest_llm_calls"] += ingest_llm_calls
+            if interleaved:
+                # 块含"全部 ingest 后"的补齐块：按 ingest_upto 的实际调用记，空切片不计
+                interleaved_blocks.extend(block_sizes)
 
             records.extend(dialogue_records)
             for record in dialogue_records:
@@ -1453,6 +1646,10 @@ class Runner:
                 dialogue_id=dialogue_id,
                 scope_dialogues=[dialogue],
                 trace_n=trace_states_by_dialogue.get(dialogue_id, 0),
+                # 对话级：只有 interleaved 给摄入块；sequence 不落该字段
+                ingest_blocks=(
+                    summarize_ingest_blocks(block_sizes) if interleaved else None
+                ),
             )
             fallbacks_seen = fallbacks_now
             dialogue_report_dir = layout.dialogue_report_dir(
@@ -1506,6 +1703,8 @@ class Runner:
             ),
             scope_dialogues=dialogues,
             trace_n=n_trace_states,
+            # 数据集级：汇总全部 interleaved 对话的块；没有 interleaved 时不落该字段
+            ingest_blocks=summarize_ingest_blocks(interleaved_blocks),
         )
         if replay_verify is not None:
             metrics["replay_verify"] = replay_verify

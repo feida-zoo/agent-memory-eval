@@ -67,9 +67,21 @@ speaker.role / turn_kind 显式为 assistant/agent/bot 一类时才映射为
 计数（不猜时点）。注意：interleaved 与题目级分片 / ``--replay`` 不兼容，
 评测时需 ``--shard-by dialogue``（见 ``membench.runner``）。
 
+**evidence（rubric 要点 → episode 片段映射）**：checkpoint 的 ``judge_spec.include``
+是判分要点（多为正则），不是对话原文子串，因此 evidence 由转换器在**该 checkpoint
+所属 episode 的全部 turns** 里搜索得到：``include`` 逐条按 ``re.search``（忽略
+大小写；正则写坏退化为字面量）匹配，``leak_targets`` 按字面量 + ASCII 词边界
+（忽略大小写）匹配——与 judge 的判分口径一致。命中的 turn 原文按 turn 顺序
+去重收集，每题最多 :data:`_MAX_EVIDENCE_ITEMS` 条、每条截断到
+:data:`_MAX_EVIDENCE_CHARS` 字符；include 为空的安全 / 隐私题退化为只用
+``leak_targets`` 搜索，仍无命中时 evidence 保持为空（不编造）。
+
 已知局限：
-- evidence 一律为 []：judge_spec.include 是判分要点而非对话原文子串。失败归因
-  因此无法逐题判定"证据是否已写入"，相关题会记 ``evidence_in_state=null``。
+- evidence 是按 rubric 要点回搜 episode 原文得到的**近似**证据：一个 include
+  要点可能命中多条与本题无关的 turn（要点是短值，如 ``9%``），多要点题只取
+  前若干条命中 turn。它用于检索召回与失败归因，不参与判分。
+- 搜索范围是 episode 的全部 turns（不只 as_of 之前），时点之后才出现的原文
+  也会成为 evidence——这类题在归因里会呈现为"证据未写入"。
 - asker 身份未建模：privacy 题的"该向谁拒答"依赖提问者身份，membench
   schema 无对应字段，统一按 abstention/single_hop 处理。
 - utility 题 judge_spec.notes 中的 stale 信息（旧值）未填入 gold_stale。
@@ -86,6 +98,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -112,6 +125,71 @@ _ASSISTANT_HINTS = ("assistant", "agent", "bot")
 
 #: (privacy, refuse) 题被 --ignore-privacy-refuse 标记时的忽略原因。
 PRIVACY_REFUSE_IGNORE_REASON = "多用户权限语义，单用户个人 agent 场景不适用"
+
+#: 每题最多保留的 evidence 条数（命中 turn 可能很多，超出部分对检索召回无增量）。
+_MAX_EVIDENCE_ITEMS = 5
+
+#: 单条 evidence 的最大字符数（turn 原文可能很长，截断防止 results.jsonl 膨胀）。
+_MAX_EVIDENCE_CHARS = 2000
+
+
+def _regex_hit(pattern: str, text: str) -> bool:
+    """``judge_spec.include`` 单条命中的预筛：忽略大小写的正则；写坏时按字面量。
+
+    与 judge 的 ``_include_hit`` 同口径：evidence 必须能被判分同一套规则找到，
+    否则召回指标与判分口径脱节。
+    """
+    try:
+        return re.search(pattern, text, re.IGNORECASE) is not None
+    except re.error:
+        return pattern.lower() in text.lower()
+
+
+def _literal_hit(target: str, text: str) -> bool:
+    """``leak_targets`` 的字面量命中（忽略大小写、ASCII 字母数字边缘带词边界）。
+
+    与 judge 的 ``_literal_hit`` 同口径：``yes`` / ``no`` / ``active`` 这类短值
+    不加词边界会命中 ``yesterday`` / ``not`` / ``inactive``，把无关 turn 收成
+    证据。非 ASCII 边缘（中文等）不加边界。
+    """
+    needle = (target or "").lower()
+    if not needle:
+        return False
+    pattern = re.escape(needle)
+    if needle[0].isascii() and needle[0].isalnum():
+        pattern = r"(?<![a-z0-9])" + pattern
+    if needle[-1].isascii() and needle[-1].isalnum():
+        pattern = pattern + r"(?![a-z0-9])"
+    return re.search(pattern, (text or "").lower()) is not None
+
+
+def _collect_evidence(
+    turn_texts: list[str], include: list[str], leak_targets: list[str]
+) -> list[str]:
+    """在 episode 的全部 turn 原文里搜索 rubric 要点，返回命中的 turn 原文。
+
+    匹配口径与 judge 一致（``include`` 正则 / ``leak_targets`` 字面量 + 词边界）。
+    命中 turn 按 turn 顺序收集、按原文去重，最多 :data:`_MAX_EVIDENCE_ITEMS`
+    条，每条截断到 :data:`_MAX_EVIDENCE_CHARS` 字符。``include`` 与
+    ``leak_targets`` 都为空、或全部无命中时返回空列表（不编造证据）。
+    """
+    if not include and not leak_targets:
+        return []
+    evidence: list[str] = []
+    seen: set[str] = set()
+    for text in turn_texts:
+        if not text or text in seen:
+            continue
+        hit = any(_regex_hit(pattern, text) for pattern in include) or any(
+            _literal_hit(target, text) for target in leak_targets
+        )
+        if not hit:
+            continue
+        seen.add(text)
+        evidence.append(text[:_MAX_EVIDENCE_CHARS])
+        if len(evidence) >= _MAX_EVIDENCE_ITEMS:
+            break
+    return evidence
 
 
 def _normalize_role(speaker: dict, turn_kind: str) -> str:
@@ -181,12 +259,15 @@ def _convert_checkpoint(
     cp: dict,
     as_of: int | None = None,
     ignore_privacy_refuse: bool = False,
+    turn_texts: list[str] | None = None,
 ) -> dict | None:
     """将一个 checkpoint 转为 membench question dict；未知组合返回 None。
 
     ``judge_spec.include`` / ``not_include`` 与 ``leak_targets`` 原样写入
     ``question["judge_spec"]``（三段全空时不写）；``gold_answer`` 仍保留
-    include 的可读拼接（拒答类为哨兵），供报告展示。
+    include 的可读拼接（拒答类为哨兵），供报告展示。``evidence`` 由
+    :func:`_collect_evidence` 在该 checkpoint 所属 episode 的 turn 原文里
+    回搜 rubric 要点得到（口径见模块 docstring）。
 
     Args:
         cp: checkpoint 记录。
@@ -194,6 +275,8 @@ def _convert_checkpoint(
             ``as_of_turn_id`` 在 turns 里的下标 + 1 算好）；None 表示该对话
             无法定位时点——写入后 runner 会把它排到全部 ingest 之后。
         ignore_privacy_refuse: True 时 (privacy, refuse) 题附加 ignore 标记。
+        turn_texts: 该 checkpoint 所属 episode 的全部 turn 原文；None / 空
+            列表时 evidence 为空。
     """
     key = (str(cp.get("query_type", "")), str(cp.get("expected_action", "")))
     category = _ACTION_MAP.get(key)
@@ -207,7 +290,7 @@ def _convert_checkpoint(
         "qid": str(cp.get("checkpoint_id", "")),
         "question": str(cp.get("query_text", cp.get("query", ""))),
         "category": category,
-        "evidence": [],
+        "evidence": _collect_evidence(turn_texts or [], include, leak_targets),
     }
     if as_of is not None:
         question["as_of"] = int(as_of)
@@ -248,7 +331,9 @@ def convert_gatemem(
             多用户共享记忆场景不要开）。
 
     Returns:
-        dict: 统计信息（dialogues/questions/categories/skipped/ignored/output）。
+        dict: 统计信息（dialogues/questions/categories/skipped/ignored/
+        evidence_filled/evidence_none/output）。``evidence_filled`` +
+        ``evidence_none`` = ``questions``。
     """
     episodes = _read_jsonl(episodes_path)
     checkpoints = _read_jsonl(checkpoints_path)
@@ -265,6 +350,7 @@ def convert_gatemem(
     n_skipped = 0
     n_ignored = 0
     n_as_of_missing = 0
+    n_evidence_filled = 0
     as_of_positions: list[int] = []
     category_counts: dict[str, int] = {}
     for cp in checkpoints:
@@ -284,8 +370,17 @@ def convert_gatemem(
                 )
                 n_skipped += 1
                 continue
+        target = by_id.get(episode_id)
+        turn_texts = (
+            [str(message.get("content", "")) for message in target["sessions"][0]]
+            if target is not None
+            else []
+        )
         question = _convert_checkpoint(
-            cp, as_of=as_of, ignore_privacy_refuse=ignore_privacy_refuse
+            cp,
+            as_of=as_of,
+            ignore_privacy_refuse=ignore_privacy_refuse,
+            turn_texts=turn_texts,
         )
         if question is None:
             n_skipped += 1
@@ -297,7 +392,6 @@ def convert_gatemem(
                 file=sys.stderr,
             )
             continue
-        target = by_id.get(episode_id)
         if target is None:
             n_skipped += 1
             print(
@@ -308,6 +402,8 @@ def convert_gatemem(
             continue
         target["questions"].append(question)
         n_questions += 1
+        if question["evidence"]:
+            n_evidence_filled += 1
         if as_of is not None:
             as_of_positions.append(as_of)
         if question.get("ignore"):
@@ -322,6 +418,10 @@ def convert_gatemem(
         "categories": category_counts,
         "skipped": n_skipped,
         "ignored": n_ignored,
+        # evidence 覆盖率：有命中片段 / 无命中（后者是 include 与 leak_targets
+        # 在整段 episode 里都找不到的题，保持空 evidence，不编造）。
+        "evidence_filled": n_evidence_filled,
+        "evidence_none": n_questions - n_evidence_filled,
         "as_of_missing": n_as_of_missing,
         "as_of_min": min(as_of_positions) if as_of_positions else None,
         "as_of_max": max(as_of_positions) if as_of_positions else None,
@@ -348,6 +448,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"[convert_gatemem] {stats['dialogues']} dialogues, {stats['questions']} questions"
           f"（跳过 {stats['skipped']} 个 checkpoint）")
+    print(f"[convert_gatemem] evidence 覆盖 {stats['evidence_filled']}/{stats['questions']}"
+          f"（{stats['evidence_none']} 题在 episode 原文里无命中）")
     if stats["as_of_min"] is not None:
         print(
             f"[convert_gatemem] 提问时点 as_of（已 ingest 消息条数）范围 "

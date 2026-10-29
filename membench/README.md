@@ -227,26 +227,42 @@ as_of 的状态）。`--snapshot` 仍可用：快照在**全部 ingest 完成后
 `run --trace-state` 在每个有提问的 as_of ingest 完成后、query 之前把状态导出到
 `<对话目录>/trace_state/t<as_of>/`（适配器需声明快照能力；不支持时警告一次并
 跳过，归因记 unknown）。sequence 对话不需要它——提问时点就是末尾的
-`memory_snapshot/`。`results.jsonl` 每题新增 `as_of` 与 `evidence_in_state`
+`memory_snapshot/`。`evaluate` / `evaluate-compare` 同样接受 `--trace-state`
+（透传给每个数据集的 run），`run_task.py` 的 `eval` / `ab` 也透传它。
+`results.jsonl` 每题新增 `as_of` 与 `evidence_in_state`
 （证据片段是否出现在该题提问时点的**可读文本状态文件**里；无快照 / 无 evidence
-标注 / 状态不可读记 `null`，不猜），`metrics.json` 的 `attribution` 与报告
-「失败归因」小节给出四桶：`not_written`（没写进去）/ `not_retrieved`（写入但没
-检索到）/ `wrong_answer`（检索到仍答错）/ `unknown`（不可判定）。四桶只统计
-**判错且带 evidence 标注**的题——没有 evidence 就无从判断"证据是否写入"，另记
-`n_wrong_without_evidence`，不硬塞进 `unknown`。
+标注 / 状态不可读 / 状态超扫描上限记 `null`，不猜），`metrics.json` 的
+`attribution` 与报告「失败归因」小节给出四桶：`not_written`（没写进去）/
+`not_retrieved`（写入但没检索到）/ `wrong_answer`（检索到仍答错）/ `unknown`
+（不可判定）。四桶只统计**判错且带 evidence 标注**的题——没有 evidence 就无从
+判断"证据是否写入"，另记 `n_wrong_without_evidence`，不硬塞进 `unknown`。
 
 ```bash
 # GateMem：interleaved 数据集；按对话分片（不能按题目分片），--trace-state 产出逐时点状态
 python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/gatemem_office.jsonl \
     --shard-by dialogue --shards 4 --shard-index 0 --trace-state
+
+# 多数据集全量评估：逐数据集透传 --trace-state（sequence 数据集照常跑，只是不写 trace_state/）
+python -m membench.cli evaluate --adapter my-sys --dataset office --dataset sample --trace-state
 ```
 
-状态扫描的代价与边界：只读 UTF-8 可解码、不含 NUL 的文本文件（跳过
-`manifest.json`），证据 >200 字符时取前 200 字符作 needle；每题扫一次状态目录，
-成本 ≈ 带 evidence 的题数 × 状态体积。适配器把记忆只存成二进制（向量库 /
-SQLite）时扫不到文本，`evidence_in_state` 记 `null`（归因 unknown）而不是
-"没写入"。`--trace-state` 的磁盘占用 = 有提问的 as_of 数 × 单份状态体积；单份
->100MB 或总份数 >200 会提示（同快照告警风格）。
+状态扫描的口径与代价：只读 UTF-8 可解码、不含 NUL 的文本文件（跳过
+`manifest.json`）。证据 ≤200 字符时整段作为 needle；更长的证据按中英文句号 /
+问号 / 叹号 / 换行切句，取**最长且不同的至多 5 句**（每句 ≥20 字符，纯标点 /
+空白句跳过）再加"前 200 字符"这一条，**任一** needle 命中即算已写入——只比开头
+200 字符会漏掉"事实在中段"的证据。同一状态目录的归一化文本按目录指纹（文件
+mtime / 大小）缓存，进程内最多 8 份（LRU；目录被改写即失效），所以带 evidence 的
+题共享一个状态目录时只读一次。单文件 >20MB 或单目录合计 >200MB 时不做判定、
+记 `null`（归因 unknown）并在 stderr 告警一次，避免巨大状态把内存打爆。
+适配器把记忆只存成二进制（向量库 / SQLite）时扫不到文本，`evidence_in_state`
+记 `null` 而不是"没写入"。`--trace-state` 的磁盘占用 = 有提问的 as_of 数 × 单份
+状态体积；单份 >100MB 或总份数 >200 会提示（同快照告警风格）。
+
+`metrics.json` 的 `ingest_blocks` 记录 interleaved 对话的**摄入块**：每次 ingest
+的消息条数汇总成 `{"n", "min", "median", "max"}`（含最后补齐剩余消息的那一块），
+报告「评测配置」表给一行「摄入块」（如 `31 块（4~60 条/块，中位 5）`）。sequence
+对话不产出该字段，数据集级没有 interleaved 对话时同样不落该字段。interleaved 下
+`--jobs > 1` 只警告一次、不降并发——组内 query 并发的前提是 `query` 不写入记忆状态。
 
 ## 大数据集：冒烟与分片
 
@@ -362,6 +378,7 @@ fuse 的融合产物（`shard_index=None`）不带这个标注，它覆盖全部
 - `run_mode`：`full` / `replay-restore` / `replay-rebuild`（见「状态快照与回放」）；
 - `ingest_strategy`：`sequence` / `interleaved` / `mixed`（分片把不同策略拼在一起）；`compare` 的**关键可比性维度**，缺省归一 `sequence`（旧产物不误伤）；
 - `as_of_questions` / `as_of_enforced`：带 `as_of` 标注的题数与是否全部被强制；sequence 下 `as_of_enforced=false`，报告据此提示"时点错位"；
+- `ingest_blocks`：interleaved 对话的摄入块 `{"n", "min", "median", "max"}`（每次 ingest 的消息条数，含最后的补齐块）；sequence 对话不落该字段，数据集级没有 interleaved 对话时同样不落该字段；
 - `trace_state`：`--trace-state` 的角色（`exported` / `unsupported` / `not_applicable`）与导出的状态份数；
 - `attribution`：失败归因四桶与 `n_wrong` / `n_wrong_with_evidence` / `n_state_readable`（只统计判错且带 evidence 的题；见「interleaved 摄入与失败归因」）；
 - `state_snapshot`：快照**默认导出**（适配器声明了快照能力时；`--no-snapshot` 关闭）或快照回放时记入；普通 run 的 `root` 指向**数据集目录**（即 `--replay` 可传的目录）；回放任务的 `root` 是快照源（数据集目录或回放任务路径），另给 `snapshots_dir`（本 run 的任务级池）与 `n_buckets` / `n_reused` / `n_new`（对话级给 `bucket` / `reused`）。适配器不支持快照时该块记 `role="unsupported"`（如实说明"没导"，读完可区分"这次没导"与"导不了"）。
@@ -1052,12 +1069,12 @@ python -m membench.cli run --adapter mock-strong --dataset ~/.membench/datasets/
 | LoCoMo | cat1→multi_hop, cat2→temporal, cat3→open_ended, cat4→single_hop, cat5→abstention（gold 为 `<ABSTAIN>` 哨兵） | evidence 自动从 dia_id 解析为原文；消息带真实说话人名 `name`（role 仍按 speaker_a→user、其余→assistant 映射，渲染成 `[user:Caroline]`）；约 6% 标注质量争议是数据集本身已知问题 |
 | LongMemEval | user/assistant→single_hop, multi-session→multi_hop, temporal-reasoning→temporal, knowledge-update→knowledge_update, preference→preference | 会话按 `haystack_dates` 升序输出（原始 500 题中 34 题非升序）；`question_date` 归一 ISO 后落库并追加到问题文本；oracle 与 S/M 的 evidence 都是从 `answer_session_ids` 解析的**完整 session 文本**（不截断，中位约 14k 字符）；oracle 无 per-turn 标注不等于无证据；无 gold_stale（stale_rate 显示 n/a，不再记 0）；cleaned 版无拒答题 |
 | BEAM | 10 类题型按原始 key 直传（information_extraction / multi_session_reasoning / event_ordering / temporal_reasoning / knowledge_update / contradiction_resolution / instruction_following / preference_following / summarization / abstention），不做多对一归并 | evidence 为空；rubric 未利用；`gold_stale` 从 `potential_confusion` 抽**裸旧值**，抽不出时留空、原句存 `gold_stale_note`（启发式不可机检，LLM judge 可判） |
-| GateMem | (utility,answer)→utility_answer、(privacy,refuse)→privacy_refuse、(privacy,answer_redacted)→privacy_answer_redacted、(safety,no_memory)→safety_no_memory（4 类原始组合直传，不合并） | `judge_spec`（include 正则 / not_include / leak_targets）落库并走**确定性 rubric**，leak_targets 命中是红线；asker 身份与 **as_of_turn_id 时间截断未建模**（需运行时按题前缀状态，题目挂在完整 episode 上）；内置集 140 道 privacy-refuse 题已标记 `ignore=true`（单用户场景跳过，见下节） |
+| GateMem | (utility,answer)→utility_answer、(privacy,refuse)→privacy_refuse、(privacy,answer_redacted)→privacy_answer_redacted、(safety,no_memory)→safety_no_memory（4 类原始组合直传，不合并） | `judge_spec`（include 正则 / not_include / leak_targets）落库并走**确定性 rubric**，leak_targets 命中是红线；`as_of_turn_id` 已建模为 `Question.as_of` + `ingest_strategy="interleaved"`（按 checkpoint 时点边 ingest 边提问），**asker 身份未建模**；内置集 140 道 privacy-refuse 题已标记 `ignore=true`（单用户场景跳过，见下节） |
 
 **公开集重转与指纹变化（2026-10）**：LongMemEval / GateMem / LoCoMo 的转换口径都变了，重新转换会改变数据集指纹（`dataset_sha256`）——**历史分数不能与新产物直接对比**（`compare` 会按指纹判不可比）。已下载的 `~/.membench/datasets/<key>.jsonl` 不会自动更新，按新口径重跑前先删 `~/.membench/datasets/<key>.jsonl` 与同名 raw 缓存目录（如 `.longmemeval_oracle_raw/`、`.gatemem_office_raw/`、`.locomo_raw/`），再 `dataset fetch <key>`（或手动重转）。
 
 - **LongMemEval 的 session 级证据匹配**：session 证据很长（S/M/oracle 中位约 14k 字符），chunk 级记忆返回的本就是其中一段，严格子串判定会让 recall@5 / 证据召回系统性接近 0。因此 `membench/metrics/evidence.py` 对**长证据（> 500 字符）**在子串 / token 判定失败后追加 containment 兜底：检索条目去空白后 ≥ 20 字符、且是证据的子串（或证据是它的子串）即算命中，`recall_at_5` 用同一判定。短证据（office / LoCoMo 的裸值）行为不变，仍要求原文子串。这是**代理口径**，不是语义匹配——深度改写的摘要仍走 `--evidence-match llm`。
-- **GateMem 的确定性 rubric**：题目带 `judge_spec` 时，`heuristic` 与 `llm` judge 都不再做 token_f1 / 模型判分——`include` 逐条按正则（忽略大小写，原始数据里有 `no[- ]auto[- ]renewal` 这类写法）、`not_include` 与 `leak_targets` 按字面量 + ASCII 词边界校验（避免 `no` 命中 `not`、`active` 命中 `inactive`）；`leak_targets` 命中记为**红线泄露**并写进 reason。拒答题在 rubric 之上**仍要求系统确实拒答**（`gold_answer=<ABSTAIN>`），避免 include 为空的 safety 题被任意非泄露回答骗过。`gold_answer` 的 include 拼接只用于报告展示。**`as_of_turn_id` 本轮未建模**：题目仍挂在完整 episode 上，不要把这类题的分数当"已按当时可见内容截断"来解读。
+- **GateMem 的确定性 rubric**：题目带 `judge_spec` 时，`heuristic` 与 `llm` judge 都不再做 token_f1 / 模型判分——`include` 逐条按正则（忽略大小写，原始数据里有 `no[- ]auto[- ]renewal` 这类写法）、`not_include` 与 `leak_targets` 按字面量 + ASCII 词边界校验（避免 `no` 命中 `not`、`active` 命中 `inactive`）；`leak_targets` 命中记为**红线泄露**并写进 reason。拒答题在 rubric 之上**仍要求系统确实拒答**（`gold_answer=<ABSTAIN>`），避免 include 为空的 safety 题被任意非泄露回答骗过。`gold_answer` 的 include 拼接只用于报告展示。**`as_of_turn_id` 已建模**：转换器把 checkpoint 时点写成 `Question.as_of`（已 ingest 的消息条数）并把对话标成 `ingest_strategy="interleaved"`，评测时按 as_of 边 ingest 边提问；但必须按 interleaved 的约束跑（`--shard-by dialogue`、不支持 `--replay`），按 sequence 跑会时点错位（报告会提示）。转换器同时把 rubric 要点回搜到 episode 原文作为 **evidence**（`include` 按正则、`leak_targets` 按词边界，每题最多 5 条、每条截断 2000 字符），CLI 打印 `evidence 覆盖 N/547`；带 `judge_spec` 的题 `token_f1` / `bleu1` 记 `null`（不是 0——gold 是正则拼接，没有字面参考答案），均值跳过 `null`，某题型 / 数据集无可计算值时报告显示「未定义」。
 - **LoCoMo 的说话人**：两个人类（speaker_a / speaker_b）此前被压成 user / assistant，抽取提示词分不清"谁说的"；现在每条消息额外带 `name`，渲染为 `[user:Caroline]` / `[assistant:Melanie]`（role 映射不变，保持历史兼容）。
 
 **`gold_stale` / `gold_stale_note` 字段口径**：

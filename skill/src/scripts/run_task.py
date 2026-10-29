@@ -9,6 +9,7 @@
         [--fusion {weighted,equal}] [--platform P] [--commit SHA] \
         [--driver-llm M] [--adapter-version V] \
         [--shards N|max] [--jobs N] [--limit N] [--report-out DIR] [--no-snapshot] \
+        [--trace-state] \
         [--name TAG] [--evidence-match-threshold X] [--llm-* ...] \
         [--adapter-arg KEY=VALUE]... [--task-dir DIR] [--background] [--dry-run]
 
@@ -17,7 +18,7 @@
         [--fusion {weighted,equal}] [--baseline-version V] [--candidate-version V] \
         [--driver-llm-a/-b M] \
         [--platform P] [--commit SHA] [--shards N|max] [--jobs N] [--limit N] \
-        [--name TAG] [--report-out DIR] [--no-snapshot] \
+        [--name TAG] [--report-out DIR] [--no-snapshot] [--trace-state] \
         [--adapter-arg-a/-b KEY=VALUE]... [--task-dir DIR] [--background] [--dry-run]
 
 固定流程（不许省步骤）
@@ -60,6 +61,9 @@
   缺文件时报错提示先 ``dataset fetch``；显式清单请逐项 ``--dataset``。
 - ``--fusion`` 透传给 ``evaluate`` / ``evaluate-compare``（默认 ``weighted`` 按
   参与题数加权、单数据集封顶 500）；``ab`` 的逐数据集 ``compare`` 门禁不受它影响。
+- ``--trace-state`` 透传给 ``run`` / ``evaluate`` / ``evaluate-compare``（失败归因）：
+  只对 interleaved 对话生效（在每个有提问的 as_of 导出 ``trace_state/t<as_of>/``），
+  sequence 对话用末尾 ``memory_snapshot/``；磁盘占用 = 有提问的 as_of 数 × 单份状态体积。
 - ``compare --require-comparable`` 是 strict 门禁：关键维度（``adapter`` /
   ``adapter_version`` / ``driver_llm`` / ``platform`` / ``judge`` 等）缺失或不同
   都会判 FAIL。A/B 只应让被测变量（通常是 ``commit``）不同；正式对比请显式给
@@ -200,6 +204,7 @@ class CommonArgs:
     jobs: Optional[int] = None
     limit: Optional[int] = None
     no_snapshot: bool = False
+    trace_state: bool = False
     evidence_match_threshold: Optional[float] = None
     llm_base_url: Optional[str] = None
     llm_api_key: Optional[str] = None
@@ -779,6 +784,8 @@ def _run_argv(
         argv += ["--limit", str(common.limit)]
     if common.no_snapshot:
         argv += ["--no-snapshot"]
+    if common.trace_state:
+        argv += ["--trace-state"]
     if common.evidence_match_threshold is not None:
         argv += ["--evidence-match-threshold", str(common.evidence_match_threshold)]
     if common.llm_base_url:
@@ -841,6 +848,8 @@ def _evaluate_argv(
         argv += ["--jobs", str(common.jobs)]
     if common.no_snapshot:
         argv += ["--no-snapshot"]
+    if common.trace_state:
+        argv += ["--trace-state"]
     if common.evidence_match_threshold is not None:
         argv += ["--evidence-match-threshold", str(common.evidence_match_threshold)]
     if common.llm_base_url:
@@ -1524,6 +1533,15 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         help="不导出对话状态快照（默认导出；适配器不支持时警告一次并跳过）",
     )
     parser.add_argument(
+        "--trace-state",
+        action="store_true",
+        help=(
+            "失败归因（透传 run / evaluate / evaluate-compare）：仅 interleaved 对话生效，"
+            "在每个有提问的 as_of 导出 <对话>/trace_state/t<as_of>/；"
+            "sequence 对话用末尾 memory_snapshot/"
+        ),
+    )
+    parser.add_argument(
         "--evidence-match-threshold",
         type=float,
         default=None,
@@ -1677,6 +1695,7 @@ def _common_from_args(args: argparse.Namespace) -> CommonArgs:
         jobs=args.jobs,
         limit=args.limit,
         no_snapshot=args.no_snapshot,
+        trace_state=args.trace_state,
         evidence_match_threshold=args.evidence_match_threshold,
         llm_base_url=args.llm_base_url,
         llm_api_key=args.llm_api_key,

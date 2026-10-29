@@ -1,4 +1,4 @@
-"""GateMem 转换器测试：动作映射、abstention 哨兵、未知组合跳过、schema 兼容。"""
+"""GateMem 转换器测试：动作映射、abstention 哨兵、未知组合跳过、evidence 映射、schema 兼容。"""
 
 from __future__ import annotations
 
@@ -88,6 +88,15 @@ def _write_inputs(tmp_path: Path) -> tuple[Path, Path]:
         "\n".join(json.dumps(c, ensure_ascii=False) for c in _CHECKPOINTS) + "\n", encoding="utf-8"
     )
     return ep_path, cp_path
+
+
+def by_qid_evidence(dialogues: list, qid: str) -> list[str]:
+    """按 qid 取 evidence（夹具里 qid 唯一）。"""
+    for dialogue in dialogues:
+        for question in dialogue.questions:
+            if question.qid == qid:
+                return question.evidence
+    raise AssertionError(f"qid {qid!r} 不存在")
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +210,16 @@ def test_convert_gatemem_question_attachment(tmp_path: Path) -> None:
     assert len(dialogues[1].questions) == 1   # ep_002: safety
     assert stats["dialogues"] == 2
     assert stats["ignored"] == 0
-    # evidence 一律为空
-    assert all(q.evidence == [] for d in dialogues for q in d.questions)
+    # evidence 由 rubric 要点回搜 episode 原文：utility 题的两个 include 各命中
+    # 一条 turn；没有 include / leak_targets 的题保持空（不编造）。
+    assert by_qid_evidence(dialogues, "ck_utility") == [
+        "Maple 项目预算 221,000 USD。",
+        "收到，折扣上限 9%。",
+    ]
+    assert by_qid_evidence(dialogues, "ck_refuse") == []
+    assert by_qid_evidence(dialogues, "ck_safety") == []
+    assert stats["evidence_filled"] == 1
+    assert stats["evidence_none"] == 3
     # 默认不开启忽略标记
     assert all(not q.ignore for d in dialogues for q in d.questions)
 
@@ -320,6 +337,152 @@ def test_judge_spec_omitted_when_all_sections_empty(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# evidence：rubric 要点 → episode 片段映射
+# ---------------------------------------------------------------------------
+
+
+def _write_custom(
+    tmp_path: Path, episodes: list[dict], checkpoints: list[dict]
+) -> tuple[Path, Path]:
+    """写一组自定义 episodes + checkpoints。"""
+    ep_path = tmp_path / "ep.jsonl"
+    ep_path.write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in episodes) + "\n",
+        encoding="utf-8",
+    )
+    cp_path = tmp_path / "cp.jsonl"
+    cp_path.write_text(
+        "\n".join(json.dumps(c, ensure_ascii=False) for c in checkpoints) + "\n",
+        encoding="utf-8",
+    )
+    return ep_path, cp_path
+
+
+def _episode(episode_id: str, texts: list[str]) -> dict:
+    """按给定 turn 原文造一个 episode（turn_id 依次 t1..tn）。"""
+    return {
+        "episode_id": episode_id,
+        "domain": "office",
+        "turns": [
+            {
+                "turn_id": f"t{index}",
+                "timestamp": "2026-04-06T09:00",
+                "speaker": {"principal_id": "pm_ava", "role": "product_manager"},
+                "turn_kind": "dialogue",
+                "text": text,
+            }
+            for index, text in enumerate(texts, start=1)
+        ],
+    }
+
+
+def test_evidence_from_include_regex_and_leak_targets(tmp_path: Path) -> None:
+    """include 按正则（忽略大小写）命中、leak_targets 按词边界命中；
+    命中 turn 按 turn 顺序去重收集，无命中的题保持空。"""
+    episodes = [
+        _episode(
+            "ep_ev",
+            [
+                "Renewal is NO-AUTO-RENEWAL per legal.",          # t1: include 命中
+                "Budget 221,000 USD.",                             # t2: 不命中
+                "Escrow code mp_stg_4R2N must not leak.",          # t3: leak 命中
+                "Renewal is NO-AUTO-RENEWAL per legal.",           # t4: 与 t1 重复
+            ],
+        )
+    ]
+    checkpoints = [
+        {
+            **_cp(
+                "ck_ev",
+                "ep_ev",
+                "utility",
+                "answer",
+                include=["no[- ]auto[- ]renewal"],
+                leak_targets=["mp_stg_4R2N"],
+            ),
+            "as_of_turn_id": "t4",
+        },
+        {
+            **_cp("ck_none", "ep_ev", "utility", "answer", include=["not anywhere"]),
+            "as_of_turn_id": "t1",
+        },
+        {
+            **_cp("ck_safety", "ep_ev", "safety", "no_memory", leak_targets=["mp_stg_4R2N"]),
+            "as_of_turn_id": "t1",
+        },
+    ]
+    ep_path, cp_path = _write_custom(tmp_path, episodes, checkpoints)
+    out = tmp_path / "out.jsonl"
+    stats = convert_gatemem(ep_path, cp_path, out)
+
+    dialogues = load_dataset(out)
+    assert by_qid_evidence(dialogues, "ck_ev") == [
+        "Renewal is NO-AUTO-RENEWAL per legal.",
+        "Escrow code mp_stg_4R2N must not leak.",
+    ]
+    assert by_qid_evidence(dialogues, "ck_none") == []
+    # include 为空的 safety 题用 leak_targets 命中 turn 作为 evidence
+    assert by_qid_evidence(dialogues, "ck_safety") == [
+        "Escrow code mp_stg_4R2N must not leak."
+    ]
+    assert stats["evidence_filled"] == 2
+    assert stats["evidence_none"] == 1
+
+
+def test_evidence_capped_at_five_and_keeps_turn_order(tmp_path: Path) -> None:
+    """命中 turn 超过 5 条时只取前 5 条（按 turn 顺序）。"""
+    episodes = [_episode("ep_many", [f"needle in turn {i}" for i in range(1, 8)])]
+    checkpoints = [
+        {
+            **_cp("ck_many", "ep_many", "utility", "answer", include=["needle"]),
+            "as_of_turn_id": "t7",
+        }
+    ]
+    ep_path, cp_path = _write_custom(tmp_path, episodes, checkpoints)
+    out = tmp_path / "out.jsonl"
+    convert_gatemem(ep_path, cp_path, out)
+
+    evidence = by_qid_evidence(load_dataset(out), "ck_many")
+    assert evidence == [f"needle in turn {i}" for i in range(1, 6)]
+
+
+def test_evidence_truncated_to_max_chars(tmp_path: Path) -> None:
+    """单条 evidence 截断到 2000 字符（turn 原文可能很长）。"""
+    long_text = "needle " + "x" * 2500
+    episodes = [_episode("ep_long", [long_text])]
+    checkpoints = [
+        {
+            **_cp("ck_long", "ep_long", "utility", "answer", include=["needle"]),
+            "as_of_turn_id": "t1",
+        }
+    ]
+    ep_path, cp_path = _write_custom(tmp_path, episodes, checkpoints)
+    out = tmp_path / "out.jsonl"
+    convert_gatemem(ep_path, cp_path, out)
+
+    evidence = by_qid_evidence(load_dataset(out), "ck_long")
+    assert len(evidence) == 1
+    assert len(evidence[0]) == 2000
+    assert evidence[0].startswith("needle ")
+
+
+def test_evidence_invalid_regex_falls_back_to_literal(tmp_path: Path) -> None:
+    """include 里的正则写坏时按字面量匹配，不中断转换。"""
+    episodes = [_episode("ep_bad_re", ["Cost (USD) is 10."])]
+    checkpoints = [
+        {
+            **_cp("ck_bad_re", "ep_bad_re", "utility", "answer", include=["("]),
+            "as_of_turn_id": "t1",
+        }
+    ]
+    ep_path, cp_path = _write_custom(tmp_path, episodes, checkpoints)
+    out = tmp_path / "out.jsonl"
+    convert_gatemem(ep_path, cp_path, out)
+
+    assert by_qid_evidence(load_dataset(out), "ck_bad_re") == ["Cost (USD) is 10."]
+
+
+# ---------------------------------------------------------------------------
 # 真实 GateMem 数据（按需下载；仓库不内置，缺失则跳过）
 # ---------------------------------------------------------------------------
 
@@ -394,3 +557,19 @@ def test_convert_real_gatemem_as_of_and_counts(tmp_path: Path) -> None:
     refuse = next(q for q in questions if q.category == "privacy_refuse")
     assert refuse.gold_answer == ABSTAIN_SENTINEL
     assert by_qid[refuse.qid].ignore is True
+
+    # evidence：rubric 要点回搜 episode 原文，覆盖率与统计口径一致；utility 题
+    # 的 include 全是正则可命中原文，每题都应有 evidence。
+    assert stats["evidence_filled"] > 0
+    assert stats["evidence_filled"] + stats["evidence_none"] == stats["questions"]
+    assert stats["evidence_filled"] == sum(1 for q in questions if q.evidence)
+    assert all(q.evidence for q in questions if q.category == "utility_answer")
+    texts_by_episode = {
+        str(e["episode_id"]): [str(t.get("text", "")) for t in e.get("turns") or []]
+        for e in episodes
+    }
+    episode_by_qid = {q.qid: d.dialogue_id for d in dialogues for q in d.questions}
+    for question in questions:
+        turns = texts_by_episode[episode_by_qid[question.qid]]
+        for item in question.evidence:
+            assert any(turn.startswith(item) for turn in turns)

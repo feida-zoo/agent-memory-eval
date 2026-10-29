@@ -281,6 +281,7 @@ METADATA_FIELD_ZH: dict[str, str] = {
     "retrieval_match_fallbacks": "检索匹配回退数",
     "ingest_strategy": "摄入策略",
     "as_of_questions": "带 as_of 的题数",
+    "ingest_blocks": "摄入块",
 }
 
 
@@ -330,6 +331,22 @@ def trace_role_display(role: Any) -> str:
     if role is None or role == "":
         return "n/a"
     return TRACE_ROLE_ZH.get(str(role), str(role))
+
+
+def ingest_blocks_display(blocks: dict[str, Any]) -> str:
+    """「摄入块」一行的值：``31 块（4~60 条/块，中位 5）``。
+
+    中位数可能是 .5（偶数个块），用 ``:g`` 去掉无意义的小数点。
+    """
+
+    def _num(value: Any) -> str:
+        return f"{float(value):g}"
+
+    return (
+        f"{int(blocks.get('n') or 0)} 块"
+        f"（{_num(blocks.get('min') or 0)}~{_num(blocks.get('max') or 0)} 条/块，"
+        f"中位 {_num(blocks.get('median') or 0)}）"
+    )
 
 
 def shard_scope_text(metrics: dict[str, Any]) -> "str | None":
@@ -1022,6 +1039,11 @@ def write_run_report_md(
         [metadata_label("retrieval_match"), str(metrics.get("retrieval_match") or "substring")],
         [metadata_label("ingest_strategy"), str(metrics.get("ingest_strategy") or "sequence")],
     ]
+    ingest_blocks = metrics.get("ingest_blocks")
+    if isinstance(ingest_blocks, dict) and ingest_blocks:
+        config_rows.append(
+            [metadata_label("ingest_blocks"), ingest_blocks_display(ingest_blocks)]
+        )
     if metrics.get("dialogue_id"):
         # 对话级报告：先声明这份报告只覆盖哪一段对话，避免被读成数据集级结论
         config_rows.insert(2, [metadata_label("dialogue_id"), f"`{metrics['dialogue_id']}`"])

@@ -14,10 +14,21 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
 from .base import BaseMemoryAdapter, IngestStats, QueryResult, estimate_tokens
+
+#: LongMemEval 转换器追加在问题文本**行尾**的提问日期后缀（见
+#: ``membench.data.convert_longmemeval``）：它是展示用的时间提示，不是问题
+#: 本身。转录文件很可能是在后缀引入前录制的（键里没有该行），匹配前先剥掉。
+_QUESTION_DATE_SUFFIX_RE = re.compile(r"\n（提问日期：[^）]*）$")
+
+
+def strip_question_date(question: str) -> str:
+    """剥掉问题文本行尾的 ``\\n（提问日期：…）`` 后缀；没有后缀原样返回。"""
+    return _QUESTION_DATE_SUFFIX_RE.sub("", question or "")
 
 
 class TranscriptAdapter(BaseMemoryAdapter):
@@ -72,9 +83,17 @@ class TranscriptAdapter(BaseMemoryAdapter):
         )
 
     def query(self, question: str) -> QueryResult:
-        """按问题精确匹配回放记录；未命中返回空答案。"""
+        """按问题精确匹配回放记录；未命中返回空答案。
+
+        匹配前先剥掉行尾的提问日期后缀（LongMemEval 转换器追加的展示用时间
+        提示）；转录文件本身若按带后缀的原文录制，再回退到原问题查找——两种
+        录制时点都能回放。
+        """
         t0 = time.perf_counter()
-        rec = self._records.get(question)
+        stripped = strip_question_date(question)
+        rec = self._records.get(stripped)
+        if rec is None and stripped != question:
+            rec = self._records.get(question)
         if rec is None:
             answer, retrieved = "", []
         else:

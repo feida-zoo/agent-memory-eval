@@ -310,6 +310,36 @@ class TestAggregate:
         # 该数据集没有 abstention 题 → abstention_accuracy 显式 None
         assert metrics["overall"]["abstention_accuracy"] is None
 
+    def test_none_f1_skipped_in_means(self) -> None:
+        """judge_spec 题的 token_f1/bleu1 记为 None：均值只对存在的值计算。
+
+        None 不是 0——按 0 计入会把 rubric 题拉低字面重合度，误导诊断。
+        """
+        spec = _record("utility_answer", True)
+        spec["token_f1"] = None
+        spec["bleu1"] = None
+        hit = _record("single_hop", True)
+        hit["token_f1"], hit["bleu1"] = 0.6, 0.4
+        miss = _record("single_hop", True)
+        miss["token_f1"], miss["bleu1"] = 0.2, 0.1
+        metrics = aggregate([spec, hit, miss])
+
+        assert metrics["overall"]["token_f1"] == pytest.approx(0.4)
+        assert metrics["overall"]["bleu1"] == pytest.approx(0.25)
+        # 分题型：judge_spec 题所在题型没有可用值 → None（报告显示未定义）
+        assert metrics["by_category"]["utility_answer"]["token_f1"] is None
+        assert metrics["by_category"]["single_hop"]["token_f1"] == pytest.approx(0.4)
+
+    def test_all_none_f1_overall_is_none(self) -> None:
+        """全部为 None 时 overall 的 token_f1 / bleu1 也是 None（不是 0）。"""
+        spec = _record("utility_answer", True)
+        spec["token_f1"] = None
+        spec["bleu1"] = None
+        metrics = aggregate([spec])
+        assert metrics["overall"]["token_f1"] is None
+        assert metrics["overall"]["bleu1"] is None
+        assert metrics["by_category"]["utility_answer"]["token_f1"] is None
+
     def test_capabilities_default_fallback(self) -> None:
         """aggregate 不传 capabilities 时从 records 推断（fallback）。"""
         recs = [
