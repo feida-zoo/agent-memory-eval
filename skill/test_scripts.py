@@ -378,6 +378,30 @@ def test_eval_dry_run_passes_trace_state(
     assert "--trace-state" in shlex.split(run_line)
 
 
+def test_eval_dry_run_passes_no_trace_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--no-trace-state 原样透传（显式关闭自动开启）。"""
+    assert _eval_dry_run(tmp_path, "--no-trace-state") == 0
+    out = capsys.readouterr().out
+    run_line = next(line for line in out.splitlines() if "-m membench.cli run" in line)
+    argv = shlex.split(run_line)
+    assert "--no-trace-state" in argv
+    assert "--trace-state" not in argv
+
+
+def test_eval_dry_run_omits_trace_state_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """不给参数时不拼任何 trace-state 开关：自动判定交给 membench（interleaved + safety 才开）。"""
+    assert _eval_dry_run(tmp_path) == 0
+    out = capsys.readouterr().out
+    run_line = next(line for line in out.splitlines() if "-m membench.cli run" in line)
+    argv = shlex.split(run_line)
+    assert "--trace-state" not in argv
+    assert "--no-trace-state" not in argv
+
+
 def test_eval_common_dry_run_passes_trace_state(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

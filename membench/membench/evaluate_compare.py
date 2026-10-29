@@ -587,7 +587,7 @@ def evaluate_compare(
     evidence_matcher: Any = None,
     task_dir: Union[str, None] = None,
     snapshot: Union[bool, None] = None,
-    trace_state: bool = False,
+    trace_state: Union[bool, None] = None,
     fusion: str = FUSION_WEIGHTED,
 ) -> dict[str, Any]:
     """两组（baseline vs candidate）× 多数据集融合 A/B 对比。
@@ -625,6 +625,8 @@ def evaluate_compare(
             False = 关闭（``--no-snapshot``），逐侧透传到每个数据集的 Runner。
         trace_state: 失败归因（``--trace-state``），逐侧透传给 Runner：只对
             interleaved 对话生效，sequence 对话的提问时点就是末尾 ``memory_snapshot/``。
+            None（缺省）= Runner 的**自动**判定（有 interleaved 对话含 safety 题时
+            开启），``--no-trace-state`` 传 False 两侧同时关闭。
         fusion: 两侧共用的基准集融合口径（``weighted`` 默认 / ``equal``）。
             两侧必须同口径，否则 diff 不可归因——本函数只有一个参数，天然一致；
             口径会写进两侧各数据集与任务级 metrics（可比性维度）。

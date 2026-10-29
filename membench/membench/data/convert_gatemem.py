@@ -72,10 +72,14 @@ speaker.role / turn_kind 显式为 assistant/agent/bot 一类时才映射为
 提问时点之前已 ingest 的 turn**（``turn_texts[:as_of]``）里搜索得到：``include``
 逐条按 ``re.search``（忽略大小写；正则写坏退化为字面量）匹配，``leak_targets``
 按字面量 + ASCII 词边界（忽略大小写）匹配——与 judge 的判分口径一致。
-**每条 pattern 只取它最后一次命中的 turn**（问"当前值"时最近的更新优先），
-不同 pattern 的命中按 turn 顺序合并去重，每题最多 :data:`_MAX_EVIDENCE_ITEMS`
-条、每条截断到 :data:`_MAX_EVIDENCE_CHARS` 字符；include 为空的安全 / 隐私题
-退化为只用 ``leak_targets`` 搜索，仍无命中时 evidence 保持为空（不编造）。
+``include`` 每条 pattern 只取它最后一次命中的 turn（问"当前值"时最近的更新优先）；
+``leak_targets`` 每条 pattern **同时保留首次与末次命中**——末次常是删除指令那轮
+（"remove the token ..."），只留末次会让"状态里只有秘密串、没有删除指令"的系统
+在状态扫描里匹配不到证据（见 ``runner.state_needle_extras`` 的 leak_targets
+needle）。不同 pattern 的命中按 turn 顺序合并去重，每题最多
+:data:`_MAX_EVIDENCE_ITEMS` 条、每条截断到 :data:`_MAX_EVIDENCE_CHARS` 字符；
+include 为空的安全 / 隐私题退化为只用 ``leak_targets`` 搜索，仍无命中时 evidence
+保持为空（不编造）。
 
 搜索范围按 ``as_of`` 截断是硬口径：时点之后才出现的 turn 对被测系统不可见，
 拿它当检索召回目标会系统性压低召回，也会把"未来内容"误判成"当时没写"
@@ -180,10 +184,12 @@ def _collect_evidence(
     把"当时还没写"误判成"没写入"。
 
     匹配口径与 judge 一致（``include`` 正则 / ``leak_targets`` 字面量 + 词边界）。
-    **每条 pattern 只取它最后一次命中的 turn**——问"当前值"时最近的更新优先；
-    不同 pattern 的命中按 turn 顺序合并去重，最多 :data:`_MAX_EVIDENCE_ITEMS`
-    条，每条截断到 :data:`_MAX_EVIDENCE_CHARS` 字符。``as_of`` 为 None（时点
-    不可定位）时返回空列表：不拿整段 episode 猜。
+    ``include`` 每条 pattern 只取它最后一次命中的 turn——问"当前值"时最近的更新
+    优先；``leak_targets`` 每条 pattern **同时保留首次与末次命中**：末次常是删除
+    指令那轮（"remove the token ..."），只留它会让"状态里只剩秘密串"的系统匹配
+    不到证据（秘密仍在却被判成已遗忘）。不同 pattern 的命中按 turn 顺序合并去重，
+    最多 :data:`_MAX_EVIDENCE_ITEMS` 条，每条截断到 :data:`_MAX_EVIDENCE_CHARS`
+    字符。``as_of`` 为 None（时点不可定位）时返回空列表：不拿整段 episode 猜。
     """
     if as_of is None or not turn_texts:
         return []
@@ -201,10 +207,16 @@ def _collect_evidence(
                 hit_indices.add(index)
                 break
     for target in targets:
-        for index in range(len(prefix) - 1, -1, -1):
+        first: int | None = None
+        last: int | None = None
+        for index in range(len(prefix)):
             if _literal_hit(target, prefix[index]):
+                if first is None:
+                    first = index
+                last = index
+        for index in (first, last):
+            if index is not None:
                 hit_indices.add(index)
-                break
     evidence: list[str] = []
     seen: set[str] = set()
     for index in sorted(hit_indices):

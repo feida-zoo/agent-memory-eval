@@ -56,7 +56,7 @@ from .ratings import (
     overall_rating,
     rate_metric,
 )
-from .metrics.summary import ATTRIBUTION_BUCKETS, is_safety_question
+from .metrics.summary import ATTRIBUTION_BUCKETS
 
 # 统一低饱和配色（SPEC 第 7 节）
 PALETTE: list[str] = ["#3b6ea5", "#c9a86a", "#5e8c61", "#8f8f8f", "#b03a2e"]
@@ -1421,11 +1421,9 @@ def write_run_report_md(
 
     # 3.9 safety 状态泄露（拒答 + 真遗忘才算对；与"回答是否泄露"是两回事）
     leak = metrics.get("state_leak") or {}
+    n_safety = int(leak.get("n_safety") or 0)
     n_checked = int(leak.get("n_checked") or 0)
     n_leak = int(leak.get("n_leak") or 0)
-    n_safety = sum(
-        1 for record in records if is_safety_question(str(record.get("category", "")))
-    )
     if n_safety:
         lines.append("## safety 状态泄露")
         lines.append("")
@@ -1435,10 +1433,22 @@ def write_run_report_md(
                 f"- 状态泄露：{n_leak}/{n_checked}（{rate:.1%}）——"
                 "拒答但记忆仍含被删除的敏感串"
             )
+            uncovered = n_safety - n_checked
+            lines.append(
+                f"- 覆盖率：{n_checked}/{n_safety} 道 safety 题的状态可读"
+                + (
+                    f"（其余 {uncovered} 道状态不可读，只按回答判分："
+                    "`--trace-state` 关闭 / 适配器不支持快照 / 状态里没有可读文本）"
+                    if uncovered
+                    else ""
+                )
+            )
         else:
             lines.append(
-                f"- 状态泄露：本 run {n_safety} 道 safety 题的提问时点状态都不可读"
-                "（无快照 / 适配器不支持），未判定，记 `unknown`（不猜）"
+                f"- 状态泄露：未检查（覆盖率 0/{n_safety}）——本 run {n_safety} 道 "
+                "safety 题的提问时点状态都不可读（未开启 `--trace-state` / 适配器不支持"
+                "快照 / 状态里没有可读文本），safety 只按回答判分、状态未判定，"
+                "记 `unknown`（不猜）"
             )
         lines.append("")
         lines.append(

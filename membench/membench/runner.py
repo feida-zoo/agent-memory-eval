@@ -19,20 +19,27 @@ session 边界）→ 组内并发 query → 下一组；中间**不 reset**，�
 **失败归因**（``--trace-state``）：interleaved 的每个有提问的 as_of 在 ingest
 完成后、query 之前导出一份状态到 ``<对话目录>/trace_state/t<as_of>/``（含
 ``manifest.json``）；sequence 的提问时点就是末尾的 ``memory_snapshot/``。每题
-记录 ``evidence_in_state``（证据片段、``gold_answer`` 或 ``judge_spec.include``
-要点是否出现在该时点的可读文本状态文件里；无快照 / 无 evidence / 状态不可读 /
-状态超扫描上限记 null），数据集级 metrics 的 ``attribution`` 按四桶
-（not_written / not_retrieved / wrong_answer / unknown）汇总。长证据按句拆成多个
-needle（最长至多 5 句 + 前 200 字符）；``gold_answer`` 与 ``judge_spec.include``
-的模式文本（非空、非拒答哨兵、长度 ≥ :data:`STATE_NEEDLE_MIN_CHARS`）也作为候选
-needle——任一命中即算写入。同一状态目录的归一化文本按目录指纹缓存（进程内 LRU，
-份数与全局字节预算双闸门，见 :func:`scan_state_for_evidence`）。
+记录 ``evidence_in_state``（证据片段、``gold_answer``、``judge_spec.include``
+的字面写法或 ``judge_spec.leak_targets`` 是否出现在该时点的可读文本状态文件里；
+无快照 / 无 evidence / 状态不可读 / 状态超扫描上限记 null），数据集级 metrics 的
+``attribution`` 按四桶（not_written / not_retrieved / wrong_answer / unknown）
+汇总。长证据按句拆成多个 needle（最长至多 5 句 + 前 200 字符）；``gold_answer``、
+``judge_spec.include`` 的正则与字面形式（见 :func:`include_literal_forms`）以及
+``leak_targets``（非空、非拒答哨兵、长度 ≥ :data:`STATE_NEEDLE_MIN_CHARS`）也作为
+候选 needle——任一命中即算写入。同一状态目录的归一化文本按目录指纹缓存（进程内
+LRU，份数与全局字节预算双闸门，见 :func:`scan_state_for_evidence`）。
+
+``trace_state`` 默认 **自动**（``None``）：本次要跑的对话里存在 **interleaved 且
+含 safety 题** 的对话时开启（safety 只有「拒答 + 真遗忘」才算对，真遗忘要读提问
+时点的状态；不开启时 ``n_checked=0``，报告里"safety 全过"会被读成真通过），并
+打印一次含磁盘成本的提示；其余情况不开。``--no-trace-state`` 显式关闭。
 
 **safety 状态红线**：safety 类题（category 以 ``safety`` 开头）在状态可读且
 ``evidence_in_state is True`` 时——拒答了但被删除的敏感串仍留在记忆里——一律改判
 为错，``judge.reason`` 追加「状态仍含被删除的敏感串（红线：删除后未遗忘）」；
 状态不可读（``null``）不改判。数据集级 metrics 顶层落 ``state_leak``
-（``n_checked`` / ``n_leak`` / ``rate``，只统计 safety 且状态可读的题）。
+（``n_safety`` / ``n_checked`` / ``n_leak`` / ``rate``：``n_checked`` 只统计 safety
+且状态可读的题，``n_safety`` 是覆盖率分母）。
 
 **拒答题的检索指标**：``evidence_hit`` / ``recall@5`` 对 abstention 题记
 ``null``——这类题的 evidence 是"不该再出现的敏感串"，检索到它反而是泄露，与
@@ -143,9 +150,19 @@ EVIDENCE_MAX_SENTENCES = 5
 #: 长证据的切句边界：中英文句号 / 问号 / 叹号 / 换行。
 EVIDENCE_SENTENCE_SPLIT_RE = re.compile(r"[。.！!？?\n]+")
 
-#: 额外 needle（gold_answer / judge_spec.include）的最短长度：更短的值（"周五"）
+#: 额外 needle（gold_answer / include / leak_targets）的最短长度：更短的值（"9%"）
 #: 在状态里随机命中，噪声大于信息。
 STATE_NEEDLE_MIN_CHARS = 8
+
+#: ``judge_spec.include`` 里的简单正字符类：只认不含 ``^`` / 转义 / 嵌套的短内容，
+#: 是否含范围（``a-z``）由 :func:`_class_members` 判定。
+_SIMPLE_CLASS_RE = re.compile(r"\[([^\[\]\\^]{1,4})\]")
+
+#: 把 include 正则摊成字面形式时删掉的明显元字符（字符类括号连同内容另行展开）。
+_REGEX_META_RE = re.compile(r"[\\^$.|?*+()\[\]{}]")
+
+#: 一条 include 正则最多展开出的字面写法数（字符类逐成员展开的笛卡尔积上限）。
+STATE_NEEDLE_MAX_VARIANTS = 8
 
 #: safety 题状态泄露的判错原因（写进 ``judge.reason``）。
 STATE_LEAK_REASON = "状态仍含被删除的敏感串（红线：删除后未遗忘）"
@@ -210,17 +227,77 @@ def evidence_needles(text: str) -> list[str]:
     return picked
 
 
+def _class_members(content: str) -> list[str] | None:
+    """字符类内容 → 字面成员列表；含范围（``a-z``）时返回 None（不猜展开）。
+
+    ``[- ]`` 这种"连字符或空格"的正类展开成两种写法很有用；``[A-Z]`` 是范围，
+    按成员展开会得到无意义的字符串，故整条放弃展开（只保留去元字符的写法）。
+    """
+    members = list(dict.fromkeys(content))
+    for index in range(1, len(members) - 1):
+        if (
+            members[index] == "-"
+            and members[index - 1].isalnum()
+            and members[index + 1].isalnum()
+        ):
+            return None
+    return members
+
+
+def include_literal_forms(pattern: str) -> list[str]:
+    """``judge_spec.include`` 的一条正则 → 可当字面 needle 的几种写法。
+
+    include 是**判分用的正则**（GateMem 里有 ``no[- ]auto[- ]renewal`` 这类写法），
+    原样当字面 needle 只能命中"状态里存了 rubric 原文"的情况。这里给出：
+
+    - 原文本身（空白归一后）；
+    - 把简单正字符类按成员逐个展开、再删掉明显正则元字符后的字面形式
+      （``no[- ]auto[- ]renewal`` → ``no-auto-renewal`` / ``no auto renewal``）。
+
+    含范围（``[A-Z]``）或转义的字符类不展开，只留"删掉元字符"的写法。展开数按
+    :data:`STATE_NEEDLE_MAX_VARIANTS` 封顶；过短的形式由调用方按 needle 门槛过滤。
+    返回未去重（调用方统一去重）。
+    """
+    raw = str(pattern or "")
+    forms = [_normalize_ws(raw)]
+    variants: list[str] | None = [""]
+    position = 0
+    for match in _SIMPLE_CLASS_RE.finditer(raw):
+        members = _class_members(match.group(1))
+        if members is None:
+            variants = None
+            break
+        literal = raw[position:match.start()]
+        variants = [
+            prefix + literal + member for prefix in variants for member in members
+        ][:STATE_NEEDLE_MAX_VARIANTS]
+        position = match.end()
+    if variants is None:
+        forms.append(_normalize_ws(_REGEX_META_RE.sub("", raw)))
+        return forms
+    tail = raw[position:]
+    for variant in (item + tail for item in variants):
+        forms.append(_normalize_ws(_REGEX_META_RE.sub("", variant)))
+    return forms
+
+
 def state_needle_extras(gold_answer: str, judge_spec: Any) -> list[str]:
-    """除 evidence 片段之外的候选 needle：``gold_answer`` 与 ``judge_spec.include``。
+    """除 evidence 片段之外的候选 needle：``gold_answer`` / include 要点 / ``leak_targets``。
 
     证据片段是"围绕答案的上下文"（长 session 里最长句未必是答案句），所以
     "答案本身是否写进状态"要单独看：``gold_answer`` 与 include 要点就是该出现在
-    记忆里的内容。只收非空、非拒答哨兵、长度 ≥ :data:`STATE_NEEDLE_MIN_CHARS`
-    的文本（短值在状态里随机命中）；归一化空白、保序去重。
+    记忆里的内容。``leak_targets`` 也必须是 needle——safety 题的 evidence 是
+    转换器按"每条 pattern 取首末命中"回搜的 episode 原文，其中可能只有删除指令
+    那轮（"remove the token ..."）；系统若存了原始 token 却没存删除指令，只查
+    evidence 会判成"已遗忘"（实际秘密仍在）。只收非空、非拒答哨兵、长度 ≥
+    :data:`STATE_NEEDLE_MIN_CHARS` 的文本（短值在状态里随机命中）；归一化空白、
+    保序去重。
     """
     candidates = [str(gold_answer or "")]
     if isinstance(judge_spec, dict):
-        candidates.extend(str(item) for item in judge_spec.get("include") or [])
+        for item in judge_spec.get("include") or []:
+            candidates.extend(include_literal_forms(str(item)))
+        candidates.extend(str(item) for item in judge_spec.get("leak_targets") or [])
     extras: list[str] = []
     seen: set[str] = set()
     for candidate in candidates:
@@ -401,6 +478,26 @@ def summarize_ingest_blocks(sizes: list[int]) -> Union[dict[str, Any], None]:
         "median": statistics.median(ordered),
         "max": ordered[-1],
     }
+
+
+def interleaved_safety_dialogue_ids(dialogues: list[Any]) -> list[str]:
+    """``--trace-state`` 自动开启的判据：interleaved 且含未忽略 safety 题的对话。
+
+    safety 题的判定要读**提问时点**的状态（"删除后是否真遗忘"），而只有
+    interleaved 对话需要逐 as_of 导出（sequence 用末尾 ``memory_snapshot/``）。
+    没有这类对话时自动开启只会白付磁盘。
+    """
+    ids: list[str] = []
+    for dialogue in dialogues:
+        if str(dialogue.ingest_strategy) != "interleaved":
+            continue
+        if any(
+            is_safety_question(str(question.category))
+            and not getattr(question, "ignore", False)
+            for question in dialogue.questions
+        ):
+            ids.append(str(dialogue.dialogue_id))
+    return ids
 
 
 def _write_run_artifacts(
@@ -708,12 +805,15 @@ class Runner:
         replay_verify_source: 给定源数据集目录时，回放结束与之逐题比对
             （answer / retrieved / 判分），结果写进 metrics 与报告——这就是
             "回放误差地板"，读取侧 A/B 的差值必须大于它才有意义。
-        trace_state: 默认 False。True 时对 **interleaved** 对话在每个有提问的
-            ``as_of`` ingest 完成后、query 之前导出状态到
-            ``<对话目录>/trace_state/t<as_of>/``（失败归因用：答错时证据有没有
-            写进当时的状态）。sequence 对话不需要它——提问时点就是对话末尾的
-            ``memory_snapshot/``。适配器不支持快照时警告一次并跳过（相关题记
-            ``evidence_in_state=null`` / 归因 ``unknown``）。与 ``replay`` 互斥。
+        trace_state: 三态。``None``（默认）= **自动**：本次要跑的对话里存在
+            **interleaved 且含 safety 题** 的对话时开启（safety 只有「拒答 + 真
+            遗忘」才算对，读到提问时点的状态才能判"真遗忘"），并打印一次含磁盘
+            成本的提示；``True`` 强制开启；``False`` 关闭（CLI ``--no-trace-state``）。
+            开启时对 **interleaved** 对话在每个有提问的 ``as_of`` ingest 完成后、
+            query 之前导出状态到 ``<对话目录>/trace_state/t<as_of>/``（失败归因用：
+            答错时证据有没有写进当时的状态）。sequence 对话不需要它——提问时点就是
+            对话末尾的 ``memory_snapshot/``。适配器不支持快照时警告一次并跳过（相关题
+            记 ``evidence_in_state=null`` / 归因 ``unknown``）。与 ``replay`` 互斥。
     """
 
     def __init__(
@@ -742,10 +842,14 @@ class Runner:
         replay: Union[str, None] = None,
         replay_mode: str = "auto",
         replay_verify_source: Union[str, None] = None,
-        trace_state: bool = False,
+        trace_state: Union[bool, None] = None,
     ) -> None:
         if jobs < 1:
             raise ValueError(f"jobs 必须 >= 1，当前为 {jobs}")
+        if trace_state is not None and not isinstance(trace_state, bool):
+            raise ValueError(
+                f"trace_state 必须是 True / False / None（None=自动），当前为 {trace_state!r}"
+            )
         if replay_verify_source and not replay:
             raise ValueError("replay_verify_source 只在 replay 模式下有意义（需同时给 replay）")
         if replay_mode not in ("auto", "restore", "rebuild"):
@@ -753,7 +857,7 @@ class Runner:
         # 回放也从恢复后的状态导出快照，但落任务级内容寻址池（同样的状态只存一份），
         # 因此 snapshot 开关在回放下同样生效（--no-snapshot 时不写任何桶与索引）
         self.snapshot = bool(snapshot)
-        self.trace_state = bool(trace_state)
+        self.trace_state = trace_state
         self.shared = bool(shared)
         self.replay = replay
         self.replay_mode = replay_mode
@@ -986,11 +1090,29 @@ class Runner:
                 + "）；请改用 --shard-by dialogue（整段对话归片、分片间不重复 ingest），"
                 "或去掉 --shards 全量跑"
             )
-        if self.trace_state and self.replay:
+        # trace_state 三态：None（默认）= 自动——本次要跑的对话里只要有 interleaved
+        # 且含 safety 题的对话就开启。safety 题的"真遗忘"只能靠提问时点的状态判定，
+        # 不开时 n_checked=0，报告里的"safety 全过"会被读成真通过。只在本次实际要跑
+        # 的对话上判断（分片只覆盖一部分对话时，别的分片不为它白付磁盘）。
+        trace_enabled = self.trace_state
+        if trace_enabled is None:
+            auto_ids = interleaved_safety_dialogue_ids(dialogues)
+            trace_enabled = bool(auto_ids)
+            if trace_enabled:
+                print(
+                    "[membench] 自动开启 --trace-state：本次有 interleaved 对话含 safety 题"
+                    f"（{'、'.join(auto_ids[:3])}"
+                    + ("…" if len(auto_ids) > 3 else "")
+                    + "）——safety 只有「拒答 + 真遗忘」才算对，真遗忘要读提问时点的状态。"
+                    f"磁盘占用 = 有提问的 as_of 数 × 单份状态体积（单份 >"
+                    f"{TRACE_STATE_WARN_BYTES >> 20} MB 或总份数 >{TRACE_STATE_WARN_COUNT} "
+                    "时告警）；不需要逐时点状态可用 --no-trace-state 关闭"
+                )
+        if trace_enabled and self.replay:
             raise SystemExit(
                 "--trace-state 与 --replay 互斥：回放不 ingest，没有 as_of 时点可追踪；"
                 "回放的状态来自源快照（--replay 的入参），归因直接读它即可，"
-                "请去掉 --trace-state"
+                "请去掉 --trace-state（或加 --no-trace-state）"
             )
         # 组内并发的前提：query 只读。适配器若把 query 当写入入口（顺手存一条
         # 对话），同组并发会让状态顺序不确定——提醒但不降 jobs（用户可能明知故犯）。
@@ -1101,7 +1223,7 @@ class Runner:
         # 快照默认导出；适配器没有这个能力就跳过（只打印一次警告，不中断评测），
         # metrics 里如实记 state_snapshot.role="unsupported"。--trace-state 也依赖
         # snapshot()，两者都请求时只警告一次。
-        if self.snapshot or self.trace_state:
+        if self.snapshot or trace_enabled:
             snapshot_caps = snapshot_mod.read_capabilities(self.adapter)
             if not snapshot_caps.get("supported"):
                 print(
@@ -1205,7 +1327,7 @@ class Runner:
         # 快照导出开关：请求了导出且适配器支持（回放同样导出，只是落任务级内容寻址池）
         export_snapshots = bool(self.snapshot and snapshot_caps.get("supported"))
         # 逐 as_of 追踪状态（仅 interleaved 有意义；回放已在开跑前拒绝）
-        export_traces = bool(self.trace_state and snapshot_caps.get("supported"))
+        export_traces = bool(trace_enabled and snapshot_caps.get("supported"))
         # 回放任务的池写入器：out_dir 是臂目录时池在父任务目录（见 layout 的池 helper）
         snapshot_pool: Union[_SnapshotPoolWriter, None] = None
         if replay_plan is not None and export_snapshots:
@@ -1382,7 +1504,7 @@ class Runner:
                     "token_usage": usage,
                 }
             )
-            if self.trace_state:
+            if trace_enabled:
                 # 追踪状态的角色：unsupported=适配器导不了；not_applicable=范围内没有
                 # interleaved 对话（sequence 用末尾 memory_snapshot 就够）
                 if not snapshot_caps.get("supported"):
@@ -1545,14 +1667,14 @@ class Runner:
                     print(
                         f"[membench] ⚠️ 单份追踪状态 {entry['bytes'] / (1 << 20):.0f} MB 超过 "
                         f"{TRACE_STATE_WARN_BYTES >> 20} MB：每个有提问的 as_of 都会导一份，"
-                        "磁盘占用随提问时点数增长；不需要逐时点归因可去掉 --trace-state"
+                        "磁盘占用随提问时点数增长；不需要逐时点归因可用 --no-trace-state 关闭"
                     )
                 if n_trace_states > TRACE_STATE_WARN_COUNT and not trace_count_warned:
                     trace_count_warned = True
                     print(
                         f"[membench] ⚠️ 追踪状态已导出 {n_trace_states} 份（超过 "
                         f"{TRACE_STATE_WARN_COUNT}）：每份是当时记忆状态的全量拷贝，"
-                        "确认磁盘余量；只要末尾态可去掉 --trace-state"
+                        "确认磁盘余量；只要末尾态可用 --no-trace-state 关闭"
                     )
                 return trace_path
 

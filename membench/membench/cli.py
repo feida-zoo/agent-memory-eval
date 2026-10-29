@@ -22,10 +22,11 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
         [--adapter-arg KEY=VALUE]...   # 适配器构造参数，如 base_url=http://127.0.0.1:8787 \
         [--shards N|max --shard-index I --shard-by question|dialogue] \
         [--evidence-match substring|overlap|llm] \
-        [--no-snapshot] [--trace-state] \
+        [--no-snapshot] [--trace-state | --no-trace-state] \
         # --no-snapshot：默认每对话 ingest 后导出状态快照（适配器不支持时警告一次并跳过）
         # --trace-state：失败归因，interleaved 数据集在每个有提问的 as_of 导一份状态到
-        #   <对话目录>/trace_state/t<as_of>/（sequence 用末尾 memory_snapshot/）
+        #   <对话目录>/trace_state/t<as_of>/（sequence 用末尾 memory_snapshot/）。
+        #   缺省=自动：有 interleaved 对话含 safety 题时开启，--no-trace-state 关闭
         # interleaved 数据集（如 gatemem_office）要求 --shard-by dialogue，且不支持 --replay
         # --dataset：key（office / sample / locomo…，按需下载集先 dataset fetch）或 JSONL 路径
     python -m membench.cli run --adapter mock-strong --dataset ... \
@@ -37,8 +38,9 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
         [--judge heuristic] [--platform wx --commit a1b2c3] \
         [--driver-llm gpt-4o] [--adapter-version a1b2c3] \
         [--report-out DIR | --task-dir DIR] [--adapter-arg KEY=VALUE]... \
-        [--no-snapshot] [--trace-state] \
-        # --trace-state：失败归因（仅 interleaved 对话生效；sequence 用末尾 memory_snapshot/）
+        [--no-snapshot] [--trace-state | --no-trace-state] \
+        # --trace-state：失败归因（仅 interleaved 对话生效；sequence 用末尾 memory_snapshot/）；
+        #   缺省=自动（有 interleaved 对话含 safety 题时开启）
         [--quick | --beam-10m | --no-beam] [--no-lme-s] [--common] \
         [--fusion weighted|equal]   # 基准集融合口径（默认 weighted：按题数加权、封顶 500）\
         [--evidence-match substring|overlap|llm] \
@@ -50,7 +52,8 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
         [--driver-llm-b gpt-4o-mini] [--adapter-version-b d4e5f6] \
         [--adapter-arg-a KEY=VALUE]... [--adapter-arg-b KEY=VALUE]... \
         [--acc-threshold 0.02] [--stale-threshold 0.02] [--latency-warn 0.30] \
-        [--report-out DIR | --task-dir DIR] [--no-snapshot] [--trace-state] [--tag <name>] \
+        [--report-out DIR | --task-dir DIR] [--no-snapshot] \
+        [--trace-state | --no-trace-state] [--tag <name>] \
         [--quick | --beam-10m | --no-beam] [--common] \
         [--fusion weighted|equal]   # 两侧共用（默认 weighted）\
         [--no-lme-s] [--evidence-match substring|overlap|llm] \
@@ -134,7 +137,9 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
 - ``interleaved``（如 gatemem_office）：按 ``as_of``（已 ingest 的消息条数）升序
   分组，边 ingest 边提问；要求 ``--shard-by dialogue``、不支持 ``--replay``；
 - ``run --trace-state`` 对 interleaved 的每个有提问 as_of 导出状态到
-  ``<对话目录>/trace_state/t<as_of>/``；``results.jsonl`` 每题记 ``as_of`` /
+  ``<对话目录>/trace_state/t<as_of>/``；缺省**自动**——本次有 interleaved 对话含
+  safety 题时开启（safety 的「真遗忘」要读提问时点的状态），``--no-trace-state``
+  关闭。``results.jsonl`` 每题记 ``as_of`` /
   ``evidence_in_state``，metrics 与报告给出失败归因四桶
   （not_written / not_retrieved / wrong_answer / unknown）。
 
@@ -230,10 +235,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_run.add_argument(
         "--trace-state",
-        action="store_true",
+        dest="trace_state",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="失败归因：对 interleaved 数据集在每个有提问的 as_of ingest 完成后、query 之前"
         "导出状态到 <对话目录>/trace_state/t<as_of>/（sequence 对话用末尾 memory_snapshot/）；"
-        "用于判断答错是「没写入 / 写入但没检索到 / 检索到但答错」",
+        "用于判断答错是「没写入 / 写入但没检索到 / 检索到但答错」。默认自动：本次有 "
+        "interleaved 对话含 safety 题时开启（safety 的「真遗忘」要读提问时点的状态），"
+        "其余情况不开；可用 --no-trace-state 关闭",
     )
     p_run.add_argument(
         "--replay",
@@ -446,10 +455,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ev.add_argument(
         "--trace-state",
-        action="store_true",
+        dest="trace_state",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="失败归因：透传给每个数据集的 run，仅 interleaved 对话生效"
         "（在每个有提问的 as_of 导出 <对话目录>/trace_state/t<as_of>/）；"
-        "sequence 对话用末尾 memory_snapshot/，可通过 evidence_in_state 判定证据是否已写入",
+        "sequence 对话用末尾 memory_snapshot/。默认自动：有 interleaved 对话含 safety 题时"
+        "开启（safety 的「真遗忘」要读提问时点的状态），可用 --no-trace-state 关闭",
     )
     ev_group = p_ev.add_mutually_exclusive_group()
     ev_group.add_argument("--quick", action="store_true", help="快速模式：跳过 BEAM 与 LongMemEval-S（等价 --no-beam --no-lme-s，分钟级回归）")
@@ -562,10 +574,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ev_cmp.add_argument(
         "--trace-state",
-        action="store_true",
+        dest="trace_state",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="失败归因：两侧逐数据集透传给 run，仅 interleaved 对话生效"
         "（在每个有提问的 as_of 导出 <对话目录>/trace_state/t<as_of>/）；"
-        "sequence 对话用末尾 memory_snapshot/，可通过 evidence_in_state 判定证据是否已写入",
+        "sequence 对话用末尾 memory_snapshot/。默认自动：有 interleaved 对话含 safety 题时"
+        "开启（safety 的「真遗忘」要读提问时点的状态），可用 --no-trace-state 关闭",
     )
     ev_cmp_group = p_ev_cmp.add_mutually_exclusive_group()
     ev_cmp_group.add_argument("--quick", action="store_true", help="快速模式：跳过 BEAM 与 LongMemEval-S（等价 --no-beam --no-lme-s）")

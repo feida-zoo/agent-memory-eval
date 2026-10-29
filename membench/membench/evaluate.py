@@ -911,7 +911,7 @@ def run_datasets(
     adapter_version: Union[str, None] = None,
     evidence_matcher: Any = None,
     snapshot: Union[bool, None] = None,
-    trace_state: bool = False,
+    trace_state: Union[bool, None] = None,
 ) -> list[DatasetResult]:
     """对每个数据集用 Runner 各跑一次写进同一个实验目录，收集 metrics。
 
@@ -923,8 +923,9 @@ def run_datasets(
     Runner，记入每个 run 的元数据。evidence_matcher 为检索命中口径匹配器
     （默认 substring）。snapshot 默认 None = 用 Runner 的默认（导出对话状态快照），
     显式 False 才关掉（不传该参数时按 Runner 默认处理，别把 None 当成"不导出"）。
-    trace_state 透传给 Runner（``--trace-state``）：只对 interleaved 对话生效，
-    sequence 对话的提问时点就是末尾 ``memory_snapshot/``。
+    trace_state 透传给 Runner：只对 interleaved 对话生效，sequence 对话的提问时点
+    就是末尾 ``memory_snapshot/``。None（缺省）= Runner 的**自动**判定（有
+    interleaved 对话含 safety 题时开启），True / False 强制开关。
     """
     # snapshot=None 表示"不表态"，交给 Runner 的默认值（导出）；显式值才透传
     snapshot_kwarg: dict[str, Any] = {} if snapshot is None else {"snapshot": snapshot}
@@ -1520,7 +1521,7 @@ def evaluate(
     evidence_matcher: Any = None,
     task_dir: Union[str, None] = None,
     snapshot: Union[bool, None] = None,
-    trace_state: bool = False,
+    trace_state: Union[bool, None] = None,
     fusion: str = FUSION_WEIGHTED,
 ) -> int:
     """执行全量评估：一个实验目录承载全部数据集 + 基准集融合 + 门禁 + 报告。
@@ -1562,7 +1563,9 @@ def evaluate(
             False = 关闭（``--no-snapshot``），透传到每个数据集的 Runner。
         trace_state: 失败归因（``--trace-state``）：透传给每个数据集的 Runner，
             只对 interleaved 对话生效（逐 as_of 导出 ``trace_state/t<as_of>/``）；
-            sequence 对话的提问时点就是末尾 ``memory_snapshot/``。
+            sequence 对话的提问时点就是末尾 ``memory_snapshot/``。None（缺省）=
+            Runner 的**自动**判定（有 interleaved 对话含 safety 题时开启），
+            ``--no-trace-state`` 传 False 强制关闭。
         fusion: 基准集融合口径（``weighted`` 默认 / ``equal``），见
             :func:`fuse_metrics`；会写进任务级 metrics 与各数据集 metrics
             （``fusion`` 可比性维度——旧产物缺该字段归一为 ``legacy``）。

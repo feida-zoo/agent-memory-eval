@@ -177,7 +177,12 @@ class TestAggregate:
             "has_abstention",
             "state_leak",
         }
-        assert metrics["state_leak"] == {"n_checked": 0, "n_leak": 0, "rate": None}
+        assert metrics["state_leak"] == {
+            "n_safety": 0,
+            "n_checked": 0,
+            "n_leak": 0,
+            "rate": None,
+        }
         assert metrics["has_evidence"] is True
         assert metrics["has_stale"] is True
         assert metrics["has_abstention"] is True
@@ -371,6 +376,8 @@ class TestStateLeak:
 
         metrics = aggregate([leak, forgot, unreadable, other])
         summary = metrics["state_leak"]
+        # n_safety 是覆盖率分母：三道 safety 题（含状态不可读的那道）
+        assert summary["n_safety"] == 3
         assert summary["n_checked"] == 2
         assert summary["n_leak"] == 1
         assert summary["rate"] == pytest.approx(0.5)
@@ -378,7 +385,12 @@ class TestStateLeak:
     def test_no_safety_questions_rate_is_none(self) -> None:
         """没有 safety 题时 rate 为 None（"没查"不等于"没泄露"）。"""
         metrics = aggregate([_record("single_hop", True)])
-        assert metrics["state_leak"] == {"n_checked": 0, "n_leak": 0, "rate": None}
+        assert metrics["state_leak"] == {
+            "n_safety": 0,
+            "n_checked": 0,
+            "n_leak": 0,
+            "rate": None,
+        }
 
     def test_abstention_null_retrieval_fields_do_not_leak_into_means(self) -> None:
         """拒答题的 evidence_hit / recall@5 记 None：检索类均值只算非拒答题。"""
