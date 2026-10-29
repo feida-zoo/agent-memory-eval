@@ -500,6 +500,29 @@ def interleaved_safety_dialogue_ids(dialogues: list[Any]) -> list[str]:
     return ids
 
 
+def planned_trace_states(dialogues: list[Any]) -> int:
+    """``--trace-state`` 预计导出份数：各 interleaved 对话的**提问时点**数之和。
+
+    导出按 ``as_of`` 分组，一组一份（同组的题共用同一份状态），所以分母是
+    distinct ``as_of`` 而不是题数——按题数估会把成本高估。只数本次
+    实际要跑的对话与未忽略的题（分片/题级 ignore 都会改变结果），与 run 时的
+    分组口径一致；``as_of`` 为 ``None`` 的题在全部 ingest 完之后提问，走末尾
+    ``memory_snapshot/``，不额外导状态。
+    """
+    total = 0
+    for dialogue in dialogues:
+        if str(dialogue.ingest_strategy) != "interleaved":
+            continue
+        as_ofs = {
+            int(question.as_of)
+            for question in dialogue.questions
+            if getattr(question, "as_of", None) is not None
+            and not getattr(question, "ignore", False)
+        }
+        total += len(as_ofs)
+    return total
+
+
 def _write_run_artifacts(
     report_dir: str,
     records: list[dict[str, Any]],
@@ -1095,19 +1118,26 @@ class Runner:
         # 不开时 n_checked=0，报告里的"safety 全过"会被读成真通过。只在本次实际要跑
         # 的对话上判断（分片只覆盖一部分对话时，别的分片不为它白付磁盘）。
         trace_enabled = self.trace_state
+        auto_ids = interleaved_safety_dialogue_ids(dialogues)
         if trace_enabled is None:
-            auto_ids = interleaved_safety_dialogue_ids(dialogues)
             trace_enabled = bool(auto_ids)
-            if trace_enabled:
-                print(
-                    "[membench] 自动开启 --trace-state：本次有 interleaved 对话含 safety 题"
-                    f"（{'、'.join(auto_ids[:3])}"
-                    + ("…" if len(auto_ids) > 3 else "")
-                    + "）——safety 只有「拒答 + 真遗忘」才算对，真遗忘要读提问时点的状态。"
-                    f"磁盘占用 = 有提问的 as_of 数 × 单份状态体积（单份 >"
-                    f"{TRACE_STATE_WARN_BYTES >> 20} MB 或总份数 >{TRACE_STATE_WARN_COUNT} "
-                    "时告警）；不需要逐时点状态可用 --no-trace-state 关闭"
-                )
+        trace_plan = planned_trace_states(dialogues) if trace_enabled else 0
+        if auto_ids and trace_enabled and self.trace_state is None:
+            print(
+                "[membench] 自动开启 --trace-state：本次有 interleaved 对话含 safety 题"
+                f"（{'、'.join(auto_ids[:3])}"
+                + ("…" if len(auto_ids) > 3 else "")
+                + "）——safety 只有「拒答 + 真遗忘」才算对，真遗忘要读提问时点的状态。"
+                f"预计导出 {trace_plan} 份状态（interleaved 对话的提问时点数）× 单份"
+                f"状态体积；单份 >{TRACE_STATE_WARN_BYTES >> 20} MB 或总份数 >"
+                f"{TRACE_STATE_WARN_COUNT} 时告警，不需要逐时点状态可用 "
+                "--no-trace-state 关闭"
+            )
+        elif trace_plan:
+            print(
+                f"[membench] --trace-state 已开启：预计导出 {trace_plan} 份状态"
+                "（interleaved 对话的提问时点数）"
+            )
         if trace_enabled and self.replay:
             raise SystemExit(
                 "--trace-state 与 --replay 互斥：回放不 ingest，没有 as_of 时点可追踪；"

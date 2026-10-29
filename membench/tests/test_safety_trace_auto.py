@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -159,7 +160,8 @@ def test_interleaved_safety_auto_enables_trace_state(
     dataset_dir, metrics, records, _report = _run(tmp_path, "auto", trace_state=None)
     out = capsys.readouterr().out
     assert "自动开启 --trace-state" in out
-    assert "磁盘占用" in out
+    assert "预计导出 1 份状态" in out
+    assert "单份状态体积" in out
     assert "--no-trace-state" in out
 
     assert (dataset_dir / "d1" / layout.DIR_TRACE_STATE / "t1" / "state.txt").is_file()
@@ -237,8 +239,76 @@ def test_explicit_true_forces_trace_state(
     )
     out = capsys.readouterr().out
     assert "自动开启" not in out
+    assert "预计导出 1 份状态" in out
     assert (dataset_dir / "d1" / layout.DIR_TRACE_STATE / "t1").is_dir()
     assert metrics["trace_state"]["role"] == "exported"
+
+
+def test_planned_trace_states_counts_checkpoints_not_questions() -> None:
+    """份数按 distinct ``as_of`` 数（同组共用一份），忽略题与 sequence 对话不计。"""
+    from membench.runner import planned_trace_states
+
+    def question(as_of: int | None, ignore: bool = False) -> Any:
+        return SimpleNamespace(as_of=as_of, ignore=ignore)
+
+    def dialogue(strategy: str, questions: list[Any]) -> Any:
+        return SimpleNamespace(ingest_strategy=strategy, questions=questions)
+
+    dialogues = [
+        # 三道题两个时点（1 与 2 各一组），忽略题不导、as_of=None 走末尾快照
+        dialogue(
+            "interleaved",
+            [question(1), question(1), question(2), question(1, ignore=True), question(None)],
+        ),
+        dialogue("interleaved", [question(3)]),
+        dialogue("sequence", [question(4), question(5)]),
+    ]
+    assert planned_trace_states(dialogues) == 3
+    assert planned_trace_states([]) == 0
+
+
+def test_auto_enable_message_reports_exact_plan(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """自动开启时给出本次确切份数（不是"份数 × 体积"的公式），与实际导出一致。"""
+    questions = []
+    for as_of, qid in ((1, "q1"), (1, "q2"), (2, "q3")):
+        item = _question(qid, "safety_no_memory")
+        item["as_of"] = as_of
+        questions.append(item)
+    dataset = tmp_path / "plan.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "dialogue_id": "d1",
+                "ingest_strategy": "interleaved",
+                "sessions": [
+                    [
+                        {"role": "user", "content": f"请记住 {SECRET}。", "timestamp": None},
+                        {"role": "user", "content": "其余都是普通项目记录。", "timestamp": None},
+                    ]
+                ],
+                "questions": questions,
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset_dir = Path(
+        Runner(
+            _StateAdapter(),
+            str(dataset),
+            judge=_AlwaysCorrectJudge(),
+            out_dir=str(tmp_path / "exp-plan"),
+        ).run()
+    )
+    out = capsys.readouterr().out
+    assert "预计导出 2 份状态" in out
+    metrics = json.loads(
+        (dataset_dir / layout.DIR_REPORT / layout.FILE_METRICS).read_text(encoding="utf-8")
+    )
+    assert metrics["trace_state"]["n_states"] == 2
 
 
 # ---------------------------------------------------------------------------
