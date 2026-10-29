@@ -69,19 +69,23 @@ speaker.role / turn_kind 显式为 assistant/agent/bot 一类时才映射为
 
 **evidence（rubric 要点 → episode 片段映射）**：checkpoint 的 ``judge_spec.include``
 是判分要点（多为正则），不是对话原文子串，因此 evidence 由转换器在**该 checkpoint
-所属 episode 的全部 turns** 里搜索得到：``include`` 逐条按 ``re.search``（忽略
-大小写；正则写坏退化为字面量）匹配，``leak_targets`` 按字面量 + ASCII 词边界
-（忽略大小写）匹配——与 judge 的判分口径一致。命中的 turn 原文按 turn 顺序
-去重收集，每题最多 :data:`_MAX_EVIDENCE_ITEMS` 条、每条截断到
-:data:`_MAX_EVIDENCE_CHARS` 字符；include 为空的安全 / 隐私题退化为只用
-``leak_targets`` 搜索，仍无命中时 evidence 保持为空（不编造）。
+提问时点之前已 ingest 的 turn**（``turn_texts[:as_of]``）里搜索得到：``include``
+逐条按 ``re.search``（忽略大小写；正则写坏退化为字面量）匹配，``leak_targets``
+按字面量 + ASCII 词边界（忽略大小写）匹配——与 judge 的判分口径一致。
+**每条 pattern 只取它最后一次命中的 turn**（问"当前值"时最近的更新优先），
+不同 pattern 的命中按 turn 顺序合并去重，每题最多 :data:`_MAX_EVIDENCE_ITEMS`
+条、每条截断到 :data:`_MAX_EVIDENCE_CHARS` 字符；include 为空的安全 / 隐私题
+退化为只用 ``leak_targets`` 搜索，仍无命中时 evidence 保持为空（不编造）。
+
+搜索范围按 ``as_of`` 截断是硬口径：时点之后才出现的 turn 对被测系统不可见，
+拿它当检索召回目标会系统性压低召回，也会把"未来内容"误判成"当时没写"
+（污染失败归因）。``as_of`` 无法定位时不给 evidence（不拿整段 episode 猜）。
 
 已知局限：
 - evidence 是按 rubric 要点回搜 episode 原文得到的**近似**证据：一个 include
-  要点可能命中多条与本题无关的 turn（要点是短值，如 ``9%``），多要点题只取
-  前若干条命中 turn。它用于检索召回与失败归因，不参与判分。
-- 搜索范围是 episode 的全部 turns（不只 as_of 之前），时点之后才出现的原文
-  也会成为 evidence——这类题在归因里会呈现为"证据未写入"。
+  要点可能命中多条与本题无关的 turn（要点是短值，如 ``9%``），多要点题最多
+  取 5 条。"最近命中"让当前值优先，但同一 pattern 更早的旧值不会再成为证据。
+  它用于检索召回与失败归因，不参与判分。
 - asker 身份未建模：privacy 题的"该向谁拒答"依赖提问者身份，membench
   schema 无对应字段，统一按 abstention/single_hop 处理。
 - utility 题 judge_spec.notes 中的 stale 信息（旧值）未填入 gold_stale。
@@ -164,32 +168,72 @@ def _literal_hit(target: str, text: str) -> bool:
 
 
 def _collect_evidence(
-    turn_texts: list[str], include: list[str], leak_targets: list[str]
+    turn_texts: list[str],
+    include: list[str],
+    leak_targets: list[str],
+    as_of: int | None,
 ) -> list[str]:
-    """在 episode 的全部 turn 原文里搜索 rubric 要点，返回命中的 turn 原文。
+    """在提问时点**之前**已 ingest 的 turn 原文里搜索 rubric 要点，返回命中片段。
+
+    搜索范围是 ``turn_texts[:as_of]``（``as_of`` = 已 ingest 的消息条数）：时点
+    之后才出现的 turn 对被测系统不可见，拿它当证据等于要求检索"未来内容"，也会
+    把"当时还没写"误判成"没写入"。
 
     匹配口径与 judge 一致（``include`` 正则 / ``leak_targets`` 字面量 + 词边界）。
-    命中 turn 按 turn 顺序收集、按原文去重，最多 :data:`_MAX_EVIDENCE_ITEMS`
-    条，每条截断到 :data:`_MAX_EVIDENCE_CHARS` 字符。``include`` 与
-    ``leak_targets`` 都为空、或全部无命中时返回空列表（不编造证据）。
+    **每条 pattern 只取它最后一次命中的 turn**——问"当前值"时最近的更新优先；
+    不同 pattern 的命中按 turn 顺序合并去重，最多 :data:`_MAX_EVIDENCE_ITEMS`
+    条，每条截断到 :data:`_MAX_EVIDENCE_CHARS` 字符。``as_of`` 为 None（时点
+    不可定位）时返回空列表：不拿整段 episode 猜。
     """
-    if not include and not leak_targets:
+    if as_of is None or not turn_texts:
         return []
+    prefix = turn_texts[: max(0, int(as_of))]
+    if not prefix:
+        return []
+    patterns = [pattern for pattern in include if pattern]
+    targets = [target for target in leak_targets if target]
+    if not patterns and not targets:
+        return []
+    hit_indices: set[int] = set()
+    for pattern in patterns:
+        for index in range(len(prefix) - 1, -1, -1):
+            if _regex_hit(pattern, prefix[index]):
+                hit_indices.add(index)
+                break
+    for target in targets:
+        for index in range(len(prefix) - 1, -1, -1):
+            if _literal_hit(target, prefix[index]):
+                hit_indices.add(index)
+                break
     evidence: list[str] = []
     seen: set[str] = set()
-    for text in turn_texts:
+    for index in sorted(hit_indices):
+        text = prefix[index]
         if not text or text in seen:
-            continue
-        hit = any(_regex_hit(pattern, text) for pattern in include) or any(
-            _literal_hit(target, text) for target in leak_targets
-        )
-        if not hit:
             continue
         seen.add(text)
         evidence.append(text[:_MAX_EVIDENCE_CHARS])
         if len(evidence) >= _MAX_EVIDENCE_ITEMS:
             break
     return evidence
+
+
+def count_evidence_after_as_of(
+    turn_texts: list[str], as_of: int, evidence: list[str]
+) -> int:
+    """统计 evidence 里**只能由 as_of 之后的 turn 提供**的条目数（重转后应为 0）。
+
+    按产物独立复算而不是信实现返回 0：一条 evidence 只要能在 ``turn_texts[:as_of]``
+    里找到原文（同名 turn 在时点之前也出现过），就算当时可见，不计越界。
+    """
+    prefix = turn_texts[: max(0, int(as_of))]
+    suffix = turn_texts[max(0, int(as_of)):]
+    return sum(
+        1
+        for item in evidence
+        if not any(text.startswith(item) for text in prefix)
+        and any(text.startswith(item) for text in suffix)
+    )
 
 
 def _normalize_role(speaker: dict, turn_kind: str) -> str:
@@ -266,14 +310,15 @@ def _convert_checkpoint(
     ``judge_spec.include`` / ``not_include`` 与 ``leak_targets`` 原样写入
     ``question["judge_spec"]``（三段全空时不写）；``gold_answer`` 仍保留
     include 的可读拼接（拒答类为哨兵），供报告展示。``evidence`` 由
-    :func:`_collect_evidence` 在该 checkpoint 所属 episode 的 turn 原文里
+    :func:`_collect_evidence` 在该 checkpoint 提问时点**之前**的 turn 原文里
     回搜 rubric 要点得到（口径见模块 docstring）。
 
     Args:
         cp: checkpoint 记录。
         as_of: 该 checkpoint 时点已 ingest 的消息条数（调用方按
             ``as_of_turn_id`` 在 turns 里的下标 + 1 算好）；None 表示该对话
-            无法定位时点——写入后 runner 会把它排到全部 ingest 之后。
+            无法定位时点——写入后 runner 会把它排到全部 ingest 之后，此时不给
+            evidence（不猜时点）。
         ignore_privacy_refuse: True 时 (privacy, refuse) 题附加 ignore 标记。
         turn_texts: 该 checkpoint 所属 episode 的全部 turn 原文；None / 空
             列表时 evidence 为空。
@@ -290,7 +335,9 @@ def _convert_checkpoint(
         "qid": str(cp.get("checkpoint_id", "")),
         "question": str(cp.get("query_text", cp.get("query", ""))),
         "category": category,
-        "evidence": _collect_evidence(turn_texts or [], include, leak_targets),
+        "evidence": _collect_evidence(
+            turn_texts or [], include, leak_targets, as_of
+        ),
     }
     if as_of is not None:
         question["as_of"] = int(as_of)
@@ -332,8 +379,10 @@ def convert_gatemem(
 
     Returns:
         dict: 统计信息（dialogues/questions/categories/skipped/ignored/
-        evidence_filled/evidence_none/output）。``evidence_filled`` +
-        ``evidence_none`` = ``questions``。
+        evidence_filled/evidence_none/evidence_after_as_of/output）。
+        ``evidence_filled`` + ``evidence_none`` = ``questions``；
+        ``evidence_after_as_of`` 是 evidence 里只能由提问时点之后的 turn 提供的
+        条目数（按产物独立复算，正常应为 0）。
     """
     episodes = _read_jsonl(episodes_path)
     checkpoints = _read_jsonl(checkpoints_path)
@@ -351,6 +400,7 @@ def convert_gatemem(
     n_ignored = 0
     n_as_of_missing = 0
     n_evidence_filled = 0
+    n_evidence_after_as_of = 0
     as_of_positions: list[int] = []
     category_counts: dict[str, int] = {}
     for cp in checkpoints:
@@ -404,6 +454,11 @@ def convert_gatemem(
         n_questions += 1
         if question["evidence"]:
             n_evidence_filled += 1
+        # 越界校验按产物独立复算：evidence 是否只能由 as_of 之后的 turn 提供
+        if as_of is not None:
+            n_evidence_after_as_of += count_evidence_after_as_of(
+                turn_texts, as_of, question["evidence"]
+            )
         if as_of is not None:
             as_of_positions.append(as_of)
         if question.get("ignore"):
@@ -419,9 +474,12 @@ def convert_gatemem(
         "skipped": n_skipped,
         "ignored": n_ignored,
         # evidence 覆盖率：有命中片段 / 无命中（后者是 include 与 leak_targets
-        # 在整段 episode 里都找不到的题，保持空 evidence，不编造）。
+        # 在提问时点之前的 turn 里都找不到的题，保持空 evidence，不编造）。
         "evidence_filled": n_evidence_filled,
         "evidence_none": n_questions - n_evidence_filled,
+        # 越界条数按产物复算：正常恒为 0（搜索范围就是 as_of 前缀），
+        # 由 CLI 打印出来作为回归断言的可观测值。
+        "evidence_after_as_of": n_evidence_after_as_of,
         "as_of_missing": n_as_of_missing,
         "as_of_min": min(as_of_positions) if as_of_positions else None,
         "as_of_max": max(as_of_positions) if as_of_positions else None,
@@ -449,7 +507,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[convert_gatemem] {stats['dialogues']} dialogues, {stats['questions']} questions"
           f"（跳过 {stats['skipped']} 个 checkpoint）")
     print(f"[convert_gatemem] evidence 覆盖 {stats['evidence_filled']}/{stats['questions']}"
-          f"（{stats['evidence_none']} 题在 episode 原文里无命中）")
+          f"（{stats['evidence_none']} 题在提问时点之前的原文里无命中）")
+    print(f"[convert_gatemem] evidence 来自 as_of 之后的 turn："
+          f"{stats['evidence_after_as_of']} 条（应为 0）")
     if stats["as_of_min"] is not None:
         print(
             f"[convert_gatemem] 提问时点 as_of（已 ingest 消息条数）范围 "

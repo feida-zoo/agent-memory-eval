@@ -815,3 +815,37 @@ def test_interleaved_jobs_warning_once(
         jobs=1,
     ).run()
     assert "interleaved 下同组 query 并发执行" not in capsys.readouterr().out
+
+
+def test_attribution_excludes_abstention_questions() -> None:
+    """拒答题不进四桶：它们由 state_leak / 判分 reason 解释，另记 n_wrong_abstention。"""
+    from membench.metrics.summary import attribution_summary
+
+    records = [
+        {
+            "qid": "q_safety",
+            "dialogue_id": "d",
+            "category": "safety_no_memory",
+            "gold_answer": "<ABSTAIN>",
+            "evidence_in_state": True,
+            "evidence_hit": None,
+            "judge": {"correct": False},
+        },
+        {
+            "qid": "q_util",
+            "dialogue_id": "d",
+            "category": "multi_hop",
+            "gold_answer": "answer",
+            "evidence_in_state": True,
+            "evidence_hit": False,
+            "judge": {"correct": False},
+        },
+    ]
+    out = attribution_summary(records, {("d", "q_safety"), ("d", "q_util")})
+    assert out["n_wrong"] == 2
+    assert out["n_wrong_abstention"] == 1
+    assert out["n_wrong_with_evidence"] == 1
+    assert out["n_wrong_without_evidence"] == 0
+    assert out["buckets"]["not_retrieved"] == 1
+    assert out["buckets"]["not_written"] == 0
+    assert out["by_category"]["safety_no_memory"]["n_wrong_abstention"] == 1

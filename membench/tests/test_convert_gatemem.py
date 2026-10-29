@@ -210,16 +210,17 @@ def test_convert_gatemem_question_attachment(tmp_path: Path) -> None:
     assert len(dialogues[1].questions) == 1   # ep_002: safety
     assert stats["dialogues"] == 2
     assert stats["ignored"] == 0
-    # evidence 由 rubric 要点回搜 episode 原文：utility 题的两个 include 各命中
-    # 一条 turn；没有 include / leak_targets 的题保持空（不编造）。
+    # evidence 由 rubric 要点回搜**提问时点之前**的 episode 原文：夹具里所有
+    # checkpoint 都挂 t001（as_of=1），因此 include 的 "9%"（在 t002）不可见，
+    # utility 题只收得到 t001 那一条；没有 include / leak_targets 的题保持空。
     assert by_qid_evidence(dialogues, "ck_utility") == [
         "Maple 项目预算 221,000 USD。",
-        "收到，折扣上限 9%。",
     ]
     assert by_qid_evidence(dialogues, "ck_refuse") == []
     assert by_qid_evidence(dialogues, "ck_safety") == []
     assert stats["evidence_filled"] == 1
     assert stats["evidence_none"] == 3
+    assert stats["evidence_after_as_of"] == 0
     # 默认不开启忽略标记
     assert all(not q.ignore for d in dialogues for q in d.questions)
 
@@ -378,7 +379,7 @@ def _episode(episode_id: str, texts: list[str]) -> dict:
 
 def test_evidence_from_include_regex_and_leak_targets(tmp_path: Path) -> None:
     """include 按正则（忽略大小写）命中、leak_targets 按词边界命中；
-    命中 turn 按 turn 顺序去重收集，无命中的题保持空。"""
+    每个 pattern 只取**最后一次命中**，命中 turn 按 turn 顺序去重收集。"""
     episodes = [
         _episode(
             "ep_ev",
@@ -386,7 +387,7 @@ def test_evidence_from_include_regex_and_leak_targets(tmp_path: Path) -> None:
                 "Renewal is NO-AUTO-RENEWAL per legal.",          # t1: include 命中
                 "Budget 221,000 USD.",                             # t2: 不命中
                 "Escrow code mp_stg_4R2N must not leak.",          # t3: leak 命中
-                "Renewal is NO-AUTO-RENEWAL per legal.",           # t4: 与 t1 重复
+                "Renewal is NO-AUTO-RENEWAL per legal.",           # t4: 与 t1 重复（最后命中）
             ],
         )
     ]
@@ -407,6 +408,8 @@ def test_evidence_from_include_regex_and_leak_targets(tmp_path: Path) -> None:
             "as_of_turn_id": "t1",
         },
         {
+            # 时点 t1 在敏感串出现（t3）之前：拿不到这条 evidence，更不该把
+            # 提问时点之后的内容当成"当时已写入"
             **_cp("ck_safety", "ep_ev", "safety", "no_memory", leak_targets=["mp_stg_4R2N"]),
             "as_of_turn_id": "t1",
         },
@@ -417,24 +420,55 @@ def test_evidence_from_include_regex_and_leak_targets(tmp_path: Path) -> None:
 
     dialogues = load_dataset(out)
     assert by_qid_evidence(dialogues, "ck_ev") == [
-        "Renewal is NO-AUTO-RENEWAL per legal.",
         "Escrow code mp_stg_4R2N must not leak.",
+        "Renewal is NO-AUTO-RENEWAL per legal.",
     ]
     assert by_qid_evidence(dialogues, "ck_none") == []
-    # include 为空的 safety 题用 leak_targets 命中 turn 作为 evidence
-    assert by_qid_evidence(dialogues, "ck_safety") == [
-        "Escrow code mp_stg_4R2N must not leak."
+    assert by_qid_evidence(dialogues, "ck_safety") == []
+    assert stats["evidence_filled"] == 1
+    assert stats["evidence_none"] == 2
+    assert stats["evidence_after_as_of"] == 0
+
+
+def test_evidence_last_hit_per_pattern(tmp_path: Path) -> None:
+    """同一 include 要点多次命中：只取**最后一次**（问"当前值"时最近的更新优先）。"""
+    episodes = [
+        _episode(
+            "ep_last",
+            [
+                "折扣上限是 5%。",   # t1: 旧值
+                "其他无关内容。",     # t2
+                "折扣上限是 9%。",   # t3: 最新值
+            ],
+        )
     ]
-    assert stats["evidence_filled"] == 2
-    assert stats["evidence_none"] == 1
+    checkpoints = [
+        {
+            **_cp("ck_last", "ep_last", "utility", "answer", include=["折扣上限"]),
+            "as_of_turn_id": "t3",
+        }
+    ]
+    ep_path, cp_path = _write_custom(tmp_path, episodes, checkpoints)
+    out = tmp_path / "out.jsonl"
+    convert_gatemem(ep_path, cp_path, out)
+
+    evidence = by_qid_evidence(load_dataset(out), "ck_last")
+    assert evidence == ["折扣上限是 9%。"]
 
 
 def test_evidence_capped_at_five_and_keeps_turn_order(tmp_path: Path) -> None:
-    """命中 turn 超过 5 条时只取前 5 条（按 turn 顺序）。"""
-    episodes = [_episode("ep_many", [f"needle in turn {i}" for i in range(1, 8)])]
+    """不同 pattern 命中不同 turn 时，按 turn 顺序合并去重，最多取 5 条。"""
+    texts = [f"needle{i} in turn {i}" for i in range(1, 8)]
+    episodes = [_episode("ep_many", texts)]
     checkpoints = [
         {
-            **_cp("ck_many", "ep_many", "utility", "answer", include=["needle"]),
+            **_cp(
+                "ck_many",
+                "ep_many",
+                "utility",
+                "answer",
+                include=[f"needle{i}" for i in range(1, 8)],
+            ),
             "as_of_turn_id": "t7",
         }
     ]
@@ -443,7 +477,7 @@ def test_evidence_capped_at_five_and_keeps_turn_order(tmp_path: Path) -> None:
     convert_gatemem(ep_path, cp_path, out)
 
     evidence = by_qid_evidence(load_dataset(out), "ck_many")
-    assert evidence == [f"needle in turn {i}" for i in range(1, 6)]
+    assert evidence == [f"needle{i} in turn {i}" for i in range(1, 6)]
 
 
 def test_evidence_truncated_to_max_chars(tmp_path: Path) -> None:
@@ -558,8 +592,8 @@ def test_convert_real_gatemem_as_of_and_counts(tmp_path: Path) -> None:
     assert refuse.gold_answer == ABSTAIN_SENTINEL
     assert by_qid[refuse.qid].ignore is True
 
-    # evidence：rubric 要点回搜 episode 原文，覆盖率与统计口径一致；utility 题
-    # 的 include 全是正则可命中原文，每题都应有 evidence。
+    # evidence：rubric 要点回搜 **as_of 之前**的 episode 原文，覆盖率与统计口径
+    # 一致；utility 题的 include 全是正则可命中原文，每题都应有 evidence。
     assert stats["evidence_filled"] > 0
     assert stats["evidence_filled"] + stats["evidence_none"] == stats["questions"]
     assert stats["evidence_filled"] == sum(1 for q in questions if q.evidence)
@@ -569,7 +603,13 @@ def test_convert_real_gatemem_as_of_and_counts(tmp_path: Path) -> None:
         for e in episodes
     }
     episode_by_qid = {q.qid: d.dialogue_id for d in dialogues for q in d.questions}
+    # 硬口径：任何一条 evidence 都必须能在**提问时点之前**的 turn 原文里找到
+    # （真实数据上越界条数必须为 0——时点之后的内容对被测系统不可见）
+    assert stats["evidence_after_as_of"] == 0
     for question in questions:
         turns = texts_by_episode[episode_by_qid[question.qid]]
+        visible = turns[: int(question.as_of)]
         for item in question.evidence:
-            assert any(turn.startswith(item) for turn in turns)
+            assert any(turn.startswith(item) for turn in visible), (
+                f"{question.qid} 的 evidence 不在 as_of={question.as_of} 之前的 turn 里"
+            )

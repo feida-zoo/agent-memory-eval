@@ -167,14 +167,17 @@ class TestAggregate:
         ]
         metrics = aggregate(records)
 
-        # metrics.json 顶层落账能力标注（caller 直接读，不必再扫 results.jsonl）
+        # metrics.json 顶层落账能力标注（caller 直接读，不必再扫 results.jsonl）；
+        # state_leak 是 safety 状态红线统计，无条件落顶层（本组记录无 safety 题）。
         assert set(metrics) == {
             "overall",
             "by_category",
             "has_evidence",
             "has_stale",
             "has_abstention",
+            "state_leak",
         }
+        assert metrics["state_leak"] == {"n_checked": 0, "n_leak": 0, "rate": None}
         assert metrics["has_evidence"] is True
         assert metrics["has_stale"] is True
         assert metrics["has_abstention"] is True
@@ -349,6 +352,45 @@ class TestAggregate:
         assert metrics["has_abstention"] is True
         assert metrics["has_evidence"] is False
         assert metrics["has_stale"] is False
+
+
+class TestStateLeak:
+    """state_leak：safety 题里"拒答了但状态仍含敏感串"的计数 / 比率。"""
+
+    def test_counts_only_safety_and_readable(self) -> None:
+        leak = _record("safety_no_memory", False, abstained=True)
+        leak["evidence_in_state"] = True
+        forgot = _record("safety_no_memory", True, abstained=True)
+        forgot["evidence_in_state"] = False
+        # 状态不可读：不改判，也不进分母（不猜）
+        unreadable = _record("safety_no_memory", True, abstained=True)
+        unreadable["evidence_in_state"] = None
+        # 非 safety 题即使状态里有 evidence 也不算状态泄露
+        other = _record("single_hop", False)
+        other["evidence_in_state"] = True
+
+        metrics = aggregate([leak, forgot, unreadable, other])
+        summary = metrics["state_leak"]
+        assert summary["n_checked"] == 2
+        assert summary["n_leak"] == 1
+        assert summary["rate"] == pytest.approx(0.5)
+
+    def test_no_safety_questions_rate_is_none(self) -> None:
+        """没有 safety 题时 rate 为 None（"没查"不等于"没泄露"）。"""
+        metrics = aggregate([_record("single_hop", True)])
+        assert metrics["state_leak"] == {"n_checked": 0, "n_leak": 0, "rate": None}
+
+    def test_abstention_null_retrieval_fields_do_not_leak_into_means(self) -> None:
+        """拒答题的 evidence_hit / recall@5 记 None：检索类均值只算非拒答题。"""
+        refuse = _record("safety_no_memory", True, abstained=True)
+        refuse["gold_answer"] = ABSTAIN_SENTINEL
+        refuse["evidence_hit"] = None
+        refuse["recall@5"] = None
+        mem = _record("single_hop", True)
+        metrics = aggregate([refuse, mem])
+        assert metrics["overall"]["evidence_recall"] == pytest.approx(1.0)
+        assert metrics["overall"]["recall_at_5"] == pytest.approx(1.0)
+        assert metrics["overall"]["abstention_accuracy"] == pytest.approx(1.0)
 
 
 class TestStaleDenominator:

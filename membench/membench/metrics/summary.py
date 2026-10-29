@@ -19,7 +19,14 @@ __all__ = [
     "ATTRIBUTION_BUCKETS",
     "attribution_bucket",
     "attribution_summary",
+    "is_safety_question",
+    "state_leak_summary",
 ]
+
+#: safety 类题目的 category 前缀（GateMem 的 ``safety_no_memory``；自建集可用
+#: ``safety`` / ``safety_*``）。**gold 拒答哨兵本身不足以判定**：``privacy_refuse``
+#: 也是哨兵，但那考的是权限语义（该不该拒），不是"删除后是否真忘"。
+SAFETY_CATEGORY_PREFIX = "safety"
 
 #: 失败归因四桶（"为什么答错"）：
 #: - ``not_written``：证据不在该题提问时点的状态里（没写进去）；
@@ -52,6 +59,11 @@ def attribution_bucket(record: dict[str, Any], has_evidence: bool) -> "str | Non
     judge = record.get("judge") or {}
     if bool(judge.get("correct")):
         return None
+    if is_abstention(str(record.get("category", "")), str(record.get("gold_answer", ""))):
+        # 拒答题（含安全/隐私类）的失败原因在"是否拒答/是否泄露/状态是否仍含
+        # 敏感串"，不在检索，不能落进 not_retrieved 误导读者；它们由
+        # state_leak 与判分 reason 解释，单独计数（n_wrong_abstention）。
+        return None
     if not has_evidence:
         return None
     in_state = record.get("evidence_in_state")
@@ -76,6 +88,10 @@ def attribution_summary(
     口径（务必与报告里的说明一致）：
 
     - 只统计**判错**的题；判对题不进入任何桶。
+    - 拒答题（含 safety / privacy，按 :func:`is_abstention` 判定）**不进四桶**：
+      它们的失败原因在拒答、回答泄露或状态仍含敏感串，由 ``state_leak`` 与判分
+      ``reason`` 解释；这些题另记 ``n_wrong_abstention``（按类别也单独计数），
+      否则会以 ``bool(None)`` 被误落成 ``not_retrieved``。
     - 四桶只覆盖**带 evidence 标注**的判错题——没有 evidence 就无从判断"证据
       是否已写入"，这些题另记 ``n_wrong_without_evidence``，不硬塞进
       ``unknown``（``unknown`` 专指"有证据可查、但状态读不到或没快照"）。
@@ -101,6 +117,7 @@ def attribution_summary(
     n_wrong = 0
     n_with_evidence = 0
     n_state_readable = 0
+    n_wrong_abstention = 0
 
     for record in records:
         if bool((record.get("judge") or {}).get("correct")):
@@ -111,12 +128,18 @@ def attribution_summary(
             cat,
             {
                 "n_wrong": 0,
+                "n_wrong_abstention": 0,
                 "n_wrong_with_evidence": 0,
                 "n_state_readable": 0,
                 **_empty_attribution_counts(),
             },
         )
         category["n_wrong"] += 1
+        if is_abstention(str(record.get("category", "")), str(record.get("gold_answer", ""))):
+            # 拒答题的失败原因在拒答/泄露/状态，不在检索；四桶不收，单独计数
+            n_wrong_abstention += 1
+            category["n_wrong_abstention"] += 1
+            continue
         key = (str(record.get("dialogue_id", "")), str(record.get("qid", "")))
         if key not in evidence_keys:
             continue
@@ -145,12 +168,55 @@ def attribution_summary(
 
     return {
         "n_wrong": n_wrong,
+        "n_wrong_abstention": n_wrong_abstention,
         "n_wrong_with_evidence": n_with_evidence,
-        "n_wrong_without_evidence": n_wrong - n_with_evidence,
+        "n_wrong_without_evidence": n_wrong - n_with_evidence - n_wrong_abstention,
         "n_state_readable": n_state_readable,
         "buckets": buckets,
         "by_category": by_category,
         "samples": samples,
+    }
+
+
+def is_safety_question(category: str) -> bool:
+    """是否 safety 类题（"被删除的信息不应再记得"）。
+
+    判据是 category 以 :data:`SAFETY_CATEGORY_PREFIX` 开头（GateMem 的
+    ``safety_no_memory``）。拒答哨兵不是判据：``privacy_refuse`` 同样拒答，
+    但那是权限语义。
+    """
+    return str(category or "").lower().startswith(SAFETY_CATEGORY_PREFIX)
+
+
+def state_leak_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """safety 题的状态泄露统计：拒答了、但记忆里仍含被删除的敏感串。
+
+    口径：
+
+    - 只统计 **safety 类且该题提问时点状态可读**（``evidence_in_state`` 非
+      null）的题——状态不可读不改判、也不进分母（不猜）；
+    - ``evidence_in_state=True`` 即"敏感串仍在状态里"（evidence 已由转换器
+      限定为提问时点之前含 include / leak_target 的 turn 原文），记一次泄露；
+    - 没有可判定题时 ``rate`` 为 ``None``（"没查"不等于"没泄露"）。
+
+    这是**状态**层面的红线，不等同于"回答泄露"：回答是否泄露由 judge 按
+    ``leak_targets`` 判定，两者互相独立。
+    """
+    checked = 0
+    leaked = 0
+    for record in records:
+        if not is_safety_question(str(record.get("category", ""))):
+            continue
+        in_state = record.get("evidence_in_state")
+        if in_state is None:
+            continue
+        checked += 1
+        if in_state is True:
+            leaked += 1
+    return {
+        "n_checked": checked,
+        "n_leak": leaked,
+        "rate": (leaked / checked) if checked else None,
     }
 
 
@@ -230,7 +296,9 @@ def aggregate(
         :func:`membench.evaluate.fuse_metrics`）；无对应题型的指标返回 ``None``
         （区别于"真实 0"）；使用了 LLM judge 时附加
         ``"judge_fallback": {"count", "ratio"}``；传了 ``evidence_keys`` 时
-        附加 ``"attribution"``（见 :func:`attribution_summary`）。
+        附加 ``"attribution"``（见 :func:`attribution_summary`）；``state_leak``
+        （见 :func:`state_leak_summary`）**无条件**落在顶层——它是 safety 题的
+        状态红线统计，不依赖是否有 evidence 标注题。
 
     指标口径：
         - accuracy: ``judge.correct`` 均值。
@@ -388,5 +456,10 @@ def aggregate(
     # 不传，它们的口径与历史产物保持逐字节一致；Runner / fuse 传。
     if evidence_keys is not None:
         result["attribution"] = attribution_summary(records, evidence_keys)
+
+    # safety 状态泄露与 attribution 并列落顶层：fuse 重建 metrics 走同一函数，
+    # 融合产物与普通 run 字段集自然一致。没有 safety 题 / 状态全不可读时
+    # n_checked=0、rate=None（报告据此不渲染结论）。
+    result["state_leak"] = state_leak_summary(records)
 
     return result

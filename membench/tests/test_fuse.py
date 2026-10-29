@@ -822,3 +822,148 @@ def test_fused_smoke_and_full_products_are_incomparable(tmp_path: Path) -> None:
     assert dims["n_questions"]["a"] != dims["n_questions"]["b"]
     assert dims["n_questions"]["severity"] == "critical"
     assert any("n_questions" in reason for reason in comparability["reasons"])
+
+
+# ---------------------------------------------------------------------------
+# 融合产物的 ingest_blocks / trace_state：与普通 run 同一套字段
+# ---------------------------------------------------------------------------
+
+
+class _TraceAdapter(BaseMemoryAdapter):
+    """最小「状态可读 + 可快照」适配器：interleaved 分片融合的字段一致性用。"""
+
+    name = "mock-trace"
+
+    def __init__(self) -> None:
+        self._messages: list[dict] = []
+
+    def reset(self) -> None:
+        self._messages = []
+
+    def ingest(self, messages: list[dict]) -> IngestStats:
+        self._messages.extend(messages)
+        return IngestStats()
+
+    def query(self, question: str) -> QueryResult:
+        return QueryResult(answer="答案", retrieved=[])
+
+    def snapshot_capabilities(self) -> dict:
+        return {"supported": True, "restore": False, "rebuild": False, "format_version": 1}
+
+    def snapshot(self, target_dir: str, tag: str) -> dict:
+        Path(target_dir, "state.txt").write_text(
+            "\n".join(str(message.get("content", "")) for message in self._messages),
+            encoding="utf-8",
+        )
+        return {"n_messages": len(self._messages)}
+
+
+def _interleaved_dataset(path: Path, dialogues: int = 2) -> Path:
+    """N 个 interleaved 对话，每个 2 条消息、2 道题（as_of=1 / 2）。"""
+    lines = []
+    for i in range(dialogues):
+        lines.append(
+            {
+                "dialogue_id": f"d{i}",
+                "ingest_strategy": "interleaved",
+                "sessions": [
+                    [
+                        {"role": "user", "content": f"d{i} m1", "timestamp": None},
+                        {"role": "user", "content": f"d{i} m2", "timestamp": None},
+                    ]
+                ],
+                "questions": [
+                    {
+                        "qid": f"d{i}q{as_of}",
+                        "question": f"d{i}q{as_of}: 问题？",
+                        "gold_answer": "答案",
+                        "category": "single_hop",
+                        "evidence": [],
+                        "as_of": as_of,
+                    }
+                    for as_of in (1, 2)
+                ],
+            }
+        )
+    path.write_text(
+        "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_fuse_rebuilds_ingest_blocks_and_trace_state(tmp_path: Path) -> None:
+    """两个对话级分片融合后带 ingest_blocks / trace_state，字段与全量 run 一致。"""
+    dataset = _interleaved_dataset(tmp_path / "interleaved.jsonl")
+    merged = []
+    for index in range(2):
+        merged.append(
+            _shard_run(
+                tmp_path,
+                f"s{index}",
+                _TraceAdapter(),
+                2,
+                index,
+                shard_by="dialogue",
+                dataset=dataset,
+                trace_state=True,
+            )
+        )
+    fused = fuse_runs(merged, str(tmp_path / "fused"))
+    fused_metrics = _read_metrics(fused["dataset_dir"])
+
+    full_dir = Runner(
+        _TraceAdapter(), str(dataset), judge="heuristic",
+        out_dir=str(tmp_path / "full"), trace_state=True,
+    ).run()
+    full_metrics = _read_metrics(full_dir)
+
+    # 摄入块：字段集一致；n / min / max 与全量 run 相同（median 是近似口径）
+    assert set(fused_metrics["ingest_blocks"]) == set(full_metrics["ingest_blocks"])
+    assert fused_metrics["ingest_blocks"]["n"] == full_metrics["ingest_blocks"]["n"] == 4
+    assert fused_metrics["ingest_blocks"]["min"] == full_metrics["ingest_blocks"]["min"] == 1
+    assert fused_metrics["ingest_blocks"]["max"] == full_metrics["ingest_blocks"]["max"] == 1
+    assert (
+        fused_metrics["ingest_blocks"]["min"]
+        <= fused_metrics["ingest_blocks"]["median"]
+        <= fused_metrics["ingest_blocks"]["max"]
+    )
+
+    # 逐时点追踪状态：两份每对话 2 个 as_of，合计 4；与全量 run 同形
+    assert fused_metrics["trace_state"] == full_metrics["trace_state"] == {
+        "enabled": True,
+        "role": "exported",
+        "n_states": 4,
+    }
+
+    # 跨目录融合重建的对话级 metrics 同样带这两个字段
+    for index in range(2):
+        dialogue_metrics = _dialogue_metrics(fused["dataset_dir"], f"d{index}")
+        assert dialogue_metrics["ingest_blocks"]["n"] == 2
+        assert dialogue_metrics["trace_state"] == {
+            "enabled": True,
+            "role": "exported",
+            "n_states": 2,
+        }
+
+
+def test_fuse_omits_trace_state_without_trace_dirs(tmp_path: Path) -> None:
+    """源 run 没开 --trace-state：融合产物同样不落 trace_state（字段集一致）。"""
+    dataset = _interleaved_dataset(tmp_path / "interleaved.jsonl")
+    merged = [
+        _shard_run(
+            tmp_path,
+            f"n{index}",
+            _TraceAdapter(),
+            2,
+            index,
+            shard_by="dialogue",
+            dataset=dataset,
+        )
+        for index in range(2)
+    ]
+    fused = fuse_runs(merged, str(tmp_path / "fused-no-trace"))
+    fused_metrics = _read_metrics(fused["dataset_dir"])
+    assert "trace_state" not in fused_metrics
+    # ingest_blocks 仍在（interleaved 对话确实有摄入块）
+    assert fused_metrics["ingest_blocks"]["n"] == 4

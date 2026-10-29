@@ -56,6 +56,13 @@
 快照文件本身随对话目录并入（就地模式本来就在位），能不能回放由 manifest 决定
 （``membench.snapshot.plan_replay`` 只读 manifest），不看这段元数据。
 
+``ingest_blocks`` / ``trace_state`` 则由 fuse **重建**（与普通 run 同一套字段）：
+前者从各对话级 metrics 合并（``n`` 求和、``min`` / ``max`` 取极值、``median`` 取各
+对话 median 的中位数——块级明细没落盘，这是近似口径）；后者按各片对话目录下
+``trace_state/t<as_of>/`` 的并集计份数（有则 ``enabled=True, role="exported"``），
+没有时透传源 run 的落账值，源 run 也没有该字段时同样省略。``state_leak`` 与
+``attribution`` 一样由 :func:`membench.metrics.aggregate` 从逐题记录重算。
+
 回放任务（任务根带 ``snapshots/``）走完 fuse 时顺手重算一次快照池的派生索引
 ``snapshots/index.json``（真源是 ``snapshots/entries/`` 的逐对话条目 + 各桶清单）：
 分片并行回放各写各的条目，索引只在收尾时由这里的 :func:`membench.layout.materialize_snapshot_index`
@@ -72,6 +79,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import statistics
 from datetime import datetime
 from typing import Any, Union
 
@@ -699,6 +707,51 @@ def _caps_or(blocks: list[dict[str, Any]]) -> dict[str, bool]:
     }
 
 
+def _merge_ingest_blocks(
+    copies: list[dict[str, Any]],
+) -> Union[dict[str, Any], None]:
+    """合并各对话级 metrics 的 ``ingest_blocks``（``{"n","min","median","max"}``）。
+
+    ``n`` 求和、``min`` / ``max`` 取极值、``median`` 取**各对话 median 的中位数**。
+    这是**近似**：块级明细（每次 ingest 的消息条数）没有落进对话级 metrics，只有
+    汇总值，所以跨对话的中位数不是"全部块的真实中位数"；question 分片下同一对话
+    被多片各自 ingest 时，``n`` 按各片实际调用次数相加（与 ``token_usage`` 同口径：
+    各片自己的计数才是真实成本）。
+
+    没有任何对话落账该字段（sequence 数据集）时返回 None——与普通 run 一致：
+    该字段整块不出现。
+    """
+    blocks = [
+        block["ingest_blocks"]
+        for block in copies
+        if isinstance(block.get("ingest_blocks"), dict)
+    ]
+    if not blocks:
+        return None
+    return {
+        "n": sum(int(block.get("n") or 0) for block in blocks),
+        "min": min(int(block.get("min") or 0) for block in blocks),
+        "median": statistics.median(float(block.get("median") or 0) for block in blocks),
+        "max": max(int(block.get("max") or 0) for block in blocks),
+    }
+
+
+def _trace_as_of(dialogue_dir: str) -> set[int]:
+    """对话目录下 ``trace_state/t<as_of>/`` 的 as_of 集合（没有则空集）。"""
+    root = os.path.join(dialogue_dir, layout.DIR_TRACE_STATE)
+    if not os.path.isdir(root):
+        return set()
+    found: set[int] = set()
+    for name in os.listdir(root):
+        if not name.startswith("t"):
+            continue
+        try:
+            found.add(int(name[1:]))
+        except ValueError:
+            continue
+    return found
+
+
 def fuse_runs(
     run_dirs: Union[list[str], None],
     out_dir: str,
@@ -776,11 +829,15 @@ def fuse_runs(
     merged: dict[str, list[dict[str, Any]]] = {}
     copies: dict[str, list[dict[str, Any]]] = {}
     sources: dict[str, str] = {}
+    # 逐对话的逐时点状态 as_of 并集：跨目录融合只并入一片的对话目录，直接数产物会
+    # 漏掉其他片导出的时点，因此按各片源目录求并集（同一 as_of 只算一份）。
+    trace_as_of: dict[str, set[int]] = {}
     for index, shard in sorted(by_index.items()):
         for name, item in sorted(shard["dialogues"].items()):
             merged.setdefault(name, []).extend(item["records"])
             copies.setdefault(name, []).append(item["metrics"])
             sources.setdefault(name, item["dir"])
+            trace_as_of.setdefault(name, set()).update(_trace_as_of(item["dir"]))
     total_records = sum(len(records) for records in merged.values())
     counted = sum(int(shard["entry"].get("n_questions", 0) or 0) for shard in by_index.values())
     if counted != total_records:
@@ -915,6 +972,24 @@ def fuse_runs(
     )
     if fallbacks:
         metrics["retrieval_match_fallbacks"] = fallbacks
+    # 摄入块与逐时点追踪状态：与普通 run 同一套字段（对话级 metrics 只有本片
+    # 那一段，这里按并集 / 汇总重建；见两个 helper 的近似口径说明）。
+    ingest_blocks = _merge_ingest_blocks(
+        [block for blocks in copies.values() for block in blocks]
+    )
+    if ingest_blocks is not None:
+        metrics["ingest_blocks"] = ingest_blocks
+    n_trace_states = sum(len(values) for values in trace_as_of.values())
+    if n_trace_states:
+        metrics["trace_state"] = {
+            "enabled": True,
+            "role": "exported",
+            "n_states": n_trace_states,
+        }
+    elif isinstance(ref_metrics.get("trace_state"), dict):
+        # 没有逐时点状态目录：按源 run 的落账值透传（没开 --trace-state 时源 run
+        # 整块不落，这里同样省略——字段集与普通 run 一致）
+        metrics["trace_state"] = dict(ref_metrics["trace_state"])
     usage = _combine_usage([dialogue_usage[name] for name in merged])
     if usage is not None:
         metrics["token_usage"] = usage
@@ -958,6 +1033,18 @@ def fuse_runs(
             dialogue_metrics["n_ignored"] = sum(
                 int(block.get("n_ignored", 0) or 0) for block in copies[name]
             )
+            dialogue_blocks = _merge_ingest_blocks(copies[name])
+            if dialogue_blocks is not None:
+                dialogue_metrics["ingest_blocks"] = dialogue_blocks
+            dialogue_trace_n = len(trace_as_of.get(name, ()))
+            if dialogue_trace_n:
+                dialogue_metrics["trace_state"] = {
+                    "enabled": True,
+                    "role": "exported",
+                    "n_states": dialogue_trace_n,
+                }
+            elif isinstance(copies[name][0].get("trace_state"), dict):
+                dialogue_metrics["trace_state"] = dict(copies[name][0]["trace_state"])
             if dialogue_usage[name] is not None:
                 dialogue_metrics["token_usage"] = dialogue_usage[name]
             _write_report_dir(

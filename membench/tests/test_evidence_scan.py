@@ -136,6 +136,63 @@ def test_state_dir_scanned_once_per_run(
     assert len(calls) == 2
 
 
+def test_cache_global_byte_budget_evicts_lru(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """份数未超但全局字节预算超限：淘汰最久未用的状态目录，下次重扫。"""
+    import collections
+    import sys
+
+    monkeypatch.setattr(runner_mod, "_STATE_TEXT_CACHE", collections.OrderedDict())
+    monkeypatch.setattr(runner_mod, "STATE_SCAN_CACHE_SIZE", 8)
+    # 预算只够一份：按 runtime 实际报告的单条体积设定
+    monkeypatch.setattr(
+        runner_mod, "STATE_SCAN_CACHE_MAX_BYTES", sys.getsizeof("alpha fact") + 1
+    )
+    calls: list[str] = []
+    real_reader = runner_mod._read_state_texts
+
+    def counted(state_dir: str):
+        calls.append(state_dir)
+        return real_reader(state_dir)
+
+    monkeypatch.setattr(runner_mod, "_read_state_texts", counted)
+
+    first = _write_state(tmp_path, "alpha fact", name="first")
+    second = _write_state(tmp_path, "beta fact", name="second")
+    assert scan_state_for_evidence(str(first), ["alpha fact"]) is True
+    assert scan_state_for_evidence(str(second), ["beta fact"]) is True
+    # 第二份写入后总字节超预算 → 最久未用的 first 被淘汰，再扫要重读
+    assert scan_state_for_evidence(str(first), ["alpha fact"]) is True
+    assert len(calls) == 3
+
+
+def test_cache_count_cap_evicts_lru(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """份数闸门：超过 STATE_SCAN_CACHE_SIZE 份时淘汰最久未用条目。"""
+    import collections
+
+    monkeypatch.setattr(runner_mod, "_STATE_TEXT_CACHE", collections.OrderedDict())
+    monkeypatch.setattr(runner_mod, "STATE_SCAN_CACHE_SIZE", 1)
+    monkeypatch.setattr(runner_mod, "STATE_SCAN_CACHE_MAX_BYTES", 1 << 30)
+    calls: list[str] = []
+    real_reader = runner_mod._read_state_texts
+
+    def counted(state_dir: str):
+        calls.append(state_dir)
+        return real_reader(state_dir)
+
+    monkeypatch.setattr(runner_mod, "_read_state_texts", counted)
+
+    first = _write_state(tmp_path, "alpha fact", name="first")
+    second = _write_state(tmp_path, "beta fact", name="second")
+    assert scan_state_for_evidence(str(first), ["alpha fact"]) is True
+    assert scan_state_for_evidence(str(second), ["beta fact"]) is True
+    assert scan_state_for_evidence(str(first), ["alpha fact"]) is True
+    assert len(calls) == 3
+
+
 # ---------------------------------------------------------------------------
 # 读取上限
 # ---------------------------------------------------------------------------
