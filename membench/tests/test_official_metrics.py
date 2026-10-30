@@ -190,3 +190,73 @@ def test_run_records_action_and_renders_official_section(tmp_path: Path) -> None
     assert "## GateMem 官方口径（U / A / F / MGS）" in report
     assert "action_source=inferred" in report
     assert "推断动作分布" in report
+
+
+def _dataset_result(key: str, official: dict | None, *, office: bool = False):
+    """构造 DatasetResult（只填 pool_official 需要的字段）。"""
+    from membench.evaluate import DatasetResult, DatasetSpec
+
+    metrics = {"overall": {}}
+    if official is not None:
+        metrics["official"] = official
+    return DatasetResult(
+        spec=DatasetSpec(
+            key=key, name=key, path=f"/data/{key}.jsonl", source="fetch", is_office_slot=office
+        ),
+        run_dir=f"/tmp/{key}",
+        metrics=metrics,
+        capabilities={},
+    )
+
+
+def test_pool_official_merges_by_counts_not_average() -> None:
+    """池化按 Σ分子/Σ分母：不是两份 MGS 的平均。"""
+    from membench.evaluate import pool_official
+
+    first = {
+        "U": 1.0, "A": 0.0, "F": 0.0, "OR": 0.0, "MGS": 1.0,
+        "n_utility": 10, "n_utility_correct": 10, "n_over_refusal": 0,
+        "n_access": 10, "n_access_violation": 0,
+        "n_forget": 10, "n_forget_failure": 0,
+    }
+    second = {
+        "U": 0.0, "A": 1.0, "F": 1.0, "OR": 1.0, "MGS": 0.0,
+        "n_utility": 2, "n_utility_correct": 0, "n_over_refusal": 2,
+        "n_access": 2, "n_access_violation": 2,
+        "n_forget": 2, "n_forget_failure": 2,
+    }
+    pooled = pool_official([_dataset_result("a", first), _dataset_result("b", second)])
+    assert pooled is not None
+    assert pooled["U"] == pytest.approx(10 / 12)
+    assert pooled["A"] == pytest.approx(2 / 12)
+    assert pooled["F"] == pytest.approx(2 / 12)
+    assert pooled["MGS"] == pytest.approx((10 / 12) * (1 - 2 / 12) * (1 - 2 / 12))
+    # 与"两份 MGS 平均"（0.5）不同——这正是不能用加权平均的理由
+    assert pooled["MGS"] != pytest.approx(0.5)
+    assert pooled["participants"] == ["a", "b"]
+    assert pooled["pooling"] == "sum_numerator_over_sum_denominator"
+
+
+def test_pool_official_excludes_office_slot() -> None:
+    """办公域槽位不参与基准池化（与 fuse_metrics 同口径），但会记在 excluded。"""
+    from membench.evaluate import pool_official
+
+    official = {
+        "U": 1.0, "A": 0.0, "F": 0.0, "OR": 0.0, "MGS": 1.0,
+        "n_utility": 2, "n_utility_correct": 2, "n_over_refusal": 0,
+        "n_access": 1, "n_access_violation": 0,
+        "n_forget": 1, "n_forget_failure": 0,
+    }
+    pooled = pool_official(
+        [_dataset_result("gatemem_office", official), _dataset_result("office", official, office=True)]
+    )
+    assert pooled is not None
+    assert pooled["participants"] == ["gatemem_office"]
+    assert pooled["excluded"] == ["office"]
+    assert pooled["n_utility"] == 2
+
+
+def test_pool_official_none_without_official_block() -> None:
+    from membench.evaluate import pool_official
+
+    assert pool_official([_dataset_result("locomo", None)]) is None

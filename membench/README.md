@@ -1091,8 +1091,14 @@ membench 的六维指标**不是同一套东西**。数据集覆盖官方三支�
 **它是参考视图，不是评分口径**：`official` 块不参与多数据集融合（`fuse_metrics` 只遍历
 `FUSED_METRICS`）、不参与综合评级（`ratings.METRIC_THRESHOLDS` 只有 accuracy /
 evidence_recall / abstention_accuracy / stale_rate）、不参与门禁；`compare` / `evaluate-compare` /
-`matrix` 目前也不读它。跨数据集也不能对 MGS 做加权平均——它是乘法指标，需要按分子分母池化
-（`official` 块已落 `n_utility_correct` / `n_access_violation` / `n_forget_failure` 等计数）。
+`matrix` 目前也不读它（A/B 的官方口径 diff 暂未实现）。
+
+**多数据集报告**会多一节「GateMem 官方口径（逐数据集 + 池化）」：逐数据集一行 U / OR / A / F / MGS，
+外加一行**池化**值。池化按「Σ分子 / Σ分母」先把三个支柱的分子分母合并再算
+（`U_pool = Σn_utility_correct / Σn_utility` …，`MGS_pool = U_pool×(1−A_pool)×(1−F_pool)`）——
+**不是**对各数据集的 MGS 取平均（乘法指标，平均没有意义）。办公域槽位不参与池化，单列业务结论；
+带官方口径的数据集全是办公域槽位时，报告只出逐数据集表并说明"无可池化数据集"。
+池化结果同时落 `reports/metrics.json` 的 `official_pooled`。
 
 ```bash
 # 只看官方口径的三支柱题（utility / privacy / safety）

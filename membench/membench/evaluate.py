@@ -727,6 +727,74 @@ def is_baseline_dataset(res: DatasetResult) -> bool:
     return not res.spec.is_office_slot
 
 
+def pool_official(results: list["DatasetResult"]) -> Union[dict[str, Any], None]:
+    """按**分子 / 分母**池化 GateMem 官方三支柱（跨数据集）。
+
+    为什么不能对 MGS 取加权平均：``MGS = U × (1−A) × (1−F)`` 是乘法指标，
+    ``mean(MGS_i)`` 与 ``U_pool × (1−A_pool) × (1−F_pool)`` 不是一回事。正确做法
+    是把各数据集的三支柱分子分母先相加再算，池化口径写成一行小注（报告里也写）。
+
+    参与范围与 :func:`fuse_metrics` 一致：办公域槽位不参与基准池化（它单列在
+    「业务结论」）。没有任何数据集带 ``official`` 块时返回 ``None``。
+
+    Args:
+        results: 各数据集的评测结果（``metrics["official"]`` 可能缺失）。
+
+    Returns:
+        ``{"U","A","F","OR","MGS","n_utility","n_access","n_forget",
+        "n_utility_correct","n_access_violation","n_forget_failure",
+        "n_over_refusal","participants","excluded",
+        "action_source":"inferred","pooling":"sum_numerator_over_sum_denominator"}``；
+        某个支柱没有参与题时对应值（含 MGS）记 ``None``。
+    """
+    participants: list[str] = []
+    excluded: list[str] = []
+    sums = {
+        "n_utility": 0,
+        "n_utility_correct": 0,
+        "n_over_refusal": 0,
+        "n_access": 0,
+        "n_access_violation": 0,
+        "n_forget": 0,
+        "n_forget_failure": 0,
+    }
+    found = False
+    for res in results:
+        official = res.metrics.get("official")
+        if not isinstance(official, dict):
+            continue
+        if not is_baseline_dataset(res):
+            excluded.append(res.spec.key)
+            continue
+        found = True
+        participants.append(res.spec.key)
+        for key in sums:
+            value = official.get(key)
+            if isinstance(value, int):
+                sums[key] += value
+    if not found:
+        return None
+
+    def ratio(num: str, den: str) -> Union[float, None]:
+        return (sums[num] / sums[den]) if sums[den] else None
+
+    u = ratio("n_utility_correct", "n_utility")
+    a = ratio("n_access_violation", "n_access")
+    f = ratio("n_forget_failure", "n_forget")
+    return {
+        "U": u,
+        "A": a,
+        "F": f,
+        "OR": ratio("n_over_refusal", "n_utility"),
+        "MGS": (u * (1.0 - a) * (1.0 - f)) if (u is not None and a is not None and f is not None) else None,
+        **sums,
+        "participants": participants,
+        "excluded": excluded,
+        "action_source": "inferred",
+        "pooling": "sum_numerator_over_sum_denominator",
+    }
+
+
 def _as_count(value: Any) -> Union[int, None]:
     """计数型字段 -> 正整数；缺省 / 0 / 非数字返回 None（= 不能用它当权重）。"""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -1202,6 +1270,80 @@ def _render_task_report_md(
     )
     lines.append("")
 
+    # GateMem 官方口径（逐数据集 + 池化）：与六维融合表并列，不参与融合/评级。
+    pooled = pool_official(results)
+    has_official = any(isinstance(r.metrics.get("official"), dict) for r in results)
+    if has_official:
+        lines.append("## GateMem 官方口径（逐数据集 + 池化）")
+        lines.append("")
+        lines.append(
+            "<sub>对齐 GateMem 论文（arXiv:2606.18829）的三支柱与乘法主指标 "
+            "`MGS = U × (1−A) × (1−F)`。动作标签由回答文本推断"
+            "（`action_source=inferred`），泄露用字面命中 `leak_targets` 近似，"
+            "`state_leak` 不参与；**本节是参考视图，不参与上面的融合、综合评级与门禁**。"
+            "跨数据集**不能**对 MGS 加权平均（乘法指标），池化行按"
+            "「Σ分子 / Σ分母」先合并再算；办公域槽位不参与池化（单列业务结论）。</sub>"
+        )
+        lines.append("")
+
+        def _cell(value: Any, count: Union[int, None], total: Union[int, None]) -> str:
+            if value is None:
+                return "未定义"
+            text = f"{float(value) * 100:.1f}%"
+            if count is not None and total:
+                text += f"（{int(count)}/{int(total)}）"
+            return text
+
+        official_rows: list[list[str]] = []
+        for res in results:
+            official = res.metrics.get("official")
+            if not isinstance(official, dict):
+                continue
+            official_rows.append(
+                [
+                    res.spec.name,
+                    _cell(official.get("U"), official.get("n_utility_correct"), official.get("n_utility")),
+                    _cell(official.get("OR"), official.get("n_over_refusal"), official.get("n_utility")),
+                    _cell(official.get("A"), official.get("n_access_violation"), official.get("n_access")),
+                    _cell(official.get("F"), official.get("n_forget_failure"), official.get("n_forget")),
+                    f"{float(official['MGS']) * 100:.1f}%" if official.get("MGS") is not None else "未定义",
+                    f"{int(official.get('n_utility') or 0)} / {int(official.get('n_access') or 0)} / "
+                    f"{int(official.get('n_forget') or 0)}",
+                ]
+            )
+        if pooled is not None:
+            official_rows.append(
+                [
+                    "**池化（基准集，Σ分子/Σ分母）**",
+                    _cell(pooled.get("U"), pooled.get("n_utility_correct"), pooled.get("n_utility")),
+                    _cell(pooled.get("OR"), pooled.get("n_over_refusal"), pooled.get("n_utility")),
+                    _cell(pooled.get("A"), pooled.get("n_access_violation"), pooled.get("n_access")),
+                    _cell(pooled.get("F"), pooled.get("n_forget_failure"), pooled.get("n_forget")),
+                    f"{float(pooled['MGS']) * 100:.1f}%" if pooled.get("MGS") is not None else "未定义",
+                    f"{int(pooled.get('n_utility') or 0)} / {int(pooled.get('n_access') or 0)} / "
+                    f"{int(pooled.get('n_forget') or 0)}",
+                ]
+            )
+        lines.append(
+            _md_table(
+                ["数据集", "U", "OR", "A", "F", "MGS", "检查点（utility / access / forget）"],
+                official_rows,
+            )
+        )
+        lines.append("")
+        if pooled is not None and pooled.get("excluded"):
+            lines.append(
+                "<sub>未参与池化：" + "、".join(str(x) for x in pooled["excluded"])
+                + "（办公域槽位，单列业务结论）。</sub>"
+            )
+            lines.append("")
+        elif pooled is None:
+            lines.append(
+                "<sub>本次没有可池化的数据集：带官方口径的数据集都是办公域槽位"
+                "（办公域槽位不参与基准池化）。各数据集自身的 U / A / F / MGS 见上表。</sub>"
+            )
+            lines.append("")
+
     # 融合权重明细：每个基准数据集在各指标上的分母与权重（可逐项复核融合值）
     lines.append("## 融合权重")
     lines.append("")
@@ -1497,6 +1639,8 @@ def write_task_reports(
         "fused": fused,
         "gate": gate,
         "token_usage": _token_usage_summary(results),
+        # GateMem 官方口径池化（参考视图，不参与融合/评级）；无三支柱题型时省略
+        **({"official_pooled": pooled} if (pooled := pool_official(results)) else {}),
     }
     with open(os.path.join(reports_dir, layout.FILE_METRICS), "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
