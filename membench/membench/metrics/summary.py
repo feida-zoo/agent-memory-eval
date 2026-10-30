@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from membench.data.schema import is_abstention
+from membench.metrics.official import official_summary
 
 __all__ = [
     "percentile",
@@ -493,6 +494,12 @@ def aggregate(
         # "数据集里出现过 gold_stale 字段"——没有判定依据的题不构成能力。
         "has_stale": stale_n > 0,
     }
+
+    # GateMem 官方口径（U / A / F / OR / MGS）：只在记录覆盖官方三支柱题型时
+    # 才产出（GateMem / gatemem_office）；其余数据集没有这些 category，省略该块。
+    official = official_summary(records)
+    if official is not None:
+        result["official"] = official
 
     # LLM judge 回退统计：任一记录由 llm / llm-fallback 判分时，
     # 统计 judge=="llm-fallback" 的数量与占比（无 LLM judge 时省略该键）。

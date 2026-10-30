@@ -121,6 +121,7 @@ from membench.judges import get_judge
 from membench.judges.heuristic import _include_hit, is_question_echo_target
 from membench.metrics import aggregate
 from membench.metrics.evidence import SubstringMatcher
+from membench.metrics.official import infer_action
 from membench.metrics.summary import is_safety_question
 from membench.metrics.text import bleu1, token_f1
 from membench.version import runner_version
@@ -1155,6 +1156,13 @@ class Runner:
             # 状态扫描里因"题面自带该值"被剔除的 needle 数：探针注入的值不能
             # 用来判"删除后未遗忘"，但剔除量要可见（状态红线实际覆盖面变小）。
             "state_echo_skipped": len(echo_skipped),
+            # GateMem 官方口径把回答看成 (动作, 文本)：这里的动作由文本推断
+            # （infer_action），落账后供 official_summary 计算 U/A/F/MGS。
+            "action": infer_action(
+                answer,
+                category,
+                leaked="泄露 leak_target" in str(judge_dict.get("reason") or ""),
+            ),
             "token_f1": None if has_judge_spec else float(token_f1(gold_answer, answer)),
             "bleu1": None if has_judge_spec else float(bleu1(gold_answer, answer)),
             "recall@5": None if recall_at_5 is None else float(recall_at_5),
