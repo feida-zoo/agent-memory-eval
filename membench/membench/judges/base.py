@@ -34,6 +34,11 @@ class JudgeResult:
             ``gold_stale_note`` 非空）。与 ``stale_checkable`` 不同，它只描述
             数据标注、不依赖判分器：报告用 ``stale_annotated`` 的题数作覆盖率
             分母，回答"多少道 stale 题可机检"。
+        abstention_rechecked: 本题是否走过 LLM 拒答复核（``None`` = 没走，
+            例如词表已判拒答 / 非拒答题 / 关掉了复核 / 没配端点）。落进
+            ``results.jsonl``，聚合侧据此统计 `abstention_recheck{n_calls}`
+            ——**不能只记在 metrics 里**，否则分片 fuse 会丢。
+        abstention_flipped: 复核是否把"未拒答"翻成"拒答"。
     """
 
     correct: bool
@@ -44,6 +49,10 @@ class JudgeResult:
     reason: str = ""
     stale_checkable: bool = False
     stale_annotated: bool = False
+    #: 是否走过 LLM 拒答复核（None = 没走）；逐题落账，供聚合/fuse 统计
+    abstention_rechecked: bool = False
+    #: 复核是否把"未拒答"翻成"拒答"
+    abstention_flipped: bool = False
 
 
 class Judge(ABC):

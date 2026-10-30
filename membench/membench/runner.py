@@ -121,7 +121,7 @@ from membench.judges import get_judge
 from membench.judges.heuristic import _include_hit, is_question_echo_target
 from membench.metrics import aggregate
 from membench.metrics.evidence import SubstringMatcher
-from membench.metrics.official import infer_action
+from membench.metrics.official import infer_action, is_leak_reason
 from membench.metrics.summary import is_safety_question
 from membench.metrics.text import bleu1, token_f1
 from membench.version import runner_version
@@ -1167,7 +1167,7 @@ class Runner:
             "action": infer_action(
                 answer,
                 category,
-                leaked="泄露 leak_target" in str(judge_dict.get("reason") or ""),
+                leaked=is_leak_reason(str(judge_dict.get("reason") or "")),
             ),
             # gold 是拒答哨兵时没有可比对的文本：逐字重合恒为 0，会把均值拉低
             # （与 judge_spec 题同口径记 None，让 _mean 跳过）——"该拒答"题的
@@ -1542,13 +1542,7 @@ class Runner:
             token_usage["ingest_skipped"] = 1
         # 检索回退数按本次 run 增量统计（matcher 实例可在多数据集间共享）
         match_fallbacks_start = int(getattr(self._evidence_matcher, "fallbacks", 0) or 0)
-        # 拒答复核计数同样按增量：judge 实例在 evaluate 里跨数据集复用
-        recheck_calls_start = int(
-            getattr(self.judge, "abstention_recheck_calls", 0) or 0
-        )
-        recheck_flips_start = int(
-            getattr(self.judge, "abstention_recheck_flips", 0) or 0
-        )
+
         # 快照目录登记：普通 run 是本次导出的目录（逐对话 memory_snapshot/）；回放是
         # **源**的逐对话快照目录（数据集目录或源池里的桶），state_snapshot 依据
         snapshot_dirs: dict[str, str] = dict(replay_plan["snapshots"]) if replay_plan else {}
@@ -1653,7 +1647,6 @@ class Runner:
             trace_n: int = 0,
             ingest_blocks: Union[dict[str, Any], None] = None,
             state_scan: Union[dict[str, Any], None] = None,
-            abstention_recheck: Union[dict[str, Any], None] = None,
         ) -> dict[str, Any]:
             """组装某一层级的 metrics（数据集级 / 对话级同一套字段与口径）。
 
@@ -1770,10 +1763,6 @@ class Runner:
             if state_scan:
                 # 快照里的疑似日志/轨迹文件：只落账，不参与任何判定
                 out["state_scan"] = state_scan
-            if abstention_recheck:
-                # 拒答复核的成本与效果：n_calls 是额外 LLM 调用数，n_flipped 是
-                # 因此从"未拒答"翻成"拒答"的题数（abstention_accuracy 由此修正）
-                out["abstention_recheck"] = abstention_recheck
             out.update(retrieval_meta)
             if state is not None:
                 out["state_snapshot"] = state
@@ -2182,15 +2171,6 @@ class Runner:
             ),
             scope_dialogues=dialogues,
             trace_n=n_trace_states,
-            abstention_recheck={
-                "n_calls": int(getattr(self.judge, "abstention_recheck_calls", 0) or 0)
-                - recheck_calls_start,
-                "n_flipped": int(getattr(self.judge, "abstention_recheck_flips", 0) or 0)
-                - recheck_flips_start,
-            }
-            if int(getattr(self.judge, "abstention_recheck_calls", 0) or 0)
-            > recheck_calls_start
-            else None,
             # 数据集级：汇总全部 interleaved 对话的块；没有 interleaved 时不落该字段
             ingest_blocks=summarize_ingest_blocks(interleaved_blocks),
             state_scan=(

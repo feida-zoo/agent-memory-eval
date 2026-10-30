@@ -458,3 +458,66 @@ class TestStaleDenominator:
         assert metrics["overall"]["stale_rate"] == pytest.approx(1.0)
         assert metrics["overall"]["stale_total"] == 0
         assert metrics["has_stale"] is True
+
+
+def test_abstention_recheck_counted_from_records() -> None:
+    """abstention_recheck 由**逐题记录**聚合，而不是 runner 写死的计数。
+
+    分片 fuse 只保留 records：写死在 metrics 里的计数会丢，所以口径必须来自记录。
+    """
+    from membench.metrics.summary import aggregate
+
+    records = [
+        {
+            "qid": "q1",
+            "category": "abstention",
+            "gold_answer": "<ABSTAIN>",
+            "judge": {
+                "correct": True,
+                "abstained_pred": True,
+                "stale": False,
+                "reason": "ok；拒答判定=llm",
+                "abstention_rechecked": True,
+                "abstention_flipped": True,
+            },
+            "evidence_hit": None,
+            "latency_ms": 1.0,
+        },
+        {
+            "qid": "q2",
+            "category": "single_hop",
+            "gold_answer": "x",
+            "judge": {"correct": True, "abstained_pred": False, "stale": False, "reason": ""},
+            "evidence_hit": True,
+            "latency_ms": 1.0,
+        },
+    ]
+    metrics = aggregate(records)
+    assert metrics["abstention_recheck"] == {"n_calls": 1, "n_flipped": 1}
+
+
+def test_ingest_latency_counts_per_dialogue() -> None:
+    """对话级 ingest 口径：同一对话的每题重复记同一个值，聚合要按对话去重。"""
+    from membench.metrics.summary import aggregate
+
+    def rec(qid: str, dialogue: str, ingest_ms: float) -> dict:
+        return {
+            "qid": qid,
+            "dialogue_id": dialogue,
+            "category": "single_hop",
+            "gold_answer": "x",
+            "prediction": "x",
+            "judge": {"correct": True, "abstained_pred": False, "stale": False},
+            "evidence_hit": True,
+            "latency_ms": 1.0,
+            "ingest_latency_ms": ingest_ms,
+        }
+
+    # d1 有两个题（每题都记 300ms）、d2 一个题（100ms）
+    metrics = aggregate([rec("a", "d1", 300.0), rec("b", "d1", 300.0), rec("c", "d2", 100.0)])
+    block = metrics["ingest_latency"]
+    assert block["n_dialogues"] == 2
+    assert block["total_ms"] == pytest.approx(400.0)
+    assert block["median_ms"] == pytest.approx(200.0)
+    # 按题摊分 = (300+300+100)/3，与对话级总计不同（正是要分开报的原因）
+    assert block["per_question_attr_ms"] == pytest.approx(700 / 3)

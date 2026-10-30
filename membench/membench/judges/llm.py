@@ -528,9 +528,11 @@ class LLMJudge(Judge):
         pred = prediction or ""
         abstained = rubric.abstained_pred
         suffix = "；拒答判定=lexicon"
+        rechecked = False
         if not abstained and self.base_url and self.abstention_recheck:
+            rechecked = True
+            self.abstention_recheck_calls += 1
             try:
-                self.abstention_recheck_calls += 1
                 llm_abstained = self._chat_abstention(
                     str(getattr(question, "question", question)), pred
                 )
@@ -737,8 +739,11 @@ class LLMJudge(Judge):
             # ——非 judge_spec 题的 correct 权威是上面的模型判分。
             # 放在主判分成功之后：主判分失败会回退启发式，这时不必再多花一次调用。
             abstain_suffix = ""
+            rechecked = False
+            flipped = False
             if is_abstention(category, gold) and not abstained:
                 if self.base_url and self.abstention_recheck:
+                    rechecked = True
                     try:
                         self.abstention_recheck_calls += 1
                         llm_abstained = self._chat_abstention(
@@ -749,6 +754,7 @@ class LLMJudge(Judge):
                     if llm_abstained is not None:
                         abstained = llm_abstained
                         if abstained:
+                            flipped = True
                             self.abstention_recheck_flips += 1
                         abstain_suffix = "；拒答判定=llm"
                     else:
@@ -764,6 +770,8 @@ class LLMJudge(Judge):
                 reason=(reason + abstain_suffix) if abstain_suffix else reason,
                 stale_checkable=stale_checkable,
                 stale_annotated=has_stale_annotation,
+                abstention_rechecked=rechecked,
+                abstention_flipped=flipped,
             )
         except Exception as exc:  # noqa: BLE001 - 任何异常都必须回退
             fb = self._fallback.grade(question, gold, prediction)

@@ -756,6 +756,7 @@ def pool_official(results: list["DatasetResult"]) -> Union[dict[str, Any], None]
     """
     participants: list[str] = []
     excluded: list[str] = []
+    missing: list[str] = []
     sums = {
         "n_utility": 0,
         "n_utility_correct": 0,
@@ -769,6 +770,8 @@ def pool_official(results: list["DatasetResult"]) -> Union[dict[str, Any], None]
     for res in results:
         official = res.metrics.get("official")
         if not isinstance(official, dict):
+            # 旧产物（加官方口径之前跑的）没有该块：不能静默跳过，要报出来
+            missing.append(res.spec.key)
             continue
         if not is_baseline_dataset(res):
             excluded.append(res.spec.key)
@@ -797,6 +800,7 @@ def pool_official(results: list["DatasetResult"]) -> Union[dict[str, Any], None]
         **sums,
         "participants": participants,
         "excluded": excluded,
+        "missing": missing,
         "action_source": "inferred",
         "pooling": "sum_numerator_over_sum_denominator",
     }
@@ -1366,6 +1370,14 @@ def _render_task_report_md(
             lines.append(
                 "<sub>本次没有可池化的数据集：带官方口径的数据集都是办公域槽位"
                 "（办公域槽位不参与基准池化）。各数据集自身的 U / A / F / MGS 见上表。</sub>"
+            )
+            lines.append("")
+        # 旧产物没有 official 块：不能静默不算，否则"池化值"看起来覆盖了全部数据集
+        missing = (pooled or {}).get("missing") or []
+        if missing:
+            lines.append(
+                "<sub>未纳入官方口径：" + "、".join(str(x) for x in missing)
+                + "（产物里没有 `official` 块——多半是加该口径之前跑的；重跑才有）。</sub>"
             )
             lines.append("")
 

@@ -509,6 +509,23 @@ def aggregate(
             by_dialogue.get(dialogue_id, 0.0),
             float(record.get("ingest_latency_ms", 0.0) or 0.0),
         )
+    # 拒答复核的成本与效果：**从逐题记录**聚合（不是 runner 侧计数）——
+    # 分片 fuse 只保留 records，写死在 metrics 里的计数会丢。
+    recheck_calls = sum(
+        1
+        for r in records
+        if (r.get("judge") or {}).get("abstention_rechecked")
+    )
+    recheck_flips = sum(
+        1 for r in records if (r.get("judge") or {}).get("abstention_flipped")
+    )
+    abstention_recheck_block: Union[dict[str, Any], None] = None
+    if recheck_calls:
+        abstention_recheck_block = {
+            "n_calls": recheck_calls,
+            "n_flipped": recheck_flips,
+        }
+
     ingest_latency_block: Union[dict[str, Any], None] = None
     if by_dialogue:
         ingest_latency_block = {
@@ -520,6 +537,8 @@ def aggregate(
 
     # GateMem 官方口径（U / A / F / OR / MGS）：只在记录覆盖官方三支柱题型时
     # 才产出（GateMem / gatemem_office）；其余数据集没有这些 category，省略该块。
+    if abstention_recheck_block is not None:
+        result["abstention_recheck"] = abstention_recheck_block
     if ingest_latency_block is not None:
         result["ingest_latency"] = ingest_latency_block
 

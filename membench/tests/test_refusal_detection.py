@@ -687,3 +687,31 @@ class TestNearMissSingleItemRubric:
         result = judge.grade(question, "a; b; c; d", "alpha and beta only")
         assert len(stub.calls) == 1
         assert result.correct is True
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [((), None), (("--abstention-recheck",), True), (("--no-abstention-recheck",), False)],
+)
+@pytest.mark.parametrize(
+    "command",
+    ["run", "evaluate", "evaluate-compare"],
+)
+def test_cli_abstention_recheck_tristate(command, extra_args, expected) -> None:
+    """``--abstention-recheck`` / ``--no-...`` / 缺省（None=默认开）三条命令都解析。"""
+    from membench import cli
+
+    base = {
+        "run": ["--adapter", "mock-strong", "--dataset", "/tmp/dummy.jsonl"],
+        "evaluate": ["--adapter", "mock-strong", "--dataset", "/tmp/dummy.jsonl"],
+        "evaluate-compare": [
+            "--baseline-adapter",
+            "mock-weak",
+            "--candidate-adapter",
+            "mock-strong",
+            "--dataset",
+            "/tmp/dummy.jsonl",
+        ],
+    }[command]
+    args = cli._build_parser().parse_args([command, *base, *extra_args])
+    assert args.abstention_recheck is expected
