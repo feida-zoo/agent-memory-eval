@@ -117,6 +117,7 @@ from membench.data.schema import (
     question_capabilities,
 )
 from membench.judges import get_judge
+from membench.judges.heuristic import _include_hit
 from membench.metrics import aggregate
 from membench.metrics.evidence import SubstringMatcher
 from membench.metrics.summary import is_safety_question
@@ -153,6 +154,12 @@ EVIDENCE_SENTENCE_SPLIT_RE = re.compile(r"[。.！!？?\n]+")
 #: 额外 needle（gold_answer / include / leak_targets）的最短长度：更短的值（"9%"）
 #: 在状态里随机命中，噪声大于信息。
 STATE_NEEDLE_MIN_CHARS = 8
+
+#: ``results.jsonl`` 里落盘的 evidence 原文：每题最多几条、每条截断到多长。
+#: 不落原文的话，事后复算命中 / 复核判分只能回数据集 join，而数据集是按需
+#: 下载、指纹会变的；截断上限与 needle 口径一致（200 字符足够判定子串命中）。
+EVIDENCE_RECORD_MAX_ITEMS = 5
+EVIDENCE_RECORD_CHARS = 200
 
 #: ``judge_spec.include`` 里的简单正字符类：只认不含 ``^`` / 转义 / 嵌套的短内容，
 #: 是否含范围（``a-z``）由 :func:`_class_members` 判定。
@@ -192,6 +199,22 @@ _STATE_SCAN_OVERSIZE_WARNED = False
 def _normalize_ws(text: str) -> str:
     """折叠全部空白（含换行）为单个空格：状态文件与证据片段的比较口径。"""
     return " ".join(str(text).split())
+
+
+def _include_hit_rate(judge_spec: Any, prediction: str) -> Union[float, None]:
+    """``judge_spec.include`` 的逐条命中比例；没有 include 要点时为 ``None``。
+
+    与判分同源（同一个 ``_include_hit``，正则忽略大小写、写坏时按字面量），
+    但只统计比例不做"全命中才算对"的门槛——用来把"作答质量"与"rubric 判分
+    口径"分开呈现（GateMem 这类题 accuracy 会被全或无口径压低）。
+    """
+    if not isinstance(judge_spec, dict):
+        return None
+    patterns = [str(item) for item in (judge_spec.get("include") or [])]
+    if not patterns:
+        return None
+    hits = sum(1 for pattern in patterns if _include_hit(pattern, prediction or ""))
+    return hits / len(patterns)
 
 
 def evidence_needles(text: str) -> list[str]:
@@ -986,6 +1009,7 @@ class Runner:
         # 正则拼接，不是可比对的参考答案——字面重合度没有意义，记 None
         # （不是 0，避免污染均值；aggregate 跳过 None）。
         has_judge_spec = bool(getattr(question, "judge_spec", None))
+        include_hit_rate = _include_hit_rate(getattr(question, "judge_spec", None), answer)
 
         return {
             "qid": str(getattr(question, "qid", "")),
@@ -995,7 +1019,17 @@ class Runner:
             "gold_answer": gold_answer,
             "prediction": answer,
             "retrieved": retrieved,
+            # evidence 原文（截断）：不落它，事后想复算命中 / 复核判分只能回数据集
+            # join，而数据集随时可能按需重新 fetch（指纹变化后旧记录的 evidence
+            # 就对不上了）。每题最多 5 条、每条 200 字符，量级与 retrieved 同阶。
+            "evidence": [
+                str(item)[:EVIDENCE_RECORD_CHARS] for item in (evidence or [])
+            ][:EVIDENCE_RECORD_MAX_ITEMS],
             "evidence_hit": evidence_hit,
+            # rubric 要点命中率（诊断）：judge_spec.include 的逐条命中比例。
+            # "全命中才算对"的 accuracy 会掩盖"只差一条要点"的近失，这个数
+            # 把作答质量与判分口径分开；非 judge_spec 题为 None。
+            "include_hit_rate": include_hit_rate,
             # 归因输入：提问时点（已 ingest 的消息条数）与"证据是否已写入状态"。
             # 后者为 None = 没有快照 / 状态不可读 / 没有任何 needle（evidence、
             # gold_answer、judge_spec.include 都没达到判定门槛）。
@@ -1137,6 +1171,18 @@ class Runner:
             print(
                 f"[membench] --trace-state 已开启：预计导出 {trace_plan} 份状态"
                 "（interleaved 对话的提问时点数）"
+            )
+        # trace 被显式关掉、但本次确实有 safety 题时，必须喊出来：这一跑 safety
+        # 只按回答层判分，状态红线（n_checked=0）完全没查，报告里的"safety 通过"
+        # 会被读成"记忆里真忘了"。原因也落进 metrics.trace_state，供报告区分
+        # "显式关闭 / 适配器不支持 / 状态不可读"——否则读者无法判断是哪一种。
+        trace_disabled_reason: Union[str, None] = None
+        if not trace_enabled and auto_ids:
+            trace_disabled_reason = "disabled"
+            print(
+                "[membench] ⚠️ --trace-state 被关闭，但本次有 interleaved 对话含 safety 题"
+                "：safety 只判回答层，「记忆里是否真遗忘」不会检查（state_leak 的"
+                " n_checked 记为 0）。要判状态红线请去掉 --no-trace-state"
             )
         if trace_enabled and self.replay:
             raise SystemExit(
@@ -1547,6 +1593,15 @@ class Runner:
                     "enabled": True,
                     "role": trace_role,
                     "n_states": trace_n,
+                }
+            elif trace_disabled_reason:
+                # 显式关闭（--no-trace-state）但范围内确实有 safety 题：落账
+                # enabled=False，报告据此写"本次显式关闭，safety 只判回答层"，
+                # 而不是笼统的"未检查（可能是没开 / 不支持 / 不可读）"。
+                out["trace_state"] = {
+                    "enabled": False,
+                    "role": trace_disabled_reason,
+                    "n_states": 0,
                 }
             if dialogue_id is not None:
                 out["dialogue_id"] = dialogue_id

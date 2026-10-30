@@ -596,9 +596,14 @@ class TestJudgeSpecRubric:
         assert calls == []
 
     def test_llm_judge_rubric_failure_reason(self, monkeypatch) -> None:
+        import membench.judges.llm as llm_module
+
         judge = LLMJudge(base_url="http://stub", api_key="k", model="m")
+        # safety 题会追加一次拒答复核；这里让复核失败，验证 rubric 判分照常。
         monkeypatch.setattr(
-            judge, "_chat", lambda *a, **k: (_ for _ in ()).throw(AssertionError("boom"))
+            llm_module,
+            "chat_completion",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
         )
         spec = {"include": [], "not_include": [], "leak_targets": ["Granite Mutual"]}
         result = judge.grade(

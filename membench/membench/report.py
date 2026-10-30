@@ -124,6 +124,7 @@ METRIC_LABEL_ZH: dict[str, str] = {
     "mean_points": "综合点数",
     "recall_at_5": "检索召回率@5",
     "over_refusal_rate": "过度拒答率",
+    "rubric_item_recall": "要点命中率",
 }
 
 
@@ -1071,6 +1072,39 @@ def write_run_report_md(
             + "；与默认 substring 口径的跑分不可直接比较。"
         )
         lines.append("")
+    # 检索诊断：条数规模 / 空转题数 / LLM 命中回退数。recall@5 的窗口只有 5 条，
+    # 适配器返回 20~40 条时 top-5 天然偏低；不给条数，读者会把"窗口窄"读成
+    # "检索差"。空转（retrieved 为空）与"检索到了但没进前 5"必须分开。
+    retrieval_notes: list[str] = []
+    retrieved_median = overall.get("retrieved_median")
+    n_empty = overall.get("n_empty_retrieved")
+    if isinstance(retrieved_median, (int, float)) and retrieved_median:
+        window_note = (
+            "——窗口远窄于返回列表，两个指标的差距主要来自窗口，不全是排序问题"
+            if retrieved_median >= 10
+            else "——窗口与返回列表规模接近，差距更能反映排序质量"
+        )
+        retrieval_notes.append(
+            f"检索条数中位 **{retrieved_median:.0f}** 条（`recall@5` 只看前 5 条"
+            f"{window_note}）。"
+        )
+    if isinstance(n_empty, int) and n_empty:
+        retrieval_notes.append(
+            f"**{n_empty} 道题检索结果为空**（`retrieved=[]`）：这类 0 命中不是"
+            "「检索差」，而是「没东西可检索」——常见于 ingest 还没落盘就被查"
+            "（接入侧异步写入），先查这一类再谈排序。"
+        )
+    fallbacks = metrics.get("retrieval_match_fallbacks")
+    if isinstance(fallbacks, int) and fallbacks:
+        retrieval_notes.append(
+            f"LLM 命中口径回退 **{fallbacks}** 次（模型输出不可解析 / 调用失败时"
+            "退回子串判定）：这些题的 evidence_hit 口径与其余题不同，复核时注意。"
+        )
+    if retrieval_notes:
+        lines.append("> 检索诊断：")
+        for note in retrieval_notes:
+            lines.append(f"> - {note}")
+        lines.append("")
     # 检索指标全 0 警示：疑似 evidence 与被检索文本格式不一致（摘要式存储）
     if (
         metrics.get("has_evidence")
@@ -1150,6 +1184,7 @@ def write_run_report_md(
         ["正确性", metric_label_with_role("bleu1"), format_metric("bleu1", overall.get("bleu1", "n/a"))],
         ["检索质量", metric_label("evidence_recall"), format_metric("evidence_recall", overall.get("evidence_recall", "n/a"))],
         ["检索质量", metric_label_with_role("recall_at_5"), format_metric("recall_at_5", overall.get("recall_at_5", "n/a"))],
+        ["正确性", metric_label_with_role("rubric_item_recall"), format_metric("rubric_item_recall", overall.get("rubric_item_recall", "n/a"))],
         ["效率成本", metric_label("latency_p50_ms"), _fmt(overall.get("latency_p50_ms", "n/a"))],
         ["效率成本", metric_label("latency_p95_ms"), _fmt(overall.get("latency_p95_ms", "n/a"))],
         ["效率成本", metric_label("avg_input_tokens"), _fmt(overall.get("avg_input_tokens", "n/a"))],
@@ -1163,7 +1198,8 @@ def write_run_report_md(
     lines.append(
         "<sub>Token F1 / BLEU-1 为诊断指标：只测与参考答案的字面重合度，"
         "不代表语义正确性——正确但表述更完整的回答也会因字面重合低而失分。"
-        "它们与检索召回率@5 / 过度拒答率一样照常展示具体值，但不参与综合评级。</sub>"
+        "它们与检索召回率@5 / 过度拒答率 / 要点命中率一样照常展示具体值，"
+        "但不参与综合评级。</sub>"
     )
     lines.append("")
     # 有 stale 注解但没有任何可机检题：解释 n/a 的来源，避免被读成"零陈旧"。
@@ -1203,7 +1239,10 @@ def write_run_report_md(
             "abstention_accuracy / stale_rate）的连续点数"
             "（1.0~4.0，档内随数值线性变化）均值，阈值 3.5 / 2.5 / 1.5；"
             "token_f1 / bleu1（字面重合度，非语义正确性）与 "
-            "recall_at_5 / over_refusal_rate 为诊断指标，仅展示不参与评级；"
+            "recall_at_5 / over_refusal_rate / rubric_item_recall 为诊断指标，"
+            "仅展示不参与评级（`rubric_item_recall` 是 judge_spec include 的逐条"
+            "命中比例——accuracy 对这类题全命中才算对，两者差得越多说明判分口径"
+            "把近失记成了完全答错）；"
             "stale_rate 的分母只含可机检的 stale 题（有裸 gold_stale；"
             "LLM judge 下含 gold_stale_note）；"
             "效率成本指标同样不参与评级。</sub>"
@@ -1444,11 +1483,22 @@ def write_run_report_md(
                 )
             )
         else:
+            # 区分"为什么没查"：显式关闭 / 适配器不支持 / 没开（含旧版本没自动开）
+            # / 状态不可读。四者的处置完全不同，笼统一句"未检查"读者只能猜。
+            trace_meta = metrics.get("trace_state") or {}
+            role = str(trace_meta.get("role") or "")
+            if role == "disabled":
+                why = "本次显式 `--no-trace-state` 关闭"
+            elif role == "unsupported":
+                why = "适配器不支持快照，`snapshot_capabilities.supported=false`"
+            elif trace_meta.get("enabled"):
+                why = "有些时点的状态目录不可读：二进制 / 超大 / 没有可读文本"
+            else:
+                why = "本次未开启 `--trace-state`——interleaved + safety 本应自动开启，未开说明跑的是旧版本或手工关闭"
             lines.append(
                 f"- 状态泄露：未检查（覆盖率 0/{n_safety}）——本 run {n_safety} 道 "
-                "safety 题的提问时点状态都不可读（未开启 `--trace-state` / 适配器不支持"
-                "快照 / 状态里没有可读文本），safety 只按回答判分、状态未判定，"
-                "记 `unknown`（不猜）"
+                f"safety 题的提问时点状态都不可读（{why}），safety 只按回答判分、"
+                "状态未判定，记 `unknown`（不猜）"
             )
         lines.append("")
         lines.append(
@@ -1469,7 +1519,10 @@ def write_run_report_md(
             "<sub>回答「为什么答错」：只有**判错**且带 evidence 标注的题进入四桶——"
             "证据不在该题提问时点的状态里（`not_written`）→ 在状态里但没被检索进"
             "回答上下文（`not_retrieved`）→ 两者都有仍答错（`wrong_answer`，推理 / 表述"
-            "问题）；状态读不到 / 没有快照记 `unknown`（不猜）。没有 evidence 标注的"
+            "问题）；状态读不到 / 没有快照记 `unknown`（不猜）。既然证据已经被检索进"
+            "回答上下文（`evidence_hit=true`），失败就只可能在回答——这类题**不需要**"
+            "状态快照也直接落 `wrong_answer`，所以没开 `--trace-state` 的运行里这一桶"
+            "仍会有值。没有 evidence 标注的"
             "判错题无法判断「证据是否已写入」，单独计数、不塞进任何桶。</sub>"
         )
         lines.append("")

@@ -52,7 +52,7 @@ def test_rate_accuracy_thresholds(value: float, expected: str) -> None:
 
 @pytest.mark.parametrize(
     "key",
-    ["token_f1", "bleu1", "recall_at_5", "over_refusal_rate"],
+    ["token_f1", "bleu1", "recall_at_5", "over_refusal_rate", "rubric_item_recall"],
 )
 def test_rate_metric_diagnostic_keys(key: str) -> None:
     """诊断指标不评级（含字面重合的 token_f1 / bleu1），返回 None。"""
@@ -66,7 +66,7 @@ def test_metric_roles() -> None:
         {"accuracy", "evidence_recall", "abstention_accuracy", "stale_rate"}
     )
     assert DIAGNOSTIC_METRICS == frozenset(
-        {"token_f1", "bleu1", "recall_at_5", "over_refusal_rate"}
+        {"token_f1", "bleu1", "recall_at_5", "over_refusal_rate", "rubric_item_recall"}
     )
     assert DIAGNOSTIC_METRICS.isdisjoint(METRIC_THRESHOLDS)
     assert RATE_METRICS == frozenset(METRIC_THRESHOLDS) | DIAGNOSTIC_METRICS

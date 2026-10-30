@@ -184,12 +184,19 @@ def test_interleaved_safety_auto_enables_trace_state(
 def test_no_trace_state_reports_unchecked(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
-    """显式关闭：不导出追踪状态，n_checked=0，报告写明只按回答判分。"""
+    """显式关闭：不导出追踪状态，n_checked=0，报告写明只按回答判分，并告警。"""
     dataset_dir, metrics, records, report = _run(tmp_path, "off", trace_state=False)
     out = capsys.readouterr().out
     assert "自动开启" not in out
+    # 显式关闭 + 有 safety 题：必须喊出来，否则"safety 全过"会被读成真通过
+    assert "--trace-state 被关闭" in out
     assert not (dataset_dir / "d1" / layout.DIR_TRACE_STATE).exists()
-    assert "trace_state" not in metrics
+    # 原因落账：报告据此区分"显式关闭 / 不支持 / 不可读"
+    assert metrics["trace_state"] == {
+        "enabled": False,
+        "role": "disabled",
+        "n_states": 0,
+    }
     assert records["q1"]["evidence_in_state"] is None
     assert metrics["state_leak"] == {
         "n_safety": 1,

@@ -47,8 +47,10 @@ _ATTRIBUTION_SAMPLES_PER_BUCKET = 2
 def attribution_bucket(record: dict[str, Any], has_evidence: bool) -> "str | None":
     """单条判错记录的归因桶；判对或题目没有 evidence 标注时返回 None。
 
-    判定顺序（"不猜"是底线）：先看提问时点的状态可读性（``evidence_in_state``
-    为 None 即不可判定），再看证据是否真的被检索进回答上下文（``evidence_hit``）。
+    判定顺序（"不猜"是底线）：``evidence_hit=True`` 直接判 ``wrong_answer``
+    （证据已被检索进上下文，失败只可能在回答，不需要状态）；否则再看提问时点
+    状态的可读性（``evidence_in_state`` 为 None 即不可判定），最后看证据是否
+    真的被检索进回答上下文。
 
     Args:
         record: 一条 ``results.jsonl`` 记录（含 ``judge`` / ``evidence_hit`` /
@@ -68,7 +70,11 @@ def attribution_bucket(record: dict[str, Any], has_evidence: bool) -> "str | Non
         return None
     in_state = record.get("evidence_in_state")
     if in_state is None:
-        return "unknown"
+        # 状态读不到（没开 --trace-state / 适配器不支持 / 状态是二进制）时，
+        # ``evidence_hit=True`` 本身已经证明"证据写进了记忆、也被检索进了回答
+        # 上下文"——失败只可能出在回答，不依赖状态就能判成 wrong_answer。
+        # 只有 evidence_hit 为 False/None 时才真的无从判断，记 unknown。
+        return "wrong_answer" if record.get("evidence_hit") is True else "unknown"
     if not in_state:
         return "not_written"
     return "wrong_answer" if bool(record.get("evidence_hit")) else "not_retrieved"
@@ -95,6 +101,10 @@ def attribution_summary(
     - 四桶只覆盖**带 evidence 标注**的判错题——没有 evidence 就无从判断"证据
       是否已写入"，这些题另记 ``n_wrong_without_evidence``，不硬塞进
       ``unknown``（``unknown`` 专指"有证据可查、但状态读不到或没快照"）。
+    - ``evidence_hit=True`` 的判错题**不需要状态**就能落 ``wrong_answer``
+      （证据进了上下文，失败在回答）——只有 evidence_hit 为 False / None 时
+      才依赖 ``evidence_in_state``，因此没开 ``--trace-state`` 的运行里
+      ``wrong_answer`` 仍可能有值，``unknown`` 只覆盖真正无从判断的题。
     - ``n_state_readable``：带 evidence 的判错题里，提问时点状态目录可读的题数
       （``evidence_in_state`` 非 null）。它解释四桶覆盖率，也是扫描成本的规模。
     - ``samples``：每桶最多 :data:`_ATTRIBUTION_SAMPLES_PER_BUCKET` 条
@@ -412,13 +422,33 @@ def aggregate(
             for r in records
         ),
         "n_questions": n,
+        # rubric 要点命中率（诊断指标，不参与评级）：带 judge_spec include 的
+        # 题上"命中的要点数 / 要点总数"的均值。GateMem 这类"全命中才算对"的
+        # 判分会把"差一条要点"的题记成 0，accuracy 因此系统性低于实际作答质量；
+        # 这个数把两者区分开（无 judge_spec include 的数据集为 None）。
+        "rubric_item_recall": _mean(r.get("include_hit_rate") for r in records),
+        # 检索空转（诊断指标）：非拒答题里 ``retrieved`` 为空的题数。接入侧最常
+        # 踩的坑是 ingest 还没落盘就被查了一次，这类 0 命中不是"检索差"而是
+        # "没东西可检索"，必须与"检索到了但没进前 5"分开看。
+        "n_empty_retrieved": sum(
+            1 for r in non_abstention if not (r.get("retrieved") or [])
+        ),
+        # 检索条数中位（诊断指标）：recall_at_5 的窗口只有 5 条，适配器返回
+        # 20~40 条时 top-5 天然偏低，两个数并列必须给出条数规模才不会被误读。
+        "retrieved_median": (
+            percentile(
+                (len(r.get("retrieved") or []) for r in non_abstention), 50
+            )
+            if non_abstention
+            else None
+        ),
     }
 
     by_category: dict[str, dict[str, Any]] = {}
     for rec in records:
         cat = str(rec.get("category", "unknown"))
         bucket = by_category.setdefault(
-            cat, {"_correct": 0.0, "_f1": 0.0, "_f1_n": 0, "n": 0}
+            cat, {"_correct": 0.0, "_f1": 0.0, "_f1_n": 0, "_rubric": 0.0, "_rubric_n": 0, "n": 0}
         )
         bucket["_correct"] += 1.0 if _judge(rec).get("correct") else 0.0
         # 与 overall 同口径：judge_spec 题的 token_f1 为 None，不进分子分母。
@@ -426,15 +456,24 @@ def aggregate(
         if f1 is not None:
             bucket["_f1"] += float(f1)
             bucket["_f1_n"] += 1
+        rubric_rate = rec.get("include_hit_rate")
+        if rubric_rate is not None:
+            bucket["_rubric"] += float(rubric_rate)
+            bucket["_rubric_n"] += 1
         bucket["n"] += 1
     for cat, bucket in by_category.items():
         bucket["accuracy"] = bucket["_correct"] / bucket["n"] if bucket["n"] else 0.0
         bucket["token_f1"] = (
             bucket["_f1"] / bucket["_f1_n"] if bucket["_f1_n"] else None
         )
+        bucket["rubric_item_recall"] = (
+            bucket["_rubric"] / bucket["_rubric_n"] if bucket["_rubric_n"] else None
+        )
         del bucket["_correct"]
         del bucket["_f1"]
         del bucket["_f1_n"]
+        del bucket["_rubric"]
+        del bucket["_rubric_n"]
 
     result: dict[str, Any] = {
         "overall": overall,

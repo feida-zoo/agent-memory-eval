@@ -71,9 +71,11 @@ METRIC_THRESHOLDS: dict[str, tuple[str, list[tuple[float, str]]]] = {
 
 # 诊断指标：照常计算、以百分比展示具体值，但不参与综合评级。
 # token_f1 / bleu1 是字面重合度；recall_at_5 / over_refusal_rate 用于
-# 检索与拒答的分诊归因。
+# 检索与拒答的分诊归因；rubric_item_recall 是 judge_spec 要点命中率——它把
+# "作答质量"与"全命中才算对"的判分口径分开（GateMem 这类题 accuracy 会被
+# 口径压低，单看 accuracy 会把"只差一条要点"读成"完全答错"）。
 DIAGNOSTIC_METRICS: frozenset[str] = frozenset(
-    {"token_f1", "bleu1", "recall_at_5", "over_refusal_rate"}
+    {"token_f1", "bleu1", "recall_at_5", "over_refusal_rate", "rubric_item_recall"}
 )
 
 # 比率型指标（[0,1]，报告中以百分比展示具体值）：四项可评级质量指标 +

@@ -593,7 +593,11 @@ def test_attribution_four_buckets(tmp_path: Path) -> None:
 
 
 def test_attribution_all_unknown_without_snapshot_support(tmp_path: Path) -> None:
-    """适配器不支持快照：状态不可读，带 evidence 的判错题全部记 unknown。"""
+    """适配器不支持快照：状态不可读，只有 evidence_hit 能证实的题可落桶。
+
+    ``evidence_hit=True`` 已证明"证据写进了记忆、也进了回答上下文"，不依赖
+    状态就能判 ``wrong_answer``；其余题确实无从判断，记 ``unknown``。
+    """
     result = _attribution_run(tmp_path, snapshot_support=False)
     records = {r["qid"]: r for r in result["records"]}
     assert all(r["evidence_in_state"] is None for r in records.values())
@@ -603,8 +607,8 @@ def test_attribution_all_unknown_without_snapshot_support(tmp_path: Path) -> Non
     assert attribution["buckets"] == {
         "not_written": 0,
         "not_retrieved": 0,
-        "wrong_answer": 0,
-        "unknown": 3,
+        "wrong_answer": 1,
+        "unknown": 2,
     }
 
 

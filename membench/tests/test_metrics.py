@@ -208,6 +208,10 @@ class TestAggregate:
             "avg_ingest_latency_ms",
             "avg_llm_calls",
             "n_questions",
+            # 诊断项：rubric 要点命中率 / 检索空转题数 / 检索条数中位
+            "rubric_item_recall",
+            "n_empty_retrieved",
+            "retrieved_median",
         }
         assert set(overall) == expected_keys
 
@@ -245,6 +249,8 @@ class TestAggregate:
         assert by_cat["single_hop"] == {
             "accuracy": pytest.approx(0.5),
             "token_f1": pytest.approx(0.5),
+            # 无 judge_spec include 的题型：要点命中率记为 None（不是 0）
+            "rubric_item_recall": None,
             "n": 2,
         }
         assert by_cat["knowledge_update"]["n"] == 2
