@@ -51,6 +51,7 @@ from .heuristic import (
     contains_refusal,
     grade_judge_spec,
     is_answer_shape_target,
+    is_question_echo_target,
     is_stale,
 )
 
@@ -196,6 +197,7 @@ def _has_hard_violation(
     prediction: str,
     *,
     abstained: bool,
+    question_text: str = "",
 ) -> bool:
     """rubric 的 include 之外是否有硬违规（not_include / leak_targets 命中）。
 
@@ -210,6 +212,10 @@ def _has_hard_violation(
             return True
     for target in judge_spec.get("leak_targets") or []:
         if abstained and is_answer_shape_target(str(target)):
+            continue
+        # 题面自带的值不算硬违规（与 grade_judge_spec 同口径），否则近失复核
+        # 会被句尾复述题面 needle 的拒答挡回去。
+        if abstained and is_question_echo_target(str(target), question_text):
             continue
         if _literal_hit(str(target), pred):
             return True
@@ -452,6 +458,7 @@ class LLMJudge(Judge):
                 judge_spec,
                 gold,
                 pred,
+                question_text=str(getattr(question, "question", "") or ""),
                 abstained=abstained,
                 stale=rubric.stale,
                 stale_checkable=rubric.stale_checkable,
@@ -498,6 +505,8 @@ class LLMJudge(Judge):
         judge_spec: dict,
         prediction: str,
         rubric: JudgeResult,
+        *,
+        question_text: str = "",
     ) -> JudgeResult:
         """非拒答 rubric 题的近失复核：include 命中率达标时补判语义覆盖。
 
@@ -518,7 +527,10 @@ class LLMJudge(Judge):
             not includes
             or not self.base_url
             or _has_hard_violation(
-                judge_spec, pred, abstained=rubric.abstained_pred
+                judge_spec,
+                pred,
+                abstained=rubric.abstained_pred,
+                question_text=question_text,
             )
         ):
             return self._llm_result(rubric, default_reason)
@@ -574,7 +586,10 @@ class LLMJudge(Judge):
                     question, judge_spec, gold, prediction, rubric
                 )
             return self._grade_near_miss_spec(
-                judge_spec, prediction or "", rubric
+                judge_spec,
+                prediction or "",
+                rubric,
+                question_text=str(getattr(question, "question", "") or ""),
             )
 
         # 拒答检测保持确定性（与启发式一致）；stale 由模型同一次调用判出，

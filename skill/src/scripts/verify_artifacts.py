@@ -53,12 +53,15 @@ DIR_REPORTS = "reports"
 DIR_RUNS = "runs"
 DIR_RUNTIME = "runtime"
 DIR_SNAPSHOT = "memory_snapshot"
+DIR_TRACE_STATE = "trace_state"
 FILE_COMMANDS = "commands.jsonl"
 FILE_SHARDS = "shards.json"
 REPORT_FILES: tuple[str, ...] = ("metrics.json", "results.jsonl", "report.md")
 
 #: 框架在对话目录 / 实验根自建或持有的条目；其余给「未登记」警告。
-_DIALOGUE_ENTRIES: frozenset[str] = frozenset({DIR_REPORT, DIR_RUNTIME, DIR_SNAPSHOT})
+_DIALOGUE_ENTRIES: frozenset[str] = frozenset(
+    {DIR_REPORT, DIR_RUNTIME, DIR_SNAPSHOT, DIR_TRACE_STATE}
+)
 _ROOT_ENTRIES: frozenset[str] = frozenset(
     {DIR_RUNS, DIR_REPORTS, DIR_RUNTIME, "snapshots", "A", "B"}
 )
@@ -310,7 +313,8 @@ def _warn_unknown_entry(
 def _check_dialogue_entries(
     dialogue_dir: str, result: Verification, *, where: str
 ) -> None:
-    """对话目录只应有 ``report/`` / ``runtime/`` / ``memory_snapshot/``（第 8 项）。"""
+    """对话目录只应有 ``report/`` / ``runtime/`` / ``memory_snapshot/`` /
+    ``trace_state/``（第 8 项；逐 as_of 追踪状态，interleaved + safety 自动开启）。"""
     for name in _entry_names(dialogue_dir):
         if name not in _DIALOGUE_ENTRIES:
             _warn_unknown_entry(

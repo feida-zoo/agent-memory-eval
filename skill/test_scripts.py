@@ -1005,3 +1005,20 @@ def test_watch_task_until_done_exit_codes(
         == 2
     )
     assert "没有 orchestrator.json" in capsys.readouterr().err
+
+
+def test_trace_state_dir_is_registered(tmp_path: Path) -> None:
+    """对话目录下的 ``trace_state/`` 是框架产物（--trace-state 逐 as_of 状态）。
+
+    interleaved + safety 题会**自动开启** trace-state，所以这目录在正常产物里
+    必然出现；不登记就会把合规产物报成"未登记条目"。
+    """
+    task = _eval_task(tmp_path)
+    dialogue = task / "runs" / "sample" / "d001"
+    _write_json(
+        dialogue / "trace_state" / "t60" / "manifest.json",
+        {"dialogue_id": "d001", "trace": {"as_of": 60}},
+    )
+    result = verify_artifacts.verify_task(str(task))
+    assert result.ok, [item.message for item in result.errors]
+    assert "dialogue_entry" not in _codes(result)
