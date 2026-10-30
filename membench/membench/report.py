@@ -98,7 +98,7 @@ METRIC_ZH: dict[str, str] = {
     "query latency p95 (ms)": "查询延迟 p95（ms）",
     "avg input tokens / query": "平均输入 token / 题",
     "avg output tokens / query": "平均输出 token / 题",
-    "avg ingest latency (ms)": "平均 ingest 耗时（ms）",
+    "avg ingest latency (ms)": "按题摊分的对话 ingest 耗时（ms）",
     "avg llm calls / query": "平均 LLM 调用次数 / 题",
 }
 
@@ -119,7 +119,7 @@ METRIC_LABEL_ZH: dict[str, str] = {
     "avg_input_tokens": "平均输入 Token",
     "avg_output_tokens": "平均输出 Token",
     "avg_llm_calls": "平均 LLM 调用次数",
-    "avg_ingest_latency_ms": "平均记忆写入耗时",
+    "avg_ingest_latency_ms": "按题摊分的对话 ingest 耗时",
     "n_questions": "题目数",
     "n_ignored": "忽略题数",
     "mean_points": "综合点数",
@@ -1559,8 +1559,26 @@ def write_run_report_md(
         [METRIC_ZH["avg ingest latency (ms)"], _fmt(overall.get("avg_ingest_latency_ms", "n/a"))],
         [METRIC_ZH["avg llm calls / query"], _fmt(overall.get("avg_llm_calls", "n/a"))],
     ]
+    ingest_block = metrics.get("ingest_latency") or {}
+    if ingest_block:
+        # 同一对话的每题都记同一个对话级耗时：按题摊分会随"每题对话题数"变化，
+        # 必须把对话级口径一起给出来，否则 locomo / beam 会显示夸张的单题成本
+        eff_rows.extend(
+            [
+                ["对话级 ingest 总计（ms）", _fmt(ingest_block.get("total_ms", "n/a"))],
+                ["对话级 ingest 中位（ms）", _fmt(ingest_block.get("median_ms", "n/a"))],
+                ["对话数", str(ingest_block.get("n_dialogues", "n/a"))],
+            ]
+        )
     lines.append(_md_table(["指标", "值"], eff_rows))
     lines.append("")
+    if ingest_block:
+        lines.append(
+            "<sub>**ingest 耗时的两个口径**：对话级（总计 / 中位）= 每个对话 ingest"
+            " 一次的真实耗时；「按题摊分」= 把该对话耗时记到它每一道题上再按题平均，"
+            "随「每题对话有多少题」变化，**不能读成单题写入成本**，也不要跨数据集横比。</sub>"
+        )
+        lines.append("")
     if with_figures:
         lines.append(f"![查询延迟分布]({FIG_LATENCY})")
         lines.append("")

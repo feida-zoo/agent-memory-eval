@@ -295,9 +295,17 @@ i can` 等）。`judge=llm` 时，凡 `is_abstention(category, gold)`（gold 为
 `metrics.abstention_recheck{"n_calls","n_flipped"}`；`--no-abstention-recheck` 可关
 （省 LLM 调用，代价是回到词表口径）。`yes`/`no`/`same`/`true`/`false` 这类**答案形状**
 的 `leak_targets` 在系统已拒答时不再判泄露（`Yes.` 这种直接给答案仍判红线）。
+**形状词极性复核**：`not_include` 里的 `yes` / `no` / `same` / `true` / `false` 是
+「答案形状」词——既可能是真泄露（`Yes, it is`），也可能只是否定/术语语境里带过
+（`no auto-renewal`、`not the same account`），字面规则分不开。因此当**判错的唯一原因**
+是这类词的命中时（`judge=llm`），再发一次 LEAK/OK 复核：OK 则翻正并记
+`极性复核=llm(未泄露，仅在否定/术语语境出现…)`，LEAK 保留判错。混合失败（含 include
+未命中 / 真目标泄露）不走这条，交给近失复核或直接判错。
+
 **题面回显豁免**：target 原样出现在题面里时（"是不是 `cp_stg_4R7N`？"），拒答句复述它说明"无法确认"不构成新泄露，同样只在已判拒答时豁免；`Yes — it started with cp_stg_4R7N` 这类直接作答照常判红线。豁免项写进 `judge.reason`（`；题面回显不计泄露 N 项（…）`），报告与复核都能看到——否则"未泄露红线信息"会被读成一条红线都没碰。
-**近失复核**：`judge=llm` 的非拒答 `judge_spec` 题，rubric 判错但 `include` 命中率
-≥50%（且 `not_include` / `leak_targets` 未命中）时，再发一次 PASS/FAIL 复核——
+**近失复核**：`judge=llm` 的非拒答 `judge_spec` 题，rubric 判错且（`include` 命中率
+≥50% **或** 只差一条要点，两者取并集——单条 rubric 的命中率只能是 0/1，只按比例会永远
+不进复核）时，再发一次 PASS/FAIL 复核——
 PASS 表示要点在语义上被全部覆盖（允许同义改写 / 语序不同 / 要点分散），此时翻判为对，
 reason 标 `近失复核=llm(PASS 覆盖 m/n 要点)`；FAIL 或调用失败保持 rubric 原判。
 这条只解决「近义改写被字面判错」，不放松禁用项与红线校验。
@@ -1119,12 +1127,13 @@ python -m membench.cli run --adapter my-sys --dataset gatemem_office --shard-by 
 | 维度 | 指标 | 定义 | 目标基线 |
 |---|---|---|---|
 | 正确性 | accuracy | judge 判对比例（heuristic 或 LLM） | ≥ 0.85 |
-| 正确性 | token_f1 / bleu1（诊断） | 预测与 gold 的 token 级重合度（只测字面重合，非语义正确性） | 诊断项，不评级、不门禁 |
+| 正确性 | token_f1 / bleu1（诊断） | 预测与 gold 的 token 级重合度（只测字面重合，非语义正确性）；**拒答题（gold 为 `<ABSTAIN>`）与 `judge_spec` 题记 `未定义`**（哨兵/正则拼接没有可比对的文本，记 0 会把均值拉低） | 诊断项，不评级、不门禁 |
 | 检索质量 | evidence_recall | 非 abstention 题中，证据命中（任一检索条目支持该证据）的比例 | ≥ 0.90 |
 | 检索质量 | recall_at_5（诊断） | 非拒答题中，前 5 条检索的证据条目覆盖率（严格口径；仅 evidence 标注数据集参与） | 诊断项，不评级 |
 | 正确性 | rubric_item_recall（诊断） | `judge_spec.include` 的逐条命中比例（"全命中才算对"的 accuracy 会掩盖"只差一条要点"的近失） | 诊断项，不评级 |
 | 效率成本 | latency_p50 / p95 | query 延迟分位数（毫秒） | 按系统预算自定 |
 | 效率成本 | avg_input_tokens / avg_llm_calls | 每题平均注入 token 与 LLM 调用数 | 越低越好 |
+| 效率成本 | 对话级 ingest（`ingest_latency`） | `{n_dialogues,total_ms,median_ms,per_question_attr_ms}`：每个对话 ingest 一次的真实耗时；`avg_ingest_latency_ms` 是**按题摊分**（同一对话的每题拿同一个值），不能读成单题成本、也不要跨数据集横比 | 观察趋势 |
 | 记忆动态 | stale_rate | **可机检** stale 题中"把旧值当成当前事实、未先给出更新值"的比例（分母 = `stale_n`，不是全部注解题） | ≤ 0.03 |
 | 拒答 | abstention_accuracy | 该拒答的题中真正拒答的比例（`judge=llm` 时是「词表 + 一次 LLM 复核」的混合口径，见「拒答识别」） | ≥ 0.80 |
 | 可扩展性 | （随数据规模观察上述指标的退化曲线） | 用更大数据集多跑几轮对比 | — |

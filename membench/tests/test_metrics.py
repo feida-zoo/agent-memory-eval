@@ -176,6 +176,8 @@ class TestAggregate:
             "has_stale",
             "has_abstention",
             "state_leak",
+            # 对话级 ingest 成本（与"按题摊分"分开落账）
+            "ingest_latency",
         }
         assert metrics["state_leak"] == {
             "n_safety": 0,

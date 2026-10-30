@@ -425,6 +425,9 @@ def aggregate(
         "latency_p95_ms": percentile((r.get("latency_ms", 0.0) for r in records), 95),
         "avg_input_tokens": _mean(r.get("input_tokens", 0) for r in records),
         "avg_output_tokens": _mean(r.get("output_tokens", 0) for r in records),
+        # 按题摊分的对话 ingest 耗时：同一对话的每题拿的是**同一个**对话级耗时，
+        # 这里的均值随"每题对话有多少题"变化，不能读成单题写入成本（见
+        # ingest_latency 块的对话级口径）。
         "avg_ingest_latency_ms": _mean(r.get("ingest_latency_ms", 0.0) for r in records),
         "avg_llm_calls": _mean(
             float(r.get("llm_calls", 0)) + float(r.get("ingest_llm_calls", 0))
@@ -495,8 +498,31 @@ def aggregate(
         "has_stale": stale_n > 0,
     }
 
+    # 对话级 ingest 成本（与"按题摊分"分开落账）：同一对话的每题重复记同一个值，
+    # 直接按题平均会把"每题对话题数多"的集（locomo / beam）算成夸张的单题成本。
+    by_dialogue: dict[str, float] = {}
+    for record in records:
+        dialogue_id = str(record.get("dialogue_id", ""))
+        if not dialogue_id:
+            continue
+        by_dialogue[dialogue_id] = max(
+            by_dialogue.get(dialogue_id, 0.0),
+            float(record.get("ingest_latency_ms", 0.0) or 0.0),
+        )
+    ingest_latency_block: Union[dict[str, Any], None] = None
+    if by_dialogue:
+        ingest_latency_block = {
+            "n_dialogues": len(by_dialogue),
+            "total_ms": sum(by_dialogue.values()),
+            "median_ms": percentile(by_dialogue.values(), 50),
+            "per_question_attr_ms": overall["avg_ingest_latency_ms"],
+        }
+
     # GateMem 官方口径（U / A / F / OR / MGS）：只在记录覆盖官方三支柱题型时
     # 才产出（GateMem / gatemem_office）；其余数据集没有这些 category，省略该块。
+    if ingest_latency_block is not None:
+        result["ingest_latency"] = ingest_latency_block
+
     official = official_summary(records)
     if official is not None:
         result["official"] = official

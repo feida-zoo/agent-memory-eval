@@ -1278,6 +1278,22 @@ def _render_task_report_md(
         "过度拒答率为诊断指标，仅展示与归因，不参与基准评级与门禁。</sub>"
     )
     lines.append("")
+    # stale 覆盖面：缺少可机检 stale 标注的数据集不参与 stale_rate，若不点名，
+    # 读者会把"融合 stale_rate"当成全局结论（实际可能只由一两个集决定）。
+    stale_blind = [
+        r.spec.name
+        for r in results
+        if is_baseline_dataset(r)
+        and not (r.metrics.get("overall") or {}).get("stale_n")
+    ]
+    if stale_blind and fused.get("stale_rate", {}).get("value") is not None:
+        lines.append(
+            "<sub>**stale 覆盖**："
+            + "、".join(stale_blind)
+            + " 没有可机检的 stale 标注，不参与 `stale_rate`——上表的陈旧率只由"
+            "其余数据集决定，不能当全局结论（要覆盖它们，需要给这些集补 `gold_stale`）。</sub>"
+        )
+        lines.append("")
 
     # GateMem 官方口径（逐数据集 + 池化）：与六维融合表并列，不参与融合/评级。
     pooled = pool_official(results)

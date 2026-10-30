@@ -1169,8 +1169,19 @@ class Runner:
                 category,
                 leaked="泄露 leak_target" in str(judge_dict.get("reason") or ""),
             ),
-            "token_f1": None if has_judge_spec else float(token_f1(gold_answer, answer)),
-            "bleu1": None if has_judge_spec else float(bleu1(gold_answer, answer)),
+            # gold 是拒答哨兵时没有可比对的文本：逐字重合恒为 0，会把均值拉低
+            # （与 judge_spec 题同口径记 None，让 _mean 跳过）——"该拒答"题的
+            # 正确性由 judge 判，不由字面重合度判。
+            "token_f1": (
+                None
+                if has_judge_spec or is_abstention(category, gold_answer)
+                else float(token_f1(gold_answer, answer))
+            ),
+            "bleu1": (
+                None
+                if has_judge_spec or is_abstention(category, gold_answer)
+                else float(bleu1(gold_answer, answer))
+            ),
             "recall@5": None if recall_at_5 is None else float(recall_at_5),
             "judge": judge_dict,
             "latency_ms": float(getattr(result, "latency_ms", 0.0) or 0.0),

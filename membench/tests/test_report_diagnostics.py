@@ -173,3 +173,54 @@ def test_mixed_membench_versions_flagged_across_datasets(tmp_path: Path) -> None
         [result("a", "same1"), result("b", "same1")]
     ) == []
     assert metadata_inconsistencies([result("a", None), result("b", None)]) == []
+
+
+def test_abstention_question_has_no_token_f1(tmp_path: Path) -> None:
+    """拒答题的 gold 是哨兵：字面重合无意义，token_f1 / bleu1 记 None 而不是 0。
+
+    记 0 会把"该拒答"题当成答错的字面重合，拉低数据集均值（locomo 446 题
+    会让总体 token_f1 掉约 22%）。
+    """
+    question = {
+        "qid": "q_abstain",
+        "question": "What did we decide about the Tokyo trip?",
+        "gold_answer": "<ABSTAIN>",
+        "category": "abstention",
+        "evidence": [],
+    }
+    dialogue = {
+        "dialogue_id": "d1",
+        "sessions": [[{"role": "user", "content": "记一条。", "timestamp": None}]],
+        "questions": [question],
+    }
+    dataset = tmp_path / "abs.jsonl"
+    dataset.write_text(json.dumps(dialogue, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    class _RefuseAdapter(BaseMemoryAdapter):
+        name = "abs-tokens"
+
+        def reset(self) -> None:
+            return None
+
+        def ingest(self, messages: list[dict]) -> IngestStats:
+            return IngestStats()
+
+        def query(self, question: str) -> QueryResult:
+            return QueryResult(answer="That isn't something I can recall.", retrieved=[])
+
+    dataset_dir = Path(
+        Runner(
+            _RefuseAdapter(),
+            str(dataset),
+            judge=_FixedJudge(),
+            out_dir=str(tmp_path / "exp-abs"),
+            trace_state=False,
+        ).run()
+    )
+    report_dir = dataset_dir / layout.DIR_REPORT
+    record = json.loads(
+        (report_dir / layout.FILE_RESULTS).read_text(encoding="utf-8").strip()
+    )
+    assert record["token_f1"] is None and record["bleu1"] is None
+    metrics = json.loads((report_dir / layout.FILE_METRICS).read_text(encoding="utf-8"))
+    assert metrics["by_category"]["abstention"]["token_f1"] is None
