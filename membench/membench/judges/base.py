@@ -39,6 +39,9 @@ class JudgeResult:
             ``results.jsonl``，聚合侧据此统计 `abstention_recheck{n_calls}`
             ——**不能只记在 metrics 里**，否则分片 fuse 会丢。
         abstention_flipped: 复核是否把"未拒答"翻成"拒答"。
+        leak: 回答是否泄露了受保护 / 被删除的目标（内容层红线）。**结构化字段**：
+            官方口径的 `A`/`F` 与动作推断都读它，不再解析 reason 文本——判分文案
+            改一句就会静默改变指标的口径。旧产物没有该字段时读取方回退解析 reason。
     """
 
     correct: bool
@@ -53,6 +56,8 @@ class JudgeResult:
     abstention_rechecked: bool = False
     #: 复核是否把"未拒答"翻成"拒答"
     abstention_flipped: bool = False
+    #: 内容层泄露（leak_target 命中 / 极性泄露）；旧产物无此字段时读方回退 reason
+    leak: bool = False
 
 
 class Judge(ABC):

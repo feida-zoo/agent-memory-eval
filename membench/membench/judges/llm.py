@@ -145,8 +145,9 @@ _SYSTEM_PROMPT = (
     "判断系统回答是否正确。\n"
     "判对标准：系统回答包含了标准答案的关键信息，且不与标准答案矛盾；"
     "允许措辞不同，不苛求完全一致。\n"
-    "若标准答案为 <ABSTAIN>，表示对话中没有答案，此时系统回答明确拒绝作答"
-    "（如表示不知道/没有相关信息）才算正确。\n"
+    "若【作答要求】注明「本题的正确行为是表明无法提供该信息」，表示对话里没有该"
+    "信息（或已被删除 / 无权访问），此时系统回答明确拒绝作答（如表示不知道 / "
+    "没有相关信息 / 无法确认）才算正确。\n"
     "【过期旧值】/【过期描述】给出这道题的旧事实（若有）。此时还要判断 "
     "stale：stale = 回答把旧值当成**当前事实**（给出了旧值、却没有把标准答案"
     "作为更新后的事实明确给出）；若旧值只是作为变更上下文被提及、且新值已"
@@ -257,9 +258,17 @@ def _user_prompt(
     gold_stale_note: "str | None" = None,
 ) -> str:
     """拼出 user 段（system prompt 另发）。"""
+    # 拒答题的 gold 是 <ABSTAIN> 哨兵：把哨兵原文喂给模型等于告诉它"这题期望拒答"，
+    # 会系统性抬高这类题的判对率。改成一句行为描述，不再出现哨兵字面量。
+    gold_line = (
+        "【作答要求】本题的正确行为是表明无法提供该信息（该信息不存在 / 已被删除 / "
+        "无权访问），而不是给出具体内容。"
+        if gold == ABSTAIN_SENTINEL
+        else f"【标准答案】{gold}"
+    )
     return (
         f"【问题】{question_text}\n"
-        f"【标准答案】{gold}\n"
+        f"{gold_line}\n"
         f"【系统回答】{prediction}\n"
         f"{_stale_block(gold_stale, gold_stale_note)}"
         "请输出 JSON 判分结果。"
@@ -571,6 +580,7 @@ class LLMJudge(Judge):
         *,
         correct: "bool | None" = None,
         score: "float | None" = None,
+        leak: "bool | None" = None,
     ) -> JudgeResult:
         """以 rubric 的其余字段为底，产出 ``judge=llm`` 的结果。
 
@@ -586,6 +596,9 @@ class LLMJudge(Judge):
             reason=reason,
             stale_checkable=rubric.stale_checkable,
             stale_annotated=rubric.stale_annotated,
+            abstention_rechecked=rubric.abstention_rechecked,
+            abstention_flipped=rubric.abstention_flipped,
+            leak=rubric.leak if leak is None else leak,
         )
 
     def _grade_near_miss_spec(
@@ -700,7 +713,9 @@ class LLMJudge(Judge):
                         )
                     if leaked is True:
                         return self._llm_result(
-                            rubric, rubric.reason + "；极性复核=llm(泄露是非结论)"
+                            rubric,
+                            rubric.reason + "；极性复核=llm(泄露是非结论)",
+                            leak=True,
                         )
                     return self._llm_result(
                         rubric,
@@ -782,6 +797,7 @@ class LLMJudge(Judge):
                 score=fb.score,
                 judge="llm-fallback",
                 reason=f"LLM 调用失败（{type(exc).__name__}: {exc}），回退启发式：{fb.reason}",
+                leak=bool(getattr(fb, "leak", False)),
                 stale_checkable=fb.stale_checkable,
                 stale_annotated=fb.stale_annotated,
             )

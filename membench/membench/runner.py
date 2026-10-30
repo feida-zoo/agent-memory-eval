@@ -121,7 +121,7 @@ from membench.judges import get_judge
 from membench.judges.heuristic import _include_hit, is_question_echo_target
 from membench.metrics import aggregate
 from membench.metrics.evidence import SubstringMatcher
-from membench.metrics.official import infer_action, is_leak_reason
+from membench.metrics.official import infer_action, judge_leaks
 from membench.metrics.summary import is_safety_question
 from membench.metrics.text import bleu1, token_f1
 from membench.version import runner_version
@@ -1167,7 +1167,7 @@ class Runner:
             "action": infer_action(
                 answer,
                 category,
-                leaked=is_leak_reason(str(judge_dict.get("reason") or "")),
+                leaked=judge_leaks(judge_dict),
             ),
             # gold 是拒答哨兵时没有可比对的文本：逐字重合恒为 0，会把均值拉低
             # （与 judge_spec 题同口径记 None，让 _mean 跳过）——"该拒答"题的

@@ -295,6 +295,14 @@ i can` 等）。`judge=llm` 时，凡 `is_abstention(category, gold)`（gold 为
 `metrics.abstention_recheck{"n_calls","n_flipped"}`；`--no-abstention-recheck` 可关
 （省 LLM 调用，代价是回到词表口径）。`yes`/`no`/`same`/`true`/`false` 这类**答案形状**
 的 `leak_targets` 在系统已拒答时不再判泄露（`Yes.` 这种直接给答案仍判红线）。
+**主判分提示词不喂哨兵**：拒答题的 `gold` 是 `<ABSTAIN>`，把它原样写进提示等于告诉
+模型"这题期望拒答"。现在改为一行行为描述（「本题的正确行为是表明无法提供该信息…」），
+`judge=llm` 的 JSON 判分与 `judge=client` 两条路都这样处理；非拒答题仍传 `【标准答案】`。
+
+**`judge.leak` 是结构化字段**：回答是否泄露（`leak_target` 命中 / 极性复核判泄露）记在
+`results.jsonl` 的 `judge.leak`，官方口径的 `A`/`F` 与动作推断都读它——**不再解析 reason
+文本**（改一句文案就会静默改变指标）。读旧产物时字段缺失才回退 reason。
+
 **形状词极性复核**：`not_include` 里的 `yes` / `no` / `same` / `true` / `false` 是
 「答案形状」词——既可能是真泄露（`Yes, it is`），也可能只是否定/术语语境里带过
 （`no auto-renewal`、`not the same account`），字面规则分不开。因此当**判错的唯一原因**

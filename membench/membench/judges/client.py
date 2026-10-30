@@ -29,7 +29,7 @@ import json
 import re
 from typing import Any, Callable, Union
 
-from membench.data.schema import is_abstention
+from membench.data.schema import ABSTAIN_SENTINEL, is_abstention
 from membench.data.stale import resolve_stale
 from membench.llm_ref import import_from_path
 
@@ -42,17 +42,23 @@ _SYSTEM_PROMPT = (
     "判断系统回答是否正确。\n"
     "判对标准：系统回答包含了标准答案的关键信息，且不与标准答案矛盾；"
     "允许措辞不同，不苛求完全一致。\n"
-    "若标准答案为 <ABSTAIN>，表示对话中没有答案，此时系统回答明确拒绝作答"
-    "（如表示不知道/没有相关信息）才算正确。\n"
+    "若【作答要求】注明「本题的正确行为是表明无法提供该信息」，表示对话里没有该"
+    "信息（或已被删除 / 无权访问），此时系统回答明确拒绝作答才算正确。\n"
     "只输出 JSON，不要输出任何其他内容："
     '{"correct": true 或 false, "reason": "一句话理由"}'
 )
 
 _USER_TEMPLATE = (
     "【问题】{question}\n"
-    "【标准答案】{gold}\n"
+    "{gold_line}\n"
     "【系统回答】{prediction}\n"
     "请输出 JSON 判分结果。"
+)
+
+#: 拒答题的 gold 是哨兵，不能把它原样喂给模型（等于提示"这题期望拒答"）。
+_ABSTAIN_TEMPLATE_LINE = (
+    "【作答要求】本题的正确行为是表明无法提供该信息（该信息不存在 / 已被删除 / "
+    "无权访问），而不是给出具体内容。"
 )
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -133,7 +139,11 @@ class ClientLLMJudge(Judge):
                 + "\n\n"
                 + _USER_TEMPLATE.format(
                     question=getattr(question, "question", ""),
-                    gold=gold,
+                    gold_line=(
+                        _ABSTAIN_TEMPLATE_LINE
+                        if gold == ABSTAIN_SENTINEL
+                        else f"【标准答案】{gold}"
+                    ),
                     prediction=prediction,
                 )
             )
