@@ -134,9 +134,12 @@ python -m membench.cli evaluate --adapter <a> \
 说明：默认全量**包含** LongMemEval-S（每题约 50 个干扰会话 / ~115k token 的检索压力
 变体，与 oracle 的分差反映检索/精确率损失）；未下载时默认全量会报错提示先
 `dataset fetch longmemeval_s`，不需要则用 `--no-lme-s` 剔除。显式 `--dataset`
-清单中**第一个数据集承担办公域槽位**（stale 门禁作用域；无可机检 stale 题时门禁自动
-SKIP）；未显式给出时默认清单的办公域槽位规则不变。这条位置规则**只服务显式
-`--dataset` 清单**，纯汇总不适用（见上）。
+办公域槽位的判定按**数据集身份**：内置 `office` / 已安装的用户测试集才承担槽位
+（stale 门禁作用域；无可机检 stale 题时门禁自动 SKIP）。身份全不命中时，显式
+`--dataset` 清单里**第一个用户自定义数据文件**（`source=user-specified`）兜底槽位
+——业务数据要过 stale 门禁，这与书写位置无关；**公开基准集不兜底**（
+`--dataset locomo --dataset gatemem_office` 不会再把 locomo 或 gatemem 当办公域踢出
+基准融合）。纯汇总（`--from-runs`）连这个兜底也不用（见上）。
 
 三档预设是**由宽到窄**的三个口径（不是严格集合包含：`--quick` 保留办公域槽位，`--common` 不含）：
 **默认全量**（办公域槽位 + locomo + longmemeval_oracle + gatemem_office + LongMemEval-S + BEAM-1M）；

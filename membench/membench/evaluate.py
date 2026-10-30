@@ -303,8 +303,11 @@ def mark_office_slot(
     身份不命中时是否由清单第一个数据集兜底，两条路径不同：
 
     - ``positional_fallback=True``（:func:`dataset_specs`，即显式 ``--dataset`` 清单）：
-      保留"第一个数据集承担办公域槽位"的既有口径——用户给的清单顺序就是他的意图，
-      直接给自定义路径 / 公开集时仍按第一个承担槽位。
+      身份全不命中时，由清单里**第一个用户自定义数据集**（``source="user-specified"``，
+      即用户自己给的数据文件）承担槽位——业务数据要过 stale 门禁，这是它的本意。
+      **公开基准集不兜底**：``--dataset locomo --dataset gatemem_office`` 这种列表的
+      顺序只是书写顺序，按位置挑一个当办公域会把它踢出基准融合、还把它的 stale 当
+      业务红线（历史 bug：locomo / gatemem 被误标成办公域槽位）。
     - ``positional_fallback=False``（:func:`evaluate` 的纯汇总分支）：清单由
       ``--from-runs`` 的产物拼成，顺序只反映书写顺序，与"谁是办公域"无关；按位置兜底
       会把第一个（如 locomo）当成槽位踢出基准融合、还把它的 stale 当业务门禁。没有
@@ -316,8 +319,12 @@ def mark_office_slot(
     """
     for spec in specs:
         spec.is_office_slot = is_office_slot_dataset(spec.path)
-    if positional_fallback and specs and not any(spec.is_office_slot for spec in specs):
-        specs[0].is_office_slot = True
+    if positional_fallback and not any(spec.is_office_slot for spec in specs):
+        # 只让"用户自己的数据文件"兜底槽位；公开基准集不按位置挑（顺序不代表意图）
+        for spec in specs:
+            if spec.source == "user-specified":
+                spec.is_office_slot = True
+                break
 
 
 def _capabilities_from_metrics(metrics: dict[str, Any], dataset_path: str) -> dict[str, bool]:

@@ -670,7 +670,17 @@ def test_dataset_specs_parsing_rules(tmp_path: Path, monkeypatch: pytest.MonkeyP
     specs = ev_mod.dataset_specs(["locomo", "longmemeval_s"])
     assert [s.key for s in specs] == ["locomo", "longmemeval_s"]
     assert all(s.source == "fetch" for s in specs)
-    assert specs[0].is_office_slot is True and specs[1].is_office_slot is False
+    # 公开基准集不按位置兜底办公域槽位（历史 bug：locomo / gatemem 被踢出基准融合）
+    assert specs[0].is_office_slot is False and specs[1].is_office_slot is False
+
+    # 用户自定义数据文件仍兜底槽位（业务数据要过 stale 门禁），且与顺序无关
+    custom = _write_dataset(
+        tmp_path / "mine.jsonl",
+        [{"dialogue_id": "d1", "sessions": [_session()], "questions": []}],
+    )
+    specs = ev_mod.dataset_specs(["locomo", str(custom)])
+    assert specs[0].is_office_slot is False
+    assert specs[1].is_office_slot is True and specs[1].source == "user-specified"
 
     # 显式 office 参与时以它为准（已安装用户测试集 → 来源 user）
     user_dir = tmp_path / "user_dataset"
