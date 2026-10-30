@@ -89,6 +89,7 @@ from membench.report import (
     metric_labels,
 )
 from membench.ratings import format_metric, format_metric_delta, format_metric_value, overall_rating
+from membench.version import version_display
 
 
 @dataclass
@@ -1049,6 +1050,12 @@ def _write_evaluate_compare_report(
     lines.append(f"- judge: `{judge_name}`")
     lines.append(f"- platform: `{platform or 'default'}`")
     lines.append(f"- commit: `{commit or 'n/a'}`")
+    # 评测代码自身版本：两侧同一次 compare 由同一版本产出，这里只记一行
+    # 供回查（判分口径随代码变，历史分数差异要靠它对账）。
+    lines.append(
+        "- membench 版本: "
+        + version_display((arms[0].baseline if arms else {}).get("membench_version"))
+    )
     lines.append(f"- 数据集数: {len(arms)}（{', '.join(r.spec.name for r in arms)}）")
     match_modes = sorted(
         {

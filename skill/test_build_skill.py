@@ -36,6 +36,13 @@ def fake_repo(tmp_path: Path) -> Path:
     (tmp_path / "membench").mkdir()
     (tmp_path / "membench" / "membench").mkdir()
     (tmp_path / "membench" / "membench" / "__init__.py").write_text("", encoding="utf-8")
+    # 最小版 version.py：只提供打包脚本需要的两个名字（真实规则见 membench/version.py）
+    (tmp_path / "membench" / "membench" / "version.py").write_text(
+        "BUILD_HASH_FILE = \"_build_hash.py\"\n"
+        "def compute_hash(package_dir):\n"
+        "    return \"0123456789ab\"\n",
+        encoding="utf-8",
+    )
     (tmp_path / "membench" / "README.md").write_text("README\n", encoding="utf-8")
     (tmp_path / "docs").mkdir()
     (tmp_path / "docs" / "x.md").write_text("docs\n", encoding="utf-8")
@@ -142,3 +149,27 @@ def test_full_build_size_under_5mb() -> None:
     finally:
         if os.path.exists(out_path):
             os.remove(out_path)
+
+
+def test_build_writes_and_packs_hash_file(fake_repo: Path) -> None:
+    """打包前写入构建哈希，且该文件确实进包（运行时要直接读常量）。"""
+    hash_value = bs.write_build_hash(str(fake_repo))
+    assert hash_value == "0123456789ab"
+    target = fake_repo / "membench" / "membench" / "_build_hash.py"
+    assert target.is_file()
+    text = target.read_text(encoding="utf-8")
+    assert 'BUILD_HASH = "0123456789ab"' in text
+    assert "BUILT_AT = \"" in text
+
+    included, _ = bs.plan(str(fake_repo))
+    arcs = {arc for _, arc in included}
+    assert "agent-memory-eval/membench/membench/_build_hash.py" in arcs
+
+
+def test_build_hash_idempotent_keeps_built_at(fake_repo: Path) -> None:
+    """代码没变时重复打包不重写文件（BUILT_AT 不动，保证可复现构建）。"""
+    bs.write_build_hash(str(fake_repo))
+    target = fake_repo / "membench" / "membench" / "_build_hash.py"
+    first = target.read_text(encoding="utf-8")
+    bs.write_build_hash(str(fake_repo))
+    assert target.read_text(encoding="utf-8") == first

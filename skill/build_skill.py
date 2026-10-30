@@ -99,6 +99,116 @@ def _is_excluded_data(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in EXCLUDE_DATA_GLOBS)
 
 
+#: 构建哈希文件（相对 membench 包目录）：打包前写入，包内运行时直接读常量。
+BUILD_HASH_REL = os.path.join("membench", "_build_hash.py")
+
+
+def write_build_hash(repo_root: str) -> str:
+    """打包前把 membench 代码哈希写进 ``membench/membench/_build_hash.py``。
+
+    为什么在打包时定稿：安装后的 skill 包没有 ``.git``，无法事后追溯"这份代码
+    对应哪个提交"；而且用户拿到的是压缩包，改动后也无法还原。哈希算在**打包前**
+    的源码上，写进一个**不参与哈希计算**的文件（否则自引用），运行时直接读。
+
+    哈希规则与运行时同源（``membench.version.compute_hash``），不在这里复制一份。
+
+    幂等：代码没变时不重写文件（``BUILT_AT`` 也不动），保证同一份源码每次打出的
+    包字节一致。
+
+    Returns:
+        写入的哈希值。
+
+    Raises:
+        SystemExit: membench 包目录缺失，或算哈希时导入失败（源码有语法错误等）。
+    """
+    mb_root = os.path.join(repo_root, "membench")
+    package_dir = os.path.join(mb_root, "membench")
+    if not os.path.isdir(package_dir):
+        raise SystemExit(f"缺少 membench 包目录: {package_dir}")
+    try:
+        version_mod = _load_version_module(package_dir)
+        hash_value = version_mod.compute_hash(package_dir)
+        build_hash_file = str(version_mod.BUILD_HASH_FILE)
+    except Exception as exc:  # noqa: BLE001 - 打包前的源码问题要给出可操作报错
+        raise SystemExit(f"计算 membench 代码哈希失败: {exc}") from exc
+    old_hash, old_at = _read_built_hash(package_dir, build_hash_file)
+
+    target = os.path.join(package_dir, build_hash_file)
+    built_at = old_at if (old_hash == hash_value and old_at) else _now_iso()
+    content = (
+        '"""构建时写入的 membench 代码哈希（由 ``skill/build_skill.py`` 生成）。\n'
+        "\n"
+        "这个文件**不参与**哈希计算（见 ``membench/version.py`` 的排除规则），否则会自引用。\n"
+        "安装后的 skill 包没有 ``.git``，所以版本标识必须在打包时定稿并硬编码到这里：\n"
+        "运行时直接读常量，报告里带出去即可。\n"
+        "\n"
+        "``BUILD_HASH`` 为空表示\"还没打包过\"（开发态），此时运行时按当前代码现算，\n"
+        "并在报告里标注来源。\n"
+        '"""\n'
+        "\n"
+        "from __future__ import annotations\n"
+        "\n"
+        "#: 打包时计算出的 membench 包内容指纹（sha256 前 12 位）；空 = 未打包。\n"
+        f'BUILD_HASH = "{hash_value}"\n'
+        "\n"
+        "#: 该哈希的生成时间（ISO 8601，本地时区）；空 = 未打包。\n"
+        f'BUILT_AT = "{built_at}"\n'
+    )
+    if old_hash != hash_value or not os.path.isfile(target):
+        with open(target, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+    return hash_value
+
+
+
+def _load_version_module(package_dir: str):
+    """按文件路径加载 ``membench/version.py``，拿到哈希规则本身。
+
+    不 ``import membench.version``：打包脚本可能对着一个临时假仓库跑（测试里就是
+    这样），也不能保证 ``sys.path`` 上的 ``membench`` 是目标那份。按路径加载只依赖
+    文件内容，且 ``version.py`` 对 ``_build_hash`` 的相对导入做了缺省处理。
+    """
+    import importlib.util
+
+    module_path = os.path.join(package_dir, "version.py")
+    if not os.path.isfile(module_path):
+        raise FileNotFoundError(f"缺少版本模块: {module_path}")
+    spec = importlib.util.spec_from_file_location("_membench_version_for_hash", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载 {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _read_built_hash(package_dir: str, build_hash_file: str) -> Tuple[str, str]:
+    """读已有的 ``BUILD_HASH`` / ``BUILT_AT``（没有文件返回空串）。
+
+    只做正则取值，不执行目标文件——打包脚本不该为了读两个常量而执行任意代码。
+    """
+    import re
+
+    path = os.path.join(package_dir, build_hash_file)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        return "", ""
+    hash_match = re.search(r'^BUILD_HASH\s*=\s*"([^"]*)"', text, re.MULTILINE)
+    at_match = re.search(r'^BUILT_AT\s*=\s*"([^"]*)"', text, re.MULTILINE)
+    return (
+        hash_match.group(1) if hash_match else "",
+        at_match.group(1) if at_match else "",
+    )
+
+
+def _now_iso() -> str:
+    """当前本地时间（ISO 8601，秒级）——只用于构建哈希的生成时间。"""
+    from datetime import datetime
+
+    return datetime.now().isoformat(timespec="seconds")
+
+
 def _walk_files(root: str) -> Iterator[str]:
     """遍历目录下的文件绝对路径（跳过构建缓存与系统垃圾）。
 
@@ -283,6 +393,16 @@ def main(argv: List[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     repo_root = os.path.abspath(args.repo_root)
+    # 先定稿代码哈希再算打包计划：哈希文件本身也要进包（运行时直接读常量），
+    # 而它不参与哈希计算，所以顺序反过来会漏掉当次生成的哈希。
+    if args.list:
+        print(
+            f"[list] 不写盘：构建哈希未更新（实际打包时会写入 {BUILD_HASH_REL}）",
+            file=sys.stderr,
+        )
+    else:
+        hash_value = write_build_hash(repo_root)
+        print(f"代码哈希: {hash_value} → {BUILD_HASH_REL}")
     included, excluded = plan(repo_root)
 
     if args.list:

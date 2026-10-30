@@ -89,6 +89,7 @@ from membench.evaluate import STALE_GATE_THRESHOLD, is_office_slot_dataset
 from membench.metrics import aggregate
 from membench.report import copy_report, render_dataset_report, render_dialogue_report
 from membench.runner import select_shard_questions
+from membench.version import runner_version
 
 #: 跨分片必须一致的元数据：身份（adapter / platform / commit）、判分与驱动
 #: （judge / judge_model / driver_llm / adapter_version / adapter_meta）、口径
@@ -913,6 +914,9 @@ def fuse_runs(
         "adapter_meta": ref_metrics.get("adapter_meta"),
         "adapter_describe": ref_metrics.get("adapter_describe"),
         "schema_version": ref_metrics.get("schema_version"),
+        # 融合产物由**当前**代码重建（重算 aggregate），因此记当前版本而不是
+        # 源分片的版本——否则"换版本后重新 fuse"会显示成旧版本算的分。
+        "membench_version": runner_version(),
         "driver_llm": ref_metrics.get("driver_llm"),
         "judge_model": ref_metrics.get("judge_model"),
         "adapter_version": ref_metrics.get("adapter_version"),

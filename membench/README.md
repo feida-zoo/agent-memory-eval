@@ -428,6 +428,7 @@ fuse 的融合产物（`shard_index=None`）不带这个标注，它覆盖全部
 每个数据集目录的 `report/metrics.json` 除了六维指标，还记一组元数据，回答"这次分数是用什么跑出来的"：
 
 - `schema_version`：元数据 schema 版本（当前 `"0.2"`）；
+- `membench_version`：**评测代码自身的版本标识** `{"version", "hash", "hash_source", "stale_build"}`——`version` 是包语义版本，`hash` 是**打包时定稿**的代码哈希（包内全部 `*.py` 的 sha256 前 12 位，写入 `membench/membench/_build_hash.py`，该文件本身不参与计算以免自引用）。安装后的 skill 包没有 `.git`、也无法事后追溯构建，所以哈希只能在打包时算好硬编码进去，运行时直接读常量。`hash_source=build` 表示读的就是打包值；`computed` 表示开发态（未打包）或**打包后改过代码**，此时按当前代码现算并在报告里标注——绝不把过期哈希当事实（`stale_build=true` 会提示重新打包）。报告「评测配置」段显示成 `0.1.0+<hash>（构建哈希）`；`evaluate` / `evaluate-compare` 报告头部同款一行。判分口径（拒答词表、rubric 近失复核、归因顺序）随代码变化，**跨版本分数不可直接比较时，用它来对账**；`fuse` 重建产物时记**当前**代码的版本（融合指标是当前代码重算的，不是源分片算的）；
 - `run_id`：本次评测的身份字符串（形如 `<adapter>_<platform>[_<commit8>]_<dataset>[_shardIofN|_dshardIofN][_limitN]_<%Y%m%d_%H%M%S>`，只作身份标识，不再是目录名）；
 - `adapter` / `platform` / `commit` / `dataset` / `dataset_path` / `dataset_source`；
 - `driver_llm`：驱动被测系统的 LLM 标识（`--driver-llm`，自由文本）；

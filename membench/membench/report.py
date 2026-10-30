@@ -57,6 +57,7 @@ from .ratings import (
     rate_metric,
 )
 from .metrics.summary import ATTRIBUTION_BUCKETS
+from .version import version_display
 
 # 统一低饱和配色（SPEC 第 7 节）
 PALETTE: list[str] = ["#3b6ea5", "#c9a86a", "#5e8c61", "#8f8f8f", "#b03a2e"]
@@ -277,6 +278,7 @@ METADATA_FIELD_ZH: dict[str, str] = {
     "fused": "融合产物",
     "fused_from": "来源分片",
     "schema_version": "schema 版本",
+    "membench_version": "membench 版本",
     "retrieval_match": "检索匹配口径",
     "retrieval_match_threshold": "检索匹配阈值",
     "retrieval_match_fallbacks": "检索匹配回退数",
@@ -1032,6 +1034,7 @@ def write_run_report_md(
         [metadata_label("dataset_source"), str(metrics.get("dataset_source", "n/a"))],
         [metadata_label("platform"), str(metrics.get("platform", "default"))],
         [metadata_label("commit"), str(metrics.get("commit") or "n/a")],
+        [metadata_label("membench_version"), version_display(metrics.get("membench_version"))],
         [metadata_label("judge"), str(metrics.get("judge", "n/a"))],
         [metadata_label("driver_llm"), _fmt_opt(metrics.get("driver_llm"))],
         [metadata_label("judge_model"), _fmt_opt(metrics.get("judge_model"))],

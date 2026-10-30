@@ -61,6 +61,7 @@ from membench.report import (
     token_usage_totals,
 )
 from membench.runner import Runner
+from membench.version import version_display
 from membench.userdata import (
     USER_DATASET_FILENAME,
     builtin_office_dataset_path,
@@ -1078,6 +1079,10 @@ def _render_task_report_md(
         ["judge", f"`{judge_name}`"],
         ["platform", str(platform or "default")],
         ["commit", str(commit or "n/a")],
+        [
+            "membench 版本",
+            version_display(first_metrics.get("membench_version")) if results else "n/a",
+        ],
         ["驱动 LLM", _fmt_opt(first_metrics.get("driver_llm"))],
         ["判分模型", _fmt_opt(first_metrics.get("judge_model"))],
         ["adapter 版本", _fmt_opt(first_metrics.get("adapter_version"))],

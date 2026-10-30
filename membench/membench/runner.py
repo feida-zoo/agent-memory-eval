@@ -122,6 +122,7 @@ from membench.metrics import aggregate
 from membench.metrics.evidence import SubstringMatcher
 from membench.metrics.summary import is_safety_question
 from membench.metrics.text import bleu1, token_f1
+from membench.version import runner_version
 from membench.report import (
     copy_report,
     format_token_usage,
@@ -1558,6 +1559,10 @@ class Runner:
                     "adapter_meta": self.adapter_meta,
                     "adapter_describe": adapter_describe,
                     "schema_version": "0.2",
+                    # 评测代码自身的版本标识（语义版本 + 包内容指纹 + git 短
+                    # commit）：判分口径随代码变化，光有被测系统的 commit 无法
+                    # 解释历史分数漂移（见 membench/version.py）。
+                    "membench_version": runner_version(),
                     "driver_llm": self.driver_llm,
                     "judge_model": self.judge_model,
                     "adapter_version": self.adapter_version,

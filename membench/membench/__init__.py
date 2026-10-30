@@ -15,8 +15,7 @@ from .adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
 from .agent_loop import AgentLoopAdapter, run_tool_loop
 from .data.schema import Dataset, Dialogue, Question, load_dataset
 from .runner import Runner
-
-__version__ = "0.1.0"
+from .version import __version__, runner_version
 
 __all__ = [
     "BaseMemoryAdapter",
@@ -30,4 +29,5 @@ __all__ = [
     "Runner",
     "load_dataset",
     "__version__",
+    "runner_version",
 ]
