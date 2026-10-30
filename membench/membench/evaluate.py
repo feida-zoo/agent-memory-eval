@@ -456,7 +456,13 @@ def load_provided_result(key: str, product_dir: str) -> DatasetResult:
 #: 汇总模式的「提示型」不一致维度：被测对象与评测口径维度（:data:`_IDENTITY_KEYS`）
 #: 混用已在跑前直接拒绝，这里只剩 platform 这类允许跨 run 差异、仅需标注的维度；
 #: commit 是 A/B 的被测变量，不在此列。
-_META_CHECK_KEYS = ("platform",)
+_META_CHECK_KEYS = ("platform", "membench_hash")
+
+
+def _membench_hash(metrics: dict[str, Any]) -> Union[str, None]:
+    """评测代码版本（``membench_version.hash``）；旧产物没有该字段时为 None。"""
+    info = metrics.get("membench_version")
+    return info.get("hash") if isinstance(info, dict) else None
 
 
 #: 同一侧/同一报告内必须唯一的维度：被测对象身份 + 评测口径（A/B 差异只应发生在侧之间）。
@@ -571,7 +577,8 @@ def metadata_inconsistencies(results: list[DatasetResult]) -> list[str]:
     for key in _META_CHECK_KEYS:
         grouped: dict[str, list[str]] = {}
         for r in results:
-            grouped.setdefault(repr(r.metrics.get(key)), []).append(r.spec.key)
+            value = _membench_hash(r.metrics) if key == "membench_hash" else r.metrics.get(key)
+            grouped.setdefault(repr(value), []).append(r.spec.key)
         if len(grouped) > 1:
             detail = "；".join(
                 f"{value} ← {','.join(keys)}" for value, keys in grouped.items()

@@ -475,3 +475,33 @@ def test_ingest_strategy_mixed_is_incomparable() -> None:
     )
     assert _ingest_strategy_check(result)["same"] is False
     assert result["comparable"] is False
+
+
+def _membench_hash_check(result: dict) -> dict:
+    return next(
+        check for check in result["checks"] if check["dimension"] == "membench_hash"
+    )
+
+
+def test_membench_hash_mismatch_warns_but_not_fails() -> None:
+    """评测代码版本不同：判分口径可能已变，必须 WARN，但不该 FAIL 回归对比。"""
+    from membench.compare import check_comparability
+
+    result = check_comparability(
+        _metrics(membench_version={"version": "0.1.0", "hash": "aaaa", "hash_source": "build"}),
+        _metrics(membench_version={"version": "0.1.0", "hash": "bbbb", "hash_source": "build"}),
+    )
+    check = _membench_hash_check(result)
+    assert check["same"] is False
+    assert check["severity"] == "warn"
+    assert result["comparable"] is True
+
+
+def test_membench_hash_missing_on_both_sides_is_not_a_mismatch() -> None:
+    """旧产物没有 membench_version：两侧同缺，不判不一致（不误伤历史对比）。"""
+    from membench.compare import check_comparability
+
+    result = check_comparability(_metrics(), _metrics())
+    check = _membench_hash_check(result)
+    assert check["same"] is True
+    assert check["a"] is None and check["b"] is None

@@ -429,7 +429,7 @@ fuse 的融合产物（`shard_index=None`）不带这个标注，它覆盖全部
 每个数据集目录的 `report/metrics.json` 除了六维指标，还记一组元数据，回答"这次分数是用什么跑出来的"：
 
 - `schema_version`：元数据 schema 版本（当前 `"0.2"`）；
-- `membench_version`：**评测代码自身的版本标识** `{"version", "hash", "hash_source", "stale_build"}`——`version` 是包语义版本，`hash` 是**打包时定稿**的代码哈希（包内全部 `*.py` 的 sha256 前 12 位，写入 `membench/membench/_build_hash.py`，该文件本身不参与计算以免自引用）。安装后的 skill 包没有 `.git`、也无法事后追溯构建，所以哈希只能在打包时算好硬编码进去，运行时直接读常量。`hash_source=build` 表示读的就是打包值；`computed` 表示开发态（未打包）或**打包后改过代码**，此时按当前代码现算并在报告里标注——绝不把过期哈希当事实（`stale_build=true` 会提示重新打包）。报告「评测配置」段显示成 `0.1.0+<hash>（构建哈希）`；`evaluate` / `evaluate-compare` 报告头部同款一行。判分口径（拒答词表、rubric 近失复核、归因顺序）随代码变化，**跨版本分数不可直接比较时，用它来对账**；`fuse` 重建产物时记**当前**代码的版本（融合指标是当前代码重算的，不是源分片算的）；
+- `membench_version`：**评测代码自身的版本标识** `{"version", "hash", "hash_source", "stale_build"}`——`version` 是包语义版本，`hash` 是**打包时定稿**的代码哈希（包内全部 `*.py` 的 sha256 前 12 位，写入 `membench/membench/_build_hash.py`，该文件本身不参与计算以免自引用）。安装后的 skill 包没有 `.git`、也无法事后追溯构建，所以哈希只能在打包时算好硬编码进去，运行时直接读常量。`hash_source=build` 表示读的就是打包值；`computed` 表示开发态（未打包）或**打包后改过代码**，此时按当前代码现算并在报告里标注——绝不把过期哈希当事实（`stale_build=true` 会提示重新打包）。报告「评测配置」段显示成 `0.1.0+<hash>（构建哈希）`；`evaluate` / `evaluate-compare` 报告头部同款一行。判分口径（拒答词表、rubric 近失复核、归因顺序）随代码变化，**跨版本分数不可直接比较时，用它来对账**；`fuse` 重建产物时记**当前**代码的版本（融合指标是当前代码重算的，不是源分片算的）；**跨产物一致性**：`compare` 把该哈希列为次要维度（不一致 WARN、不 FAIL）；`evaluate` 汇总（含 `--from-runs` 混合新旧产物）时，跨数据集哈希不一致会打印告警并在报告头部写明「混合口径」——只重跑部分数据集时，这是唯一的兜底提示；
 - `run_id`：本次评测的身份字符串（形如 `<adapter>_<platform>[_<commit8>]_<dataset>[_shardIofN|_dshardIofN][_limitN]_<%Y%m%d_%H%M%S>`，只作身份标识，不再是目录名）；
 - `adapter` / `platform` / `commit` / `dataset` / `dataset_path` / `dataset_source`；
 - `driver_llm`：驱动被测系统的 LLM 标识（`--driver-llm`，自由文本）；
@@ -465,7 +465,7 @@ python -m membench.cli run --adapter my-system --dataset membench/data/office_da
 | 级别 | 维度 | 不一致的后果 |
 |---|---|---|
 | 关键 | `adapter`、`adapter_version`、`dataset_sha256`（取 `dataset_fingerprint.sha256`）、`judge`、`judge_model`、`driver_llm`、`platform`、`run_mode`（全量 / 快照回放）、`ingest_strategy`（sequence / interleaved：问的是"结尾时知道什么"还是"当时知道什么"）、`n_questions`（分数算在哪个题集上：`--limit` 冒烟 vs 全量即走这里） | 非 strict 下门禁降级 WARN；`--require-comparable`（strict）下直接 FAIL |
-| 次要 | `limit`、`shards`、`shard_index`、`adapter_meta`、`retrieval_match`、`fusion` | 降级 WARN，不 FAIL |
+| 次要 | `limit`、`shards`、`shard_index`、`adapter_meta`、`retrieval_match`、`fusion`、`membench_hash`（评测代码版本：判分口径随代码变化，两侧不同必须提醒，但不 FAIL 回归对比） | 降级 WARN，不 FAIL |
 | 提示 | `commit`、`dataset_path`、`dataset` | 仅记录（`same=false`），不影响结论 |
 
 - 关键维度**任一值缺失**（如旧 run 没有 `driver_llm`）记入 `unverifiable`：非 strict 下不判不可比，strict 下与不一致同等处理（判 FAIL）——没填就核验不了，strict 模式不允许"没填当通过"。`n_questions` 取自 `overall.n_questions`（`aggregate` 的落账位置，顶层没有该字段）。

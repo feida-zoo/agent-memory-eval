@@ -103,6 +103,10 @@ WARN_COMPARABILITY_DIMS: tuple[str, ...] = (
     # 的数值，单数据集的指标与它无关——因此不能当关键维度，否则"单集 run 产物
     # vs evaluate 产物"这种常规对比会被误判不可比。降级 WARN，报告里照样列出。
     "fusion",
+    # 评测代码版本（membench_version.hash）：判分口径随代码变化，两侧版本不同
+    # 意味着同一份回答的分数会被不同规则算出。不判 FAIL（升级评测工程后做回归
+    # 对比是常规操作），但必须 WARN——否则"口径变了"会被当成"系统变了"。
+    "membench_hash",
 )
 
 #: 提示维度：仅记录（``same=False``），不影响结论与门禁。
@@ -258,6 +262,9 @@ def _comparability_value(metrics: dict[str, Any], dim: str) -> Any:
         return metrics.get("ingest_strategy") or "sequence"
     if dim == "fusion":
         return metrics.get("fusion") or "legacy"
+    if dim == "membench_hash":
+        info = metrics.get("membench_version")
+        return info.get("hash") if isinstance(info, dict) else None
     if dim == "n_questions":
         value = metrics.get("n_questions")
         if value is not None:

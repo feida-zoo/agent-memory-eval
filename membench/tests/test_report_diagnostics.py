@@ -142,3 +142,34 @@ def test_empty_and_median_retrieval_counted(tmp_path: Path) -> None:
     assert metrics["overall"]["retrieved_median"] == pytest.approx(4.0)
     assert "检索诊断" in report
     assert "检索结果为空" in report
+
+
+def test_mixed_membench_versions_flagged_across_datasets(tmp_path: Path) -> None:
+    """汇总模式跨数据集代码版本不一致：返回说明，报告头部据此提示"混合口径"。"""
+    from membench.evaluate import DatasetResult, DatasetSpec, metadata_inconsistencies
+
+    def result(key: str, hash_value: str | None) -> DatasetResult:
+        metrics = {"overall": {"accuracy": 0.5}, "platform": "default"}
+        if hash_value:
+            metrics["membench_version"] = {
+                "version": "0.1.0",
+                "hash": hash_value,
+                "hash_source": "build",
+            }
+        return DatasetResult(
+            spec=DatasetSpec(key=key, name=key, path=f"/data/{key}.jsonl", source="fetch"),
+            run_dir=str(tmp_path / key),
+            metrics=metrics,
+            capabilities={},
+        )
+
+    notes = metadata_inconsistencies(
+        [result("gatemem_office", "new123"), result("locomo", "old456")]
+    )
+    assert any("membench_hash" in note for note in notes)
+    assert "new123" in notes[0] and "old456" in notes[0]
+    # 两侧同版本 / 都没有该字段：不产生提示
+    assert metadata_inconsistencies(
+        [result("a", "same1"), result("b", "same1")]
+    ) == []
+    assert metadata_inconsistencies([result("a", None), result("b", None)]) == []
