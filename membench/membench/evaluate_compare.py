@@ -589,6 +589,7 @@ def evaluate_compare(
     task_dir: Union[str, None] = None,
     snapshot: Union[bool, None] = None,
     trace_state: Union[bool, None] = None,
+    abstention_recheck: Union[bool, None] = None,
     fusion: str = FUSION_WEIGHTED,
 ) -> dict[str, Any]:
     """两组（baseline vs candidate）× 多数据集融合 A/B 对比。
@@ -808,6 +809,7 @@ def evaluate_compare(
             evidence_matcher=evidence_matcher,
             snapshot=snapshot,
             trace_state=trace_state,
+            abstention_recheck=abstention_recheck,
         ):
             by_key[r.spec.key] = r
         out: list[DatasetResult] = []

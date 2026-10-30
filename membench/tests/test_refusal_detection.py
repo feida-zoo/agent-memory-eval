@@ -456,3 +456,131 @@ class TestProbeEchoLeakTargets:
         assert "红线泄露" not in result.reason
         assert "题面回显不计泄露 1 项" in result.reason
         assert "拒答判定=llm" in result.reason
+
+
+def _abstain_q(category: str = "abstention") -> Question:
+    """非 judge_spec 的"该拒答"题（locomo 形态：gold 为哨兵、无 rubric）。"""
+    return Question(
+        qid="q_abstain",
+        question="What did we decide about the Tokyo trip?",
+        gold_answer=ABSTAIN_SENTINEL,
+        category=category,
+    )
+
+
+#: 改写式拒答：词表抓不到，但语义上是拒答。
+REWRITTEN_REFUSAL = "The memory doesn't record that, so it isn't something I can confirm."
+
+
+class TestAbstentionRecheckWithoutJudgeSpec:
+    """拒答复核必须覆盖所有"该拒答"的题，而不只是带 judge_spec 的。"""
+
+    def test_recheck_applies_without_judge_spec(self, monkeypatch) -> None:
+        stub = _StubChat('{"correct": true, "reason": "拒答正确"}', "YES")
+        judge = _llm_judge(monkeypatch, stub)
+        assert contains_refusal(REWRITTEN_REFUSAL) is False
+        result = judge.grade(_abstain_q(), ABSTAIN_SENTINEL, REWRITTEN_REFUSAL)
+        assert len(stub.calls) == 2  # 主判分 + 拒答复核
+        assert result.abstained_pred is True
+        assert result.correct is True          # correct 仍以模型判分为准
+        assert "拒答判定=llm" in result.reason
+        assert judge.abstention_recheck_calls == 1
+        assert judge.abstention_recheck_flips == 1
+
+    def test_recheck_prompt_has_no_sentinel(self, monkeypatch) -> None:
+        """**复核**提示词不得把标准答案 / 哨兵喂给模型：那等于告诉它"这题期望拒答"。
+
+        只断言复核那一次调用（主判分提示词里 <ABSTAIN> 是"哨兵语义"的规则说明，
+        另一件事，改它会动所有 accuracy，未在本轮范围）。
+        """
+        stub = _StubChat('{"correct": true, "reason": "ok"}', "YES")
+        judge = _llm_judge(monkeypatch, stub)
+        judge.grade(_abstain_q(), ABSTAIN_SENTINEL, REWRITTEN_REFUSAL)
+        recheck_messages = stub.calls[-1]
+        joined = "\n".join(str(item.get("content", "")) for item in recheck_messages)
+        assert ABSTAIN_SENTINEL not in joined
+        assert "【标准答案】" not in joined
+
+    def test_recheck_can_be_disabled(self, monkeypatch) -> None:
+        stub = _StubChat('{"correct": true, "reason": "ok"}')
+        judge = _llm_judge(monkeypatch, stub)
+        judge.abstention_recheck = False
+        result = judge.grade(_abstain_q(), ABSTAIN_SENTINEL, REWRITTEN_REFUSAL)
+        assert len(stub.calls) == 1  # 只有主判分
+        assert result.abstained_pred is False
+        assert "拒答判定=lexicon" in result.reason
+        assert judge.abstention_recheck_calls == 0
+
+    def test_non_abstention_question_not_rechecked(self, monkeypatch) -> None:
+        """不该拒答的题不进复核（否则每题多一次调用，且 over_refusal 会虚高）。"""
+        stub = _StubChat('{"correct": true, "reason": "ok"}')
+        judge = _llm_judge(monkeypatch, stub)
+        question = Question(
+            qid="q_util",
+            question="What is the budget?",
+            gold_answer="221,000 USD",
+            category="utility_answer",
+        )
+        judge.grade(question, "221,000 USD", "The budget is 221,000 USD.")
+        assert len(stub.calls) == 1
+        assert judge.abstention_recheck_calls == 0
+
+
+def test_run_metrics_record_abstention_recheck(tmp_path, monkeypatch) -> None:
+    """run 落账 abstention_recheck，且 abstention_accuracy 用复核后的判定。
+
+    构造一道 locomo 形态的拒答题（gold=<ABSTAIN>、无 judge_spec），回答是词表
+    抓不到的改写式拒答；模型判「正确」、复核判「拒答」——若不复核，
+    abstention_accuracy 会是 0。
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
+    from membench.runner import Runner
+
+    class _Adapter(BaseMemoryAdapter):
+        name = "recheck-run"
+
+        def reset(self) -> None:
+            return None
+
+        def ingest(self, messages: list[dict]) -> IngestStats:
+            return IngestStats()
+
+        def query(self, question: str) -> QueryResult:
+            return QueryResult(answer=REWRITTEN_REFUSAL, retrieved=[])
+
+    dialogue = {
+        "dialogue_id": "d1",
+        "sessions": [[{"role": "user", "content": "记一条。", "timestamp": None}]],
+        "questions": [
+            {
+                "qid": "q_abstain",
+                "question": "What did we decide about the Tokyo trip?",
+                "gold_answer": ABSTAIN_SENTINEL,
+                "category": "abstention",
+                "evidence": [],
+            }
+        ],
+    }
+    dataset = _Path(tmp_path) / "locomo_like.jsonl"
+    dataset.write_text(_json.dumps(dialogue, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    stub = _StubChat('{"correct": true, "reason": "拒答正确"}', "YES")
+    judge = _llm_judge(monkeypatch, stub)
+    dataset_dir = _Path(
+        Runner(
+            _Adapter(),
+            str(dataset),
+            judge=judge,
+            out_dir=str(_Path(tmp_path) / "exp"),
+            trace_state=False,
+        ).run()
+    )
+    metrics = _json.loads(
+        (dataset_dir / "report" / "metrics.json").read_text(encoding="utf-8")
+    )
+    assert metrics["abstention_recheck"] == {"n_calls": 1, "n_flipped": 1}
+    assert metrics["overall"]["abstention_accuracy"] == pytest.approx(1.0)
+    assert metrics["overall"]["abstention_n"] == 1

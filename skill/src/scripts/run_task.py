@@ -210,6 +210,8 @@ class CommonArgs:
     no_snapshot: bool = False
     #: ``--trace-state`` / ``--no-trace-state``：None = 不给参数（membench 自动判定）。
     trace_state: Optional[bool] = None
+    #: ``--abstention-recheck`` / ``--no-abstention-recheck``：None = 不给参数（默认开）
+    abstention_recheck: Optional[bool] = None
     evidence_match_threshold: Optional[float] = None
     llm_base_url: Optional[str] = None
     llm_api_key: Optional[str] = None
@@ -791,6 +793,12 @@ def _run_argv(
         argv += ["--no-snapshot"]
     if common.trace_state is not None:
         argv.append("--trace-state" if common.trace_state else "--no-trace-state")
+    if common.abstention_recheck is not None:
+        argv.append(
+            "--abstention-recheck"
+            if common.abstention_recheck
+            else "--no-abstention-recheck"
+        )
     if common.evidence_match_threshold is not None:
         argv += ["--evidence-match-threshold", str(common.evidence_match_threshold)]
     if common.llm_base_url:
@@ -855,6 +863,12 @@ def _evaluate_argv(
         argv += ["--no-snapshot"]
     if common.trace_state is not None:
         argv.append("--trace-state" if common.trace_state else "--no-trace-state")
+    if common.abstention_recheck is not None:
+        argv.append(
+            "--abstention-recheck"
+            if common.abstention_recheck
+            else "--no-abstention-recheck"
+        )
     if common.evidence_match_threshold is not None:
         argv += ["--evidence-match-threshold", str(common.evidence_match_threshold)]
     if common.llm_base_url:
@@ -1550,6 +1564,14 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--abstention-recheck",
+        dest="abstention_recheck",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="该拒答的题词表判「未拒答」时再发一次 YES/NO 复核（默认开启；"
+        "--no-abstention-recheck 省 LLM 调用，代价是改写式拒答记成未拒答）",
+    )
+    parser.add_argument(
         "--evidence-match-threshold",
         type=float,
         default=None,
@@ -1704,6 +1726,7 @@ def _common_from_args(args: argparse.Namespace) -> CommonArgs:
         limit=args.limit,
         no_snapshot=args.no_snapshot,
         trace_state=args.trace_state,
+        abstention_recheck=args.abstention_recheck,
         evidence_match_threshold=args.evidence_match_threshold,
         llm_base_url=args.llm_base_url,
         llm_api_key=args.llm_api_key,

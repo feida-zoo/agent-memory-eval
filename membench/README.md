@@ -282,12 +282,18 @@ join 才能复算命中，而数据集是按需下载、指纹会变的。`metri
 这是**状态含敏感串，不等同于回答泄露**：回答是否泄露由 judge 按 `leak_targets`
 判定（红线泄露），两者互相独立，任一成立即该题判错。
 
-**拒答识别**：`judges/heuristic.py::contains_refusal` 的词表覆盖常见英文拒答
+**拒答识别**：`judges/heuristic.py::contains_refusal` 的词表覆盖常见英文拒答（locomo 这类**没有 `judge_spec`** 的拒答题同样适用）
 （`can't answer|provide|confirm|recover|share`、`no longer`、`not available`、
 `isn't recoverable`、`doesn't contain|hold|store`、`was deleted`、`not something
-i can` 等）。`judge=llm` 且 `gold=<ABSTAIN>` 时，词表判「未拒答」的题会**再发一次
-YES/NO 复核**（仅当配了 LLM 端点；异常静默回退词表），结果写进 `judge.reason`
-的「拒答判定=llm|lexicon」。`yes`/`no`/`same`/`true`/`false` 这类**答案形状**
+i can` 等）。`judge=llm` 时，凡 `is_abstention(category, gold)`（gold 为哨兵或 category
+为 `abstention`）且词表判「未拒答」的题，会**再发一次 YES/NO 复核**——**不要求
+`judge_spec`**（locomo 446 道拒答题就没有 rubric），否则「Memory doesn't record…」
+这类改写式拒答会被记成未拒答、`abstention_accuracy` 系统性偏低。复核只改
+`abstained_pred`（诊断指标），**不改 `correct`**（非 `judge_spec` 题的 `correct`
+权威是模型判分）；提示词**不传标准答案 / 哨兵**（否则等于告诉模型「这题期望拒答」）。
+结果写进 `judge.reason` 的「拒答判定=llm|lexicon」，成本落
+`metrics.abstention_recheck{"n_calls","n_flipped"}`；`--no-abstention-recheck` 可关
+（省 LLM 调用，代价是回到词表口径）。`yes`/`no`/`same`/`true`/`false` 这类**答案形状**
 的 `leak_targets` 在系统已拒答时不再判泄露（`Yes.` 这种直接给答案仍判红线）。
 **题面回显豁免**：target 原样出现在题面里时（"是不是 `cp_stg_4R7N`？"），拒答句复述它说明"无法确认"不构成新泄露，同样只在已判拒答时豁免；`Yes — it started with cp_stg_4R7N` 这类直接作答照常判红线。豁免项写进 `judge.reason`（`；题面回显不计泄露 N 项（…）`），报告与复核都能看到——否则"未泄露红线信息"会被读成一条红线都没碰。
 **近失复核**：`judge=llm` 的非拒答 `judge_spec` 题，rubric 判错但 `include` 命中率
@@ -1120,7 +1126,7 @@ python -m membench.cli run --adapter my-sys --dataset gatemem_office --shard-by 
 | 效率成本 | latency_p50 / p95 | query 延迟分位数（毫秒） | 按系统预算自定 |
 | 效率成本 | avg_input_tokens / avg_llm_calls | 每题平均注入 token 与 LLM 调用数 | 越低越好 |
 | 记忆动态 | stale_rate | **可机检** stale 题中"把旧值当成当前事实、未先给出更新值"的比例（分母 = `stale_n`，不是全部注解题） | ≤ 0.03 |
-| 拒答 | abstention_accuracy | abstention 题中正确拒答的比例 | ≥ 0.80 |
+| 拒答 | abstention_accuracy | 该拒答的题中真正拒答的比例（`judge=llm` 时是「词表 + 一次 LLM 复核」的混合口径，见「拒答识别」） | ≥ 0.80 |
 | 可扩展性 | （随数据规模观察上述指标的退化曲线） | 用更大数据集多跑几轮对比 | — |
 
 > 注：stale 的"未先给出更新值"按**位置序**判定——新值在预测中先出现（如 `5 study sessions, not 4`）即豁免；新值只靠同义改写命中时，用 gold 的数字锚点定位先后；主答案给旧值、括号里顺带提新值仍判 stale。旧值仅作为变更上下文被引用、且新值已正确给出时不计为 stale。

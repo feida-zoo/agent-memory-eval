@@ -995,6 +995,7 @@ def run_datasets(
     evidence_matcher: Any = None,
     snapshot: Union[bool, None] = None,
     trace_state: Union[bool, None] = None,
+    abstention_recheck: Union[bool, None] = None,
 ) -> list[DatasetResult]:
     """对每个数据集用 Runner 各跑一次写进同一个实验目录，收集 metrics。
 
@@ -1029,6 +1030,7 @@ def run_datasets(
             evidence_matcher=evidence_matcher,
             write_task_reports=False,
             trace_state=trace_state,
+            abstention_recheck=abstention_recheck,
             **snapshot_kwarg,
         )
         run_dir = runner.run()
@@ -1685,6 +1687,7 @@ def evaluate(
     task_dir: Union[str, None] = None,
     snapshot: Union[bool, None] = None,
     trace_state: Union[bool, None] = None,
+    abstention_recheck: Union[bool, None] = None,
     fusion: str = FUSION_WEIGHTED,
 ) -> int:
     """执行全量评估：一个实验目录承载全部数据集 + 基准集融合 + 门禁 + 报告。
@@ -1873,6 +1876,7 @@ def evaluate(
             evidence_matcher=evidence_matcher,
             snapshot=snapshot,
             trace_state=trace_state,
+            abstention_recheck=abstention_recheck,
         ):
             provided_by_key[r.spec.key] = r
 

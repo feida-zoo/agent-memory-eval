@@ -967,6 +967,7 @@ class Runner:
         replay_mode: str = "auto",
         replay_verify_source: Union[str, None] = None,
         trace_state: Union[bool, None] = None,
+        abstention_recheck: Union[bool, None] = None,
     ) -> None:
         if jobs < 1:
             raise ValueError(f"jobs 必须 >= 1，当前为 {jobs}")
@@ -1026,6 +1027,11 @@ class Runner:
             self.judge_name = getattr(judge, "name", judge.__class__.__name__)
         # judge_model 缺省时从 judge 对象的 .model 自动补全（非空才算）
         self.judge_model = judge_model or getattr(self.judge, "model", None) or None
+        # 拒答复核开关：只有支持它的判分器（LLMJudge）才生效；None = 用判分器默认
+        if abstention_recheck is not None and hasattr(
+            self.judge, "abstention_recheck"
+        ):
+            self.judge.abstention_recheck = bool(abstention_recheck)
         # 检索命中口径：默认 substring（与历史分数一致），可注入 overlap / llm
         self._evidence_matcher = (
             evidence_matcher if evidence_matcher is not None else SubstringMatcher()
@@ -1525,6 +1531,13 @@ class Runner:
             token_usage["ingest_skipped"] = 1
         # 检索回退数按本次 run 增量统计（matcher 实例可在多数据集间共享）
         match_fallbacks_start = int(getattr(self._evidence_matcher, "fallbacks", 0) or 0)
+        # 拒答复核计数同样按增量：judge 实例在 evaluate 里跨数据集复用
+        recheck_calls_start = int(
+            getattr(self.judge, "abstention_recheck_calls", 0) or 0
+        )
+        recheck_flips_start = int(
+            getattr(self.judge, "abstention_recheck_flips", 0) or 0
+        )
         # 快照目录登记：普通 run 是本次导出的目录（逐对话 memory_snapshot/）；回放是
         # **源**的逐对话快照目录（数据集目录或源池里的桶），state_snapshot 依据
         snapshot_dirs: dict[str, str] = dict(replay_plan["snapshots"]) if replay_plan else {}
@@ -1629,6 +1642,7 @@ class Runner:
             trace_n: int = 0,
             ingest_blocks: Union[dict[str, Any], None] = None,
             state_scan: Union[dict[str, Any], None] = None,
+            abstention_recheck: Union[dict[str, Any], None] = None,
         ) -> dict[str, Any]:
             """组装某一层级的 metrics（数据集级 / 对话级同一套字段与口径）。
 
@@ -1745,6 +1759,10 @@ class Runner:
             if state_scan:
                 # 快照里的疑似日志/轨迹文件：只落账，不参与任何判定
                 out["state_scan"] = state_scan
+            if abstention_recheck:
+                # 拒答复核的成本与效果：n_calls 是额外 LLM 调用数，n_flipped 是
+                # 因此从"未拒答"翻成"拒答"的题数（abstention_accuracy 由此修正）
+                out["abstention_recheck"] = abstention_recheck
             out.update(retrieval_meta)
             if state is not None:
                 out["state_snapshot"] = state
@@ -2153,6 +2171,15 @@ class Runner:
             ),
             scope_dialogues=dialogues,
             trace_n=n_trace_states,
+            abstention_recheck={
+                "n_calls": int(getattr(self.judge, "abstention_recheck_calls", 0) or 0)
+                - recheck_calls_start,
+                "n_flipped": int(getattr(self.judge, "abstention_recheck_flips", 0) or 0)
+                - recheck_flips_start,
+            }
+            if int(getattr(self.judge, "abstention_recheck_calls", 0) or 0)
+            > recheck_calls_start
+            else None,
             # 数据集级：汇总全部 interleaved 对话的块；没有 interleaved 时不落该字段
             ingest_blocks=summarize_ingest_blocks(interleaved_blocks),
             state_scan=(

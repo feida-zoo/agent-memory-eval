@@ -245,6 +245,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "其余情况不开；可用 --no-trace-state 关闭",
     )
     p_run.add_argument(
+        "--abstention-recheck",
+        dest="abstention_recheck",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="该拒答的题（gold=<ABSTAIN> 或 category=abstention，**不限 judge_spec**）"
+        "词表判「未拒答」时，再发一次 YES/NO 复核（默认开启）；"
+        "--no-abstention-recheck 关闭可省 LLM 调用，代价是改写式拒答会被记成未拒答",
+    )
+    p_run.add_argument(
         "--replay",
         default=None,
         help="回放源：实验目录、runs/<dataset> 数据集目录，或回放任务（含 snapshots/index.json 的任务目录 / 其臂目录 A/ B/）；"
@@ -463,6 +472,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "sequence 对话用末尾 memory_snapshot/。默认自动：有 interleaved 对话含 safety 题时"
         "开启（safety 的「真遗忘」要读提问时点的状态），可用 --no-trace-state 关闭",
     )
+    p_ev.add_argument(
+        "--abstention-recheck",
+        dest="abstention_recheck",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="该拒答的题（gold=<ABSTAIN> 或 category=abstention，**不限 judge_spec**）"
+        "词表判「未拒答」时，再发一次 YES/NO 复核（默认开启）；"
+        "--no-abstention-recheck 关闭可省 LLM 调用，代价是改写式拒答会被记成未拒答",
+    )
     ev_group = p_ev.add_mutually_exclusive_group()
     ev_group.add_argument("--quick", action="store_true", help="快速模式：跳过 BEAM 与 LongMemEval-S（等价 --no-beam --no-lme-s，分钟级回归）")
     ev_group.add_argument("--beam-10m", action="store_true", help="BEAM 槽位使用 beam_10m.jsonl（默认 beam_1m.jsonl）")
@@ -581,6 +599,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "（在每个有提问的 as_of 导出 <对话目录>/trace_state/t<as_of>/）；"
         "sequence 对话用末尾 memory_snapshot/。默认自动：有 interleaved 对话含 safety 题时"
         "开启（safety 的「真遗忘」要读提问时点的状态），可用 --no-trace-state 关闭",
+    )
+    p_ev_cmp.add_argument(
+        "--abstention-recheck",
+        dest="abstention_recheck",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="该拒答的题（gold=<ABSTAIN> 或 category=abstention，**不限 judge_spec**）"
+        "词表判「未拒答」时，再发一次 YES/NO 复核（默认开启）；"
+        "--no-abstention-recheck 关闭可省 LLM 调用，代价是改写式拒答会被记成未拒答",
     )
     ev_cmp_group = p_ev_cmp.add_mutually_exclusive_group()
     ev_cmp_group.add_argument("--quick", action="store_true", help="快速模式：跳过 BEAM 与 LongMemEval-S（等价 --no-beam --no-lme-s）")
@@ -927,6 +954,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 shared=args.task_dir is not None,
                 snapshot=not args.no_snapshot,
                 trace_state=args.trace_state,
+                abstention_recheck=args.abstention_recheck,
                 replay=args.replay,
                 replay_mode=args.replay_mode,
                 replay_verify_source=args.replay_verify_source,
@@ -1631,6 +1659,7 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
             **_out_kwargs(args),
             **_snapshot_kwarg(args),
             trace_state=args.trace_state,
+            abstention_recheck=args.abstention_recheck,
         )
 
 
@@ -1705,6 +1734,7 @@ def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
             **_out_kwargs(args),
             **_snapshot_kwarg(args),
             trace_state=args.trace_state,
+            abstention_recheck=args.abstention_recheck,
         )
     return 1 if result["verdict"] == "FAIL" else 0
 
