@@ -775,8 +775,17 @@ python -m membench.cli series \
 - 报告 `reports/report.md`：**结论表**（线序 / 名称 / commit 短 sha / accuracy /
   证据召回率 / ↑vs 基线 / ↑vs 上一步 / 门禁）+ **逐指标表**（行=指标，列=各线 +
   每线 vs 基线的差值，始终保留基线一列）+ **逐数据集 accuracy 表**（多数据集时，
-  单元格为值 + (vs 基线)）+ 门禁明细 + 来源与产物表；配图
-  `reports/fig_series_accuracy.png`（accuracy 随线序的走势，多数据集为多条折线 + 融合粗线）。
+  单元格为值 + (vs 基线)）+ **逐数据集关键指标表**（多数据集时每个数据集一张：
+  行是八项指标、列是各线及其 vs 基线差值，与逐指标表同一口径）+ 门禁明细 +
+  来源与产物表。配图四张，全是同目录相对引用：
+  - `fig_series_accuracy.png`：accuracy 随线序的走势（多数据集多折线 + 融合粗线）；
+  - `fig_series_delta.png`：每条线的 accuracy 差值分组柱（vs 基线＝累计收益、
+    vs 上一步＝单步收益，负值即回退）——"每一步优化提升多少"直接看柱；
+  - `fig_series_fused.png`：融合层八项指标 × 各线分组柱（表太长时看趋势）；
+  - `fig_series_per_dataset.png`：逐数据集四项质量指标（accuracy / 证据召回 /
+    拒答准确 / 陈旧率）的分组柱，每个指标一个面板、柱按线分组。
+  柱顶标数值（比率按百分比），**未计算的指标不画柱**（"没算"不是 0），
+  图未生成时报告不写引用（不留死链）。
   各线的数据集树副本落 `runs/<线序>-<slug>/<dataset>/`（中文名经 `slug` 会退化成
   `default`，所以目录名带线序前缀；报告里给可点击的相对链接）。
 - 门禁与 `compare` 同口径（accuracy 降 >0.02 / stale_rate 升 >0.02 判 FAIL，
@@ -838,7 +847,8 @@ DIR/matrix_<ts>/
 
 # 多线对比（series：--report-out DIR 为父目录）
 DIR/series_<ts>/
-├── reports/{report.md,fig_series_accuracy.png}
+├── reports/{report.md, fig_series_accuracy.png, fig_series_delta.png,
+│             fig_series_fused.png, fig_series_per_dataset.png}
 └── runs/<线序>-<slug>/<dataset>/        # 各线的数据集树副本（报告内相对链接可点）
 
 ```

@@ -689,6 +689,209 @@ def fig_dataset_overview(
     return out_path
 
 
+def _nan_or(value: Any) -> float:
+    """``None``（未计算）画成缺口而不是 0——"没算"不等于"分数为 0"。"""
+    return float("nan") if value is None else float(value)
+
+
+def _annotate_bars(ax: Any, container: Any, *, decimals: int = 0) -> None:
+    """在柱顶标数值（比率按百分比）。
+
+    柱高为 0 时柱体本身看不见，没标注就会被读成"没数据"——这和"分数为 0"
+    是两回事，必须写出来；``NaN``（该线未计算该指标）跳过不标。
+    """
+    for bar in container:
+        height = bar.get_height()
+        if height != height:  # NaN
+            continue
+        text = f"{height * 100:.{decimals}f}%"
+        positive = height >= 0
+        ax.annotate(
+            text,
+            (bar.get_x() + bar.get_width() / 2, height),
+            textcoords="offset points",
+            xytext=(0, 2 if positive else -2),
+            ha="center",
+            va="bottom" if positive else "top",
+            fontsize=5.5,
+            rotation=90,
+            color="#333333",
+        )
+
+
+def fig_series_fused(
+    names: list[str],
+    values_by_metric: "dict[str, list[Any]]",
+    out_path: str,
+    *,
+    title: str = "融合层各指标（按线）",
+) -> str:
+    """多线对比用：融合层各指标 × 各线的分组柱。
+
+    行不写表也能看出"哪条线在哪一项上抬起来了"：x 轴是指标（全是 [0,1] 比率），
+    每个指标下一组柱对应各线。缺失值（该线未计算该指标）留空不画，避免被读成 0。
+
+    Args:
+        names: 各线显示名（顺序即柱的先后）。
+        values_by_metric: ``{指标 key: [各线取值]}``。
+        out_path: 输出 png 路径。
+        title: 图标题。
+    """
+    _setup_fonts()
+    metrics = list(values_by_metric)
+    fig, ax = plt.subplots(figsize=(max(9.0, 1.5 * len(metrics)), 4.8))
+    width = min(0.8 / max(len(names), 1), 0.3)
+    x = list(range(len(metrics)))
+    for li, name in enumerate(names):
+        vals = [_nan_or(values_by_metric[m][li]) for m in metrics]
+        offset = (li - (len(names) - 1) / 2) * width
+        _annotate_bars(
+            ax,
+            ax.bar(
+                [i + offset for i in x],
+                vals,
+                width,
+                label=name,
+                color=PALETTE[li % len(PALETTE)],
+            ),
+        )
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        [metric_label(m, with_key=False) for m in metrics], rotation=20, ha="right"
+    )
+    # 上边界留白：柱顶标注（100%）不要顶到标题上
+    ax.set_ylim(0, 1.12)
+    ax.set_ylabel("value")
+    ax.set_title(title)
+    ax.legend(fontsize=8, loc="best", framealpha=0.9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
+
+
+def fig_series_per_dataset(
+    names: list[str],
+    per_dataset: "dict[str, dict[str, list[Any]]]",
+    out_path: str,
+    *,
+    metrics: "list[tuple[str, str]] | None" = None,
+) -> str:
+    """多线对比用：逐数据集关键指标的分组柱（每个指标一个面板）。
+
+    为什么按指标分面而不是按数据集分面：同一指标的面板里各数据集共用 y 轴
+    （都是 [0,1] 比率），跨数据集高低一眼可比；若按数据集分面，读者要在
+    不同面板间对着不同量纲比。
+
+    缺失指标（该数据集未标注对应能力）留空不画柱；整个面板全无值时不建该
+    面板——"没算"不能画成 0。
+
+    Args:
+        names: 各线显示名。
+        per_dataset: ``{数据集: {指标: [各线取值]}}``。
+        out_path: 输出 png 路径。
+        metrics: ``[(指标 key, 面板标题), ...]``；缺省取四项质量指标
+            （accuracy / evidence_recall / abstention_accuracy / stale_rate）。
+    """
+    _setup_fonts()
+    if metrics is None:
+        metrics = [
+            ("accuracy", "正确率"),
+            ("evidence_recall", "证据召回率"),
+            ("abstention_accuracy", "拒答准确率"),
+            ("stale_rate", "陈旧率（越低越好）"),
+        ]
+    panels = [
+        (key, label)
+        for key, label in metrics
+        if any(
+            any(value is not None for value in per_dataset[ds].get(key, []))
+            for ds in per_dataset
+        )
+    ]
+    if not panels:
+        raise ValueError("没有可画的逐数据集指标（全部为 None）")
+    cols = 2
+    rows = (len(panels) + cols - 1) // cols
+    fig, axes = plt.subplots(
+        rows, cols, figsize=(max(10.0, 1.6 * len(per_dataset)), 3.6 * rows), squeeze=False
+    )
+    datasets = list(per_dataset)
+    width = min(0.8 / max(len(names), 1), 0.3)
+    x = list(range(len(datasets)))
+    for index, (key, label) in enumerate(panels):
+        ax = axes[index // cols][index % cols]
+        for li, name in enumerate(names):
+            vals = [_nan_or(per_dataset[ds].get(key, [None] * len(names))[li]) for ds in datasets]
+            offset = (li - (len(names) - 1) / 2) * width
+            _annotate_bars(
+                ax,
+                ax.bar(
+                    [i + offset for i in x],
+                    vals,
+                    width,
+                    label=name,
+                    color=PALETTE[li % len(PALETTE)],
+                ),
+            )
+        ax.set_xticks(x)
+        ax.set_xticklabels(datasets, rotation=15, ha="right")
+        ax.set_ylim(0, 1.12)
+        ax.set_ylabel("value")
+        ax.set_title(label)
+        ax.legend(fontsize=7, loc="best", framealpha=0.9)
+    for index in range(len(panels), rows * cols):
+        axes[index // cols][index % cols].axis("off")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
+
+
+def fig_series_delta(
+    names: list[str],
+    vs_base: list[Any],
+    vs_prev: list[Any],
+    out_path: str,
+) -> str:
+    """多线对比用：每条线的 accuracy 差值（vs 基线 / vs 上一步）分组柱。
+
+    这张图直接回答"每一步优化提升多少"：两组柱并排，``vs 基线`` 看累计收益、
+    ``vs 上一步`` 看单步收益；差值为负说明回退。基线自身没有差值，柱为空。
+
+    Args:
+        names: 各线显示名。
+        vs_base: 各线 accuracy 相对基线的差值（小数，0.018 = +1.8pp）。
+        vs_prev: 各线 accuracy 相对上一步的差值。
+        out_path: 输出 png 路径。
+    """
+    _setup_fonts()
+    fig, ax = plt.subplots(figsize=(max(7.5, 1.4 * len(names)), 4.2))
+    x = list(range(len(names)))
+    width = 0.36
+    series = [("vs 基线（累计）", vs_base, PALETTE[0]), ("vs 上一步（单步）", vs_prev, PALETTE[1])]
+    for si, (label, values, color) in enumerate(series):
+        vals = [_nan_or(v) for v in values]
+        offset = (si - 0.5) * width
+        # 差值多是零点几个百分点，取 1 位小数（四舍五入到整数会把 18.5% → 19%）
+        _annotate_bars(
+            ax,
+            ax.bar([i + offset for i in x], vals, width, label=label, color=color),
+            decimals=1,
+        )
+    ax.axhline(0, color="#444444", linewidth=0.8)
+    ax.margins(y=0.22)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=20, ha="right")
+    ax.set_ylabel("Δaccuracy")
+    ax.set_title("每条线的 accuracy 变化（正=提升）")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
+
+
 def fig_series_accuracy(
     names: list[str],
     headline: list[Any],

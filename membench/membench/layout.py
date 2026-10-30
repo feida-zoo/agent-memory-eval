@@ -108,6 +108,12 @@ FIG_MATRIX_ACCURACY = "fig_matrix_accuracy.png"
 FIG_PER_DATASET_DIFF = "fig_per_dataset_diff.png"
 FIG_FUSED_DIFF = "fig_fused_diff.png"
 FIG_SERIES_ACCURACY = "fig_series_accuracy.png"
+#: 多线对比：融合层各指标 × 各线的分组柱。
+FIG_SERIES_FUSED = "fig_series_fused.png"
+#: 多线对比：逐数据集关键指标（每个数据集一个面板，柱按线分组）。
+FIG_SERIES_PER_DATASET = "fig_series_per_dataset.png"
+#: 多线对比：每条线的 accuracy 差值（vs 基线 / vs 上一步）。
+FIG_SERIES_DELTA = "fig_series_delta.png"
 
 #: 实验目录名安全化：非字母数字与 ``._-`` 的字符替换为 ``-``。
 _UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")

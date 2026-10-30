@@ -36,7 +36,8 @@
 
 产物写到 ``out_dir``（完整实验目录，见 :mod:`membench.layout`）::
 
-    <out_dir>/reports/{report.md, fig_series_accuracy.png}
+    <out_dir>/reports/{report.md, fig_series_accuracy.png, fig_series_delta.png,
+                       fig_series_fused.png, fig_series_per_dataset.png}
     <out_dir>/runs/<线序>-<slug>/<dataset>/   # 各线的数据集树副本（报告内相对链接）
 
 **只读**：各线的产物目录（实验目录或 ``runs/<dataset>`` 数据集目录）原样不动；本模块
@@ -73,7 +74,15 @@ from membench.evaluate import (
 from membench.judges.llm import chat_completion
 from membench.paths import output_root
 from membench.ratings import RATE_METRICS, format_metric_value
-from membench.report import _md_table, dim_label, fig_series_accuracy, metric_label
+from membench.report import (
+    _md_table,
+    dim_label,
+    fig_series_accuracy,
+    fig_series_delta,
+    fig_series_fused,
+    fig_series_per_dataset,
+    metric_label,
+)
 
 #: 第一条（无显式名）线的报告名。
 BASELINE_NAME = "基线"
@@ -726,6 +735,12 @@ def _write_series_report(
     worst = _worst_verdict(entries)
     icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌"}.get(worst, "")
 
+    def figure(alt: str, filename: str) -> None:
+        """图存在才写引用：matplotlib 缺失 / 无可画数据时不留下坏链接。"""
+        if os.path.isfile(os.path.join(reports_dir, filename)):
+            lines.append(f"![{alt}]({filename})")
+            lines.append("")
+
     lines: list[str] = []
     lines.append("# membench 多线对比报告")
     lines.append("")
@@ -791,6 +806,8 @@ def _write_series_report(
         )
     )
     lines.append("")
+    # 每步提升多少看柱更直观：vs 基线（累计）与 vs 上一步（单步）两组柱并排
+    figure("每条线的 accuracy 变化", layout.FIG_SERIES_DELTA)
 
     # 2. 逐指标表（行=指标，列=各线 + 每线 vs 基线的差值；始终保留基线一列）
     lines.append("## 逐指标表")
@@ -817,6 +834,7 @@ def _write_series_report(
         metric_rows.append(row)
     lines.append(_md_table(headers, metric_rows))
     lines.append("")
+    figure("融合层各指标（按线）", layout.FIG_SERIES_FUSED)
 
     # 3. 逐数据集 accuracy（多数据集时）
     if multi:
@@ -846,6 +864,38 @@ def _write_series_report(
             _md_table(["数据集", base["name"], *[e["name"] for e in entries[1:]]], ds_rows)
         )
         lines.append("")
+
+        # 3.1 逐数据集关键指标（每个数据集一张：行=指标，列=各线，括号内为 vs 基线差值）
+        lines.append("## 逐数据集关键指标（vs 基线）")
+        lines.append("")
+        lines.append(
+            "<sub>每个数据集一张表：行是参与融合的八项指标，列是各线，"
+            "非基线列括号内是该集相对基线的差值（比率类为百分点）。"
+            "某数据集没有该指标（未标注对应能力）时显示「未定义」，不当 0 处理。</sub>"
+        )
+        lines.append("")
+        for key in dataset_keys:
+            base_overall = base["datasets"][key].metrics.get("overall", {})
+            ds_headers = [f"{key} · 指标", base["name"]]
+            for entry in entries[1:]:
+                ds_headers.extend([entry["name"], f"{entry['name']} vs 基线"])
+            ds_metric_rows = []
+            for metric in FUSED_METRICS:
+                base_value = base_overall.get(metric)
+                row = [metric_label(metric), _value_cell(metric, base_value)]
+                for entry in entries[1:]:
+                    value = (
+                        entry["datasets"][key].metrics.get("overall", {}).get(metric)
+                    )
+                    row.extend(
+                        [_value_cell(metric, value), _delta(metric, value, base_value)]
+                    )
+                ds_metric_rows.append(row)
+            lines.append(f"### {key}")
+            lines.append("")
+            lines.append(_md_table(ds_headers, ds_metric_rows))
+            lines.append("")
+        figure("逐数据集关键指标（按线）", layout.FIG_SERIES_PER_DATASET)
 
     # 4. 图表
     lines.append("## accuracy 走势")
@@ -1068,6 +1118,45 @@ def run_series(
         else None,
         headline_label="融合值" if multi else "accuracy",
     )
+    # 融合层各指标 × 各线：表太长时柱更直观；全 None 的指标不画（"没算"不是 0）
+    fused_metrics_drawn = {
+        metric: [entry["overall"].get(metric) for entry in entries]
+        for metric in FUSED_METRICS
+        if any(entry["overall"].get(metric) is not None for entry in entries)
+    }
+    if fused_metrics_drawn:
+        fig_series_fused(
+            [entry["name"] for entry in entries],
+            fused_metrics_drawn,
+            os.path.join(reports_dir, layout.FIG_SERIES_FUSED),
+        )
+    fig_series_delta(
+        [entry["name"] for entry in entries],
+        [entry["diff_vs_base"] for entry in entries],
+        [entry["diff_vs_prev"] for entry in entries],
+        os.path.join(reports_dir, layout.FIG_SERIES_DELTA),
+    )
+    if multi:
+        per_dataset_values = {
+            key: {
+                metric: [
+                    entry["datasets"][key].metrics.get("overall", {}).get(metric)
+                    for entry in entries
+                ]
+                for metric in FUSED_METRICS
+            }
+            for key in dataset_keys
+        }
+        try:
+            fig_series_per_dataset(
+                [entry["name"] for entry in entries],
+                per_dataset_values,
+                os.path.join(reports_dir, layout.FIG_SERIES_PER_DATASET),
+            )
+        except ValueError:
+            # 所有数据集的四项质量指标都为 None（例如整批只跑拒答题）：不画图，
+            # 报告里的表格仍是完整事实，不因此中断。
+            pass
     report_path = _write_series_report(
         reports_dir,
         entries,

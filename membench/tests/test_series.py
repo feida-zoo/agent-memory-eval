@@ -728,6 +728,66 @@ def test_series_multi_dataset_fusion_excludes_office(tmp_path: Path, git_repo) -
     _assert_links_alive(report_path)
 
 
+def test_series_per_dataset_metrics_and_bar_charts(
+    tmp_path: Path, git_repo
+) -> None:
+    """逐数据集关键指标表 + 三张柱状图：表格与图都要有，且引用无死链。
+
+    表的单元格口径与逐指标表一致：值 + （vs 基线差值）；图是"对比看柱更清楚"
+    的补充，因此图与表必须同一个数据源（都来自各线各数据集的 metrics.overall）。
+    """
+    repo, shas = git_repo
+    datasets = (str(SAMPLE_DATASET_PATH), str(builtin_office_dataset_path()))
+    runs = [
+        _run(tmp_path, f"charts{i}", quality, datasets=datasets)
+        for i, quality in enumerate((40, 80))
+    ]
+    specs = [f"{sha}={run}" for sha, run in zip(shas, runs)]
+
+    result = series.run_series(specs, repo=repo, report_out=str(tmp_path / "out"))
+    report_path = Path(result["report_path"])
+    report = report_path.read_text(encoding="utf-8")
+
+    # 逐数据集关键指标：每个数据集一小节，行是指标、列是各线
+    assert "## 逐数据集关键指标（vs 基线）" in report
+    for dataset in ("office_dataset", "sample_dataset"):
+        assert f"### {dataset}" in report
+    section = report.split("## 逐数据集关键指标（vs 基线）", 1)[1]
+    section = section.split("## accuracy 走势", 1)[0]
+    for metric in ("正确率", "证据召回率", "陈旧率"):
+        assert metric in section
+
+    # 三张新图：都真实产出且被报告引用
+    reports_dir = report_path.parent
+    for name in (
+        layout.FIG_SERIES_FUSED,
+        layout.FIG_SERIES_PER_DATASET,
+        layout.FIG_SERIES_DELTA,
+    ):
+        assert (reports_dir / name).is_file(), f"{name} 未生成"
+        assert f"]({name})" in report, f"{name} 未在报告中引用"
+    _assert_links_alive(report_path)
+
+
+def test_series_single_dataset_has_no_per_dataset_section(
+    tmp_path: Path, git_repo
+) -> None:
+    """单数据集：不重复出"逐数据集"表/图（融合表就是该数据集本身）。"""
+    repo, shas = git_repo
+    runs = [_run(tmp_path, f"single{i}", quality) for i, quality in enumerate((40, 80))]
+    specs = [f"{sha}={run}" for sha, run in zip(shas, runs)]
+
+    result = series.run_series(specs, repo=repo, report_out=str(tmp_path / "out"))
+    report_path = Path(result["report_path"])
+    report = report_path.read_text(encoding="utf-8")
+    assert "## 逐数据集关键指标" not in report
+    assert not (report_path.parent / layout.FIG_SERIES_PER_DATASET).exists()
+    # 融合层与差值的柱状图仍然有（单数据集同样需要看图）
+    assert (report_path.parent / layout.FIG_SERIES_FUSED).is_file()
+    assert (report_path.parent / layout.FIG_SERIES_DELTA).is_file()
+    _assert_links_alive(report_path)
+
+
 def test_series_dataset_flag_selects_one(tmp_path: Path, git_repo) -> None:
     repo, shas = git_repo
     datasets = (str(SAMPLE_DATASET_PATH), str(builtin_office_dataset_path()))
