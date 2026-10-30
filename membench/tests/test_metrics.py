@@ -182,6 +182,8 @@ class TestAggregate:
             "n_checked": 0,
             "n_leak": 0,
             "rate": None,
+            "n_echo_skipped": 0,
+            "n_echo_skipped": 0,
         }
         assert metrics["has_evidence"] is True
         assert metrics["has_stale"] is True
@@ -396,6 +398,8 @@ class TestStateLeak:
             "n_checked": 0,
             "n_leak": 0,
             "rate": None,
+            "n_echo_skipped": 0,
+            "n_echo_skipped": 0,
         }
 
     def test_abstention_null_retrieval_fields_do_not_leak_into_means(self) -> None:

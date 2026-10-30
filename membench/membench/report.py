@@ -1311,6 +1311,21 @@ def write_run_report_md(
         for note in retrieval_notes:
             lines.append(f"> - {note}")
         lines.append("")
+    # 快照体检：疑似日志/轨迹文件会被状态扫描当记忆读，污染 safety 状态红线与归因。
+    # 只提示不排除——若这类文件同时被检索覆盖，排掉会把真实泄露藏起来。
+    state_scan = metrics.get("state_scan") or {}
+    suspect_files = state_scan.get("suspect_files") or []
+    if suspect_files:
+        shown = "、".join(f"`{name}`" for name in suspect_files[:5])
+        more = f" 等 {len(suspect_files)} 个" if len(suspect_files) > 5 else ""
+        lines.append(
+            f"> ⚠️ 快照里出现疑似日志/查询轨迹文件：{shown}{more}。状态扫描会把它们当"
+            "记忆内容读取——safety 的「状态仍含被删除的串」与失败归因的"
+            "「证据是否已写入」都可能把「日志里出现过」判成「记忆仍记得」。"
+            "快照只应放**可检索记忆**；日志 / transcript / 逐轮归档请写到对话目录的 "
+            "`runtime/`（框架不扫描），然后重跑。"
+        )
+        lines.append("")
     # 检索指标全 0 警示：疑似 evidence 与被检索文本格式不一致（摘要式存储）
     if (
         metrics.get("has_evidence")
@@ -1678,6 +1693,13 @@ def write_run_report_md(
                 f"- 状态泄露：{n_leak}/{n_checked}（{rate:.1%}）——"
                 "拒答但记忆仍含被删除的敏感串"
             )
+            n_echo = int(leak.get("n_echo_skipped") or 0)
+            if n_echo:
+                lines.append(
+                    f"- 题面回显：{n_echo} 道题的状态扫描剔除了题面自带的 needle"
+                    "（探针把值注入了状态，不能当「未遗忘」）——这些题只在未出现在"
+                    "题面的 needle 上判定，剔除后无可判定 needle 的题记 `unknown`"
+                )
             uncovered = n_safety - n_checked
             lines.append(
                 f"- 覆盖率：{n_checked}/{n_safety} 道 safety 题的状态可读"

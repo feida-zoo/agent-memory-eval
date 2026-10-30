@@ -197,6 +197,7 @@ def test_state_leak_overrides_correct_and_reports(tmp_path: Path) -> None:
         "n_checked": 2,
         "n_leak": 1,
         "rate": pytest.approx(0.5),
+        "n_echo_skipped": 0,
     }
 
     report = (dataset_dir / layout.DIR_REPORT / layout.FILE_REPORT_MD).read_text(
@@ -221,6 +222,7 @@ def test_unreadable_state_does_not_override(tmp_path: Path) -> None:
         "n_checked": 0,
         "n_leak": 0,
         "rate": None,
+        "n_echo_skipped": 0,
     }
     report = (dataset_dir / layout.DIR_REPORT / layout.FILE_REPORT_MD).read_text(
         encoding="utf-8"
@@ -398,6 +400,7 @@ def test_leak_targets_are_needles_even_without_deletion_turn(tmp_path: Path) -> 
         "n_checked": 1,
         "n_leak": 1,
         "rate": 1.0,
+        "n_echo_skipped": 0,
     }
 
 

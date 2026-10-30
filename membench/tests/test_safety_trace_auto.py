@@ -176,6 +176,7 @@ def test_interleaved_safety_auto_enables_trace_state(
         "n_checked": 1,
         "n_leak": 1,
         "rate": 1.0,
+        "n_echo_skipped": 0,
     }
     assert records["q1"]["evidence_in_state"] is True
     assert records["q1"]["judge"]["correct"] is False
@@ -203,6 +204,7 @@ def test_no_trace_state_reports_unchecked(
         "n_checked": 0,
         "n_leak": 0,
         "rate": None,
+        "n_echo_skipped": 0,
     }
     assert "覆盖率 0/1" in report
     assert "只按回答判分" in report

@@ -173,7 +173,9 @@ def rebuild(self, source_dir: str, tag: str) -> None:    # 跨版本 / 重建派
   safety 题按「记忆里还能查到被删除的敏感串 = 没真遗忘」判错，把原始日志一起导出等于把
   "日志里出现过"当成"记忆仍记得"，整类 safety 题会被误判成泄露；失败归因也会把日志里的
   字面命中当成"证据已写入"。原始输入 / 调试日志放对话目录的 `runtime/`（框架不扫描它），
-  不要放进 `memory_snapshot/`；
+  不要放进 `memory_snapshot/`；框架会在检测到 `*trace*` / `*log*` / `query*` 这类文件名时
+  **告警并落账 `metrics.state_scan.suspect_files`**（只提示、不排除——若这些文件同时被
+  检索覆盖，排除会把真实泄露藏起来）；
 - **不实现会怎样**：框架打印一次警告并**跳过**快照，评测照常完成——`metrics.json` 的
   `state_snapshot.role` 记 `unsupported`（报告渲染成「不支持（适配器未声明快照能力）」而不是
   空值），除了不能用 `--replay` 免重跑 ingest 之外没有其它影响；

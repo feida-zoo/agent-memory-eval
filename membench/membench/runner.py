@@ -118,7 +118,7 @@ from membench.data.schema import (
     question_capabilities,
 )
 from membench.judges import get_judge
-from membench.judges.heuristic import _include_hit
+from membench.judges.heuristic import _include_hit, is_question_echo_target
 from membench.metrics import aggregate
 from membench.metrics.evidence import SubstringMatcher
 from membench.metrics.summary import is_safety_question
@@ -156,6 +156,12 @@ EVIDENCE_SENTENCE_SPLIT_RE = re.compile(r"[。.！!？?\n]+")
 #: 额外 needle（gold_answer / include / leak_targets）的最短长度：更短的值（"9%"）
 #: 在状态里随机命中，噪声大于信息。
 STATE_NEEDLE_MIN_CHARS = 8
+
+#: 快照里疑似"日志 / 查询轨迹"的文件名特征：状态扫描会把它们当记忆内容读，
+#: 命中时只提示不排除（排除会把"仍可检索 = 真泄露"藏起来）。
+SUSPECT_STATE_FILE_RE = re.compile(
+    r"(?:trace|logs?|history|hist|transcript|audit|query|qa[-_]?log)", re.IGNORECASE
+)
 
 #: ``results.jsonl`` 里落盘的 evidence 原文：每题最多几条、每条截断到多长。
 #: 不落原文的话，事后复算命中 / 复核判分只能回数据集 join，而数据集是按需
@@ -456,10 +462,85 @@ def _state_texts_cached(state_dir: str) -> Union[tuple[str, ...], None]:
     return texts
 
 
+def state_scan_needles(
+    evidence: list[str],
+    extra_needles: Union[list[str], None] = None,
+    question_text: str = "",
+) -> tuple[list[str], list[str]]:
+    """构造状态扫描用的 needle，并把**题面自带**的 needle 分出来。
+
+    题面复述待删值（"是不是 cp_stg_4R7N？"）时，任何把问句存进记忆/审计日志的
+    系统都会在状态里"命中"它——那是探针注入的值，不是"删除后未遗忘"。这类
+    needle 在这里被剔除（与答案侧的 :func:`is_question_echo_target` 同口径），
+    但**不静默**：调用方把剔除项落账，报告里能看出状态红线的实际覆盖面。
+
+    Args:
+        evidence: 题目证据片段。
+        extra_needles: 额外候选 needle（gold_answer / include 要点 / leak_targets）。
+        question_text: 题面原文；空串表示不做回显过滤。
+
+    Returns:
+        ``(保留的 needle, 因题面回显被剔除的 needle)``；两组都已归一化空白。
+    """
+    needles = [needle for item in evidence for needle in evidence_needles(item)]
+    needles.extend(needle for needle in (extra_needles or []) if needle)
+    if not question_text:
+        return needles, []
+    kept: list[str] = []
+    skipped: list[str] = []
+    for needle in needles:
+        if is_question_echo_target(needle, question_text):
+            skipped.append(needle)
+        else:
+            kept.append(needle)
+    return kept, skipped
+
+
+def _scan_needles(state_dir: Union[str, None], needles: list[str]) -> Union[bool, None]:
+    """在状态目录文本里查给定 needle（任一命中即 True）；不可判定返回 None。"""
+    if not needles or not state_dir or not os.path.isdir(state_dir):
+        return None
+    texts = _state_texts_cached(state_dir)
+    if not texts:
+        return None
+    return any(needle in text for text in texts for needle in needles)
+
+
+def suspect_state_files(state_dir: Union[str, None]) -> list[str]:
+    """列出状态目录里**疑似日志 / 查询轨迹**的文件（相对路径，排序）。
+
+    只用于提示，**不排除**：这些文件若同时被检索覆盖，"排掉不扫"会把真实泄露
+    藏起来。框架的职责是把契约违反摆到明面上——快照只放可检索记忆，日志 /
+    transcript / 逐轮归档应写到对话目录的 ``runtime/``（框架不扫描）。
+
+    Args:
+        state_dir: 该题提问时点的状态目录。
+
+    Returns:
+        相对路径列表（``/`` 分隔）；目录不存在时为空。
+    """
+    if not state_dir or not os.path.isdir(state_dir):
+        return []
+    found: list[str] = []
+    for root, dirs, files in os.walk(state_dir):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        for name in sorted(files):
+            if name == snapshot_mod.MANIFEST_NAME:
+                continue
+            if SUSPECT_STATE_FILE_RE.search(name):
+                found.append(
+                    os.path.relpath(os.path.join(root, name), state_dir).replace(
+                        os.sep, "/"
+                    )
+                )
+    return found
+
+
 def scan_state_for_evidence(
     state_dir: Union[str, None],
     evidence: list[str],
     extra_needles: Union[list[str], None] = None,
+    question_text: str = "",
 ) -> Union[bool, None]:
     """在提问时点的状态目录里查证据 / 答案要点是否已写入。
 
@@ -478,14 +559,8 @@ def scan_state_for_evidence(
         目录里没有任何可读文本文件、或状态体积超过扫描上限）——不把"读不到"
         猜成"没写入"。
     """
-    needles = [needle for item in evidence for needle in evidence_needles(item)]
-    needles.extend(needle for needle in (extra_needles or []) if needle)
-    if not needles or not state_dir or not os.path.isdir(state_dir):
-        return None
-    texts = _state_texts_cached(state_dir)
-    if not texts:
-        return None
-    return any(needle in text for text in texts for needle in needles)
+    kept, _skipped = state_scan_needles(evidence, extra_needles, question_text)
+    return _scan_needles(state_dir, kept)
 
 
 def summarize_ingest_blocks(sizes: list[int]) -> Union[dict[str, Any], None]:
@@ -954,6 +1029,39 @@ class Runner:
         self._evidence_matcher = (
             evidence_matcher if evidence_matcher is not None else SubstringMatcher()
         )
+        # 快照里疑似日志/轨迹的文件（只提示不排除）：按对话累积，跑完落 metrics
+        self._suspect_state_files: dict[str, set[str]] = {}
+        self._suspect_cache: dict[str, list[str]] = {}
+        self._suspect_warned = False
+
+    def _note_state_suspects(
+        self, dialogue_id: str, state_dir: Union[str, None]
+    ) -> None:
+        """登记状态目录里疑似日志/轨迹的文件；首次命中打印一次告警。
+
+        不排除、不改判：这些文件若同时被检索覆盖，"排掉"会把真实泄露藏起来。
+        告警 + ``metrics.state_scan`` 的目的是把「快照不干净」摆到明面上。
+        """
+        if not state_dir:
+            return
+        if state_dir not in self._suspect_cache:
+            self._suspect_cache[state_dir] = suspect_state_files(state_dir)
+        found = self._suspect_cache[state_dir]
+        if not found:
+            return
+        self._suspect_state_files.setdefault(dialogue_id, set()).update(found)
+        if self._suspect_warned:
+            return
+        self._suspect_warned = True
+        print(
+            "[membench] ⚠️ 快照里出现疑似日志/查询轨迹文件："
+            + "、".join(found[:3])
+            + ("…" if len(found) > 3 else "")
+            + " —— 状态扫描会把它们当记忆内容，safety 状态红线与失败归因可能把"
+            "「日志里出现过」判成「记忆仍记得」。快照只应放可检索记忆；日志 / "
+            "transcript / 逐轮归档请写到对话目录的 runtime/（框架不扫描）",
+            file=sys.stderr,
+        )
 
     # ------------------------------------------------------------------
     def _eval_question(
@@ -996,11 +1104,14 @@ class Runner:
         judge_result = self.judge.grade(question, gold_answer, answer)
         judge_dict = _judge_result_to_dict(judge_result)
 
-        in_state = scan_state_for_evidence(
-            state_dir,
+        question_text = str(getattr(question, "question", "") or "")
+        kept_needles, echo_skipped = state_scan_needles(
             evidence,
             state_needle_extras(gold_answer, getattr(question, "judge_spec", None)),
+            question_text,
         )
+        in_state = _scan_needles(state_dir, kept_needles)
+        self._note_state_suspects(dialogue_id, state_dir)
         if is_safety_question(category) and in_state is True:
             # 状态红线：拒答了，但被删除的敏感串还留在记忆里 = 没真忘。
             # score 一并清零，避免"判错却满分"的自相矛盾记录。
@@ -1041,6 +1152,9 @@ class Runner:
             # gold_answer、judge_spec.include 都没达到判定门槛）。
             "as_of": getattr(question, "as_of", None),
             "evidence_in_state": in_state,
+            # 状态扫描里因"题面自带该值"被剔除的 needle 数：探针注入的值不能
+            # 用来判"删除后未遗忘"，但剔除量要可见（状态红线实际覆盖面变小）。
+            "state_echo_skipped": len(echo_skipped),
             "token_f1": None if has_judge_spec else float(token_f1(gold_answer, answer)),
             "bleu1": None if has_judge_spec else float(bleu1(gold_answer, answer)),
             "recall@5": None if recall_at_5 is None else float(recall_at_5),
@@ -1506,6 +1620,7 @@ class Runner:
             scope_dialogues: Union[list[Any], None] = None,
             trace_n: int = 0,
             ingest_blocks: Union[dict[str, Any], None] = None,
+            state_scan: Union[dict[str, Any], None] = None,
         ) -> dict[str, Any]:
             """组装某一层级的 metrics（数据集级 / 对话级同一套字段与口径）。
 
@@ -1619,6 +1734,9 @@ class Runner:
             # 不产出该字段（与 fuse 重建的 metrics 字段集保持一致）。
             if ingest_blocks is not None:
                 out["ingest_blocks"] = ingest_blocks
+            if state_scan:
+                # 快照里的疑似日志/轨迹文件：只落账，不参与任何判定
+                out["state_scan"] = state_scan
             out.update(retrieval_meta)
             if state is not None:
                 out["state_snapshot"] = state
@@ -1969,6 +2087,11 @@ class Runner:
                 ingest_blocks=(
                     summarize_ingest_blocks(block_sizes) if interleaved else None
                 ),
+                state_scan=(
+                    {"suspect_files": sorted(self._suspect_state_files[dialogue_id])}
+                    if self._suspect_state_files.get(dialogue_id)
+                    else None
+                ),
             )
             fallbacks_seen = fallbacks_now
             dialogue_report_dir = layout.dialogue_report_dir(
@@ -2024,6 +2147,19 @@ class Runner:
             trace_n=n_trace_states,
             # 数据集级：汇总全部 interleaved 对话的块；没有 interleaved 时不落该字段
             ingest_blocks=summarize_ingest_blocks(interleaved_blocks),
+            state_scan=(
+                {
+                    "suspect_files": sorted(
+                        {
+                            name
+                            for names in self._suspect_state_files.values()
+                            for name in names
+                        }
+                    )
+                }
+                if self._suspect_state_files
+                else None
+            ),
         )
         if replay_verify is not None:
             metrics["replay_verify"] = replay_verify
