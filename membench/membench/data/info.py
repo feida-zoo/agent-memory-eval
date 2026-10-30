@@ -316,6 +316,45 @@ def resolve_available_path(key: str) -> Path | None:
     return None
 
 
+def infer_dataset_source(path: str | Path) -> "str | None":
+    """按**文件路径**反推数据集来源标签；认不出来时返回 ``None``。
+
+    为什么需要它：``dataset fetch`` 的公开基准集路径一旦被显式传给 CLI
+    （``--dataset ~/.membench/datasets/locomo.jsonl``，或编排器 ``--common``
+    先把清单解析成路径再逐个下发），解析层看到的是"一个存在的文件"，默认会
+    记成 ``user-specified``——报告里于是把公开基准集标成"用户自定义"。
+
+    判定顺序：
+
+    1. 路径等于某条目的内置文件（``membench/data/<builtin_file>``）→ ``office``
+       记 ``builtin-office``，其余记 ``builtin``；
+    2. 路径位于 :func:`datasets_dir` 且文件名 stem 命中注册表里的 ``fetch``
+       条目 → ``fetch``；
+    3. 其余 → ``None``（调用方按 ``user-specified`` 兜底）。
+
+    Args:
+        path: 数据集 JSONL 路径（相对路径按当前工作目录解析）。
+
+    Returns:
+        来源标签或 ``None``。
+    """
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except OSError:
+        return None
+    for info in DATASET_REGISTRY.values():
+        if info.builtin_file is None:
+            continue
+        if resolved == (_DATA_DIR / info.builtin_file).resolve():
+            return "builtin-office" if info.key == "office" else "builtin"
+    fetch_dir = datasets_dir().resolve()
+    if resolved.parent == fetch_dir:
+        info = DATASET_REGISTRY.get(resolved.stem)
+        if info is not None and info.status == "fetch":
+            return "fetch"
+    return None
+
+
 def dataset_key_hint() -> str:
     """一行可用数据集 key 清单，按「能否直接使用」分组。
 

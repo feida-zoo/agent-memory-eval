@@ -29,6 +29,7 @@ from pathlib import Path
 from membench.data.info import (
     DATASET_REGISTRY,
     dataset_key_hint,
+    infer_dataset_source,
     resolve_available_path,
 )
 from membench.data.schema import load_dataset
@@ -72,7 +73,10 @@ def resolve_dataset_arg(value: str) -> ResolvedDataset:
 
     解析顺序：
 
-    1. 存在的文件（``~`` 会展开）-> 原样使用，来源 ``"user-specified"``，key 取 stem；
+    1. 存在的文件（``~`` 会展开）-> 原样使用，key 取 stem；来源按路径反查
+       （:func:`membench.data.info.infer_dataset_source`）：内置文件记
+       ``builtin`` / ``builtin-office``、``dataset fetch`` 目录里的基准集记
+       ``fetch``，其余 ``user-specified``；
     2. 存在但不是文件 -> 报错（数据集必须是 JSONL 文件，不能是目录）；
     3. 看起来像路径但不存在（含 ``/`` / ``~`` / 以 ``.jsonl`` / ``.json`` 结尾）
        -> 直接报错，避免下游把它当数据文件打开后抛 schema 错误；
@@ -100,9 +104,10 @@ def resolve_dataset_arg(value: str) -> ResolvedDataset:
     candidate = Path(text).expanduser()
     if candidate.is_file():
         resolved = candidate.resolve()
-        return ResolvedDataset(
-            key=resolved.stem, path=str(resolved), source="user-specified"
-        )
+        # 显式路径不一定就是"用户自定义"：编排器 --common 会先把公开基准集
+        # 解析成路径再下发，这里按路径反查来源，避免报告把基准集标成用户集。
+        source = infer_dataset_source(resolved) or "user-specified"
+        return ResolvedDataset(key=resolved.stem, path=str(resolved), source=source)
     if candidate.exists():
         raise SystemExit(f"数据集路径不是文件: {text}（--dataset 需要 JSONL 文件）")
     if _looks_like_path(text):

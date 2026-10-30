@@ -41,7 +41,9 @@ def test_metrics_contain_platform_commit_source(tmp_path: Path) -> None:
     dataset_dir, metrics = _run(tmp_path / "exp", platform="wx", commit="a1b2c3")
     assert metrics["platform"] == "wx"
     assert metrics["commit"] == "a1b2c3"
-    assert metrics["dataset_source"] == "user-specified"
+    # SAMPLE 是内置集：来源按**路径**反推为 builtin，不能因为"传了路径"
+    # 就一律记 user-specified（编排器 --common 也走路径下发）
+    assert metrics["dataset_source"] == "builtin"
     # run_id 形如 {adapter}_{platform}_{commit前8位}_{dataset}_{timestamp}
     assert metrics["run_id"].startswith("mock-strong_wx_a1b2c3_sample_dataset_")
     # run_id 不再是目录名：数据集产物固定落 runs/<dataset>/
@@ -52,7 +54,7 @@ def test_metrics_defaults_without_platform(tmp_path: Path) -> None:
     _, metrics = _run(tmp_path / "exp")
     assert metrics["platform"] == "default"
     assert metrics["commit"] is None
-    assert metrics["dataset_source"] == "user-specified"
+    assert metrics["dataset_source"] == "builtin"
     assert metrics["run_id"].startswith("mock-strong_default_sample_dataset_")
 
 
@@ -76,7 +78,7 @@ def test_report_has_config_table_at_top(tmp_path: Path) -> None:
     assert "adapter 版本" in head
     assert "数据集指纹" in head
     assert "wx" in head and "a1b2c3" in head
-    assert "user-specified" in head
+    assert "builtin" in head
 
 
 def test_copy_report_with_figures(tmp_path: Path) -> None:

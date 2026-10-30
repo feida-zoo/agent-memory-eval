@@ -109,6 +109,7 @@ from datetime import datetime
 from typing import Any, Union
 
 from membench import layout, runtime
+from membench.data.info import infer_dataset_source
 from membench.data.schema import (
     ABSTAIN_SENTINEL,
     dataset_fingerprint,
@@ -936,7 +937,11 @@ class Runner:
         self.platform = platform
         self.commit = commit
         # 显式向 Runner 传 dataset_path 即视为 user-specified
-        self.dataset_source = dataset_source or "user-specified"
+        # 来源标签缺省按路径反查：编排器 --common 会把基准集解析成路径再下发，
+        # 统统一律记 user-specified 会把公开基准集标成"用户自定义"。
+        self.dataset_source = (
+            dataset_source or infer_dataset_source(dataset_path) or "user-specified"
+        )
         if isinstance(judge, str):
             self.judge_name = judge
             self.judge = get_judge(judge)

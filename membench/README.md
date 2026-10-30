@@ -671,8 +671,11 @@ python -m membench.cli run --adapter <你的适配器> --dataset <同一个数�
 
 `--dataset` 现在是可选参数。不传时按优先级自动选择测试集：
 
-1. 显式 `--dataset <key|路径>`（文件 → `user-specified`；`office` → 用户集 / 内置 office；
-   其它注册表 key → 内置文件或按需下载文件，来源 `fetch`）；
+1. 显式 `--dataset <key|路径>`（`office` → 用户集 / 内置 office；其它注册表 key →
+   内置文件或按需下载文件；**传路径时来源按路径反查**（`data.info.infer_dataset_source`）：
+   内置文件记 `builtin` / `builtin-office`、`dataset fetch` 目录下与注册表 key 同名的
+   文件记 `fetch`，认不出来才记 `user-specified`——编排器 `--common` 会先把清单解析成
+   路径再下发，按"文件即用户自定义"处理会把公开基准集标错）；
 2. 已安装的用户测试集（来源标签 `user`）；
 3. 内置 `office_dataset.jsonl`（来源标签 `builtin-office`）。
 
