@@ -1485,7 +1485,9 @@ def write_run_report_md(
             "（expected action / judge spec / leak targets）判决并做人工一致性验证；"
             "本实现的动作标签是**从回答文本推断**的（`action_source=inferred`），"
             "泄露用字面命中 `leak_targets` 近似，`state_leak`（记忆状态红线）"
-            "不参与 MGS。因此数值不能与论文表格直接对比，只用于同一实现下的纵向比较。</sub>"
+            "不参与 MGS。因此数值不能与论文表格直接对比，只用于同一实现下的纵向比较。"
+            "**本节是参考视图：不参与多数据集融合、综合评级与门禁**——融合与评级仍走"
+            "六维指标（`accuracy` / `evidence_recall` / `abstention_accuracy` / `stale_rate`）。</sub>"
         )
         lines.append("")
 

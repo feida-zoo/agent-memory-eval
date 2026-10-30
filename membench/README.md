@@ -1088,6 +1088,12 @@ membench 的六维指标**不是同一套东西**。数据集覆盖官方三支�
 
 因此：**报告里的 MGS 不能与论文表格直接对比**，只能在同一实现下纵向比较（A/B、多线）。
 
+**它是参考视图，不是评分口径**：`official` 块不参与多数据集融合（`fuse_metrics` 只遍历
+`FUSED_METRICS`）、不参与综合评级（`ratings.METRIC_THRESHOLDS` 只有 accuracy /
+evidence_recall / abstention_accuracy / stale_rate）、不参与门禁；`compare` / `evaluate-compare` /
+`matrix` 目前也不读它。跨数据集也不能对 MGS 做加权平均——它是乘法指标，需要按分子分母池化
+（`official` 块已落 `n_utility_correct` / `n_access_violation` / `n_forget_failure` 等计数）。
+
 ```bash
 # 只看官方口径的三支柱题（utility / privacy / safety）
 python -m membench.cli run --adapter my-sys --dataset gatemem_office --shard-by dialogue --trace-state
