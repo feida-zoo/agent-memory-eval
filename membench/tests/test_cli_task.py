@@ -758,3 +758,23 @@ def test_evaluate_compare_task_dir_writes_into_arms(tmp_path: Path) -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_compare_tag_requires_ascii(tmp_path: Path) -> None:
+    """--tag 会进对比目录名：纯中文 slug 成 default，直接报可操作错误。"""
+    from membench import cli
+
+    with pytest.raises(SystemExit, match="ASCII"):
+        cli.main(
+            [
+                "compare",
+                "--baseline",
+                str(tmp_path / "a"),
+                "--candidate",
+                str(tmp_path / "b"),
+                "--tag",
+                "索引优化",
+                "--report-out",
+                str(tmp_path / "out"),
+            ]
+        )

@@ -1045,6 +1045,11 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         baseline, candidate = args.baseline, args.candidate
         out_kwargs = {"out_dir": args.report_out}
         guard = _no_leftover_experiment(args.report_out)
+    if args.tag:
+        try:
+            layout.ensure_dir_name(args.tag, what="对比标签（--tag）")
+        except ValueError as exc:
+            raise SystemExit(str(exc))
     with guard:
         result = compare_runs(
             baseline,
@@ -1708,6 +1713,11 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
 
     if args.jobs < 1:
         raise SystemExit(f"--jobs 必须 >= 1，当前为 {args.jobs}")
+    if getattr(args, "tag", None):
+        try:
+            layout.ensure_dir_name(args.tag, what="对比标签（--tag）")
+        except ValueError as exc:
+            raise SystemExit(str(exc))
     if args.beam_10m and args.no_beam:
         raise SystemExit("--beam-10m 与 --no-beam 互斥（BEAM 槽位状态冲突）")
     if args.quick and args.common:
