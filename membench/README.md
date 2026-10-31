@@ -75,6 +75,8 @@ python -m membench.cli run --adapter <你的适配器> --dataset <同一数据�
 python -m membench.cli run --adapter <你的适配器> --dataset <同一数据集> \
     --replay output/eval_<名>_<平台>_<ts> \
     --replay-verify-source output/eval_<名>_<平台>_<ts>/runs/<dataset>   # 回放 + 逐题保真校验
+#    只想验证某一类题的读取侧改动：加 --category <题型>。过滤在回放计划之前，
+#    被过滤掉的对话不再需要快照；保真校验按"共同题"比对（源多出的题不算差异）
 
 # 4b. A/B 两组回放同一源：用回放任务，状态按内容去重只存一份（见「回放任务的快照池」）
 TASK=$(python -m membench.cli task init --name replay --platform wx --groups 2 --baseline-name 基线 --candidate-name 候选 --replay)
@@ -621,6 +623,11 @@ python -m membench.cli run --adapter <你的适配器> --dataset <同一个数�
 - **该重跑的场景**：改动落在**写入侧**（抽取提示词、更新/去重决策、写入成本）或
   **逻辑 schema**（字段/粒度变了且系统没有 `rebuild`）时，快照回放测不到——必须
   重新 ingest（至少挑几个对话做子集）。
+- **与题型过滤（`--category`）配合**：过滤发生在回放计划之前，所以"只回放某一类题"
+  只需要这些题所在对话的快照——源 run 里其他对话的快照缺失 / 损坏不挡路，只落被
+  过滤后的对话目录；保真校验（`--replay-verify-source`）按**共同题**比对
+  （`n_source` / `n_replay` / `n_common`），源里多出来的题不算差异。反过来，
+  `interleaved` 数据集本来就不支持 `--replay`，与是否过滤无关。
 
 ### 回放任务的快照池
 

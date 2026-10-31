@@ -903,3 +903,82 @@ def test_parallel_shards_racing_on_same_bucket_reuse_it(tmp_path: Path) -> None:
     assert len(index["buckets"]) == 1
     group = index["groups"][layout.DIR_GROUP_BASELINE]
     assert (group["n_dialogues"], group["n_reused"], group["n_new"]) == (2, 1, 1)
+
+
+def _two_category_dataset(path: Path) -> Path:
+    """两个对话各一种题型（d1 = single_hop、d2 = temporal），用于题型过滤 + 回放。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {
+            "dialogue_id": "d1",
+            "sessions": [
+                [{"role": "user", "content": "记录一：项目截止日是周五。", "timestamp": None}]
+            ],
+            "questions": [
+                {
+                    "qid": "d1_q1",
+                    "question": "项目截止日是哪天？",
+                    "gold_answer": "周五",
+                    "category": "single_hop",
+                    "evidence": ["项目截止日是周五"],
+                }
+            ],
+        },
+        {
+            "dialogue_id": "d2",
+            "sessions": [
+                [{"role": "user", "content": "记录二：会议在周一。", "timestamp": None}]
+            ],
+            "questions": [
+                {
+                    "qid": "d2_q1",
+                    "question": "会议是哪天？",
+                    "gold_answer": "周一",
+                    "category": "temporal",
+                    "evidence": ["会议在周一"],
+                }
+            ],
+        },
+    ]
+    path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_replay_with_category_filter_needs_only_matching_dialogues(
+    tmp_path: Path,
+) -> None:
+    """题型过滤 + 回放：只恢复过滤后仍有题的对话。
+
+    过滤在建回放计划之前：被过滤掉的对话不再出现在 ``dialogue_ids`` 里，因此它的
+    快照**可以不存在**（删掉也能回放）。这条口径决定了"只想回放一类题"的成本——
+    源 run 里其他对话的快照坏了/没导出，不会挡住这次回放。
+    """
+    dataset = _two_category_dataset(tmp_path / "ds" / "ds.jsonl")
+    source = _full_run(tmp_path, name="full", dataset=dataset)
+    # 源里 d1（single_hop）的快照删掉：本次只回放 temporal，不该被它拖住
+    shutil.rmtree(source / "d1" / layout.DIR_SNAPSHOT)
+    out = Path(
+        Runner(
+            _FileMemoryAdapter(tmp_path / "mem-replay"),
+            str(dataset),
+            judge="heuristic",
+            out_dir=str(tmp_path / "replay"),
+            replay=str(source),
+            categories=["temporal"],
+            replay_verify_source=str(source),
+        ).run()
+    )
+    metrics = _metrics(out)
+    assert metrics["categories"] == ["temporal"]
+    assert metrics["overall"]["n_questions"] == 1
+    assert metrics["run_mode"] == "replay-restore"
+    assert "cat-temporal" in metrics["run_id"]
+    # 只落了 d2 的对话目录
+    assert sorted(p.name for p in out.iterdir() if p.is_dir()) == ["d2", layout.DIR_REPORT]
+    # 保真校验按"共同题"比对：源有 2 题、本次 1 题，共同题 1 且一致
+    verify = metrics["replay_verify"]
+    assert (verify["n_source"], verify["n_replay"], verify["n_common"]) == (2, 1, 1)
+    assert verify["answer_match_rate"] == 1.0
