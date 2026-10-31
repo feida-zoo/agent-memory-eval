@@ -217,7 +217,7 @@ def test_cli_compare_report_out_subdir(tmp_path: Path) -> None:
     assert rc == 0
     cmp_dir = _only_subdir(out)
     assert cmp_dir.name.startswith("compare_mock-strong_vs_mock-strong_default_")
-    assert sorted(p.name for p in cmp_dir.iterdir()) == ["A", "B", "reports", "runtime"]
+    assert sorted(p.name for p in cmp_dir.iterdir()) == ["baseline", "candidate", "groups.json", "reports", "runtime"]
 
     reports_dir = cmp_dir / "reports"
     for fname in ("comparison.md", "fig_metric_diff.png", "fig_category_diff.png"):
@@ -230,7 +230,7 @@ def test_cli_compare_report_out_subdir(tmp_path: Path) -> None:
     assert "](fig_category_diff.png)" in comparison
 
     # A / B 各为完整评测实验形态：runs/<dataset>/report/... + 任务级 reports/
-    for arm in ("A", "B"):
+    for arm in ("baseline", "candidate"):
         arm_dir = cmp_dir / arm
         assert sorted(p.name for p in arm_dir.iterdir()) == ["reports", "runs"]
         for fname in ("report.md", "metrics.json", "fig_category_accuracy.png"):
@@ -242,11 +242,11 @@ def test_cli_compare_report_out_subdir(tmp_path: Path) -> None:
         assert (dataset_dir / "d001" / "report" / "metrics.json").is_file()
 
     # A 臂是实验目录入参：整树原样复制
-    assert (cmp_dir / "A" / "reports" / "report.md").read_text(
+    assert (cmp_dir / "baseline" / "reports" / "report.md").read_text(
         encoding="utf-8"
     ) == (exp_a / "reports" / "report.md").read_text(encoding="utf-8")
     # B 臂是数据集目录入参：先构造 runs/<dataset>/，再据数据集报告补任务级 reports/
-    assert (cmp_dir / "B" / "reports" / "metrics.json").read_text(
+    assert (cmp_dir / "candidate" / "reports" / "metrics.json").read_text(
         encoding="utf-8"
     ) == (dataset_b / "report" / "metrics.json").read_text(encoding="utf-8")
 

@@ -503,7 +503,7 @@ def _identity_value(metrics: dict[str, Any], key: str) -> Any:
 
 
 def assert_single_identity(results: list[DatasetResult], label: str) -> None:
-    """校验一侧（或单臂汇总）内的被测对象与评测口径唯一，防止混入多个系统/版本/仪器。
+    """校验一侧（或单组汇总）内的被测对象与评测口径唯一，防止混入多个系统/版本/仪器。
 
     Raises:
         SystemExit: :data:`_IDENTITY_KEYS` 中任一维度出现多组取值。

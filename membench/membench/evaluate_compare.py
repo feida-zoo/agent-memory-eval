@@ -71,8 +71,8 @@ from membench.evaluate import (
     write_task_reports,
 )
 from membench.layout import (
-    DIR_ARM_A,
-    DIR_ARM_B,
+    ROLE_BASELINE,
+    ROLE_CANDIDATE,
     FIG_FUSED_DIFF,
     FIG_PER_DATASET_DIFF,
 )
@@ -158,7 +158,7 @@ def top_improved_categories(
     小样本题型的一两题翻转会制造 +50pt 的假象，那类仍留在逐数据集表里。
 
     Args:
-        arms: 各数据集两臂结果。
+        arms: 各数据集两组结果。
         limit: 取前几条（缺省 :data:`TOP_IMPROVED_CATEGORIES`）。
 
     Returns:
@@ -324,7 +324,7 @@ def _single_source_experiment(raw_runs: Union[dict[str, str], None]) -> Union[st
 
 def _stage_side_dir(
     container_dir: str,
-    arm_label: str,
+    group_dir_name: str,
     provided: dict[str, DatasetResult],
     raw_runs: Union[dict[str, str], None],
 ) -> dict[str, DatasetResult]:
@@ -334,12 +334,12 @@ def _stage_side_dir(
     一并带过来）；其余情形逐个把数据集产物并入该侧目录的 ``runs/`` 下。产物本就
     在该侧目录内时不做复制。
     """
-    side_dir = layout.arm_dir(container_dir, arm_label)
+    side_dir = os.path.join(container_dir, group_dir_name)
     source_exp = _single_source_experiment(raw_runs)
     staged: dict[str, DatasetResult] = {}
     if source_exp:
         shutil.copytree(source_exp, side_dir, dirs_exist_ok=True)
-        print(f"[membench] {arm_label} 侧整树复制已有实验目录: {source_exp} -> {side_dir}")
+        print(f"[membench] {group_dir_name} 组整树复制已有实验目录: {source_exp} -> {side_dir}")
         for key, res in provided.items():
             rel = os.path.relpath(res.run_dir, source_exp)
             staged[key] = DatasetResult(
@@ -372,7 +372,7 @@ def _precheck_side(
     """某一侧的跑前预检：身份/口径唯一、补跑参数与已有产物一致、缺项可补跑。
 
     调用方必须在**建实验目录与复制产物之前**调用：预检失败时 ``report_out`` 下
-    不留 ``compare_*/{A,B}/`` 半成品树（与单臂 ``evaluate`` 的预检位置对称）。
+    不留 ``compare_*/{A,B}/`` 半成品树（与单组 ``evaluate`` 的预检位置对称）。
 
     Args:
         label: 侧标签（如 ``"基线侧"``），用于报错定位。
@@ -664,6 +664,10 @@ def evaluate_compare(
     latency_warn: float = 0.30,
     evidence_matcher: Any = None,
     task_dir: Union[str, None] = None,
+    baseline_label: Union[str, None] = None,
+    candidate_label: Union[str, None] = None,
+    baseline_dir: Union[str, None] = None,
+    candidate_dir: Union[str, None] = None,
     snapshot: Union[bool, None] = None,
     trace_state: Union[bool, None] = None,
     abstention_recheck: Union[bool, None] = None,
@@ -697,7 +701,7 @@ def evaluate_compare(
         stale_threshold: stale_rate 允许最大上升（融合 diff 维度）。
         latency_warn: latency_p95 相对上升告警比例（融合 diff 维度）。
         evidence_matcher: 检索命中口径匹配器（默认 substring）。
-        task_dir: **就地模式**：输出容器就是这个已存在的任务目录——两臂分别写
+        task_dir: **就地模式**：输出容器就是这个已存在的任务目录——两组分别写
             ``<task_dir>/A`` ``<task_dir>/B``，对比报告与两张对比图写
             ``<task_dir>/reports/``，不新建 ``compare_*`` 目录。与 ``report_out`` 互斥。
         snapshot: 是否导出对话状态快照。None（缺省）= 用 Runner 默认（导出）；
@@ -816,7 +820,7 @@ def evaluate_compare(
     )
 
     # 跑前预检：两侧的身份 / 口径与补跑参数问题必须在**建实验目录与复制产物之前**
-    # 暴露——否则 report_out 下会残留 compare_*/{A,B}/ 半成品树（与单臂 evaluate 对称）。
+    # 暴露——否则 report_out 下会残留 compare_*/{A,B}/ 半成品树（与单组 evaluate 对称）。
     _precheck_side(
         "基线侧",
         baseline_provided,
@@ -851,24 +855,68 @@ def evaluate_compare(
             ),
         )
         print(f"[membench] 对比实验目录: {compare_dir}")
-    # A/B 两侧落位之前登记：两侧补跑的 Runner 会把同一条命令的日志继续写在这里
+    # 两组目录：任务目录读 groups.json；新建对比目录则校验组名并写清单
+    if task_dir is not None:
+        group_dirs = {
+            ROLE_BASELINE: layout.group_dir(compare_dir, ROLE_BASELINE),
+            ROLE_CANDIDATE: layout.group_dir(compare_dir, ROLE_CANDIDATE),
+        }
+        # 就地模式沿用任务清单里的显示名（报告直接复用，不重新推导）
+        manifest = layout.read_groups_manifest(compare_dir) or []
+        labels = {
+            str(item["role"]): str(item.get("label") or item["dir"]) for item in manifest
+        }
+    else:
+        labels = {
+            ROLE_BASELINE: baseline_label or layout.DEFAULT_BASELINE_LABEL,
+            ROLE_CANDIDATE: candidate_label or "候选",
+        }
+        dirs = layout.validate_group_labels(
+            [labels[ROLE_BASELINE], labels[ROLE_CANDIDATE]],
+            fallbacks=[
+                baseline_dir or "baseline",
+                candidate_dir or "candidate",
+            ],
+        )
+        layout.write_groups_manifest(
+            compare_dir,
+            [
+                {"role": ROLE_BASELINE, "label": labels[ROLE_BASELINE], "dir": dirs[0]},
+                {"role": ROLE_CANDIDATE, "label": labels[ROLE_CANDIDATE], "dir": dirs[1]},
+            ],
+        )
+        group_dirs = {
+            ROLE_BASELINE: os.path.join(compare_dir, dirs[0]),
+            ROLE_CANDIDATE: os.path.join(compare_dir, dirs[1]),
+        }
+
+    # 两组落位之前登记：两侧补跑的 Runner 会把同一条命令的日志继续写在这里
     runtime.set_dir(compare_dir)
 
-    # A/B 两侧各摆成完整 eval 实验形态（产物齐备与身份预检已在上方做完，再复制 / 补跑）
-    baseline_provided = _stage_side_dir(compare_dir, DIR_ARM_A, baseline_provided, baseline_runs)
-    candidate_provided = _stage_side_dir(compare_dir, DIR_ARM_B, candidate_provided, candidate_runs)
+    # 两组各摆成完整 eval 实验形态（产物齐备与身份预检已在上方做完，再复制 / 补跑）
+    baseline_provided = _stage_side_dir(
+        compare_dir,
+        os.path.basename(group_dirs[ROLE_BASELINE]),
+        baseline_provided,
+        baseline_runs,
+    )
+    candidate_provided = _stage_side_dir(
+        compare_dir,
+        os.path.basename(group_dirs[ROLE_CANDIDATE]),
+        candidate_provided,
+        candidate_runs,
+    )
 
     # 两侧组装：已有产物直接复用，缺失数据集用该侧 adapter 补跑
     def _assemble_side(
         label: str,
-        arm_label: str,
+        side_dir: str,
         adapter: Any,
         provided: dict[str, DatasetResult],
         platform_value: Union[str, None],
         driver_llm_value: Union[str, None],
         adapter_version_value: Union[str, None],
     ) -> list[DatasetResult]:
-        side_dir = layout.arm_dir(compare_dir, arm_label)
         by_key = dict(provided)
         for spec in specs:
             if spec.key in provided:
@@ -905,7 +953,7 @@ def evaluate_compare(
     print(f"[membench] ===== 基线 adapter: {baseline_name} =====")
     baseline_results = _assemble_side(
         "基线侧",
-        DIR_ARM_A,
+        group_dirs[ROLE_BASELINE],
         baseline_adapter,
         baseline_provided,
         platform_a,
@@ -915,7 +963,7 @@ def evaluate_compare(
     print(f"[membench] ===== 候选 adapter: {candidate_name} =====")
     candidate_results = _assemble_side(
         "候选侧",
-        DIR_ARM_B,
+        group_dirs[ROLE_CANDIDATE],
         candidate_adapter,
         candidate_provided,
         platform_b,
@@ -1023,12 +1071,12 @@ def evaluate_compare(
     # 产物落位：A/B 两侧各写一份任务级 reports/（该侧自身就是一个完整 eval 实验形态），
     # 对比报告与两张对比图写输出容器的 reports/（就地模式下即任务目录的）。
     _check_plt()
-    for arm_label, arm_name, side_results, side_platform, side_fused in (
-        (DIR_ARM_A, baseline_name, baseline_results, platform_a, fused_baseline),
-        (DIR_ARM_B, candidate_name, candidate_results, platform_b, fused_candidate),
+    for group_dir_path, arm_name, side_results, side_platform, side_fused in (
+        (group_dirs[ROLE_BASELINE], baseline_name, baseline_results, platform_a, fused_baseline),
+        (group_dirs[ROLE_CANDIDATE], candidate_name, candidate_results, platform_b, fused_candidate),
     ):
         write_task_reports(
-            layout.arm_dir(compare_dir, arm_label),
+            group_dir_path,
             adapter_name=arm_name,
             judge_name=judge_name,
             platform=side_platform,
@@ -1065,6 +1113,8 @@ def evaluate_compare(
         cap_sources={"baseline": cap_sources_a, "candidate": cap_sources_b},
         fusion=fusion,
         extra_notes=notes,
+        baseline_label=labels[ROLE_BASELINE] if labels else "基线",
+        candidate_label=labels[ROLE_CANDIDATE] if labels else "候选",
     )
 
     print(f"[membench] evaluate-compare verdict: {verdict}")
@@ -1105,6 +1155,8 @@ def _write_evaluate_compare_report(
     fusion: str = FUSION_WEIGHTED,
     extra_notes: list[str] | None = None,
     comparability_findings: list[dict[str, Any]] | None = None,
+    baseline_label: str = "基线",
+    candidate_label: str = "候选",
 ) -> str:
     """生成输出容器 ``reports/`` 下的 ``comparison.md``（中文）。
 
@@ -1124,8 +1176,8 @@ def _write_evaluate_compare_report(
             "（单数据集 spike 不被融合平均抹平）"
         )
     lines.append("")
-    lines.append(f"- 基线 A: `{baseline_name}`")
-    lines.append(f"- 候选 B: `{candidate_name}`")
+    lines.append(f"- 基线组（{baseline_label}）: `{baseline_name}`")
+    lines.append(f"- 候选组（{candidate_label}）: `{candidate_name}`")
     lines.append(f"- judge: `{judge_name}`")
     lines.append(f"- platform: `{platform or 'default'}`")
     lines.append(f"- commit: `{commit or 'n/a'}`")
@@ -1439,7 +1491,12 @@ def _write_evaluate_compare_report(
             ]
             for f in findings
         ]
-        lines.append(_md_table(["数据集", "维度", "级别", "A (基线)", "B (候选)", "说明"], comp_rows))
+        lines.append(
+            _md_table(
+                ["数据集", "维度", "级别", f"{baseline_label}（基线）", f"{candidate_label}（候选）", "说明"],
+                comp_rows,
+            )
+        )
     else:
         lines.append("（无：各数据集两侧关键与次要维度均一致且可核验）")
     lines.append("")

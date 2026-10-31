@@ -77,7 +77,7 @@ def _dataset(path: Path, *, n_dialogues: int = 4, per: int = 2) -> Path:
 
 def _init_task(base: Path, name: str, *, platform: str | None = "t", arms: int = 2) -> Path:
     """跑 ``task init`` 并返回它打印到 stdout 的任务目录（stdout 必须只有这一行路径）。"""
-    argv = ["task", "init", "--name", name, "--report-out", str(base), "--arms", str(arms)]
+    argv = ["task", "init", "--name", name, "--report-out", str(base), "--groups", str(arms)]
     if platform is not None:
         argv += ["--platform", platform]
     buffer = io.StringIO()
@@ -132,7 +132,7 @@ def _experiment_under(base: Path) -> Path:
 def test_task_init_arms2_prints_only_abs_path(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """arms=2（默认）：骨架 A/ B/ reports/，stdout 只有绝对路径一行，人看的说明走 stderr。"""
+    """groups=2（默认）：骨架 baseline/ candidate/ + groups.json，stdout 只有绝对路径一行。"""
     base = tmp_path / "out"
     assert (
         cli.main(["task", "init", "--name", "ab", "--platform", "t", "--report-out", str(base)])
@@ -145,15 +145,15 @@ def test_task_init_arms2_prints_only_abs_path(
     assert task.is_absolute(), f"stdout 必须是绝对路径，实际 {task}"
     assert task.is_dir() and task.parent == base
     assert task.name.startswith("compare_ab_t_")
-    assert sorted(p.name for p in task.iterdir()) == ["A", "B", "reports", "runtime"]
+    assert sorted(p.name for p in task.iterdir()) == ["baseline", "candidate", "groups.json", "reports", "runtime"]
     # 骨架 / 下一步提示都在 stderr（不污染 stdout）
-    assert "骨架: arms=2（A/ B/ + reports/）" in captured.err
-    assert f"--task-dir {task / 'A'}" in captured.err
+    assert "骨架: groups=2（baseline/ candidate/ + reports/）" in captured.err
+    assert f"--task-dir {task / layout.DIR_GROUP_BASELINE}" in captured.err
     assert f"task status {task}" in captured.err
 
 
 def test_task_init_arms1_builds_runs_skeleton(tmp_path: Path) -> None:
-    """arms=1：单臂骨架 runs/ + reports/，目录名前缀 eval_。"""
+    """groups=1：单组骨架 runs/ + reports/，目录名前缀 eval_。"""
     task = _init_task(tmp_path / "out", "solo", arms=1)
     assert task.name.startswith("eval_solo_t_")
     assert sorted(p.name for p in task.iterdir()) == ["reports", "runs", "runtime"]
@@ -178,12 +178,12 @@ def test_task_init_rejects_non_empty_dir(
     monkeypatch.setattr(layout, "ts_now", lambda *args, **kwargs: "20260101-120000")
     base = tmp_path / "out"
     task = _init_task(base, "ab")
-    (task / "A" / "keep.txt").write_text("已有产物", encoding="utf-8")
+    (task / "baseline" / "keep.txt").write_text("已有产物", encoding="utf-8")
 
     with pytest.raises(SystemExit, match="已存在且非空"):
         cli.main(["task", "init", "--name", "ab", "--platform", "t", "--report-out", str(base)])
     # 现场不被改动
-    assert (task / "A" / "keep.txt").read_text(encoding="utf-8") == "已有产物"
+    assert (task / "baseline" / "keep.txt").read_text(encoding="utf-8") == "已有产物"
 
 
 # ---------------------------------------------------------------------------
@@ -200,8 +200,8 @@ def test_task_status_fresh_task_dir(
     assert cli.main(["task", "status", str(task)]) == 0
     out = capsys.readouterr().out
     assert f"任务目录: {task}" in out
-    assert "骨架: arms=2（A/ B/ + reports/）" in out
-    assert "臂 A:" in out and "臂 B:" in out
+    assert "骨架: groups=2（baseline/ candidate/ + reports/）" in out
+    assert "组 baseline:" in out and "组 candidate:" in out
     assert out.count("数据集: （尚无产物）") == 2
     assert "下一步:" in out
     assert "--task-dir" in out and "--shard-by dialogue" in out
@@ -214,7 +214,7 @@ def test_task_status_progress_then_fuse_in_place(
     dataset = _dataset(tmp_path / "dense.jsonl")
     base = tmp_path / "out"
     task = _init_task(base, "ab")
-    arm_a = task / layout.DIR_ARM_A
+    arm_a = task / layout.DIR_GROUP_BASELINE
     capsys.readouterr()
 
     # ① 部分完成：只跑了 s0
@@ -256,7 +256,7 @@ def test_task_status_progress_then_fuse_in_place(
                 "--judge",
                 "heuristic",
                 "--task-dir",
-                str(task / layout.DIR_ARM_B),
+                str(task / layout.DIR_GROUP_CANDIDATE),
             ]
         )
         == 0
@@ -621,7 +621,7 @@ def _two_arm_task_with_products(tmp_path: Path) -> tuple[Path, Path]:
     """建一个双臂任务目录并在两臂各跑一次（不分片），返回 (任务目录, 产物根)。"""
     base = tmp_path / "out"
     task = _init_task(base, "ab")
-    for arm in (layout.DIR_ARM_A, layout.DIR_ARM_B):
+    for arm in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
         assert (
             cli.main(
                 [
@@ -653,7 +653,7 @@ def test_compare_task_dir_in_place(tmp_path: Path, capsys: pytest.CaptureFixture
     # 不新建 compare_* 目录、不复制两臂：任务目录结构与内容保持原位
     assert [p.name for p in base.iterdir()] == [task.name]
     arm_a_metrics = (
-        task / layout.DIR_ARM_A / layout.DIR_RUNS / "sample_dataset" / layout.DIR_REPORT / layout.FILE_METRICS
+        task / layout.DIR_GROUP_BASELINE / layout.DIR_RUNS / "sample_dataset" / layout.DIR_REPORT / layout.FILE_METRICS
     )
     assert arm_a_metrics.is_file()
 
@@ -664,12 +664,12 @@ def test_compare_argument_contract(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="compare 需要 --baseline"):
         cli.main(["compare"])
     with pytest.raises(SystemExit, match="compare 需要 --baseline"):
-        cli.main(["compare", "--baseline", str(under_task / "A")])
+        cli.main(["compare", "--baseline", str(under_task / "baseline")])
     with pytest.raises(SystemExit, match="任务目录不存在"):
         cli.main(["compare", "--task-dir", str(tmp_path / "nope")])
 
-    shutil.rmtree(under_task / layout.DIR_ARM_B)
-    with pytest.raises(SystemExit, match="臂目录不存在"):
+    shutil.rmtree(under_task / layout.DIR_GROUP_CANDIDATE)
+    with pytest.raises(SystemExit, match="组目录不存在"):
         cli.main(["compare", "--task-dir", str(under_task)])
 
 
@@ -747,7 +747,7 @@ def test_evaluate_compare_task_dir_writes_into_arms(tmp_path: Path) -> None:
         )
         == 0
     )
-    for arm in (layout.DIR_ARM_A, layout.DIR_ARM_B):
+    for arm in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
         assert (
             task / arm / layout.DIR_RUNS / "dense" / layout.DIR_REPORT / layout.FILE_METRICS
         ).is_file()

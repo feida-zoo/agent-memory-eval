@@ -116,15 +116,15 @@ def test_comparable_metadata_passes(tmp_path: Path) -> None:
     ):
         assert (reports / name).is_file(), f"缺少 reports/{name}"
 
-    # A/ B/ 各是一个完整 eval 形态：数据集树 + 任务级 reports/
-    for arm in ("A", "B"):
+    # 两组（baseline/ candidate）各是一个完整 eval 形态：数据集树 + 任务级 reports/
+    for arm in ("baseline", "candidate"):
         arm_dir = compare_dir / arm
         assert arm_dir.is_dir()
         assert (arm_dir / layout.DIR_RUNS / "sample_dataset" / layout.DIR_REPORT / layout.FILE_METRICS).is_file()
         assert (arm_dir / layout.DIR_REPORTS / layout.FILE_REPORT_MD).is_file()
         assert (arm_dir / layout.DIR_REPORTS / layout.FILE_METRICS).is_file()
-    assert result["arm_a"] == str(compare_dir / "A")
-    assert result["arm_b"] == str(compare_dir / "B")
+    assert result["arm_a"] == str(compare_dir / "baseline")
+    assert result["arm_b"] == str(compare_dir / "candidate")
 
     # 「来源与产物」小节回指两侧入参，便于事后定位
     md = (reports / layout.FILE_COMPARISON_MD).read_text(encoding="utf-8")
@@ -340,8 +340,8 @@ def _two_arm_task(tmp_path: Path, metrics_b: dict | None = None) -> tuple[Path, 
     """建一个双臂任务目录并在两臂各写一份完整数据集产物，返回 (任务目录, 父目录)。"""
     base = tmp_path / "out"
     task = Path(layout.init_task_dir(str(base), "ab", platform="t"))
-    _write_dataset(task / layout.DIR_ARM_A, "sample_dataset", _metrics("run_a"))
-    _write_dataset(task / layout.DIR_ARM_B, "sample_dataset", metrics_b or _metrics("run_b"))
+    _write_dataset(task / layout.DIR_GROUP_BASELINE, "sample_dataset", _metrics("run_a"))
+    _write_dataset(task / layout.DIR_GROUP_CANDIDATE, "sample_dataset", metrics_b or _metrics("run_b"))
     return task, base
 
 
@@ -349,28 +349,28 @@ def test_in_place_compare_writes_report_into_task_dir(tmp_path: Path) -> None:
     """就地对比：两臂缺省读 task_dir/A|B，报告落 task_dir/reports/，不新建目录、不复制两臂。"""
     task, base = _two_arm_task(tmp_path)
     # 两臂各留一个哨兵文件：就地模式不得复制 / 重建这两棵树
-    (task / layout.DIR_ARM_A / "keep.txt").write_text("哨兵", encoding="utf-8")
-    before_a = _tree_snapshot(task / layout.DIR_ARM_A)
-    before_b = _tree_snapshot(task / layout.DIR_ARM_B)
+    (task / layout.DIR_GROUP_BASELINE / "keep.txt").write_text("哨兵", encoding="utf-8")
+    before_a = _tree_snapshot(task / layout.DIR_GROUP_BASELINE)
+    before_b = _tree_snapshot(task / layout.DIR_GROUP_CANDIDATE)
 
     result = compare_runs(task_dir=str(task))
 
     assert result["verdict"] == "PASS"
     assert result["compare_dir"] == str(task)
     assert result["report_path"] == str(task / layout.DIR_REPORTS / layout.FILE_COMPARISON_MD)
-    assert result["arm_a"] == str(task / layout.DIR_ARM_A)
-    assert result["arm_b"] == str(task / layout.DIR_ARM_B)
+    assert result["arm_a"] == str(task / layout.DIR_GROUP_BASELINE)
+    assert result["arm_b"] == str(task / layout.DIR_GROUP_CANDIDATE)
     for name in (layout.FILE_COMPARISON_MD, layout.FIG_METRIC_DIFF, layout.FIG_CATEGORY_DIFF):
         assert (task / layout.DIR_REPORTS / name).is_file(), f"缺少 reports/{name}"
     md = result["report_path"]
     assert "**门禁结论： PASS" in Path(md).read_text(encoding="utf-8")
     # 「来源与产物」小节回指两臂（就地模式下"副本"就是 A/ 与 B/ 本身）
-    assert str(task / layout.DIR_ARM_A) in Path(md).read_text(encoding="utf-8")
+    assert str(task / layout.DIR_GROUP_BASELINE) in Path(md).read_text(encoding="utf-8")
 
     # 只有一个任务目录、没有复制两臂：两臂内容逐字节不变
     assert [p.name for p in base.iterdir()] == [task.name]
-    assert _tree_snapshot(task / layout.DIR_ARM_A) == before_a
-    assert _tree_snapshot(task / layout.DIR_ARM_B) == before_b
+    assert _tree_snapshot(task / layout.DIR_GROUP_BASELINE) == before_a
+    assert _tree_snapshot(task / layout.DIR_GROUP_CANDIDATE) == before_b
 
 
 def test_in_place_compare_accepts_explicit_arm_dirs(tmp_path: Path) -> None:
@@ -378,7 +378,7 @@ def test_in_place_compare_accepts_explicit_arm_dirs(tmp_path: Path) -> None:
     task, base = _two_arm_task(tmp_path)
 
     result = compare_runs(
-        str(task / layout.DIR_ARM_A), str(task / layout.DIR_ARM_B), task_dir=str(task)
+        str(task / layout.DIR_GROUP_BASELINE), str(task / layout.DIR_GROUP_CANDIDATE), task_dir=str(task)
     )
 
     assert result["verdict"] == "PASS"
@@ -405,9 +405,9 @@ def test_in_place_compare_reports_regression_verdict(tmp_path: Path) -> None:
 def test_in_place_compare_rejects_incomplete_arm(tmp_path: Path) -> None:
     """某一臂产物不完整 -> 当场拒绝，且不写 reports/comparison.md（就地也不留半成品报告）。"""
     task = Path(layout.init_task_dir(str(tmp_path / "out"), "ab", platform="t"))
-    _write_dataset(task / layout.DIR_ARM_A, "sample_dataset", _metrics("run_a"))
+    _write_dataset(task / layout.DIR_GROUP_BASELINE, "sample_dataset", _metrics("run_a"))
     dataset_b = Path(
-        _write_dataset(task / layout.DIR_ARM_B, "sample_dataset", _metrics("run_b"))
+        _write_dataset(task / layout.DIR_GROUP_CANDIDATE, "sample_dataset", _metrics("run_b"))
     )
     (dataset_b / layout.DIR_REPORT / layout.FILE_REPORT_MD).unlink()
 

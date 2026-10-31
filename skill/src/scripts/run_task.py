@@ -249,6 +249,10 @@ class EvalOptions:
     report_out: Optional[str]
     shards: int | str
     task_dir: Optional[str] = None
+    #: 双组任务的组名（单组为 None）；缺省「基线」/「候选」
+    group_labels: Optional[tuple[str, str]] = None
+    #: 组目录名（ASCII；缺省 baseline / candidate，中文组名不会进目录）
+    group_dirs: Optional[tuple[str, str]] = None
 
     @property
     def use_evaluate(self) -> bool:
@@ -276,6 +280,10 @@ class AbOptions:
     report_out: Optional[str]
     shards: int | str
     task_dir: Optional[str] = None
+    #: 双组任务的组名（基线, 候选）
+    group_labels: Optional[tuple[str, str]] = None
+    #: 组目录名（ASCII；缺省 baseline / candidate）
+    group_dirs: Optional[tuple[str, str]] = None
 
 
 @dataclass
@@ -448,14 +456,22 @@ def _validate_task_dir(task_dir: str, arms: int, root: Path) -> None:
             f"--task-dir 不存在: {task_dir}；先运行 task init 建任务目录，"
             "或去掉 --task-dir 让本脚本自己建"
         )
-    needed = (
-        (layout.DIR_ARM_A, layout.DIR_ARM_B, layout.DIR_REPORTS)
-        if arms == 2
-        else (layout.DIR_RUNS, layout.DIR_REPORTS)
-    )
+    if arms == 2:
+        groups = layout.read_groups_manifest(task_dir)
+        if not groups:
+            raise UsageError(
+                f"--task-dir 缺 {layout.FILE_GROUPS}（旧布局不再兼容）: {task_dir}；"
+                "请用新版 task init 重建任务目录"
+            )
+        group_dirs = [str(item["dir"]) for item in groups]
+        needed = (*group_dirs, layout.DIR_REPORTS)
+    else:
+        needed = (layout.DIR_RUNS, layout.DIR_REPORTS)
     missing = [name for name in needed if not os.path.isdir(os.path.join(task_dir, name))]
     if missing:
-        shape = "A/ B/ reports/" if arms == 2 else "runs/ reports/"
+        shape = (
+            " ".join(f"{name}/" for name in needed) if arms == 2 else "runs/ reports/"
+        )
         raise UsageError(
             f"--task-dir 不是 arms={arms} 的任务目录（缺 {'、'.join(missing)}）: {task_dir}；"
             f"该形态需要 {shape}"
@@ -552,6 +568,8 @@ def _start_background(
                 arms=arms,
                 platform=options.common.platform,
                 report_out=options.report_out,
+                group_labels=getattr(options, "group_labels", None),
+                group_dirs=getattr(options, "group_dirs", None),
             )
         )
 
@@ -738,15 +756,46 @@ class Executor:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_group_labels(args) -> tuple[str, str]:
+    """双组任务的组名：显式 > 按 commit 抽取（已有规则）> 兜底「候选」。
+
+    基线的缺省名固定「基线」；候选缺省时从 ``--commit`` 的提交主题里按
+    series 的同一套规则抽（conventional 前缀剥离 + 截断），抽不出来就用「候选」。
+    名字一旦落到 ``groups.json``，后续报告直接复用，不再重新抽取。
+    """
+    baseline = args.baseline_name or "基线"
+    candidate = args.candidate_name
+    if not candidate:
+        commit = getattr(args, "commit", None)
+        if commit:
+            try:
+                series_mod = _membench_module(
+                    Path(__file__).resolve().parent.parent, "series"
+                )
+                subject = series_mod.git_subject(
+                    str(Path.cwd()), commit
+                ) or ""
+                candidate = series_mod.extract_name_from_subject(subject) if subject else None
+            except Exception:  # noqa: BLE001 - 命名失败不该阻断跑批
+                candidate = None
+    return baseline, (candidate or "候选")
+
+
 def _task_init_argv(
     *,
     name: str,
     arms: int,
     platform: Optional[str],
     report_out: Optional[str],
+    group_labels: Optional[Sequence[str]] = None,
+    group_dirs: Optional[Sequence[str]] = None,
 ) -> list[str]:
-    """``task init`` 参数。"""
-    argv = ["task", "init", "--arms", str(arms), "--name", name]
+    """``task init`` 参数（双组任务带两个组名 + 两个 ASCII 目录名）。"""
+    argv = ["task", "init", "--groups", str(arms), "--name", name]
+    if arms == 2 and group_labels:
+        argv += ["--baseline-name", group_labels[0], "--candidate-name", group_labels[1]]
+        if group_dirs:
+            argv += ["--baseline-dir", group_dirs[0], "--candidate-dir", group_dirs[1]]
     if platform:
         argv += ["--platform", platform]
     if report_out:
@@ -1240,14 +1289,21 @@ def _execute_ab(options: AbOptions, root: Path) -> FlowState:
                 arms=2,
                 platform=options.common.platform,
                 report_out=options.report_out,
+                group_labels=getattr(options, "group_labels", None),
+                group_dirs=getattr(options, "group_dirs", None),
             )
         )
     state = FlowState(task_dir=task_dir)
-    for label, arm in (("A", options.baseline), ("B", options.candidate)):
-        arm_dir = os.path.join(task_dir, label)
+    layout = _membench_module(root, "layout")
+    baseline_dir = layout.group_dir(task_dir, layout.ROLE_BASELINE)
+    candidate_dir = layout.group_dir(task_dir, layout.ROLE_CANDIDATE)
+    for label, arm, arm_dir in (
+        (os.path.basename(baseline_dir), options.baseline, baseline_dir),
+        (os.path.basename(candidate_dir), options.candidate, candidate_dir),
+    ):
         for dataset in options.datasets:
             print(
-                f"[run_task] 臂 {label}（{arm.adapter}）数据集 {dataset.display}",
+                f"[run_task] 组 {label}（{arm.adapter}）数据集 {dataset.display}",
                 file=sys.stderr,
             )
             directory = _run_dataset(
@@ -1389,6 +1445,8 @@ def _print_task_ref(
     arms: int,
     platform: Optional[str],
     report_out: Optional[str],
+    group_labels: Optional[Sequence[str]] = None,
+    group_dirs: Optional[Sequence[str]] = None,
 ) -> None:
     """dry-run 的任务目录来源：给了 --task-dir 就直接用，否则 ``TASK=$(task init ...)``。"""
     if task_dir:
@@ -1403,6 +1461,8 @@ def _print_task_ref(
                 arms=arms,
                 platform=platform,
                 report_out=report_out,
+                group_labels=group_labels,
+                group_dirs=group_dirs,
             ),
         )
         + ")"
@@ -1458,13 +1518,19 @@ def _print_dry_run_ab(options: AbOptions, root: Path) -> None:
         arms=2,
         platform=options.common.platform,
         report_out=options.report_out,
+        group_labels=options.group_labels,
+        group_dirs=options.group_dirs,
     )
-    for label, arm in (("A", options.baseline), ("B", options.candidate)):
-        print(f"# 臂 {label}（{arm.adapter}）")
+    group_dirs = options.group_dirs or ("baseline", "candidate")
+    for label, arm, group_dir in (
+        (group_dirs[0], options.baseline, group_dirs[0]),
+        (group_dirs[1], options.candidate, group_dirs[1]),
+    ):
+        print(f"# 组 {label}（{arm.adapter}）")
         for dataset in options.datasets:
             _print_run_steps(
                 root,
-                exp_ref=f"$TASK/{label}",
+                exp_ref=f"$TASK/{group_dir}",
                 dataset=dataset,
                 arm=arm,
                 common=options.common,
@@ -1482,8 +1548,8 @@ def _print_dry_run_ab(options: AbOptions, root: Path) -> None:
                 root,
                 _compare_argv(
                     "$TASK",
-                    baseline=_predicted_dataset_dir("$TASK/A", dataset),
-                    candidate=_predicted_dataset_dir("$TASK/B", dataset),
+                    baseline=_predicted_dataset_dir(f"$TASK/{group_dirs[0]}", dataset),
+                    candidate=_predicted_dataset_dir(f"$TASK/{group_dirs[1]}", dataset),
                 ),
             )
         )
@@ -1582,7 +1648,32 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--llm-model", default=None, help="judge=llm / recall-mode=llm 的模型名")
     parser.add_argument("--llm-timeout", type=float, default=None, help="LLM 请求超时秒数")
     parser.add_argument("--client-llm", default=None, help="judge=client 的内置 LLM 类路径，如 my_agent.llm:LLMClient")
-    parser.add_argument("--name", default=None, help="任务名（进目录名）；缺省用 adapter 名 / <基线>_vs_<候选>")
+    parser.add_argument(
+        "--name",
+        required=True,
+        help="任务名（进目录名，必填）：说明这次实验是什么，如 索引优化 / 基线复测；"
+        "不再回退 adapter 名——同 adapter 的多次实验必须能靠名字区分",
+    )
+    parser.add_argument(
+        "--baseline-name",
+        default=None,
+        help="基线组名（进组目录名，允许中文；缺省「基线」）",
+    )
+    parser.add_argument(
+        "--candidate-name",
+        default=None,
+        help="候选组显示名（进报告与清单，允许中文）；缺省按 --commit 的提交信息抽取，抽不出则用「候选」",
+    )
+    parser.add_argument(
+        "--baseline-dir",
+        default=None,
+        help="基线组目录名（ASCII，缺省 baseline）；中文组名不进目录",
+    )
+    parser.add_argument(
+        "--candidate-dir",
+        default=None,
+        help="候选组目录名（ASCII，缺省 candidate）",
+    )
     parser.add_argument(
         "--report-out",
         default=None,
@@ -1763,7 +1854,7 @@ def _eval_options(args: argparse.Namespace) -> EvalOptions:
         adapter_version=args.adapter_version,
         adapter_args=list(args.adapter_arg),
     )
-    name = args.name or args.adapter
+    name = args.name
     return EvalOptions(
         common=common,
         arm=arm,
@@ -1793,7 +1884,13 @@ def _ab_options(args: argparse.Namespace) -> AbOptions:
         adapter_version=args.candidate_version,
         adapter_args=list(args.adapter_arg_b),
     )
-    name = args.name or f"{args.baseline_adapter}_vs_{args.candidate_adapter}"
+    name = args.name
+    group_labels = _resolve_group_labels(args)
+    if group_labels[0].casefold() == group_labels[1].casefold():
+        raise UsageError(
+            f"两组名字不能相同（大小写视为相同）：{group_labels[0]!r}；"
+            "请用 --baseline-name / --candidate-name 区分"
+        )
     return AbOptions(
         common=common,
         baseline=baseline,
@@ -1803,6 +1900,11 @@ def _ab_options(args: argparse.Namespace) -> AbOptions:
         report_out=report_out,
         shards=args.shards,
         task_dir=_resolve_caller_path(args.task_dir) if args.task_dir else None,
+        group_labels=group_labels,
+        group_dirs=(
+            args.baseline_dir or "baseline",
+            args.candidate_dir or "candidate",
+        ),
     )
 
 

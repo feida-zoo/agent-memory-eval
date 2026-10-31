@@ -124,13 +124,17 @@ def _orchestrator_state(task: str) -> Optional[dict[str, Any]]:
 
 
 def _arm_roots(task: str, layout: Any) -> list[tuple[str, str]]:
-    """任务下的臂（与 ``task status`` 同口径；单臂任务把任务根当唯一实验根）。"""
-    arms = [
-        (label, os.path.join(task, label))
-        for label in (layout.DIR_ARM_A, layout.DIR_ARM_B)
-        if os.path.isdir(os.path.join(task, label))
+    """任务下的组目录（与 ``task status`` 同口径；单组任务把任务根当唯一实验根）。
+
+    组目录名由用户给（可以是中文，记在 ``groups.json``），不假设固定词表。
+    """
+    groups = layout.read_groups_manifest(task) or []
+    roots = [
+        (str(item["dir"]), os.path.join(task, str(item["dir"])))
+        for item in groups
+        if os.path.isdir(os.path.join(task, str(item["dir"])))
     ]
-    return arms or [("", task)]
+    return roots or [("", task)]
 
 
 def _dataset_progress(arm_root: str, layout: Any) -> list[dict[str, Any]]:
@@ -299,7 +303,7 @@ def _format_elapsed(seconds: Optional[float]) -> str:
 
 def _arm_text(arm: dict[str, Any]) -> str:
     """一个臂的分片进度片段：``A: office 2/4(跑1)✗``。"""
-    label = arm["label"] or "单臂"
+    label = arm["label"] or "单组"
     datasets = arm["datasets"]
     if not datasets:
         return f"{label}: 无数据集"

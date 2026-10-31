@@ -340,8 +340,8 @@ def test_evaluate_compare_writes_compare_layout(mini_datasets, scripts, tmp_path
     assert (reports / FIG_PER_DATASET_DIFF).is_file()
     assert (reports / FIG_FUSED_DIFF).is_file()
 
-    # A/B 两侧各是完整 eval 形态：runs/<dataset>/report/... + 任务级 reports/
-    for arm in ("A", "B"):
+    # 两组各是完整 eval 形态：runs/<dataset>/report/... + 任务级 reports/
+    for arm in ("baseline", "candidate"):
         for key in ("a", "b", "c"):
             dataset_report = compare_dir / arm / layout.DIR_RUNS / key / layout.DIR_REPORT
             assert (dataset_report / layout.FILE_METRICS).is_file()
@@ -766,7 +766,7 @@ def test_evaluate_compare_task_dir_in_place(
     )
 
     assert result["compare_dir"] == str(task)
-    for arm in (layout.DIR_ARM_A, layout.DIR_ARM_B):
+    for arm in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
         arm_dir = task / arm
         for key in ("a", "b", "c"):
             dataset_report = arm_dir / layout.DIR_RUNS / key / layout.DIR_REPORT

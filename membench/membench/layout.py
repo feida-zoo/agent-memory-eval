@@ -2,11 +2,11 @@
 
 一次评测 = 一个自包含的**任务目录**（报告与对应数据就近归属）：
 
-- 单臂任务（``arms==1``）是 ``eval_<name>_<platform>_<ts>``，本身就是完整评测产物根；
-- 双臂任务（``arms==2``）是 ``compare_<name>_<platform>_<ts>``，``A/`` 与 ``B/`` 是任务
-  目录下的两个臂，各为一个完整的单臂评测产物根。
+- 单组任务（``arms==1``）是 ``eval_<name>_<platform>_<ts>``，本身就是完整评测产物根；
+- 双组任务（``arms==2``）是 ``compare_<name>_<platform>_<ts>``，``A/`` 与 ``B/`` 是任务
+  目录下的两个组，各为一个完整的单组评测产物根。
 
-任务目录的命名与骨架由 :func:`task_subdir` / :func:`init_task_dir` 唯一决定、臂目录经
+任务目录的命名与骨架由 :func:`task_subdir` / :func:`init_task_dir` 唯一决定、组目录经
 :func:`arm_dir` 取；同一次评测的多个分片写进同一个任务目录时，各片的进度与归属记在
 分片账本里——**每个分片一个条目文件** ``shards.<i>.json``（:func:`shard_entry_path`，
 并行分片各写各的），``shards.json`` 是由条目物化的视图（:func:`read_shard_ledger` /
@@ -30,11 +30,11 @@
 
 **回放任务**（``task init --replay``）在任务目录根多一个内容寻址快照池 ``snapshots/``：
 回放导出的状态按内容哈希去重成桶 ``snapshots/<sha256 前 12 位>/``，**每个对话一个
-条目文件** ``snapshots/entries/<臂>/<数据集>/<对话>.json``（真源，路径见
+条目文件** ``snapshots/entries/<组>/<数据集>/<对话>.json``（真源，路径见
 :func:`snapshot_entry_path`），任务级 ``snapshots/index.json`` 是由条目树 + 各桶清单
 重算出来的**派生视图**（:func:`build_snapshot_index` / :func:`materialize_snapshot_index`）。
 对话级分片下各进程只写自己负责的对话条目 ⇒ 并行回放不需要任何锁。池属于**任务**
-而不是臂：双臂回放同一源时两臂指向同一批桶，差异本身即"回放不保真"的证据。
+而不是组：双组回放同一源时两组指向同一批桶，差异本身即"回放不保真"的证据。
 
 ``<root>`` 由 :func:`membench.paths.output_root` 解析（CLI ``--report-out DIR`` 即指它）。
 
@@ -57,7 +57,7 @@ import re
 import uuid
 from collections.abc import Iterable
 from datetime import datetime
-from typing import Any, Union
+from typing import Any, Sequence, Union
 
 from membench.paths import output_root
 
@@ -75,13 +75,47 @@ DIR_SNAPSHOT = "memory_snapshot"
 DIR_TRACE_STATE = "trace_state"
 #: 回放任务的内容寻址快照池（任务根层，与 runs/ 平级）：桶 = ``<池>/<sha256 前 12 位>``。
 DIR_SNAPSHOTS = "snapshots"
-#: 快照池里的逐对话条目树（``<池>/entries/<臂>/<数据集>/<对话>.json``，池的真源）。
+#: 快照池里的逐对话条目树（``<池>/entries/<组>/<数据集>/<对话>.json``，池的真源）。
 DIR_SNAPSHOT_ENTRIES = "entries"
 
-#: A/B 对比实验目录（compare / evaluate-compare）下两侧副本的目录名：A = 基线、B = 候选。
-#: 兼作报告里的侧标签。
-DIR_ARM_A = "A"
-DIR_ARM_B = "B"
+#: 任务根里的**组**角色（取代旧的"组"）：基线与候选各一组。
+ROLE_BASELINE = "baseline"
+ROLE_CANDIDATE = "candidate"
+
+#: 基线组的默认显示名（报告/清单里用它）。
+DEFAULT_BASELINE_LABEL = "基线"
+
+#: 组目录的默认 ASCII 名（组名可以是中文，目录名不用中文）。
+DIR_GROUP_BASELINE = "baseline"
+DIR_GROUP_CANDIDATE = "candidate"
+
+#: 组清单文件名：``<任务目录>/groups.json``，记"角色 → 目录名 → 名字"。
+#: 组目录名由用户给（可以是中文），因此**所有读取方都必须查清单**，不能靠固定词表猜。
+FILE_GROUPS = "groups.json"
+
+#: 组目录名的保留词：与框架目录 / 清单同名会撞。
+RESERVED_GROUP_DIRS = frozenset(
+    {
+        DIR_RUNS,
+        DIR_REPORTS,
+        DIR_RUNTIME,
+        DIR_SNAPSHOTS,
+        "entries",
+        "A",
+        "B",
+        FILE_GROUPS,
+        "manifest.json",
+        "shards.json",
+        "evaluate_summary.json",
+        "matrix_result.json",
+    }
+)
+
+#: 组目录名的长度上限（够放一句中文短语，又不至于把路径撑爆）。
+GROUP_DIR_MAX_CHARS = 48
+
+#: 路径不安全字符：目录名保留中文，但分隔符 / 通配符 / 控制字符必须换掉。
+_PATH_UNSAFE_RE = re.compile(r'[\/:**?"<>|\x00-\x1f]+')
 
 #: 报告与数据文件名。
 FILE_REPORT_MD = "report.md"
@@ -137,6 +171,147 @@ def tag_dir_name(tag: str) -> str:
     """把对话 id 归一成安全的目录名（防路径穿越；空值兜底 ``dialogue``）。"""
     safe = _SAFE_TAG_RE.sub("_", str(tag)).strip("._-")
     return (safe or "dialogue")[:120]
+
+
+def group_dir_name(label: str, *, ascii_fallback: Union[str, None] = None) -> str:
+    """组名 → **目录名（ASCII）**：``slug`` 化，中文名必须由调用方另给英文目录名。
+
+    为什么目录名不用中文：中文路径会在报告内链编码、跨工具（Windows / CI / 归档）
+    和 ``ls`` 排序上各带一份麻烦，而组名的可读性只需要出现在**报告与清单**里。
+    所以职责拆开——``label`` 是给人看的（可以是「索引优化」），``dir`` 是 ASCII
+    短名（``index-opt``）。中文 label 里的 ASCII 片段仍会被利用，实在没有就退
+    ``ascii_fallback``（调用方给，如 commit8 / ``candidate``），再退 ``group``。
+
+    Args:
+        label: 用户给的组名。
+        ascii_fallback: label 里没有任何 ASCII 片段时用的目录名。
+
+    Returns:
+        目录名（ASCII）。
+    """
+    def _clean(value: str) -> str:
+        return slug(value).strip(".-") or "default"
+
+    text = _clean(label)
+    if text != "default":
+        return text
+    fallback = _clean(ascii_fallback) if ascii_fallback else ""
+    return fallback if fallback and fallback != "default" else "group"
+
+
+def validate_group_labels(
+    labels: "Sequence[str]", fallbacks: "Sequence[str] | None" = None
+) -> list[str]:
+    """校验一组组名：非空、不撞保留名、**大小写不敏感**唯一。
+
+    为什么大小写不敏感：``Rerank`` 与 ``rerank`` 在 macOS 默认文件系统上是同一个
+    目录，判成两个组会静默覆盖。用 ``casefold()`` 而不是 ``lower()``，避免某些
+    Unicode 大小写映射不等价。
+
+    Args:
+        labels: 组名列表（含基线）。
+        fallbacks: 与 labels 等长的 ASCII 目录名兜底（中文名没有 ASCII 片段时用，
+            如 ``baseline`` / ``candidate`` / commit8）。
+
+    Returns:
+        归一后的**目录名**列表（ASCII，顺序与入参一致）。
+
+    Raises:
+        ValueError: 名字非法 / 与保留名冲突 / 重复。
+    """
+    dirs: list[str] = []
+    seen: dict[str, str] = {}
+    fb = list(fallbacks or [])
+    for index, label in enumerate(labels):
+        if not str(label or "").strip():
+            raise ValueError("组名不能为空")
+        name = group_dir_name(
+            label, ascii_fallback=(fb[index] if index < len(fb) else None)
+        )
+        if name.casefold() in RESERVED_GROUP_DIRS_CASEFOLD:
+            raise ValueError(
+                f"组名 {name!r} 与框架目录/文件同名（保留名："
+                + "、".join(sorted(RESERVED_GROUP_DIRS))
+                + "），请换一个"
+            )
+        if name.casefold() in seen:
+            raise ValueError(
+                f"组名重复（大小写视为相同）：{seen[name.casefold()]!r} 与 {name!r}"
+            )
+        seen[name.casefold()] = name
+        dirs.append(name)
+    return dirs
+
+
+#: 保留名的大小写不敏感集合（模块加载时算一次）。
+RESERVED_GROUP_DIRS_CASEFOLD = frozenset(name.casefold() for name in RESERVED_GROUP_DIRS)
+
+
+def groups_manifest_path(task_dir: str) -> str:
+    """任务根里的组清单路径：``<task_dir>/groups.json``。"""
+    return os.path.join(task_dir, FILE_GROUPS)
+
+
+def write_groups_manifest(task_dir: str, groups: "Sequence[dict[str, Any]]") -> str:
+    """写组清单（原子替换），返回路径。
+
+    Args:
+        task_dir: 任务目录。
+        groups: ``[{"role","label","dir","commit","version"}, …]``，顺序即报告顺序。
+    """
+    path = groups_manifest_path(task_dir)
+    payload = {"schema": 1, "groups": list(groups)}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(tmp, path)
+    return path
+
+
+def read_groups_manifest(task_dir: str) -> "list[dict[str, Any]] | None":
+    """读组清单；不存在或结构不认识时返回 ``None``（不猜）。"""
+    path = groups_manifest_path(task_dir)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    groups = payload.get("groups") if isinstance(payload, dict) else None
+    if not isinstance(groups, list) or not groups:
+        return None
+    for item in groups:
+        if not isinstance(item, dict) or not item.get("role") or not item.get("dir"):
+            return None
+    return groups
+
+
+def group_dir(task_dir: str, role: str) -> str:
+    """按**角色**取组目录：``<task_dir>/<清单里的 dir>``。
+
+    组目录名由用户给（可以是中文），不能再靠 ``A`` / ``B`` 猜。缺 ``groups.json``
+    的任务是旧布局——按"不兼容旧产物"的口径直接报错，给出可操作提示。
+
+    Args:
+        task_dir: 任务目录（含 ``groups.json``）。
+        role: :data:`ROLE_BASELINE` 或 :data:`ROLE_CANDIDATE`。
+
+    Raises:
+        SystemExit: 缺清单，或清单里没有该角色。
+    """
+    groups = read_groups_manifest(task_dir)
+    if groups is None:
+        raise SystemExit(
+            f"任务目录缺 {FILE_GROUPS}：{task_dir}（旧布局不再兼容）；"
+            "请用新版 `task init` 重建任务目录后重跑"
+        )
+    for item in groups:
+        if str(item.get("role")) == role:
+            return os.path.join(task_dir, str(item["dir"]))
+    available = "、".join(f"{item.get('role')}={item.get('dir')}" for item in groups)
+    raise SystemExit(f"任务目录 {task_dir} 里没有角色 {role!r}（现有：{available}）")
 
 
 def eval_subdir(
@@ -257,7 +432,7 @@ def experiment_path(base: str | None, name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 任务目录：一次评测的产物根（单臂 eval_*，双臂 A/B compare_*）
+# 任务目录：一次评测的产物根（单组 eval_*，双组 A/B compare_*）
 # ---------------------------------------------------------------------------
 
 def task_subdir(
@@ -284,32 +459,48 @@ def init_task_dir(
     platform: str | None = None,
     arms: int = 2,
     ts: str | None = None,
+    group_labels: "Sequence[str] | None" = None,
+    group_dirs: "Sequence[str] | None" = None,
     *,
     replay: bool = False,
 ) -> str:
     """在 ``base``（默认 :func:`membench.paths.output_root`）下建任务目录骨架，返回绝对路径。
 
-    骨架：``arms==2`` 建 ``A/`` 与 ``B/``（两个臂各是一个完整评测产物根），``arms==1``
+    骨架：``arms==2`` 按 ``group_dirs``（缺省 ``baseline`` / ``candidate``）建两个组目录
+    （各是一个完整评测产物根）并写 ``groups.json``（角色 → 目录名 → 显示名）；``arms==1``
     建 ``runs/``；两种形态都建任务级 ``reports/``。``replay=True``（回放任务）在任务根
     额外建内容寻址快照池 ``snapshots/``（见 :func:`snapshot_pool_root`）：回放导出的
-    状态按内容去重后落在这里，A/B 两臂共用同一批桶。目标**已存在且非空**时拒绝新建
+    状态按内容去重后落在这里，A/B 两组共用同一批桶。目标**已存在且非空**时拒绝新建
     （守卫语义与报错文案复用 :func:`experiment_path`：上一次跑在校验阶段失败留下的
     空目录可以复用，已有产物的目录一律不覆盖）。
     """
     path = experiment_path(base, task_subdir(name, platform, arms, ts))
-    subdirs = (DIR_ARM_A, DIR_ARM_B) if arms == 2 else (DIR_RUNS,)
+    if arms == 2:
+        labels = list(group_labels or [DEFAULT_BASELINE_LABEL, "候选"])
+        if len(labels) != 2:
+            raise ValueError(
+                "双组任务需要两个组名（--baseline-name / --candidate-name）；"
+                f"当前为 {labels!r}"
+            )
+        fallbacks = list(group_dirs or ["baseline", "candidate"])
+        if len(fallbacks) != 2:
+            raise ValueError(f"group_dirs 需要两个目录名，当前为 {fallbacks!r}")
+        dirs = validate_group_labels(labels, fallbacks=fallbacks)
+        write_groups_manifest(
+            path,
+            [
+                {"role": ROLE_BASELINE, "label": labels[0], "dir": dirs[0]},
+                {"role": ROLE_CANDIDATE, "label": labels[1], "dir": dirs[1]},
+            ],
+        )
+        subdirs: tuple[str, ...] = tuple(dirs)
+    else:
+        subdirs = (DIR_RUNS,)
     if replay:
         subdirs = (*subdirs, DIR_SNAPSHOTS)
     for subdir in (*subdirs, DIR_REPORTS):
         os.makedirs(os.path.join(path, subdir), exist_ok=True)
     return os.path.abspath(path)
-
-
-def arm_dir(task_dir: str, arm: str) -> str:
-    """任务目录下的臂目录：``<task_dir>/A`` 或 ``<task_dir>/B``（arm 取 ``DIR_ARM_A/B``）。"""
-    if arm not in (DIR_ARM_A, DIR_ARM_B):
-        raise ValueError(f"arm 必须是 {DIR_ARM_A!r} 或 {DIR_ARM_B!r}，当前为 {arm!r}")
-    return os.path.join(task_dir, arm)
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +519,7 @@ SNAPSHOT_BUCKET_CHARS = 12
 #: 池内临时导出目录前缀（导出算完哈希后整体移入桶，失败即删；不是桶，遍历时必须跳过）。
 SNAPSHOT_TMP_PREFIX = ".tmp-"
 
-#: 空臂键（单臂任务 / 普通实验根）在条目树里的目录名：目录名不能是空串。
+#: 空组键（单组任务 / 普通实验根）在条目树里的目录名：目录名不能是空串。
 _EMPTY_ARM_SEGMENT = "_"
 
 #: 桶名只允许小写十六进制：索引里的条目指向什么目录必须能一眼校验，防止手改索引越出池。
@@ -336,17 +527,18 @@ _BUCKET_RE = re.compile(r"^[0-9a-f]{%d}$" % SNAPSHOT_BUCKET_CHARS)
 
 
 def snapshot_task_root(target: str) -> str:
-    """``target`` 所属的任务目录：它是任务下的臂目录（``A/`` / ``B/``）时取父任务目录。
+    """``target`` 所属的任务目录：它是任务下的**组目录**时取父任务目录。
 
-    判定依据是父目录带任务级 ``reports/``（``task init`` 建的骨架）——实验目录与
-    任务目录的命名互不相同，只有臂目录名 ``A`` / ``B`` 是固定词表（:data:`DIR_ARM_A` /
-    :data:`DIR_ARM_B`）。不是臂目录时 ``target`` 自己就是任务目录（单臂任务 / 普通实验）。
+    组目录名由用户给（可以是中文，记在父任务的 ``groups.json``），因此这里查清单，
+    不再依赖固定词表。不是组目录时 ``target`` 自己就是任务目录（单组任务 / 普通实验）。
     """
     path = os.path.abspath(target)
-    if os.path.basename(path) in (DIR_ARM_A, DIR_ARM_B):
-        parent = os.path.dirname(path)
-        if os.path.isdir(os.path.join(parent, DIR_REPORTS)):
-            return parent
+    parent = os.path.dirname(path)
+    groups = read_groups_manifest(parent)
+    if groups and os.path.basename(path).casefold() in {
+        str(item["dir"]).casefold() for item in groups
+    }:
+        return parent
     return path
 
 
@@ -356,9 +548,9 @@ def snapshot_pool_root(target: str) -> str:
 
 
 def snapshot_arm_key(target: str) -> str:
-    """臂键（条目树目录名 / 索引键的来源）：目标产物根相对任务目录的路径。
+    """组键（条目树目录名 / 索引键的来源）：目标产物根相对任务目录的路径。
 
-    ``A`` / ``B``；任务自身（单臂任务 / 普通实验根）为 ``""``（条目树里映射为 ``_``）。
+    ``A`` / ``B``；任务自身（单组任务 / 普通实验根）为 ``""``（条目树里映射为 ``_``）。
     """
     rel = os.path.relpath(os.path.abspath(target), snapshot_task_root(target))
     return "" if rel == os.curdir else rel.replace(os.sep, "/")
@@ -367,8 +559,8 @@ def snapshot_arm_key(target: str) -> str:
 def snapshot_entry_key(arm: str, dataset: str, dialogue_id: str) -> str:
     """索引 ``entries`` 的键：``<arm>|<dataset>|<dialogue_id>``。
 
-    臂键由 :func:`snapshot_arm_key` 决定（单臂任务为空串），这三段拼起来才能唯一确定
-    "哪个臂的哪个对话指向哪个桶"——桶本身只按内容寻址，不含身份。
+    组键由 :func:`snapshot_arm_key` 决定（单组任务为空串），这三段拼起来才能唯一确定
+    "哪个组的哪个对话指向哪个桶"——桶本身只按内容寻址，不含身份。
     """
     return f"{arm}|{dataset}|{dialogue_id}"
 
@@ -426,26 +618,26 @@ def snapshot_entries_root(pool_root: str) -> str:
 
 
 def snapshot_arm_segment(arm: str) -> str:
-    """臂键在条目树里的目录名：空臂键（单臂任务 / 普通实验根）用 ``_``。
+    """组键在条目树里的目录名：空组键（单组任务 / 普通实验根）用 ``_``。
 
-    目录名不能是空串；臂键口径（``""`` / ``A`` / ``B``）仍由 :func:`snapshot_arm_key`
+    目录名不能是空串；组键口径（``""`` / ``A`` / ``B``）仍由 :func:`snapshot_arm_key`
     决定，反向解析见 :func:`snapshot_arm_from_segment`。
     """
     return tag_dir_name(arm) if arm else _EMPTY_ARM_SEGMENT
 
 
 def snapshot_arm_from_segment(segment: str) -> str:
-    """条目树目录名回到臂键（``_`` → ``""``）。"""
+    """条目树目录名回到组键（``_`` → ``""``）。"""
     return "" if segment == _EMPTY_ARM_SEGMENT else segment
 
 
 def snapshot_entry_path(
     pool_root: str, arm: str, dataset: str, dialogue_id: str
 ) -> str:
-    """条目文件路径：``<池>/entries/<臂>/<数据集>/<对话目录名>.json``。
+    """条目文件路径：``<池>/entries/<组>/<数据集>/<对话目录名>.json``。
 
     条目自足（含身份、桶名、内容哈希、来源、复用标记、run_id、写入时间），读取方
-    不必再读那个跨臂共享的 ``index.json``。对话级分片下各进程只写自己负责的对话
+    不必再读那个跨组共享的 ``index.json``。对话级分片下各进程只写自己负责的对话
     文件，因此并行回放没有任何共享可变状态要抢。
     """
     return os.path.join(
@@ -540,7 +732,7 @@ def write_snapshot_entry(pool_root: str, entry: dict[str, Any]) -> str:
 
 
 def iter_snapshot_entries(pool_root: str) -> list[dict[str, Any]]:
-    """条目树里的全部条目（按 臂 / 数据集 / 对话 排序；条目树不存在时为空）。"""
+    """条目树里的全部条目（按 组 / 数据集 / 对话 排序；条目树不存在时为空）。"""
     root = snapshot_entries_root(pool_root)
     entries: list[dict[str, Any]] = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -570,7 +762,7 @@ def has_snapshot_entries(pool_root: str) -> bool:
 
 
 def snapshot_pool_arms(pool_root: str) -> list[str]:
-    """池里出现过的臂键（条目树优先；只有旧产物、没有条目树时才读索引的 ``arms`` 段）。"""
+    """池里出现过的组键（条目树优先；只有旧产物、没有条目树时才读索引的 ``arms`` 段）。"""
     root = snapshot_entries_root(pool_root)
     if os.path.isdir(root):
         arms = sorted(
@@ -639,8 +831,8 @@ def build_snapshot_index(pool_root: str) -> dict[str, Any]:
     ``index.json`` 只是便于人看、兼容旧读者的派生视图。并行回放时没有任何进程需要
     读-改-写它，因此不需要锁。
 
-    ``arms`` 段的 ``source`` 取该臂**最近一次**写入的条目（同秒时按 run_id 定序），
-    计数是该臂当前全部条目的 ``reused`` / ``reused=false`` 统计。
+    ``arms`` 段的 ``source`` 取该组**最近一次**写入的条目（同秒时按 run_id 定序），
+    计数是该组当前全部条目的 ``reused`` / ``reused=false`` 统计。
     """
     buckets: dict[str, Any] = {}
     for digest in list_snapshot_buckets(pool_root):
@@ -714,7 +906,7 @@ def read_snapshot_index(pool_root: str) -> Union[dict[str, Any], None]:
 
     结构：``buckets`` 按桶名登记内容身份（``dataset`` / ``dialogue_id`` / ``bytes`` /
     ``n_files`` / ``state_sha256``），``entries`` 是 ``arm|dataset|dialogue -> 桶名``，
-    ``arms`` 记每个臂的回放来源与计数。索引是**派生视图**（真源 = ``entries/`` 树 +
+    ``arms`` 记每个组的回放来源与计数。索引是**派生视图**（真源 = ``entries/`` 树 +
     各桶清单，见 :func:`build_snapshot_index`），只有旧产物才把它当真源读。
     """
     path = snapshot_index_path(pool_root)
@@ -1161,9 +1353,10 @@ def _looks_like_legacy_product(path: str) -> bool:
     （``A/`` / ``B/`` 各是一份平铺 run）。"""
     if any(os.path.isfile(os.path.join(path, name)) for name in _LEGACY_PRODUCT_FILES):
         return True
+    # 旧版 A/B 实验目录（平铺 run）——历史产物识别用，与"组目录名由用户给"无关
     return any(
         os.path.isfile(os.path.join(path, arm, FILE_METRICS))
-        for arm in (DIR_ARM_A, DIR_ARM_B)
+        for arm in ("A", "B")
     )
 
 

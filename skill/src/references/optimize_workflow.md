@@ -114,7 +114,7 @@
 
 1. **⛔ 检查点②**：先与用户确认**数据集范围**（单集/多集/全量）、**A/B 分组**（基线 vs 候选）、**平台/标签**与**召回口径**（`--recall-mode`，无默认）。
 2. **保证消融**：固定驱动模型与 harness，只切优化开关；两次 run 用**同一数据集、同一判分器**。
-3. **可比性前置校验 + 对比**：按 `SKILL.md` 标准流程「A/B」跑 `compare --require-comparable --tag <标签>`；两臂本来就写在同一个任务目录里时用 `compare --task-dir <任务目录> --require-comparable`。
+3. **可比性前置校验 + 对比**：按 `SKILL.md` 标准流程「A/B」跑 `compare --require-comparable --tag <标签>`；两组本来就写在同一个任务目录里时用 `compare --task-dir <任务目录> --require-comparable`。
 
 - `--require-comparable`：关键维度（`driver_llm` / `judge_model` / `adapter_version` / `dataset_fingerprint` 等）不一致或无法核验 → 可比性门禁 **FAIL**（整体 verdict=FAIL、退出码 1），即拒绝当 A/B 用；不加该参数时不一致只降级为 WARN。详见 `references/compare_workflows.md`。
 - `--tag <标签>`：决定产物目录 `compare_<name>_<platform>_<ts>/` 的 `<name>` 段（缺省 `<基线 adapter>_vs_<候选 adapter>`）。

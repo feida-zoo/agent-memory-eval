@@ -1,4 +1,4 @@
-"""任务目录（``layout.init_task_dir`` / ``task_subdir`` / ``arm_dir``）与共享目录下的分片写入。
+"""任务目录（``layout.init_task_dir`` / ``task_subdir`` / ``group_dir``）与共享目录下的分片写入。
 
 契约（见 :mod:`membench.layout` 与 :class:`membench.runner.Runner`）：
 
@@ -116,7 +116,7 @@ def test_shared_task_dir_accepts_dialogue_shards_from_several_processes(tmp_path
     """两片写同一任务目录的同一臂：对话目录互补、账本累积两条 done、无数据集级产物。"""
     dataset = _dataset(tmp_path / f"{DATASET}.jsonl")
     task = Path(layout.init_task_dir(str(tmp_path), "a_vs_b", "t", arms=2, ts="20260101-120000"))
-    arm_a = Path(layout.arm_dir(str(task), layout.DIR_ARM_A))
+    arm_a = Path(layout.group_dir(str(task), layout.ROLE_BASELINE))
 
     for index in (0, 1):
         _run_shard(str(arm_a), dataset, index=index, shards=2, shard_by="dialogue", shared=True)
@@ -140,7 +140,7 @@ def test_shared_task_dir_accepts_dialogue_shards_from_several_processes(tmp_path
     assert not (arm_a / layout.DIR_REPORTS).exists()
     assert list((task / layout.DIR_REPORTS).iterdir()) == []
     # 另一条臂没被本次评测碰过
-    assert list((task / layout.DIR_ARM_B).iterdir()) == []
+    assert list((task / layout.DIR_GROUP_CANDIDATE).iterdir()) == []
 
     # 共享树完整（两片写完之后四个对话目录都在），且每个对话目录只由一片写过：
     # 对话级 metrics 记下写它的那个分片，这正是"两片不互相覆盖"的证据

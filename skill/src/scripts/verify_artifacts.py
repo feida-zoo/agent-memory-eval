@@ -62,9 +62,27 @@ REPORT_FILES: tuple[str, ...] = ("metrics.json", "results.jsonl", "report.md")
 _DIALOGUE_ENTRIES: frozenset[str] = frozenset(
     {DIR_REPORT, DIR_RUNTIME, DIR_SNAPSHOT, DIR_TRACE_STATE}
 )
+#: 任务根里**与组无关**的框架条目；组目录名由 ``groups.json`` 给（可以是中文），
+#: 校验时动态并入，不能再写死 ``A`` / ``B``。
 _ROOT_ENTRIES: frozenset[str] = frozenset(
-    {DIR_RUNS, DIR_REPORTS, DIR_RUNTIME, "snapshots", "A", "B"}
+    {DIR_RUNS, DIR_REPORTS, DIR_RUNTIME, "snapshots", "groups.json"}
 )
+
+
+def _task_group_dirs(task: str) -> list[str]:
+    """任务根里的组目录名（读 ``groups.json``）；单组 / 旧布局返回空列表。"""
+    path = os.path.join(task, "groups.json")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    groups = payload.get("groups") if isinstance(payload, dict) else None
+    if not isinstance(groups, list):
+        return []
+    return [str(item["dir"]) for item in groups if isinstance(item, dict) and item.get("dir")]
 
 #: 门禁结论关键词（comparison.md 必须含其一）。
 GATE_KEYWORDS: tuple[str, ...] = ("门禁", "verdict")
@@ -340,7 +358,7 @@ def _check_dataset_entries(
 def _check_root_entries(root: str, result: Verification, *, where: str) -> None:
     """实验 / 任务根只应有骨架目录（第 8 项）。"""
     for name in _entry_names(root):
-        if name not in _ROOT_ENTRIES:
+        if name not in _ROOT_ENTRIES and name not in set(_task_group_dirs(root)):
             _warn_unknown_entry(
                 result, "root_entry", where, os.path.join(root, name)
             )
@@ -708,7 +726,7 @@ def _check_compare(task: str, result: Verification) -> None:
                 f"{report_path} 里没有门禁结论关键词（{' / '.join(GATE_KEYWORDS)}）",
                 report_path,
             )
-    for arm in ("A", "B"):
+    for arm in _task_group_dirs(task):
         arm_dir = os.path.join(task, arm)
         if not os.path.isdir(arm_dir):
             continue  # 骨架检查已报
@@ -717,7 +735,7 @@ def _check_compare(task: str, result: Verification) -> None:
             result.fail(
                 "compare",
                 "missing_arm_dataset",
-                f"compare 任务的臂 {arm}/ 下没有数据集级报告",
+                f"compare 任务的组 {arm}/ 下没有数据集级报告",
                 arm_dir,
             )
 
@@ -729,7 +747,7 @@ def _experiment_roots(task: str, kind: str) -> list[tuple[str, str]]:
     if kind == "compare":
         return [
             (os.path.join(task, arm), arm)
-            for arm in ("A", "B")
+            for arm in _task_group_dirs(task)
             if os.path.isdir(os.path.join(task, arm))
         ]
     # matrix: runs/<label>/ 是数据集树本身
@@ -787,7 +805,7 @@ def verify_task(
                 result.fail("skeleton", f"missing_{name}", f"eval 任务目录缺 {name}/", path)
                 skeleton_ok = False
     elif kind == "compare":
-        for name in ("A", "B", DIR_REPORTS):
+        for name in (*_task_group_dirs(task), DIR_REPORTS):
             path = os.path.join(task, name)
             if not os.path.isdir(path):
                 result.fail("skeleton", f"missing_{name}", f"compare 任务目录缺 {name}/", path)

@@ -2,17 +2,17 @@
 matrix / series / task / doctor / adapter / user-data / dataset / list-datasets。
 
 用法（SPEC 第 6 节）：
-    python -m membench.cli task init --name NAME [--platform P] [--arms 1|2] \
+    python -m membench.cli task init --name NAME [--platform P] [--groups 1|2] \
         [--report-out DIR] [--replay]
         # 建任务目录骨架（arms=2 -> A/ B/；arms=1 -> runs/，都带任务级 reports/）并
         # 打印它的绝对路径；--replay 额外建任务级快照池 snapshots/（回放任务的
         # 内容寻址桶 + index.json）；stdout 只有这一行路径，可 TASK=$(...) 接走
     python -m membench.cli task status DIR
-        # 进度视图：骨架 / 各臂各数据集的分片账本进度（status、题数、对话数、run_id）/
+        # 进度视图：骨架 / 各组各数据集的分片账本进度（status、题数、对话数、run_id）/
         # 数据集级产物齐备与否 / 快照目录数与体积（回放任务改为快照池：桶数、体积、
-        # 各臂复用/新写、两臂是否逐对话一致）/ 运行时（最近命令、非零退出条数、最近
-        # 日志；该臂/任务没有 runtime/ 时明确写「无运行时数据」）/ 下一步该跑什么；
-        # DIR 是任务目录（含 A/ B/）或单臂实验目录
+        # 各组复用/新写、两组是否逐对话一致）/ 运行时（最近命令、非零退出条数、最近
+        # 日志；该组/任务没有 runtime/ 时明确写「无运行时数据」）/ 下一步该跑什么；
+        # DIR 是任务目录（含 A/ B/）或单组实验目录
     python -m membench.cli run --adapter mock-strong \
         [--dataset KEY|PATH] --judge heuristic \
         [--platform wx --commit a1b2c3] [--driver-llm gpt-4o] \
@@ -30,7 +30,7 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
         # interleaved 数据集（如 gatemem_office）要求 --shard-by dialogue，且不支持 --replay
         # --dataset：key（office / sample / locomo…，按需下载集先 dataset fetch）或 JSONL 路径
     python -m membench.cli run --adapter mock-strong --dataset ... \
-        --replay <实验目录|数据集目录|回放任务或它的臂目录> \
+        --replay <实验目录|数据集目录|回放任务或它的组目录> \
         [--replay-mode auto|restore|rebuild] \
         [--replay-verify-source <源产物：实验目录或数据集目录>]   # 快照回放：跳过 ingest，只跑 query；
         # 回放同样默认把恢复后的状态导出到任务级快照池 snapshots/（--no-snapshot 关闭）
@@ -67,7 +67,7 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
         [--require-comparable] [--tag <name>] [--report-out DIR | --task-dir DIR]
         # --task-dir：就地读该任务目录的 A/（基线）与 B/（候选）（--baseline/--candidate
         # 显式给出时以显式为准），对比报告落它的 reports/，不再新建 compare_* 目录、
-        # 也不复制两臂；不传 --task-dir 时两臂入参必填
+        # 也不复制两组；不传 --task-dir 时两组入参必填
     python -m membench.cli matrix --runs "wx@a1b2c3=<产物目录>" "fs@a1b2c3=<产物目录>" ... \
         [--out DIR] [--report-out DIR]
     python -m membench.cli series --line <commit-or-name>=<产物目录> --line ... \
@@ -93,20 +93,20 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
 
 产物一律落「一次实验一个自包含子目录」（见 :mod:`membench.layout`）::
 
-    <report-out>/eval_<name>_<platform>_<ts>[_s<i>][_l<limit>]/   # 单臂任务目录，例 eval_mock-strong_default_20261024-193000（分片/冒烟带后缀，见 layout.experiment_tags）
+    <report-out>/eval_<name>_<platform>_<ts>[_s<i>][_l<limit>]/   # 单组任务目录，例 eval_mock-strong_default_20261024-193000（分片/冒烟带后缀，见 layout.experiment_tags）
     ├── runtime/{commands.jsonl,logs/,env.json}  # 实验级运行时数据（命令 / 全量日志 / 环境快照）
     ├── runs/<dataset>/{report/,shards.json,<对话>/{report/,runtime/,memory_snapshot/,trace_state/}}
     └── reports/                                # 任务级（report.md / metrics.json / evaluate_summary.json / fig_dataset_overview.png）
-    <report-out>/compare_<name>_<platform>_<ts>/{A/,B/,runtime/,reports/comparison.md}   # 双臂任务目录
+    <report-out>/compare_<name>_<platform>_<ts>/{A/,B/,runtime/,reports/comparison.md}   # 双组任务目录
     <report-out>/matrix_<ts>/{runtime/,reports/,runs/<label>/}
     <report-out>/series_<ts>/{runtime/,reports/,runs/<线序>-<slug>/<dataset>/}   # 多线对比
 
 回放任务（``task init --replay``）在任务目录根多一个内容寻址快照池 ``snapshots/``：
 回放导出的状态按内容哈希去重成桶 ``snapshots/<sha256 前 12 位>/``，每个对话一个
-条目文件 ``snapshots/entries/<臂>/<数据集>/<对话>.json``（真源；分片并行回放时各
+条目文件 ``snapshots/entries/<组>/<数据集>/<对话>.json``（真源；分片并行回放时各
 进程只写自己负责的对话，不需要锁），``snapshots/index.json`` 只是由条目 + 桶清单
-重算的派生视图（``task status`` / ``fuse`` 收尾刷新）。A/B 两臂回放同一源时只产生
-一份桶（两臂指向同一 digest），不同则各存一份——差异本身就是"回放不保真"的证据。
+重算的派生视图（``task status`` / ``fuse`` 收尾刷新）。A/B 两组回放同一源时只产生
+一份桶（两组指向同一 digest），不同则各存一份——差异本身就是"回放不保真"的证据。
 回放任务本身可以继续作为 ``--replay`` 源（链式回放）。
 
 "产物目录"入参（``--baseline`` / ``--candidate`` / ``--from-runs`` / ``--baseline-run`` /
@@ -119,13 +119,13 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
 工程根）。
 
 --task-dir 语义（与 --report-out 互斥，二选一）：把产物写进**已存在的任务目录**
-（``task init`` 建的骨架，或它的某个臂目录 ``A/`` / ``B/``），而不是新建 ``eval_*`` /
+（``task init`` 建的骨架，或它的某个组目录 ``A/`` / ``B/``），而不是新建 ``eval_*`` /
 ``compare_*`` 目录——同一次评测的多个分片因此能写进同一棵树：
 
 - ``run --task-dir DIR`` / ``evaluate --task-dir DIR``：产物直接落 DIR；共享目录下
   只允许 ``--shard-by dialogue``（题目级分片会让多个分片写同一对话目录并互相覆盖），
   同一分片重复跑直接拒绝；
-- ``evaluate-compare --task-dir DIR``：两臂分别写 ``DIR/A``、``DIR/B``，对比报告落
+- ``evaluate-compare --task-dir DIR``：两组分别写 ``DIR/A``、``DIR/B``，对比报告落
   ``DIR/reports/``；
 - ``compare --task-dir DIR``：就地读 ``DIR/A`` 与 ``DIR/B``，``comparison.md`` 落
   ``DIR/reports/``；
@@ -209,7 +209,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_out.add_argument(
         "--task-dir",
         default=None,
-        help="已存在的任务目录（task init 建的骨架，或它的臂目录 A/ / B/）：产物直接写进该目录，多个分片可共用同一棵树"
+        help="已存在的任务目录（task init 建的骨架，或它的组目录 A/ / B/）：产物直接写进该目录，多个分片可共用同一棵树"
         "（要求 --shard-by dialogue，同一分片重复跑会被拒绝）；与 --report-out 互斥",
     )
     p_run.add_argument("--llm-base-url", default=None, help="judge=llm 时的 OpenAI 兼容 base_url")
@@ -256,7 +256,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--replay",
         default=None,
-        help="回放源：实验目录、runs/<dataset> 数据集目录，或回放任务（含 snapshots/index.json 的任务目录 / 其臂目录 A/ B/）；"
+        help="回放源：实验目录、runs/<dataset> 数据集目录，或回放任务（含 snapshots/index.json 的任务目录 / 其组目录 A/ B/）；"
         "跳过 reset+ingest，按对话恢复快照后只跑 query（写入侧固定，结论只覆盖读取/回答层）。"
         "回放默认把恢复后的状态导出到任务级快照池 snapshots/（按内容去重，--no-snapshot 关闭）；"
         "interleaved（按 as_of 边 ingest 边提问）数据集不支持回放：只有末尾快照，给不出各时点状态",
@@ -292,13 +292,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cmp.add_argument("--latency-warn", type=float, default=0.30, help="latency_p95 上升告警比例（默认 0.30）")
     p_cmp.add_argument("--require-comparable", action="store_true", help="strict 可比性：关键维度不一致或无法核验时门禁 FAIL")
     p_cmp.add_argument("--tag", default=None, help="对比实验目录名的 <name> 段（缺省 <基线 adapter>_vs_<候选 adapter>）")
+    p_cmp.add_argument("--baseline-name", default=None, help="基线组显示名（缺省 基线）")
+    p_cmp.add_argument("--candidate-name", default=None, help="候选组显示名（缺省 候选）")
     cmp_out = p_cmp.add_mutually_exclusive_group()
     cmp_out.add_argument("--report-out", default=None, help="实验目录父目录（缺省 output_root()）：产出 <DIR>/compare_<name>_<platform>_<ts>/，A/ 与 B/ 各为完整评测产物，报告落其 reports/")
     cmp_out.add_argument(
         "--task-dir",
         default=None,
         help="已存在的任务目录：就地读它的 A/（基线）与 B/（候选）（--baseline / --candidate 显式给出时以显式为准），"
-        "comparison.md 落它的 reports/——不新建 compare_* 目录、不复制两臂；与 --report-out 互斥",
+        "comparison.md 落它的 reports/——不新建 compare_* 目录、不复制两组；与 --report-out 互斥",
     )
     p_cmp.set_defaults(func=_cmd_compare)
 
@@ -401,12 +403,32 @@ def _build_parser() -> argparse.ArgumentParser:
     p_task_init.add_argument("--name", required=True, help="任务名（进目录名，如 a_vs_b）")
     p_task_init.add_argument("--platform", default=None, help="平台标签（如 wx / fs），进目录名；缺省 default")
     p_task_init.add_argument(
-        "--arms",
+        "--groups",
         type=int,
         choices=(1, 2),
         default=2,
-        help="臂数：2（默认）= 双臂 A/B 任务目录 compare_<name>_<platform>_<ts>/，A/ 与 B/ 各是一个完整评测产物根；"
-        "1 = 单臂 eval_<name>_<platform>_<ts>/（含 runs/）",
+        help="组数：2（默认）= 双组任务目录 compare_<name>_<platform>_<ts>/（两个组目录各是一个完整评测产物根，"
+        "目录名由 --baseline-name / --candidate-name 给）；1 = 单组 eval_<name>_<platform>_<ts>/（含 runs/）",
+    )
+    p_task_init.add_argument(
+        "--baseline-name",
+        default=layout.DEFAULT_BASELINE_LABEL,
+        help=f"基线组显示名 / 目录名（默认 {layout.DEFAULT_BASELINE_LABEL}，允许中文）",
+    )
+    p_task_init.add_argument(
+        "--candidate-name",
+        default="候选",
+        help="候选组显示名（进报告与清单，允许中文；默认「候选」）",
+    )
+    p_task_init.add_argument(
+        "--baseline-dir",
+        default=None,
+        help="基线组目录名（ASCII，缺省 baseline）；与 --baseline-name 分开：目录名不用中文",
+    )
+    p_task_init.add_argument(
+        "--candidate-dir",
+        default=None,
+        help="候选组目录名（ASCII，缺省 candidate）；中文组名请在这里给英文目录名",
     )
     p_task_init.add_argument("--report-out", default=None, help="任务目录的父目录（缺省 output_root()）")
     p_task_init.add_argument(
@@ -419,7 +441,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_task_status = task_sub.add_parser(
         "status", help="进度视图：骨架 / 分片账本进度 / 数据集级产物 / 快照体积 / 下一步"
     )
-    p_task_status.add_argument("dir", metavar="DIR", help="任务目录（含 A/ B/）或单臂实验目录")
+    p_task_status.add_argument("dir", metavar="DIR", help="任务目录（含 A/ B/）或单组实验目录")
     p_task_status.set_defaults(func=_cmd_task_status)
 
     # --- user-data ---
@@ -582,7 +604,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ev_cmp_out.add_argument(
         "--task-dir",
         default=None,
-        help="已存在的任务目录：两臂分别写它的 A/（基线）与 B/（候选），对比报告落它的 reports/，不再新建 compare_* 目录；"
+        help="已存在的任务目录：两组分别写它的 A/（基线）与 B/（候选），对比报告落它的 reports/，不再新建 compare_* 目录；"
         "与 --report-out 互斥",
     )
     p_ev_cmp.add_argument(
@@ -608,6 +630,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="该拒答的题（gold=<ABSTAIN> 或 category=abstention，**不限 judge_spec**）"
         "词表判「未拒答」时，再发一次 YES/NO 复核（默认开启）；"
         "--no-abstention-recheck 关闭可省 LLM 调用，代价是改写式拒答会被记成未拒答",
+    )
+    p_ev_cmp.add_argument(
+        "--baseline-name",
+        default=None,
+        help="基线组显示名（进 groups.json 与报告；缺省 基线）",
+    )
+    p_ev_cmp.add_argument(
+        "--candidate-name",
+        default=None,
+        help="候选组显示名（进 groups.json 与报告；缺省 候选）",
+    )
+    p_ev_cmp.add_argument(
+        "--baseline-dir",
+        default=None,
+        help="基线组目录名（ASCII，缺省 baseline）",
+    )
+    p_ev_cmp.add_argument(
+        "--candidate-dir",
+        default=None,
+        help="候选组目录名（ASCII，缺省 candidate）",
     )
     ev_cmp_group = p_ev_cmp.add_mutually_exclusive_group()
     ev_cmp_group.add_argument("--quick", action="store_true", help="快速模式：跳过 BEAM 与 LongMemEval-S（等价 --no-beam --no-lme-s）")
@@ -973,27 +1015,31 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_compare(args: argparse.Namespace) -> int:
-    """compare：--task-dir 就地对比该任务目录的 A/ 与 B/，否则新建 compare_* 目录并复制两臂。"""
+    """compare：--task-dir 就地对比该任务目录的 A/ 与 B/，否则新建 compare_* 目录并复制两组。"""
     if args.task_dir is not None:
         if not os.path.isdir(args.task_dir):
             raise SystemExit(f"任务目录不存在: {args.task_dir}")
-        # 就地：两臂由任务目录给定（--baseline/--candidate 显式给出时以显式为准）
-        baseline = args.baseline or layout.arm_dir(args.task_dir, layout.DIR_ARM_A)
-        candidate = args.candidate or layout.arm_dir(args.task_dir, layout.DIR_ARM_B)
+        # 就地：两组由任务目录给定（--baseline/--candidate 显式给出时以显式为准）
+        baseline = args.baseline or layout.group_dir(
+            args.task_dir, layout.ROLE_BASELINE
+        )
+        candidate = args.candidate or layout.group_dir(
+            args.task_dir, layout.ROLE_CANDIDATE
+        )
         for arm_path in (baseline, candidate):
             if not os.path.isdir(arm_path):
                 raise SystemExit(
-                    f"任务目录里的臂目录不存在: {arm_path}；"
-                    "--task-dir 就地对比要求 A/ 与 B/ 都有产物，"
+                    f"任务目录里的组目录不存在: {arm_path}；"
+                    "--task-dir 就地对比要求两组（见 groups.json）都有产物，"
                     "或显式给 --baseline / --candidate"
                 )
-        # 输出容器 = 该任务目录（就地写 reports/，不另建 compare_* 目录、不复制两臂）
+        # 输出容器 = 该任务目录（就地写 reports/，不另建 compare_* 目录、不复制两组）
         out_kwargs: dict[str, Any] = {"task_dir": args.task_dir}
         guard: Any = nullcontext()
     else:
         if not args.baseline or not args.candidate:
             raise SystemExit(
-                "compare 需要 --baseline DIR --candidate DIR（两臂产物目录），"
+                "compare 需要 --baseline DIR --candidate DIR（两组产物目录），"
                 "或用 --task-dir DIR 就地对比该任务目录的 A/ 与 B/"
             )
         baseline, candidate = args.baseline, args.candidate
@@ -1008,6 +1054,17 @@ def _cmd_compare(args: argparse.Namespace) -> int:
             latency_warn=args.latency_warn,
             require_comparable=args.require_comparable,
             name=args.tag,
+            group_labels=(
+                [
+                    getattr(args, "baseline_name", None) or "基线",
+                    getattr(args, "candidate_name", None) or "候选",
+                ]
+                if (
+                    getattr(args, "baseline_name", None)
+                    or getattr(args, "candidate_name", None)
+                )
+                else None
+            ),
             **out_kwargs,
         )
     # compare_runs 已打印 verdict / 逐门禁 / 不可比原因 / 报告路径；此处补实验目录便于脚本消费
@@ -1133,16 +1190,17 @@ def _cmd_series(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def _task_arm_roots(task_dir: str) -> list[tuple[str, str]]:
-    """任务目录下的臂：``[(臂标签, 臂根目录)]``。
+    """任务目录下的组：``[(臂标签, 臂根目录)]``。
 
-    双臂任务目录（``task init --arms 2``）取实际存在的 ``A/`` / ``B/``；两者都不存在
-    时把任务目录本身当单臂实验根（``runs/`` 就在它下面）。骨架只建了一半（例如只跑
+    双组任务目录（``task init --groups 2``）取 ``groups.json`` 里实际存在的组目录；都不存在
+    时把任务目录本身当单组实验根（``runs/`` 就在它下面）。骨架只建了一半（例如只跑
     了 ``A/``）时只报存在的那一个——status 是进度视图，不该因为另一半还没建就拒绝。
     """
+    groups = layout.read_groups_manifest(task_dir) or []
     arms = [
-        (arm, layout.arm_dir(task_dir, arm))
-        for arm in (layout.DIR_ARM_A, layout.DIR_ARM_B)
-        if os.path.isdir(layout.arm_dir(task_dir, arm))
+        (str(item["dir"]), os.path.join(task_dir, str(item["dir"])))
+        for item in groups
+        if os.path.isdir(os.path.join(task_dir, str(item["dir"])))
     ]
     return arms or [("", task_dir)]
 
@@ -1226,7 +1284,7 @@ def _refresh_snapshot_index(pool_root: str, index: dict[str, Any]) -> None:
 
 
 def _snapshot_pool_lines(target: str) -> list[str]:
-    """回放任务快照池的进度行：桶数 / 体积 / 各臂来源与复用计数 / 两臂一致性。
+    """回放任务快照池的进度行：桶数 / 体积 / 各组来源与复用计数 / 两组一致性。
 
     新产物从条目树 + 各桶清单**重算**（:func:`membench.layout.build_snapshot_index`），
     不信任可能过期的 ``index.json``；缺索引 / 索引过期时顺手刷新一次（best effort）。
@@ -1261,7 +1319,7 @@ def _snapshot_pool_lines(target: str) -> list[str]:
     lines = [f"快照池: {pool_root}（{len(buckets)} 个桶 / {_human_bytes(total_bytes)}）"]
     for arm in sorted(str(name) for name in arms):
         info = arms.get(arm) if isinstance(arms.get(arm), dict) else {}
-        label = f"臂 {arm}" if arm else "单臂"
+        label = f"组 {arm}" if arm else "单组"
         source = str(info.get("source") or "n/a")
         manifest_sha = str(info.get("source_manifest_sha256") or "")
         lines.append(
@@ -1270,13 +1328,17 @@ def _snapshot_pool_lines(target: str) -> list[str]:
             f"源 {source}"
             + (f"（源清单 sha256 {manifest_sha[:12]}）" if manifest_sha else "")
         )
-    if layout.DIR_ARM_A in arms and layout.DIR_ARM_B in arms:
+    if len(arms) >= 2:
         lines.extend(_arm_consistency_lines(entries))
     return lines
 
 
 def _arm_consistency_lines(entries: dict[str, Any]) -> list[str]:
-    """两臂逐对话比对快照桶：全部指向同一批桶就是"回放保真"，否则列出差异规模。"""
+    """两组逐对话比对快照桶：全部指向同一批桶就是"回放保真"，否则列出差异规模。
+
+    组名由用户在 ``groups.json`` 里给（可以是中文），这里不假设固定词表：取
+    快照条目里实际出现的组键，两两比对（通常正好两组）。
+    """
     by_dataset: dict[str, dict[str, dict[str, str]]] = {}
     for key, digest in entries.items():
         parsed = layout.parse_snapshot_entry_key(key)
@@ -1287,8 +1349,11 @@ def _arm_consistency_lines(entries: dict[str, Any]) -> list[str]:
     lines: list[str] = []
     for dataset in sorted(by_dataset):
         per_arm = by_dataset[dataset]
-        arm_a = per_arm.get(layout.DIR_ARM_A) or {}
-        arm_b = per_arm.get(layout.DIR_ARM_B) or {}
+        keys = sorted(per_arm)
+        if len(keys) < 2:
+            continue
+        arm_a = per_arm.get(keys[0]) or {}
+        arm_b = per_arm.get(keys[1]) or {}
         if not arm_a or not arm_b:
             continue
         all_ids = set(arm_a) | set(arm_b)
@@ -1319,7 +1384,7 @@ def _format_duration(ms: Any) -> str:
 
 
 def _print_runtime(exp_root: str, label: str = "") -> None:
-    """打印一个实验 / 臂目录的运行时概况（只读；没有 ``runtime/`` 时明确说明）。"""
+    """打印一个实验 / 组目录的运行时概况（只读；没有 ``runtime/`` 时明确说明）。"""
     title = f"运行时（{label}）" if label else "运行时"
     summary = runtime.summarize(exp_root, limit=5)
     if not summary["exists"]:
@@ -1343,25 +1408,42 @@ def _print_runtime(exp_root: str, label: str = "") -> None:
 def _cmd_task_init(args: argparse.Namespace) -> int:
     """task init：建任务目录骨架，stdout 只打印它的绝对路径（供 ``TASK=$(...)`` 接走）。"""
     task_dir = layout.init_task_dir(
-        args.report_out, args.name, args.platform, args.arms, replay=args.replay
+        args.report_out,
+        args.name,
+        args.platform,
+        args.groups,
+        group_labels=(
+            [args.baseline_name, args.candidate_name] if args.groups == 2 else None
+        ),
+        group_dirs=(
+            [args.baseline_dir or "baseline", args.candidate_dir or "candidate"]
+            if args.groups == 2
+            else None
+        ),
+        replay=args.replay,
     )
     # 任务目录从这一刻起就是本次命令的产物根：task init 自己也记一条命令与日志
     runtime.set_dir(task_dir)
-    shape = f"{layout.DIR_ARM_A}/ {layout.DIR_ARM_B}/" if args.arms == 2 else f"{layout.DIR_RUNS}/"
+    groups = layout.read_groups_manifest(task_dir) or []
+    shape = (
+        " ".join(f"{item['dir']}/" for item in groups)
+        if args.groups == 2
+        else f"{layout.DIR_RUNS}/"
+    )
     if args.replay:
         shape += f" {layout.DIR_SNAPSHOTS}/"
     first_arm = (
-        layout.arm_dir(task_dir, layout.DIR_ARM_A) if args.arms == 2 else task_dir
+        layout.group_dir(task_dir, layout.ROLE_BASELINE) if args.groups == 2 else task_dir
     )
     # 人看的说明全部走 stderr：stdout 只有一行路径，脚本 $() 才能直接接走
     print(f"[membench] 任务目录: {task_dir}", file=sys.stderr)
-    print(f"[membench] 骨架: arms={args.arms}（{shape} + {layout.DIR_REPORTS}/）", file=sys.stderr)
+    print(f"[membench] 骨架: groups={args.groups}（{shape} + {layout.DIR_REPORTS}/）", file=sys.stderr)
     if args.replay:
         print(
             f"[membench] 下一步: 回放同一个源到该任务 —— "
             f"python -m membench.cli run --adapter <适配器> --dataset <数据集> "
             f"--task-dir {first_arm} --replay <源：实验目录 / 数据集目录 / 回放任务>"
-            "（两臂分别 --task-dir <任务>/A、<任务>/B 回放同一源时，状态相同的对话共用"
+            "（两组分别 --task-dir <任务>/A、<任务>/B 回放同一源时，状态相同的对话共用"
             "同一个桶；同一臂可再加 --shards <N> --shard-index <I> --shard-by dialogue "
             "让多个进程并行回放，各进程只写自己对话的条目）；进度用 "
             f"python -m membench.cli task status {task_dir}",
@@ -1380,19 +1462,19 @@ def _cmd_task_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_task_status(args: argparse.Namespace) -> int:
-    """task status：任务目录（或单臂实验目录）的进度视图，只读、不写任何产物。"""
+    """task status：任务目录（或单组实验目录）的进度视图，只读、不写任何产物。"""
     target = os.path.abspath(args.dir)
     if not os.path.isdir(target):
         raise SystemExit(f"任务目录不存在: {args.dir}")
     arms = _task_arm_roots(target)
     arm_labels = [label for label, _ in arms if label]
     if arm_labels:
-        skeleton = f"arms={len(arm_labels)}（{' '.join(f'{label}/' for label in arm_labels)} + {layout.DIR_REPORTS}/）"
+        skeleton = f"groups={len(arm_labels)}（{' '.join(f'{label}/' for label in arm_labels)} + {layout.DIR_REPORTS}/）"
     elif os.path.isdir(layout.runs_root(target)):
-        skeleton = f"arms=1（{layout.DIR_RUNS}/ + {layout.DIR_REPORTS}/）"
+        skeleton = f"groups=1（{layout.DIR_RUNS}/ + {layout.DIR_REPORTS}/）"
     else:
         raise SystemExit(
-            f"目录里没有任务骨架（缺 runs/ 与 A/ B/）: {target}；"
+            f"目录里没有任务骨架（缺 runs/ 或 groups.json 里的组目录）: {target}；"
             "请先用 python -m membench.cli task init --name <NAME> 建任务目录"
         )
     print(f"[membench] 任务目录: {target}")
@@ -1402,16 +1484,16 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
         print(f"[membench] {line}")
     if arm_labels:
         # 任务根的 runtime 记的是 task init / evaluate / fuse / compare 等任务级命令；
-        # 各臂的 runtime 记写进该臂的 run（分片）命令
+        # 各组的 runtime 记写进该组的 run（分片）命令
         _print_runtime(target, "任务")
 
     next_steps: list[str] = []
     n_datasets = 0
     arms_all_ready = True
     for label, arm_root in arms:
-        where = f"臂 {label}" if label else "单臂实验目录"
+        where = f"组 {label}" if label else "单组实验目录"
         print(f"[membench] {where}: {arm_root}")
-        _print_runtime(arm_root, f"臂 {label}" if label else "")
+        _print_runtime(arm_root, f"组 {label}" if label else "")
         datasets = _dataset_dirs_of(arm_root)
         if not datasets:
             print("[membench]   数据集: （尚无产物）")
@@ -1500,7 +1582,7 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
         next_steps.append("任务目录里还没有数据集产物——按上面的示例跑分片后再 status 看进度")
     if len(arms) == 2 and arms_all_ready:
         next_steps.append(
-            f"两臂数据集级产物已齐备：python -m membench.cli compare --task-dir {target}"
+            f"两组数据集级产物已齐备：python -m membench.cli compare --task-dir {target}"
         )
     print("[membench] 下一步:")
     for step in next_steps or ["产物已齐备，无需操作"]:
@@ -1735,6 +1817,10 @@ def _cmd_evaluate_compare(args: argparse.Namespace) -> int:
             **_snapshot_kwarg(args),
             trace_state=args.trace_state,
             abstention_recheck=args.abstention_recheck,
+            baseline_label=args.baseline_name,
+            candidate_label=args.candidate_name,
+            baseline_dir=args.baseline_dir,
+            candidate_dir=args.candidate_dir,
         )
     return 1 if result["verdict"] == "FAIL" else 0
 

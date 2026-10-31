@@ -265,15 +265,19 @@ def test_task_subdir_reuses_single_arm_and_two_arm_naming() -> None:
 
 
 def test_init_task_dir_skeleton_and_non_empty_guard(tmp_path: Path) -> None:
-    """双臂任务建 A/ B/ reports/，单臂任务建 runs/ reports/；非空目录拒绝复用。"""
+    """双组任务建 baseline/ candidate/ + groups.json，单组任务建 runs/ reports/；非空目录拒绝复用。"""
     base = tmp_path / "output"
     task = Path(layout.init_task_dir(str(base), "a1_vs_b1", "wx", arms=2, ts="20260101-120000"))
     assert task.is_absolute() and task.name == "compare_a1_vs_b1_wx_20260101-120000"
-    assert sorted(p.name for p in task.iterdir()) == ["A", "B", "reports"]
-    assert layout.arm_dir(str(task), layout.DIR_ARM_A) == str(task / "A")
-    assert layout.arm_dir(str(task), layout.DIR_ARM_B) == str(task / "B")
-    with pytest.raises(ValueError, match="arm"):
-        layout.arm_dir(str(task), "C")
+    assert sorted(p.name for p in task.iterdir()) == ["baseline", "candidate", "groups.json", "reports"]
+    groups = layout.read_groups_manifest(str(task))
+    assert groups is not None
+    assert [g["role"] for g in groups] == [layout.ROLE_BASELINE, layout.ROLE_CANDIDATE]
+    assert [g["dir"] for g in groups] == ["baseline", "candidate"]
+    assert layout.group_dir(str(task), layout.ROLE_BASELINE) == str(task / "baseline")
+    assert layout.group_dir(str(task), layout.ROLE_CANDIDATE) == str(task / "candidate")
+    with pytest.raises(SystemExit, match="没有角色"):
+        layout.group_dir(str(task), "third")
 
     single = Path(
         layout.init_task_dir(str(base), "mock-strong", "wx", arms=1, ts="20260101-120000")
@@ -441,3 +445,55 @@ def test_resolve_dataset_dir_reports_missing_product(tmp_path: Path) -> None:
         layout.resolve_dataset_dir(str(legacy))
     assert layout.LEGACY_LAYOUT_MSG in str(excinfo_legacy.value)
     assert layout.NO_DATASET_PRODUCT_MSG not in str(excinfo_legacy.value)
+
+
+def test_group_dir_name_keeps_ascii_and_rejects_illegal() -> None:
+    """组名 → 目录名：中文 label 不进目录（用 ASCII 兜底），非法字符清掉。"""
+    assert layout.group_dir_name("index-opt") == "index-opt"
+    # 中文 label 只有兜底目录名
+    assert layout.group_dir_name("索引优化", ascii_fallback="index-opt") == "index-opt"
+    assert layout.group_dir_name("索引优化") == "group"
+    # 路径分隔符 / 通配符清掉，首尾点与空格去掉
+    assert layout.group_dir_name("a/b:c*?. ") == "a-b-c"
+
+
+def test_validate_group_labels_uniqueness_and_reserved() -> None:
+    """组名校验：大小写不敏感唯一、不撞保留名、目录名是 ASCII。"""
+    dirs = layout.validate_group_labels(
+        ["基线", "索引优化"], fallbacks=["baseline", "index-opt"]
+    )
+    assert dirs == ["baseline", "index-opt"]
+    # 两个中文名都退同一兜底 → 判重复
+    with pytest.raises(ValueError, match="重复"):
+        layout.validate_group_labels(["甲", "乙"], fallbacks=["same", "SAME"])
+    with pytest.raises(ValueError, match="保留名"):
+        layout.validate_group_labels(["runs"])
+    with pytest.raises(ValueError, match="不能为空"):
+        layout.validate_group_labels(["   "])
+
+
+def test_groups_manifest_roundtrip(tmp_path: Path) -> None:
+    """清单读写：角色 → 目录 → 显示名；缺失 / 坏文件返回 None（不猜）。"""
+    task = Path(
+        layout.init_task_dir(
+            str(tmp_path),
+            "ab",
+            "mac",
+            arms=2,
+            ts="20260101-000000",
+            group_labels=["基线", "索引优化"],
+            group_dirs=["baseline", "index-opt"],
+        )
+    )
+    groups = layout.read_groups_manifest(str(task))
+    assert groups is not None
+    assert [(g["role"], g["label"], g["dir"]) for g in groups] == [
+        (layout.ROLE_BASELINE, "基线", "baseline"),
+        (layout.ROLE_CANDIDATE, "索引优化", "index-opt"),
+    ]
+    assert layout.group_dir(str(task), layout.ROLE_CANDIDATE) == str(task / "index-opt")
+    # 坏清单：返回 None，group_dir 报可操作错误
+    (task / layout.FILE_GROUPS).write_text("{坏", encoding="utf-8")
+    assert layout.read_groups_manifest(str(task)) is None
+    with pytest.raises(SystemExit, match="groups.json"):
+        layout.group_dir(str(task), layout.ROLE_BASELINE)

@@ -378,8 +378,8 @@ def _make_compare(tmp_path: Path) -> tuple[dict[str, str], dict[str, str]]:
     )
     ab_dir = Path(result["compare_dir"])
     # A/B 两侧各是一个完整 eval 实验形态：产物在 <compare>/<arm>/runs/<dataset>/
-    baseline = {k: str(ab_dir / "A" / "runs" / k) for k in ("a", "b")}
-    candidate = {k: str(ab_dir / "B" / "runs" / k) for k in ("a", "b")}
+    baseline = {k: str(ab_dir / "baseline" / "runs" / k) for k in ("a", "b")}
+    candidate = {k: str(ab_dir / "candidate" / "runs" / k) for k in ("a", "b")}
     for target in (*baseline.values(), *candidate.values()):
         assert (Path(target) / "report" / "metrics.json").is_file()
     return baseline, candidate
@@ -403,7 +403,7 @@ def test_evaluate_compare_pure_aggregate(tmp_path: Path) -> None:
     assert "mock-weak vs mock-strong" in md
     assert result["verdict"] in ("PASS", "WARN", "FAIL")
     # 对比实验目录的形态：A/ 与 B/ 各含 runs/ + 任务级 reports/，对比报告落根层 reports/
-    for arm in ("A", "B"):
+    for arm in ("baseline", "candidate"):
         assert (ab_dir / arm / "reports" / "report.md").is_file()
         for key in ("a", "b"):
             assert (ab_dir / arm / "runs" / key / "report" / "metrics.json").is_file()
@@ -425,7 +425,7 @@ def test_evaluate_compare_gap_fill_one_side(tmp_path: Path) -> None:
         candidate_runs={"a": candidate["a"]},
     )
     ab_dir = Path(result["compare_dir"])
-    cand_dirs = [p for p in (ab_dir / "B" / "runs").iterdir() if p.is_dir()]
+    cand_dirs = [p for p in (ab_dir / "candidate" / "runs").iterdir() if p.is_dir()]
     assert sorted(p.name for p in cand_dirs) == ["a", "b"]
     for dataset_dir in cand_dirs:
         assert (dataset_dir / "report" / "metrics.json").is_file()
@@ -495,7 +495,7 @@ def test_sharded_ab_official_path(tmp_path: Path) -> None:
     assert result["verdict"] in ("PASS", "WARN", "FAIL")
     # 融合产物的数据集突进两侧各自的 runs/<dataset>/ 下，逐题明细随之带过来
     dataset_name = Path(SAMPLE_DATASET_PATH).stem
-    for arm in ("A", "B"):
+    for arm in ("baseline", "candidate"):
         dataset_dir = Path(result["compare_dir"]) / arm / "runs" / dataset_name
         assert (dataset_dir / "report" / "metrics.json").is_file()
         assert (dataset_dir / "report" / "results.jsonl").is_file()

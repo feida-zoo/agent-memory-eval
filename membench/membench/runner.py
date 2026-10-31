@@ -78,7 +78,7 @@ results.jsonl（不浪费 LLM 调用，metrics 聚合分母口径自然正确）
 回放任务（``task init --replay``）另有任务级快照池::
 
     <任务>/snapshots/<sha256 前 12 位>/             # 内容寻址桶（含 manifest.json，来源记在 source 段）
-    <任务>/snapshots/entries/<臂>/<数据集>/<对话>.json  # 逐对话条目（真源，各进程各写各的）
+    <任务>/snapshots/entries/<组>/<数据集>/<对话>.json  # 逐对话条目（真源，各进程各写各的）
     <任务>/snapshots/index.json                    # 派生视图（由条目 + 桶清单重算，fuse/status 刷新）
 
 快照默认导出（``snapshot=True``）：每个对话只有一份，打点在该对话全部 session ingest
@@ -88,7 +88,7 @@ results.jsonl（不浪费 LLM 调用，metrics 聚合分母口径自然正确）
 **回放**（``replay``）同样在 ``restore()`` / ``rebuild()`` 之后、第一道 query 之前导出，
 但落点是任务级内容寻址池 ``<任务>/snapshots/<sha256 前 12 位>/``（见
 :class:`_SnapshotPoolWriter` 与 :mod:`membench.layout` 的池 helper）：状态内容相同的
-导出共用同一个桶，A/B 两臂回放同一源时只产生一份；``--no-snapshot`` 关闭，关闭时
+导出共用同一个桶，A/B 两组回放同一源时只产生一份；``--no-snapshot`` 关闭，关闭时
 既不写桶也不写条目 / 索引。并行分片回放时各进程只写自己对话的条目，池里没有需要
 争抢的共享可变状态。
 """
@@ -743,12 +743,12 @@ class _SnapshotPoolWriter:
     落位只靠一次 ``os.replace`` 的成败判"本次创建 / 别人已建好"——不预判目录存在性、
     不读共享索引：两个分片进程同时建同一个桶时，失败的一方按磁盘上的清单校验后记
     复用即可。每个对话另写一个自足的条目文件
-    （``snapshots/entries/<臂>/<数据集>/<对话>.json``，见
+    （``snapshots/entries/<组>/<数据集>/<对话>.json``，见
     :func:`membench.layout.write_snapshot_entry`），对话级分片下各进程只写自己的
     对话 ⇒ **并行回放没有共享可变状态要抢，不需要任何锁**。
 
-    池属于**任务**而不是臂：``out_dir`` 是 ``<任务>/A`` / ``B`` 时池在父任务目录，
-    臂键即目录名；单臂任务 / 普通实验目录的臂键是空串。
+    池属于**任务**而不是组：``out_dir`` 是 ``<任务>/A`` / ``B`` 时池在父任务目录，
+    组键即目录名；单组任务 / 普通实验目录的组键是空串。
     """
 
     def __init__(self, out_dir: str, plan: dict[str, Any], dataset: str) -> None:
@@ -810,7 +810,7 @@ class _SnapshotPoolWriter:
                 "source_manifest_sha256": self.plan.get("manifest_sha256"),
             }
             if self.plan.get("source_pool"):
-                # 链式回放：上一轮也是回放任务，记下用的是哪个臂的桶
+                # 链式回放：上一轮也是回放任务，记下用的是哪个组的桶
                 manifest["source"]["source_pool"] = self.plan["source_pool"]
                 manifest["source"]["source_arm"] = self.plan.get("source_arm")
             entry = snapshot_mod.write_snapshot(
@@ -920,7 +920,7 @@ class Runner:
             内容寻址池 ``<任务>/snapshots/<内容哈希前 12 位>/``（相同状态只存一份）；
             ``--no-snapshot``（``snapshot=False``）两种模式都不写快照。
         replay: 回放源：实验目录、数据集目录（``<实验目录>/runs/<dataset>``），或
-            **回放任务**（含 ``snapshots/index.json`` 的任务根 / 臂目录
+            **回放任务**（含 ``snapshots/index.json`` 的任务根 / 组目录
             ``<任务>/A``）。给定时跳过 reset+ingest，按对话 ``restore()``（或
             ``rebuild()``）后只跑 query。清单齐备性 / 数据集指纹 / 对话覆盖 / 能力 /
             模式都在**开跑前**校验，失败即停且不产生任何产物。
@@ -1438,7 +1438,7 @@ class Runner:
             if replay_plan.get("source_pool"):
                 print(
                     f"[membench] 回放源是回放任务: {replay_plan['source_pool']}"
-                    f"（臂 {replay_plan['source_arm'] or '单臂'}）"
+                    f"（组 {replay_plan['source_arm'] or '单组'}）"
                 )
         snapshot_caps: dict[str, Any] = {}
         # 快照默认导出；适配器没有这个能力就跳过（只打印一次警告，不中断评测），
@@ -1550,7 +1550,7 @@ class Runner:
         export_snapshots = bool(self.snapshot and snapshot_caps.get("supported"))
         # 逐 as_of 追踪状态（仅 interleaved 有意义；回放已在开跑前拒绝）
         export_traces = bool(trace_enabled and snapshot_caps.get("supported"))
-        # 回放任务的池写入器：out_dir 是臂目录时池在父任务目录（见 layout 的池 helper）
+        # 回放任务的池写入器：out_dir 是组目录时池在父任务目录（见 layout 的池 helper）
         snapshot_pool: Union[_SnapshotPoolWriter, None] = None
         if replay_plan is not None and export_snapshots:
             snapshot_pool = _SnapshotPoolWriter(self.out_dir, replay_plan, dataset_name)
@@ -2235,7 +2235,7 @@ class Runner:
             print(
                 f"[membench] 快照池: {pool['snapshots_dir']}（{pool['n_buckets']} 个桶，"
                 f"复用 {pool['n_reused']} / 新写 {pool['n_new']}）"
-                "——同一源回放到另一臂不会新增桶；--replay 传该任务目录或其臂目录可"
+                "——同一源回放到另一组不会新增桶；--replay 传该任务目录或其组目录可"
                 "继续回放（链式）"
             )
         elif export_snapshots:

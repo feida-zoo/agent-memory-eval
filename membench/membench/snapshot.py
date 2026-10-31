@@ -17,9 +17,9 @@
 回放任务（``task init --replay``）不用逐对话目录，而是任务级内容寻址池
 ``<任务>/snapshots/<sha256 前 12 位>/``（见 :mod:`membench.layout` 的池 helper）：
 桶内清单与普通快照同构；**每个对话一个条目文件**
-``snapshots/entries/<臂>/<数据集>/<对话>.json`` 是"哪个臂的哪个对话在哪个桶"的真源
+``snapshots/entries/<组>/<数据集>/<对话>.json`` 是"哪个组的哪个对话在哪个桶"的真源
 （自足、单文件原子写，并行分片各写各的），``snapshots/index.json`` 只是由条目树 +
-各桶清单重算的派生视图。:func:`plan_replay` 两种源都接受——传回放任务（任务根或臂
+各桶清单重算的派生视图。:func:`plan_replay` 两种源都接受——传回放任务（任务根或组
 目录）时按条目树解析桶（只有旧产物、没有条目树时才回退读索引），传实验目录 / 数据集
 目录时按逐对话目录解析，校验强度一致（身份与指纹都以桶内 / 目录内的
 ``manifest.json`` 为准）。
@@ -284,21 +284,23 @@ def _source_run_id(dataset_dir: str) -> str:
 
 
 def _replay_task_source(source: str) -> Union[tuple[str, str], None]:
-    """``--replay`` 入参指向**回放任务**时返回 ``(任务目录, 臂键)``，否则 None。
+    """``--replay`` 入参指向**回放任务**时返回 ``(任务目录, 组键)``，否则 None。
 
-    两种形态：任务根（自身带 ``snapshots/`` 池，臂待定）与臂目录（``<任务>/A`` /
-    ``B``，父任务目录带池）。臂键的口径与写条目时一致（见
+    两种形态：任务根（自身带 ``snapshots/`` 池，臂待定）与组目录（``<任务>/A`` /
+    ``B``，父任务目录带池）。组键的口径与写条目时一致（见
     :func:`membench.layout.snapshot_arm_key`），因此这里只把目录名交给后续解析，
     不自己拼字符串。
     """
     if layout.has_snapshot_pool(source):
         return source, ""
     parent = os.path.dirname(source)
-    if (
-        os.path.basename(source) in (layout.DIR_ARM_A, layout.DIR_ARM_B)
-        and layout.has_snapshot_pool(parent)
-    ):
-        return parent, os.path.basename(source)
+    if layout.has_snapshot_pool(parent):
+        # 组目录名由用户给（可以是中文）：按父任务的 groups.json 判断，不猜固定词表
+        groups = layout.read_groups_manifest(parent) or []
+        if os.path.basename(source).casefold() in {
+            str(item["dir"]).casefold() for item in groups
+        }:
+            return parent, os.path.basename(source)
     return None
 
 
@@ -309,7 +311,7 @@ def _read_pool_digest(
     dialogue_id: str,
     index_cache: list[Union[dict[str, Any], None]],
 ) -> Union[str, None]:
-    """该臂该对话的桶名：条目文件优先，旧产物（无条目）才回退读索引。
+    """该组该对话的桶名：条目文件优先，旧产物（无条目）才回退读索引。
 
     ``index_cache`` 是单元素缓存：只有真的有对话缺条目时才读一次索引，条目齐全的
     新产物完全不碰 ``index.json``（它是派生视图，可能还没被 fuse/status 刷新）。
@@ -328,9 +330,9 @@ def _read_pool_digest(
 def _pool_snapshot_dirs(
     task_dir: str, arm: str, dataset: str, dialogue_ids: list[str]
 ) -> tuple[dict[str, str], str]:
-    """按回放任务的条目树（旧产物回退索引）解析逐对话桶目录，返回 ``(snapshot_dirs, 臂键)``。
+    """按回放任务的条目树（旧产物回退索引）解析逐对话桶目录，返回 ``(snapshot_dirs, 组键)``。
 
-    任务根作源且池里只有**一个**臂时自动用它；多个臂必须传具体臂目录——两臂的
+    任务根作源且池里只有**一个**臂时自动用它；多个臂必须传具体组目录——两组的
     逐对话状态可能不同（那正是"回放不保真"的证据），替用户选一个臂就是替用户
     选结论。
     """
@@ -341,19 +343,19 @@ def _pool_snapshot_dirs(
             raise SystemExit(
                 f"回放任务 {task_dir} 的快照池里还没有任何快照（"
                 f"{layout.snapshot_entries_root(pool_root)} 为空）：请先把源回放到"
-                "该任务的某个臂，再用它作源"
+                "该任务的某个组，再用它作源"
             )
         if len(arms) != 1:
             hint = "、".join(os.path.join(task_dir, name) for name in arms)
             raise SystemExit(
-                f"回放任务 {task_dir} 有 {len(arms)} 个臂，无法确定用哪一个：{hint}；"
-                f"请把 --replay 指向具体臂目录（如 {os.path.join(task_dir, layout.DIR_ARM_A)}）"
+                f"回放任务 {task_dir} 有 {len(arms)} 个组，无法确定用哪一个：{hint}；"
+                f"请把 --replay 指向具体组目录（如 {os.path.join(task_dir, arms[0])}）"
             )
         arm = arms[0]
     elif arm not in arms:
         raise SystemExit(
-            f"回放任务 {task_dir} 的快照池里没有臂 {arm!r}（现有："
-            f"{'、'.join(arms) or '无'}）；请确认该臂回放时导出了快照"
+            f"回放任务 {task_dir} 的快照池里没有组 {arm!r}（现有："
+            f"{'、'.join(arms) or '无'}）；请确认该组回放时导出了快照"
         )
 
     index_cache: list[Union[dict[str, Any], None]] = [None]
@@ -372,7 +374,7 @@ def _pool_snapshot_dirs(
             "回放任务的快照池缺少本 run 需要的对话，拒绝回放："
             + "、".join(missing[:5])
             + (f" 等 {len(missing)} 个" if len(missing) > 5 else "")
-            + f"——臂 {arm or '单臂'} 没有这些对话的桶（回放时要覆盖同一批对话，"
+            + f"——组 {arm or '单组'} 没有这些对话的桶（回放时要覆盖同一批对话，"
             "链式回放也需上游导出过它们）"
         )
     absent = [f"{did} -> {path}" for did, path in snapshot_dirs.items() if not os.path.isdir(path)]
@@ -401,7 +403,7 @@ def plan_replay(
             - 实验目录（自动在其 ``runs/`` 下定位匹配 ``dataset`` 的数据集目录）；
             - 数据集目录（``<实验目录>/runs/<dataset>``）；
             - **回放任务**（任务根带 ``snapshots/``）：任务根（池里只有一个臂时自动
-              用它）或臂目录 ``<任务>/A``（按臂键取该臂的桶）。臂目录的源里，每个
+              用它）或组目录 ``<任务>/A``（按组键取该组的桶）。组目录的源里，每个
               对话的状态都来自内容寻址池，而不是对话目录下的 ``memory_snapshot/``。
         dataset: 本次评测的数据集名（用于定位与身份校验）。
         adapter: 当前适配器（读其快照能力声明）。
@@ -413,14 +415,14 @@ def plan_replay(
     校验（全部在开跑之前）：清单齐备且 ``complete=true``、清单身份与本次一致
     （数据集 / 对话 id / 对话目录名）、数据集指纹一致、各对话格式版本一致。池源
     校验强度不变——桶内 ``manifest.json`` 就是身份与指纹的凭证，逐对话条目（旧产物
-    是索引）只负责回答"哪个臂的哪个对话在哪个桶"。
+    是索引）只负责回答"哪个组的哪个对话在哪个桶"。
     模式协商：``auto`` 优先 ``restore``（要求格式兼容且适配器声明支持），
     否则退回 ``rebuild``（要求适配器声明支持），都不行则拒绝。
 
     Returns:
         ``{"root": 快照根（数据集目录，或回放任务的入参路径）, "source": --replay
         入参的绝对路径, "source_pool": 池源的任务级 snapshots/（非池源为 None）,
-        "source_arm": 池源的臂键（非池源为 None）, "mode", "run_mode",
+        "source_arm": 池源的组键（非池源为 None）, "mode", "run_mode",
         "format_version", "source_run", "manifest_sha256",
         "snapshots": {对话 id: 快照目录}}``。
 

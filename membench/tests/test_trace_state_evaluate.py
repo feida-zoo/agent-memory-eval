@@ -154,7 +154,7 @@ def test_evaluate_compare_forwards_trace_state(
     )
     assert calls == [True, True]
     compare_dir = Path(result["compare_dir"])
-    for arm in (layout.DIR_ARM_A, layout.DIR_ARM_B):
+    for arm in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
         arm_dataset = next((compare_dir / arm / layout.DIR_RUNS).iterdir())
         assert (arm_dataset / "d1" / layout.DIR_TRACE_STATE / "t1").is_dir()
 

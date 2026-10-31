@@ -117,12 +117,22 @@ def _compare_task(
     name: str = "compare_demo_default_20260101-000000",
     comparison: str | None = None,
 ) -> Path:
-    """构造一个最小的 ``compare_*`` 任务树（A/B 各一个数据集）。"""
+    """构造一个最小的 ``compare_*`` 任务树（两组各一个数据集）。"""
     task = root / name
     _write(task / "reports" / "report.md", "# compare container\n")
-    for arm in ("A", "B"):
-        _dataset_tree(task / arm / "runs" / "sample")
-        _write(task / arm / "reports" / "report.md", f"# arm {arm}\n")
+    _write_json(
+        task / "groups.json",
+        {
+            "schema": 1,
+            "groups": [
+                {"role": "baseline", "label": "基线", "dir": "baseline"},
+                {"role": "candidate", "label": "候选", "dir": "candidate"},
+            ],
+        },
+    )
+    for group in ("baseline", "candidate"):
+        _dataset_tree(task / group / "runs" / "sample")
+        _write(task / group / "reports" / "report.md", f"# group {group}\n")
     if comparison is not None:
         _write(task / "reports" / "comparison.md", comparison)
     return task
@@ -337,7 +347,7 @@ def test_eval_dry_run_shards_are_parallel(
     assert _eval_dry_run(tmp_path, "--shards", "2") == 0
     out = capsys.readouterr().out
     lines = out.splitlines()
-    assert "task init --arms 1 --name smoke" in out
+    assert "task init --groups 1 --name smoke" in out
     assert "--evidence-match substring" in out
     shard0 = next(
         line for line in lines if "--shard-index 0 --shard-by dialogue" in line
@@ -418,7 +428,7 @@ def test_eval_common_dry_run_passes_trace_state(
 def test_ab_dry_run_arm_and_compare_order(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """ab --shards 2：A 臂两片 → A fuse → B 臂两片 → B fuse → compare strict 最后。"""
+    """ab --shards 2：基线组两片 → fuse → 候选组两片 → fuse → compare strict 最后。"""
     code = run_task.main(
         [
             "ab",
@@ -453,7 +463,9 @@ def test_ab_dry_run_arm_and_compare_order(
     )
     assert code == 0
     lines = capsys.readouterr().out.splitlines()
-    assert "task init --arms 2 --name ab-smoke" in "\n".join(lines)
+    joined = "\n".join(lines)
+    assert "task init --groups 2 --name ab-smoke" in joined
+    assert "--baseline-name" in joined and "--candidate-name" in joined
 
     a_run0 = next(
         index
@@ -478,12 +490,12 @@ def test_ab_dry_run_arm_and_compare_order(
     a_fuse = next(
         index
         for index, line in enumerate(lines)
-        if "fuse --task-dir $TASK/A/runs/sample_dataset" in line
+        if "fuse --task-dir $TASK/baseline/runs/sample_dataset" in line
     )
     b_fuse = next(
         index
         for index, line in enumerate(lines)
-        if "fuse --task-dir $TASK/B/runs/sample_dataset" in line
+        if "fuse --task-dir $TASK/candidate/runs/sample_dataset" in line
     )
     compare = next(
         index
@@ -504,6 +516,8 @@ def test_heuristic_without_limit_is_rejected(
     code = run_task.main(
         [
             "eval",
+            "--name",
+            "smoke",
             "--adapter",
             "mock-strong",
             "--dataset",
@@ -530,6 +544,8 @@ def test_recall_mode_maps_to_evidence_match(
     code = run_task.main(
         [
             "eval",
+            "--name",
+            "smoke",
             "--adapter",
             "mock-strong",
             "--dataset",
@@ -557,6 +573,8 @@ def test_dry_run_redacts_llm_api_key(
     code = run_task.main(
         [
             "eval",
+            "--name",
+            "smoke",
             "--adapter",
             "mock-strong",
             "--dataset",
@@ -734,6 +752,8 @@ def test_fusion_equal_is_forwarded_to_evaluate(
     other.write_text("{}\n", encoding="utf-8")
     base = [
         "eval",
+        "--name",
+        "smoke",
         "--adapter",
         "mock-strong",
         "--dataset",
@@ -767,7 +787,7 @@ def test_ab_common_dry_run_covers_both_arms(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ab --common：两臂各自跑同一批四个数据集，融合口径透传 evaluate-compare。"""
+    """ab --common：两组各自跑同一批四个数据集，融合口径透传 evaluate-compare。"""
     datasets = _common_home(tmp_path, monkeypatch)
     code = run_task.main(
         [
@@ -806,7 +826,7 @@ def test_ab_common_dry_run_covers_both_arms(
         hits = [line for line in run_lines if f"--dataset {path}" in line]
         assert len(hits) == 2, f"{key}: {hits}"
         arms = {line.split("--task-dir ")[1].split()[0] for line in hits}
-        assert arms == {"$TASK/A", "$TASK/B"}
+        assert arms == {"$TASK/baseline", "$TASK/candidate"}
     compare_line = next(
         line for line in out.splitlines() if "-m membench.cli evaluate-compare" in line
     )
@@ -952,7 +972,7 @@ def test_watch_task_format_and_json(
     assert watch_task.main([str(task)]) == 0
     line = capsys.readouterr().out.strip()
     assert line.startswith("[watch] ")
-    assert "单臂: sample 1/1片·产物✓" in line
+    assert "单组: sample 1/1片·产物✓" in line
     assert "orchestrator done exit=0" in line
 
     assert watch_task.main([str(task), "--json"]) == 0

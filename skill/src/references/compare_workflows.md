@@ -21,7 +21,7 @@
 - `run` 用 `--driver-llm` / `--adapter-version` 显式落账这些字段。
 - `compare --require-comparable` 做**前置校验**（strict）：任一关键维度**不一致**或**无法核验**（元数据缺失）→ 可比性门禁 **FAIL**，整体 verdict=FAIL、退出码 1（即拒绝当 A/B 用）；报告含「可比性前置校验」小节与「不可比原因」清单。
 - 不加 `--require-comparable` 时：关键维度不一致 → 可比性门禁 WARN（verdict 至少 WARN，不会静默 PASS）；关键维度无法核验 → 只在 CLI 输出与报告里提示，不影响 verdict。
-- `compare --tag <标签>` 给本次对比命名，决定产物目录 `compare_<name>_<platform>_<ts>/` 的 `<name>` 段（缺省 `<基线 adapter>_vs_<候选 adapter>`；`<platform>` 取两臂一致的 platform，不一致则 `p1-p2`、缺省 `default`）。
+- `compare --tag <标签>` 给本次对比命名，决定产物目录 `compare_<name>_<platform>_<ts>/` 的 `<name>` 段（缺省 `<基线 adapter>_vs_<候选 adapter>`；`<platform>` 取两组一致的 platform，不一致则 `p1-p2`、缺省 `default`）。
 
 **不可比时的表现**：报告开头给出"不可比原因"清单（如 `dataset_fingerprint.sha256 不同`、`driver_llm 不同：gpt-4o vs claude-...`），并明确拒绝当 A/B 使用；此时应回到"同尺比较"——固定模型、判分器与数据集后重跑。
 
@@ -29,12 +29,12 @@
 
 ## 两个 commit 的 A/B 对比
 
-两个 commit 各建一个 `git worktree` 并各自构建（互不干扰），然后按 `SKILL.md` 标准流程「A/B」各跑一次：两侧用同一测试集、同一判分器、同一驱动模型，并落账 commit 与驱动模型/适配器版本（原生 `run` 对应 `--commit` / `--driver-llm` / `--adapter-version`）；再 `compare --require-comparable --tag <标签>` 出报告。两臂本来就写在同一个任务目录里时，`compare --task-dir <任务目录>` 就地出 `reports/comparison.md`（不新建 `compare_*`、不复制两臂）。可执行模板见 `scripts/eval_two_commits.sh`（原生 CLI 参考脚本，非默认路径）。
+两个 commit 各建一个 `git worktree` 并各自构建（互不干扰），然后按 `SKILL.md` 标准流程「A/B」各跑一次：两侧用同一测试集、同一判分器、同一驱动模型，并落账 commit 与驱动模型/适配器版本（原生 `run` 对应 `--commit` / `--driver-llm` / `--adapter-version`）；再 `compare --require-comparable --tag <标签>` 出报告。两组本来就写在同一个任务目录里时，`compare --task-dir <任务目录>` 就地出 `reports/comparison.md`（不新建 `compare_*`、不复制两组）。可执行模板见 `scripts/eval_two_commits.sh`（原生 CLI 参考脚本，非默认路径）。
 
 门禁规则（默认，CLI 可调）：accuracy 降 >0.02 → FAIL；stale_rate 升 >0.02 → FAIL；p95 延迟升 >30% → WARN。
 
-**多分片 A/B（任务目录通路）**：大数据集上分片跑 A/B 时，`task init --name <名> --arms 2` 建一棵
-双臂任务目录，两侧各片 `run --task-dir <任务目录>/A|B --shards N --shard-by dialogue`（每片独占
+**多分片 A/B（任务目录通路）**：大数据集上分片跑 A/B 时，`task init --name <名> --groups 2 --baseline-name 基线 --candidate-name 候选` 建一棵
+双组任务目录，两侧各片 `run --task-dir <任务目录>/A|B --shards N --shard-by dialogue`（每片独占
 一个记忆实例）→ 各自 `fuse --task-dir <任务目录>/A|B` 就地补齐数据集级与任务级产物 →
 `compare --task-dir <任务目录> --require-comparable` 就地出 `reports/comparison.md`。多数据集汇总
 仍走 `evaluate-compare --baseline-run/--candidate-run`。纪律：共享任务目录只允许**对话级**分片
@@ -43,7 +43,7 @@
 读账本以逐片条目为准。数据集级与任务级产物由 `fuse` 补齐；账本口径不一致（`shards` / `shard_by` /
 `limit` / 数据集指纹）或同片重复跑都会被拒绝。
 
-**产物目录**：单臂 `eval_*`、双臂 `compare_*`、矩阵 `matrix_*` 的完整布局与各文件含义见
+**产物目录**：单组 `eval_*`、双组 `compare_*`、矩阵 `matrix_*` 的完整布局与各文件含义见
 `membench/README.md`「产物布局」。A/B 副本是源实验目录或数据集目录的整理结果：源是实验目录时
 整树复制并保留其内部相对位置；源是数据集目录时在 `A/runs/<dataset>/` 下重建，缺任务级
 `reports/` 时由 compare 从数据集级报告补齐。

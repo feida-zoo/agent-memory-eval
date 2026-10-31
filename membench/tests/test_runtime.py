@@ -327,7 +327,7 @@ def _init_task(base: Path, name: str, arms: int = 1) -> Path:
 
     buffer = io.StringIO()
     with redirect_stdout(buffer):
-        assert cli.main(["task", "init", "--name", name, "--arms", str(arms),
+        assert cli.main(["task", "init", "--name", name, "--groups", str(arms),
                          "--report-out", str(base)]) == 0
     return Path(buffer.getvalue().strip())
 
@@ -368,7 +368,7 @@ def test_cli_run_writes_runtime_trio(tmp_path: Path) -> None:
 def test_cli_run_task_dir_writes_runtime_under_arm(tmp_path: Path) -> None:
     """--task-dir <任务>/A：runtime 落该臂目录；任务根只记 task init 的那条。"""
     task = _init_task(tmp_path / "out", "ab", arms=2)
-    arm = task / layout.DIR_ARM_A
+    arm = task / layout.DIR_GROUP_BASELINE
     assert (
         cli.main(
             [

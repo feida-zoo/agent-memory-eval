@@ -12,7 +12,7 @@ description: >
 
 # agent-memory-eval：Agent 记忆系统评测技能
 
-本技能封装 membench 评测工程（`membench/`，自带 README 与测试），覆盖**接入 → 评测 → 对比 → 优化闭环**。**所有评测报告必须输出到本 skill 的 `output/`（不传 `--report-out` 时 `output_root()` 同样是它）；一次实验一个自包含任务目录（单臂 `eval_*` / 双臂 A/B `compare_*` / `matrix_*`，目录名自带 `YYYYMMDD-HHMMSS`），报告开头注明所用测试集（membench 自动生成，勿删）。**
+本技能封装 membench 评测工程（`membench/`，自带 README 与测试），覆盖**接入 → 评测 → 对比 → 优化闭环**。**所有评测报告必须输出到本 skill 的 `output/`（不传 `--report-out` 时 `output_root()` 同样是它）；一次实验一个自包含任务目录（单组 `eval_*` / 双组 A/B `compare_*` / `matrix_*`，目录名自带 `YYYYMMDD-HHMMSS`），报告开头注明所用测试集（membench 自动生成，勿删）。**
 
 评测口径是**单用户个人 Agent**：GateMem 的 140 道 privacy-refuse 题已标 `ignore=true` 由引擎自动跳过（原始数据保留、口径可追溯）；222 道 safety 题全部参评；对外输出泄漏、提示注入等残余风险现有评测集未覆盖，可在用户测试集补题。执行位置：`scripts/*` 在 skill 根目录执行；`membench.cli` 在 `membench/` 目录内执行（下文命令省略 `cd membench`）。
 
@@ -38,8 +38,8 @@ description: >
 
 | 任务形态 | 目录 | 关键产物 |
 |---|---|---|
-| 单臂 | `eval_<name>_<platform>_<ts>/` | `runs/<dataset>/report/` + 任务级 `reports/` |
-| 双臂 A/B | `compare_<name>_<platform>_<ts>/` | `A/`、`B/` + `reports/comparison.md` |
+| 单组 | `eval_<name>_<platform>_<ts>/` | `runs/<dataset>/report/` + 任务级 `reports/` |
+| 双组 A/B | `compare_<name>_<platform>_<ts>/` | `A/`、`B/` + `reports/comparison.md` |
 | 矩阵 | `matrix_<ts>/` | `reports/report.md` + `runs/<label>/` |
 | 回放任务 | 上述目录 + `snapshots/` | 条目 `entries/` 是真源，`index.json` 是派生视图 |
 | 默认根 | `output_root()` | `MEMBENCH_OUTPUT_DIR` > skill `output/` > 工程根 |
@@ -65,7 +65,7 @@ python scripts/run_task.py ab --baseline-adapter <基线> --candidate-adapter <�
 ```
 
 - 两个 commit：先 `git worktree` 各检出并构建，再传两个 adapter（步骤见 `references/compare_workflows.md`）。
-- 脚本把两臂写进同一棵 `compare_*` → 各自 `fuse` → `compare --task-dir` 出 `reports/comparison.md`。
+- 脚本把两组写进同一棵 `compare_*` → 各自 `fuse` → `compare --task-dir` 出 `reports/comparison.md`。
 - 门禁 accuracy 降 >0.02 或 stale_rate 升 >0.02 → FAIL（退出码 1）；两侧判分器、数据集、驱动模型、适配器版本必须一致。
 - `--baseline-version` / `--candidate-version` / `--driver-llm-a` / `--driver-llm-b` 是**必填**（strict 可比性的关键维度）：同一系统只改读取侧时两侧版本填同一值；没有驱动 LLM 填 `none`。缺了会判"无法核验"→ FAIL，所以脚本直接不给默认。
 
@@ -87,8 +87,8 @@ python -m membench.cli run --adapter <适配器名> --dataset <同一数据集> 
 
 - 快照默认导出（每对话 ingest 后一份），`--no-snapshot` 关闭；回放导出落任务级内容寻址池 `snapshots/`。
 - `--replay-verify-source` 是保真地板：未改代码应逐题一致，不一致先修恢复再谈 A/B。
-- A/B 回放同一源用 `task init --replay --arms 2`，状态按内容去重只存一份；`task status` 看两臂是否逐对话一致。
-- 并行回放：同一臂按对话级分片多进程跑（各写自己的条目、无锁），收尾 `fuse --task-dir <臂>`；`run_mode` 是可比性维度，回放分与全量分不可比。
+- A/B 回放同一源用 `task init --replay --groups 2 --baseline-name 基线 --candidate-name 候选`，状态按内容去重只存一份；`task status` 看两组是否逐对话一致。
+- 并行回放：同一组按对话级分片多进程跑（各写自己的条目、无锁），收尾 `fuse --task-dir <组>`；`run_mode` 是可比性维度，回放分与全量分不可比。
 
 ### 5. 平台 × commit 矩阵
 
@@ -193,7 +193,7 @@ python scripts/watch_task.py <任务目录> --until-done --interval 300
 | `membench/examples/optimize_loop.md` | 优化闭环入门教程 |
 | `membench/examples/http_bridge_node/` | Node/Electron HTTP bridge 可复制模板 |
 | `user_dataset/` | 用户专属测试集（与内置集物理隔离，不打包） |
-| `runtime/`（实验 / 臂目录下） | 每次命令的 `commands.jsonl`、`logs/`、`env.json`；排查问题先看它（与对话级 runtime 不同） |
+| `runtime/`（实验 / 组目录下） | 每次命令的 `commands.jsonl`、`logs/`、`env.json`；排查问题先看它（与对话级 runtime 不同） |
 | `output/` | 默认产物根（`MEMBENCH_OUTPUT_DIR` 可覆盖） |
 | `docs/` | 《Agent 记忆系统深度研究报告》与配图 |
 

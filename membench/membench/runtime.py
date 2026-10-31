@@ -12,7 +12,7 @@
 
 **与对话级 runtime 的区别**：``<实验目录>/runs/<dataset>/<对话目录>/runtime/`` 是
 "该对话的运行时数据"（归适配器使用的运行时文件）；本模块写的是**实验 /
-臂目录级**的 runtime，与 ``runs/`` / ``reports/`` 平级，记录的是评测命令本身。
+组目录级**的 runtime，与 ``runs/`` / ``reports/`` 平级，记录的是评测命令本身。
 
 用法（只给 CLI 与编排脚本用）::
 
@@ -83,7 +83,7 @@ _MASK = "***"
 
 
 def runtime_dir(experiment_dir: str) -> str:
-    """实验 / 臂目录的运行时目录：``<实验目录>/runtime``。"""
+    """实验 / 组目录的运行时目录：``<实验目录>/runtime``。"""
     return os.path.join(experiment_dir, layout.DIR_RUNTIME)
 
 
@@ -580,7 +580,7 @@ def begin(command: str, argv: Sequence[Any], *, cwd: Union[str, None] = None) ->
 
 
 def set_dir(experiment_dir: str) -> None:
-    """登记本次命令的实验 / 臂目录（没有活动会话时是空操作，库调用不受影响）。"""
+    """登记本次命令的实验 / 组目录（没有活动会话时是空操作，库调用不受影响）。"""
     if _current is None:
         return
     _current.place(experiment_dir)
