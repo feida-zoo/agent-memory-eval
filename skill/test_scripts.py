@@ -310,6 +310,102 @@ def test_bad_tree_exit_code_and_fail_lines(
     assert "missing_report.md" in out
 
 
+def _tiny_dataset(path: Path, *, tag: str, categories: tuple[str, ...]) -> Path:
+    """最小真实数据集：一个对话、按给定题型各一道题（值不值得跑由调用方决定）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    questions = [
+        {
+            "qid": f"{tag}_q{i}",
+            "question": "项目截止日是哪天？",
+            "gold_answer": "周五",
+            "category": category,
+            "evidence": ["项目截止日是周五"],
+        }
+        for i, category in enumerate(categories)
+    ]
+    record = {
+        "dialogue_id": f"{tag}_d0",
+        "sessions": [
+            [
+                {
+                    "role": "user",
+                    "content": f"{tag} 的记录：项目截止日是周五。",
+                    "timestamp": None,
+                }
+            ]
+        ],
+        "questions": questions,
+    }
+    path.write_text(
+        json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return path
+
+
+def test_ab_multi_dataset_reuses_group_products(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """多数据集 AB：逐数据集 strict compare + evaluate-compare 真正跑通。
+
+    回归：``group_datasets`` 曾按 ``A`` / ``B`` 取产物，而组目录名已改成用户给的
+    ASCII 名（``baseline`` / ``candidate``），多数据集路径会在 evaluate-compare
+    那一步 KeyError——单数据集路径不走它，dry-run 也测不出来。
+    """
+    monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(tmp_path / "output-root"))
+    one = _tiny_dataset(tmp_path / "ds" / "alpha.jsonl", tag="alpha", categories=("single_hop", "temporal"))
+    two = _tiny_dataset(tmp_path / "ds" / "beta.jsonl", tag="beta", categories=("single_hop", "temporal"))
+    out = tmp_path / "out"
+    code = run_task.main(
+        [
+            "ab",
+            "--baseline-adapter",
+            "mock-strong",
+            "--candidate-adapter",
+            "mock-strong",
+            "--dataset",
+            str(one),
+            "--dataset",
+            str(two),
+            "--judge",
+            "heuristic",
+            "--limit",
+            "2",
+            "--category",
+            "single_hop",
+            "--recall-mode",
+            "substring",
+            "--name",
+            "ab-multi",
+            "--baseline-version",
+            "v1",
+            "--candidate-version",
+            "v1",
+            "--driver-llm-a",
+            "none",
+            "--driver-llm-b",
+            "none",
+            "--report-out",
+            str(out),
+        ]
+    )
+    assert code == run_task.EXIT_OK
+    tasks = list(out.glob("compare_ab-multi_*"))
+    assert len(tasks) == 1
+    task = tasks[0]
+    # 两组各自跑完两个数据集，且都只覆盖 single_hop
+    for group in ("baseline", "candidate"):
+        for key in ("alpha", "beta"):
+            metrics = json.loads(
+                (task / group / "runs" / key / "report" / "metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert metrics["categories"] == ["single_hop"]
+    report = (task / "reports" / "comparison.md").read_text(encoding="utf-8")
+    assert "题型过滤" in report
+    assert "evaluate-compare" not in report  # 报告是给读者看的，不泄露编排细节
+
+
 # ---------------------------------------------------------------------------
 # run_task --dry-run：命令序列断言（不建目录、不跑评测）
 # ---------------------------------------------------------------------------
@@ -377,6 +473,18 @@ def test_eval_dry_run_passes_task_display_name(
     assert (
         f"--name smoke --display-name {shlex.quote('索引优化')} --report-out" in out
     )
+
+
+def test_eval_dry_run_passes_category_filter(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--category 透传到 run / evaluate（可重复，原样下发给 membench）。"""
+    assert (
+        _eval_dry_run(tmp_path, "--category", "temporal", "--category", "safety_no_memory")
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "--category temporal --category safety_no_memory" in out
 
 
 def test_eval_dry_run_without_shards_has_no_fuse(

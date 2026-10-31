@@ -135,6 +135,12 @@ FILE_ORCHESTRATOR = "orchestrator.json"
 #: 子进程环境变量：标识"我是 --background 派生的编排子进程"（结束时要回写状态）。
 ORCHESTRATOR_ENV = "MEMBENCH_ORCHESTRATOR_CHILD"
 
+#: 两组的**角色**（镜像 ``membench.layout.ROLE_BASELINE`` / ``ROLE_CANDIDATE``）：
+#: 组目录名是用户给的 ASCII 名（``index-opt`` 之类），按角色做字典键才不会随目录名漂移。
+#: 这里不 import membench——skill 脚本要在 membench 不可导入时也能报参数错误。
+ROLE_BASELINE = "baseline"
+ROLE_CANDIDATE = "candidate"
+
 #: membench 工程根候选（相对脚本目录）：仓库内是 ../../../membench，打包后是 ../membench。
 _MEMBENCH_ROOT_CANDIDATES: tuple[str, ...] = (
     "../membench",
@@ -207,6 +213,8 @@ class CommonArgs:
     commit: Optional[str] = None
     jobs: Optional[int] = None
     limit: Optional[int] = None
+    #: 题型过滤（``--category``，可重复）：只评测这些题型，无匹配题的对话整段跳过
+    categories: tuple[str, ...] = ()
     no_snapshot: bool = False
     #: ``--trace-state`` / ``--no-trace-state``：None = 不给参数（membench 自动判定）。
     trace_state: Optional[bool] = None
@@ -859,6 +867,8 @@ def _run_argv(
         argv += ["--jobs", str(common.jobs)]
     if common.limit is not None:
         argv += ["--limit", str(common.limit)]
+    for category in common.categories:
+        argv += ["--category", category]
     if common.no_snapshot:
         argv += ["--no-snapshot"]
     if common.trace_state is not None:
@@ -923,6 +933,8 @@ def _evaluate_argv(
         argv += ["--platform", common.platform]
     if common.commit:
         argv += ["--commit", common.commit]
+    for category in common.categories:
+        argv += ["--category", category]
     if options.group.driver_llm:
         argv += ["--driver-llm", options.group.driver_llm]
     if options.group.adapter_version:
@@ -990,11 +1002,15 @@ def _evaluate_compare_argv(
     datasets: Sequence[DatasetArg],
     fusion: str,
 ) -> list[str]:
-    """``evaluate-compare --task-dir`` 复用两组已有产物，写跨数据集对比报告。"""
+    """``evaluate-compare --task-dir`` 复用两组已有产物，写跨数据集对比报告。
+
+    ``group_datasets`` 按**角色**（``baseline`` / ``candidate``）索引，不按组目录名：
+    组目录名是用户给的 ASCII 名（``index-opt`` 之类），拿它当键会在改名时静默 KeyError。
+    """
     argv = ["evaluate-compare", "--task-dir", task_dir, "--fusion", fusion]
     for dataset in datasets:
-        baseline = group_datasets["A"][dataset.key]
-        candidate = group_datasets["B"][dataset.key]
+        baseline = group_datasets[ROLE_BASELINE][dataset.key]
+        candidate = group_datasets[ROLE_CANDIDATE][dataset.key]
         argv += ["--baseline-run", f"{dataset.key}={baseline.directory}"]
         argv += ["--candidate-run", f"{dataset.key}={candidate.directory}"]
     return argv
@@ -1320,13 +1336,14 @@ def _execute_ab(options: AbOptions, root: Path) -> FlowState:
     layout = _membench_module(root, "layout")
     baseline_dir = layout.group_dir(task_dir, layout.ROLE_BASELINE)
     candidate_dir = layout.group_dir(task_dir, layout.ROLE_CANDIDATE)
-    for label, group, group_path in (
-        (os.path.basename(baseline_dir), options.baseline, baseline_dir),
-        (os.path.basename(candidate_dir), options.candidate, candidate_dir),
+    for role, group, group_path in (
+        (ROLE_BASELINE, options.baseline, baseline_dir),
+        (ROLE_CANDIDATE, options.candidate, candidate_dir),
     ):
         for dataset in options.datasets:
             print(
-                f"[run_task] 组 {label}（{group.adapter}）数据集 {dataset.display}",
+                f"[run_task] 组 {os.path.basename(group_path)}（{group.adapter}）"
+                f"数据集 {dataset.display}",
                 file=sys.stderr,
             )
             directory = _run_dataset(
@@ -1338,7 +1355,7 @@ def _execute_ab(options: AbOptions, root: Path) -> FlowState:
                 shards=options.shards,
                 state=state,
             )
-            state.group_datasets.setdefault(label, {})[dataset.key] = ResolvedDataset(
+            state.group_datasets.setdefault(role, {})[dataset.key] = ResolvedDataset(
                 dataset, directory
             )
 
@@ -1349,8 +1366,8 @@ def _execute_ab(options: AbOptions, root: Path) -> FlowState:
 
     # 多数据集：逐数据集 strict 门禁 + evaluate-compare 融合报告
     for dataset in options.datasets:
-        baseline = state.group_datasets["A"][dataset.key]
-        candidate = state.group_datasets["B"][dataset.key]
+        baseline = state.group_datasets[ROLE_BASELINE][dataset.key]
+        candidate = state.group_datasets[ROLE_CANDIDATE][dataset.key]
         print(
             f"[run_task] 数据集 {dataset.display} 的可比性 strict 门禁",
             file=sys.stderr,
@@ -1631,6 +1648,14 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--jobs", type=int, default=None, help="题目级并发数（默认 1）")
     parser.add_argument("--limit", type=int, default=None, help="冒烟：每个数据集只评测前 N 题")
     parser.add_argument(
+        "--category",
+        action="append",
+        default=None,
+        metavar="题型",
+        help="只评测指定题型（可重复，大小写不敏感），顺序为「先按题型过滤 → 再分片 → 再 --limit」；"
+        "无匹配题的对话整段跳过（连 ingest 一起省掉）；evaluate 路径下没有该题型的数据集自动跳过",
+    )
+    parser.add_argument(
         "--shards",
         type=_parse_shards,
         default=1,
@@ -1848,6 +1873,7 @@ def _common_from_args(args: argparse.Namespace) -> CommonArgs:
         commit=args.commit,
         jobs=args.jobs,
         limit=args.limit,
+        categories=tuple(args.category or ()),
         no_snapshot=args.no_snapshot,
         trace_state=args.trace_state,
         abstention_recheck=args.abstention_recheck,

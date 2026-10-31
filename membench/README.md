@@ -382,9 +382,19 @@ safety 的「真遗忘」）时保留，其余场景可 `--no-trace-state` 关�
 
 ## 大数据集：冒烟与分片
 
-冒烟（快速验证链路，可选）：`run --limit N` 每个数据集只取前 N 道题。
-run_id 带 `_limit{N}` 后缀、实验目录名带 `_l<N>` 后缀、metrics.json 记入
-`"limit": N`，冒烟结果不会被误当全量结果对比。
+**只跑一部分题**有两种口径，都只裁剪"题集"，不改变判分规则：
+
+- **冒烟（按条数）**：`run --limit N` 每个数据集只取前 N 道题。
+  run_id 带 `_limit{N}` 后缀、实验目录名带 `_l<N>` 后缀、metrics.json 记入
+  `"limit": N`，冒烟结果不会被误当全量结果对比。
+- **按题型**：`run --category temporal --category safety_no_memory`（可重复、大小写不敏感）。
+  顺序固定为 **先按题型过滤 → 再分片 → 再 `--limit`**：题型是范围，分片与截断是范围内
+  的抽样。没有匹配题的对话**整段跳过**（连 ingest 成本一起省掉）；一道都没有时报错并
+  列出该数据集实际有哪些题型（写错题型名不会被静默变成空结果）。metrics 记
+  `"categories": ["temporal", ...]`、run_id 带 `_cat-<题型>`、目录名带 `_c<题型>`，
+  `compare` 把 `categories` 当**关键维度**——「只跑 temporal」的分数与全量分数不可比。
+  `evaluate --category` 同口径：某数据集没有该题型时**跳过它**并打印实际题型，全都没有
+  才报错；复用产物（`--from-runs`）的题型口径与本次不一致直接拒绝。
 
 数据集级分片（BEAM / LongMemEval 这类大集，可选）。分片产物**只写各片负责的对话目录**
 （`runs/<dataset>/<对话>/report/`）与一份**分片账本**（`runs/<dataset>/shards.<i>.json`
@@ -436,7 +446,8 @@ python -m membench.cli fuse \
     --out output/beam_1m_full
 ```
 
-`--shards` 与 `--limit` 可组合（先分片再截断），用于分片链路的廉价验证。
+`--shards` 与 `--limit` 可组合（先分片再截断），用于分片链路的廉价验证；`--category`
+在这两者之前生效（先按题型过滤，再分片，再截断）。
 
 **分片账本（`runs/<dataset>/shards.<i>.json` + `runs/<dataset>/shards.json`）**：同一次
 评测各分片的进度与归属。**每个分片一个条目文件** `shards.<i>.json`（单文件原子写，并行
@@ -445,8 +456,8 @@ python -m membench.cli fuse \
 只有旧产物没有逐片条目时才读 `shards.json` 本身）。头部记口径（`schema` / `dataset` /
 `shards` / `shard_by` / `limit` / 数据集指纹），`entries.s<i>` 记该片的 `status`
 （`running` / `done`）、负责的对话、实测题数、`run_id` 与起止时间。账本口径或数据集
-指纹与本次不一致（换了 `--shards` / `--shard-by` / `--limit` / 数据集却写进同一目录）
-会被拒绝：同一个任务目录里只能放同一次评测的分片。
+指纹与本次不一致（换了 `--shards` / `--shard-by` / `--limit` / `--category` / 数据集却写进
+同一目录）会被拒绝：同一个任务目录里只能放同一次评测的分片。
 
 **分片 / 冒烟怎么进目录名**：分片用跨目录写法时（不带 `--task-dir`），实验目录名末尾追加
 `_s<分片序号>`、`--limit N` 追加 `_l<N>`（如 `eval_my-sys_wx_20261024-193000_s1_l50`）；
@@ -457,7 +468,7 @@ python -m membench.cli fuse \
 `--shards`"记下 `_s0`——目录名宁可多带标记，也不能让分片产物与不分片产物撞进同一个目录名
 （`run_id` 里则不出分片标记，因为那里用的是结算后的有效分片数）。
 
-**分片 / 冒烟怎么进融合产物**：`fuse` 校验各分片的 `limit` 一致（全量分片与 `--limit` 冒烟分片混融会得到"部分全量"的假完整结果，直接拒绝），并把 `limit` 透传到融合产物的 `metrics["limit"]`；融合产物的 `run_id` 带 `_fused`、`_shard<N>`/`_dshard<N>` 与 `_limitN` 标记——冒烟融合产物与全量融合产物因此不会被当成同一身份，`compare --require-comparable` 会按题目数（关键维度）判它们不可比。
+**分片 / 冒烟 / 题型怎么进融合产物**：`fuse` 校验各分片的 `limit` 与 `categories` 一致（全量分片与 `--limit` 冒烟分片混融会得到"部分全量"的假完整结果；只跑 temporal 的片与只跑 safety 的片混融会得到两份题集的拼接——两者都直接拒绝），并把它们透传到融合产物的 `metrics["limit"]` / `metrics["categories"]`；融合产物的 `run_id` 带 `_fused`、`_shard<N>`/`_dshard<N>`、`_limitN` 与 `_cat-<题型>` 标记——冒烟、题型过滤的融合产物与全量融合产物因此不会被当成同一身份，`compare --require-comparable` 会按题目数 / 题型过滤（关键维度）判它们不可比。
 
 **分片产物里的报告怎么读**：分片只落对话级报告，它们**顶部有一行醒目标注**
 「分片 i/N（按 dialogue|question）——仅覆盖部分题目」，题目数写成
@@ -517,7 +528,7 @@ python -m membench.cli run --adapter my-system --dataset membench/data/office_da
 
 | 级别 | 维度 | 不一致的后果 |
 |---|---|---|
-| 关键 | `adapter`、`adapter_version`、`dataset_sha256`（取 `dataset_fingerprint.sha256`）、`judge`、`judge_model`、`driver_llm`、`platform`、`run_mode`（全量 / 快照回放）、`ingest_strategy`（sequence / interleaved：问的是"结尾时知道什么"还是"当时知道什么"）、`n_questions`（分数算在哪个题集上：`--limit` 冒烟 vs 全量即走这里） | 非 strict 下门禁降级 WARN；`--require-comparable`（strict）下直接 FAIL |
+| 关键 | `adapter`、`adapter_version`、`dataset_sha256`（取 `dataset_fingerprint.sha256`）、`judge`、`judge_model`、`driver_llm`、`platform`、`run_mode`（全量 / 快照回放）、`ingest_strategy`（sequence / interleaved：问的是"结尾时知道什么"还是"当时知道什么"）、`n_questions`（分数算在哪个题集上：`--limit` 冒烟 vs 全量即走这里）、`categories`（题型过滤：题数相同但题型不同，同样是不同题目总体） | 非 strict 下门禁降级 WARN；`--require-comparable`（strict）下直接 FAIL |
 | 次要 | `limit`、`shards`、`shard_index`、`adapter_meta`、`retrieval_match`、`fusion`、`membench_hash`（评测代码版本：判分口径随代码变化，两侧不同必须提醒，但不 FAIL 回归对比） | 降级 WARN，不 FAIL |
 | 提示 | `commit`、`dataset_path`、`dataset` | 仅记录（`same=false`），不影响结论 |
 

@@ -21,6 +21,10 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
         # 二选一，见下「--task-dir 语义」
         [--adapter-arg KEY=VALUE]...   # 适配器构造参数，如 base_url=http://127.0.0.1:8787 \
         [--shards N|max --shard-index I --shard-by question|dialogue] \
+        [--limit N] [--category 题型]... \
+        # 只跑一部分题：先按题型过滤（--category，可重复）→ 再分片 → 再 --limit；
+        # 过滤结果记 metrics.categories、run_id 带 _cat-<题型>、目录名带 _c<题型>，
+        # 且 compare 视作关键维度（题型过滤的分数不得与全量分数直接对比）
         [--evidence-match substring|overlap|llm] \
         [--no-snapshot] [--trace-state | --no-trace-state] \
         # --no-snapshot：默认每对话 ingest 后导出状态快照（适配器不支持时警告一次并跳过）
@@ -227,6 +231,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--jobs", type=int, default=1, help="题目级并发数（默认 1；ingest 始终串行；query / judge / 证据匹配在此并发下执行，要求 adapter.query 与 judge 线程安全）")
     p_run.add_argument("--client-llm", default=None, help="judge=client 时的 agent 内置 LLM 类路径，如 'my_agent.llm:LLMClient'")
     p_run.add_argument("--limit", type=int, default=None, help="冒烟模式：只评测（分片后的）前 N 道题，run_id 与 metadata 记录 limit")
+    p_run.add_argument(
+        "--category",
+        action="append",
+        default=None,
+        metavar="题型",
+        help="只评测指定题型（可重复，大小写不敏感），顺序为「先按题型过滤 → 再分片 → 再 --limit」；"
+        "无匹配题的对话整段跳过（连 ingest 一起省掉）；metadata 记 categories 且 compare 视作关键维度",
+    )
     p_run.add_argument("--adapter-meta", default=None, help='适配器配置自由文本（"key=value;..."），原样记入 metadata["adapter_meta"]')
     p_run.add_argument(
         "--no-snapshot",
@@ -474,6 +486,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ev.add_argument("--judge", default=None, choices=["heuristic", "llm", "client"], help="判分器（默认 heuristic；--from-runs 全复用/纯汇总时以已有 run 判分器为准）")
     p_ev.add_argument("--platform", default=None, help="平台标签（如 wx / fs），记入元数据与实验目录名")
+    p_ev.add_argument(
+        "--category",
+        action="append",
+        default=None,
+        metavar="题型",
+        help="只评测指定题型（可重复，大小写不敏感），透传给每个数据集的 run；"
+        "某数据集没有该题型时跳过它并说明（全都没有才报错）",
+    )
     p_ev.add_argument("--commit", default=None, help="commit 标签（如 a1b2c3），记入元数据")
     p_ev.add_argument("--driver-llm", default=None, help="驱动被测系统的 LLM 标识（如 gpt-4o），记入每个 run 的元数据")
     p_ev.add_argument("--adapter-version", default=None, help="适配器实现版本/commit，记入每个 run 的元数据")
@@ -977,7 +997,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     adapter_name,
                     args.platform,
                     layout.ts_now(),
-                    layout.experiment_tags(args.shards, args.shard_index, args.limit),
+                    layout.experiment_tags(
+                        args.shards,
+                        args.shard_index,
+                        args.limit,
+                        getattr(args, "category", None) or (),
+                    ),
                 ),
             )
             print(f"[membench] 实验目录: {experiment_dir}")
@@ -992,6 +1017,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 dataset_source=dataset_source,
                 jobs=args.jobs,
                 limit=args.limit,
+                categories=getattr(args, "category", None) or (),
                 shards=args.shards,
                 shard_index=args.shard_index,
                 shard_by=args.shard_by,
@@ -1773,6 +1799,7 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
             **_snapshot_kwarg(args),
             trace_state=args.trace_state,
             abstention_recheck=args.abstention_recheck,
+            categories=getattr(args, "category", None) or (),
         )
 
 

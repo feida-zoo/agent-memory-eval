@@ -94,6 +94,8 @@ docs/                     # 深度研究报告 + 配图
 
 - 打包排除：`*.egg-info`、`__pycache__`、`.pytest_cache`、`runs/`、`output/`、`*.pyc`、`.DS_Store`，以及按需下载的数据集。历史上曾把 268MB 的 `longmemeval_s.jsonl` 打进包（83MB 的事故），自检逻辑就是为此存在。
 
+8. **范围裁剪必须记账**：`--limit`（条数）、`--category`（题型，可重复）与 `--shards` 都是"题集口径"，不是"跑法偏好"。顺序固定 **题型过滤 → 分片 → limit**（唯一实现 `runner.filter_dialogues_by_category` + `runner.select_shard_questions`，`fuse` 复算覆盖时调用同一对函数）。`categories` 进 `metrics`、`run_id`（`cat-<题型>`）、实验目录名（`_c<题型>`）与**分片账本头部**，并且是 `compare` 的**关键维度**（题数可能相同而题型不同，`n_questions` 拦不住）。新增任何"只跑一部分"的开关都要照这套走，否则过滤结果会被当成全量结果。
+
 ## 代码风格
 
 - 中文 docstring；类型注解；`from __future__ import annotations`；纯标准库优先。

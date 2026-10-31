@@ -348,6 +348,7 @@ DIM_LABEL_ZH: dict[str, str] = {
     "ingest_strategy": "摄入策略",
     "fusion": "融合口径",
     "limit": "题目上限",
+    "categories": "题型过滤",
     "shards": "分片数",
     "shard_index": "分片序号",
     "n_questions": "题目数",
@@ -372,6 +373,7 @@ METADATA_FIELD_ZH: dict[str, str] = {
     "platform": "平台",
     "commit": "commit",
     "task_name": "任务名",
+    "categories": "题型过滤",
     "judge": "判分器",
     "driver_llm": "驱动 LLM",
     "judge_model": "判分模型",
@@ -382,6 +384,7 @@ METADATA_FIELD_ZH: dict[str, str] = {
     "n_ignored": "忽略题数",
     "timestamp": "时间戳",
     "limit": "题目上限",
+    "categories": "题型过滤",
     "shards": "分片数",
     "shard_index": "分片序号",
     "shard_by": "分片维度",
@@ -1351,6 +1354,11 @@ def write_run_report_md(
         *(
             [[metadata_label("task_name"), str(metrics["task_name_display"])]]
             if metrics.get("task_name_display")
+            else []
+        ),
+        *(
+            [[metadata_label("categories"), "、".join(metrics["categories"])]]
+            if metrics.get("categories")
             else []
         ),
         [metadata_label("membench_version"), version_display(metrics.get("membench_version"))],

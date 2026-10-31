@@ -80,6 +80,7 @@ import json
 import os
 import shutil
 import statistics
+from collections.abc import Iterable
 from datetime import datetime
 from typing import Any, Union
 
@@ -88,13 +89,14 @@ from membench.data.schema import dataset_fingerprint, load_dataset
 from membench.evaluate import STALE_GATE_THRESHOLD, is_office_slot_dataset
 from membench.metrics import aggregate
 from membench.report import copy_report, render_dataset_report, render_dialogue_report
-from membench.runner import select_shard_questions
+from membench.runner import filter_dialogues_by_category, select_shard_questions
 from membench.version import runner_version
 
 #: 跨分片必须一致的元数据：身份（adapter / platform / commit）、判分与驱动
 #: （judge / judge_model / driver_llm / adapter_version / adapter_meta）、口径
 #: （dataset_fingerprint / retrieval_match / schema_version / run_mode）与分片范围
-#: （limit / shards / shard_by）。任一项不一致即拒绝融合——混片的分数不可归因。
+#: （limit / categories / shards / shard_by）。任一项不一致即拒绝融合——混片的分数
+#: 不可归因。
 _FUSED_METADATA_KEYS = (
     "adapter",
     "dataset",
@@ -111,6 +113,9 @@ _FUSED_METADATA_KEYS = (
     "schema_version",
     "run_mode",
     "limit",
+    # 题型过滤：把「只跑 temporal 的片」和「只跑 safety 的片」融在一起，得到的既不是
+    # 全量也不是任一题型的两份题集拼接，分数不可归因。
+    "categories",
     "shards",
     "shard_by",
 )
@@ -488,6 +493,7 @@ def _dataset_truth(
     shard_by: str,
     limit: Union[int, None],
     fingerprint: Union[dict[str, Any], None],
+    categories: "Iterable[str]" = (),
 ) -> Union[dict[str, Any], None]:
     """源数据集给出的真值：对话 / 题目顺序 + 每片应有的对话与题集。
 
@@ -520,6 +526,16 @@ def _dataset_truth(
         print(f"[membench] ⚠️ 源数据集无法解析（{exc}）：只按分片账本校对覆盖")
         return None
     expected: dict[int, dict[str, set[str]]] = {}
+    # 题目集口径必须先按题型过滤再分片——与 Runner 同一实现、同一顺序，否则被过滤掉
+    # 的题会被当成"缺片"，融合直接报覆盖不全。
+    if categories:
+        dialogues = filter_dialogues_by_category(dialogues, categories)
+        if not dialogues:
+            print(
+                "[membench] ⚠️ 源数据集在题型过滤后没有题目（categories="
+                f"{list(categories)!r}）：跳过与数据集的逐题覆盖比对"
+            )
+            return None
     for index in range(shards_n):
         selected = select_shard_questions(dialogues, shards_n, index, limit, shard_by)
         expected[index] = {
@@ -809,6 +825,7 @@ def fuse_runs(
         shard_by=shard_by,
         limit=limit,
         fingerprint=header.get("dataset_fingerprint"),
+        categories=header.get("categories") or (),
     )
     _check_coverage(by_index, truth)
 
@@ -892,7 +909,12 @@ def fuse_runs(
         dataset_name,
         now.strftime("%Y%m%d_%H%M%S"),
         commit=str(ref_metrics.get("commit") or "") or None,
-        tags=["fused", *layout.run_id_tags(shards_n, None, shard_by, limit)],
+        tags=[
+            "fused",
+            *layout.run_id_tags(
+                shards_n, None, shard_by, limit, header.get("categories") or ()
+            ),
+        ],
     )
     # 数据集级与逐对话共用的身份 / 口径元数据；可比性字段透传，融合产物与普通 run
     # 同等可校验、可对比
@@ -906,8 +928,10 @@ def fuse_runs(
         "commit": ref_metrics.get("commit"),
         "judge": ref_metrics.get("judge"),
         "timestamp": now.isoformat(timespec="seconds"),
-        # 冒烟范围透传（各片一致）：冒烟融合产物与全量融合产物必须能被 compare 区分
+        # 冒烟 / 题型范围透传（各片一致）：冒烟、题型过滤的融合产物与全量融合产物
+        # 必须能被 compare 区分。只在源分片真有值时落账，不过滤的产物不多出空键。
         "limit": limit,
+        **({"categories": list(header.get("categories") or [])} if header.get("categories") else {}),
         "shards": shards_n,
         "shard_index": None,
         "shard_by": shard_by,

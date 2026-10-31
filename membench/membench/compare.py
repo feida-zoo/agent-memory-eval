@@ -87,6 +87,9 @@ CRITICAL_COMPARABILITY_DIMS: tuple[str, ...] = (
     # （典型如 --limit 冒烟 vs 全量、分片融合只覆盖一部分），diff 不可归因；
     # 与数据集指纹同级——数据集身份没变但题目集变了，同样不能当 A/B。
     "n_questions",
+    # 题型过滤：题集口径本身。两个过滤结果可能题目数相同却是不同题型，n_questions
+    # 拦不住；题型不同就是不同题目总体，分数不可归因（缺省 = 不过滤，旧产物两缺即同）。
+    "categories",
 )
 
 #: 次要维度：不一致仅降级为 WARN 门禁，不判 FAIL。
@@ -271,6 +274,14 @@ def _comparability_value(metrics: dict[str, Any], dim: str) -> Any:
             return value
         overall = metrics.get("overall")
         return overall.get("n_questions") if isinstance(overall, dict) else None
+    if dim == "categories":
+        # 不过滤 = 空列表。全量跑与旧产物都不落这个字段，必须归一为空列表，
+        # 否则普通 A/B 会因为"缺这个字段"被判成关键维度缺失（strict 直接 FAIL）。
+        # 排序后比较：``--category a --category b`` 与反序是同一题集。
+        value = metrics.get("categories")
+        if isinstance(value, (list, tuple)):
+            return sorted(str(item).strip().lower() for item in value)
+        return []
     return metrics.get(dim)
 
 

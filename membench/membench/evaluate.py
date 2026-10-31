@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -64,7 +65,7 @@ from membench.report import (
     worst_categories,
     token_usage_totals,
 )
-from membench.runner import Runner
+from membench.runner import Runner, available_categories, category_key
 from membench.version import version_display
 from membench.userdata import (
     USER_DATASET_FILENAME,
@@ -1004,6 +1005,7 @@ def run_datasets(
     snapshot: Union[bool, None] = None,
     trace_state: Union[bool, None] = None,
     abstention_recheck: Union[bool, None] = None,
+    categories: "Iterable[str]" = (),
 ) -> list[DatasetResult]:
     """对每个数据集用 Runner 各跑一次写进同一个实验目录，收集 metrics。
 
@@ -1018,6 +1020,8 @@ def run_datasets(
     trace_state 透传给 Runner：只对 interleaved 对话生效，sequence 对话的提问时点
     就是末尾 ``memory_snapshot/``。None（缺省）= Runner 的**自动**判定（有
     interleaved 对话含 safety 题时开启），True / False 强制开关。
+    categories 透传给 Runner 的题型过滤（缺省空 = 不过滤）；调用方已按数据集
+    前置筛过"有没有这个题型"，这里不再重复判断。
     """
     # snapshot=None 表示"不表态"，交给 Runner 的默认值（导出）；显式值才透传
     snapshot_kwarg: dict[str, Any] = {} if snapshot is None else {"snapshot": snapshot}
@@ -1039,6 +1043,7 @@ def run_datasets(
             write_task_reports=False,
             trace_state=trace_state,
             abstention_recheck=abstention_recheck,
+            categories=categories,
             **snapshot_kwarg,
         )
         run_dir = runner.run()
@@ -1126,6 +1131,7 @@ def _render_task_report_md(
     gate: dict[str, Any],
     fusion: str = FUSION_WEIGHTED,
     extra_notes: Union[list[str], None] = None,
+    categories: "Iterable[str]" = (),
 ) -> str:
     """生成任务级 ``report.md``（中文，全量评估报告），返回报告路径。
 
@@ -1174,6 +1180,11 @@ def _render_task_report_md(
         *(
             [["任务名", str(first_metrics["task_name_display"])]]
             if first_metrics.get("task_name_display")
+            else []
+        ),
+        *(
+            [["题型过滤", "、".join(categories)]]
+            if list(categories)
             else []
         ),
         [
@@ -1728,6 +1739,7 @@ def write_task_reports(
     gate: dict[str, Any],
     fusion: str = FUSION_WEIGHTED,
     extra_notes: Union[list[str], None] = None,
+    categories: "Iterable[str]" = (),
 ) -> dict[str, Any]:
     """写任务级报告到 ``<实验目录>/reports/``，返回 evaluate_summary.json 的内容。
 
@@ -1756,6 +1768,7 @@ def write_task_reports(
         gate,
         fusion=fusion,
         extra_notes=extra_notes,
+        categories=categories,
     )
 
     metrics = {
@@ -1814,6 +1827,7 @@ def evaluate(
     trace_state: Union[bool, None] = None,
     abstention_recheck: Union[bool, None] = None,
     fusion: str = FUSION_WEIGHTED,
+    categories: "Iterable[str]" = (),
 ) -> int:
     """执行全量评估：一个实验目录承载全部数据集 + 基准集融合 + 门禁 + 报告。
 
@@ -1860,6 +1874,9 @@ def evaluate(
         fusion: 基准集融合口径（``weighted`` 默认 / ``equal``），见
             :func:`fuse_metrics`；会写进任务级 metrics 与各数据集 metrics
             （``fusion`` 可比性维度——旧产物缺该字段归一为 ``legacy``）。
+        categories: 题型过滤（``--category``，大小写不敏感，缺省空 = 全量）。
+            只跟"要补跑的数据集"有关：某数据集没有这些题型就直接跳过并说明，
+            全部都没有才报错；复用产物的题型口径必须与本次一致。
 
     Returns:
         进程退出码：门禁 FAIL 为 1，否则 0（与 compare 一致）。
@@ -1881,9 +1898,26 @@ def evaluate(
             "--from-runs 与预设开关（--quick / --beam-10m / --no-beam / --no-lme-s / --common）互斥"
         )
 
+    wanted_categories: list[str] = []
+    for category in categories or ():
+        key_cat = str(category).strip().lower()
+        if key_cat and key_cat not in wanted_categories:
+            wanted_categories.append(key_cat)
+
     provided: dict[str, DatasetResult] = {}
     for key, product_dir in (from_runs or {}).items():
         provided[key] = load_provided_result(key, product_dir)
+
+    # 复用产物的题型口径必须与本次一致：过滤后的产物与全量产物混在一个任务里，
+    # 融合分与数据集表都是两份题集的拼接，读报告的人看不出来。
+    if wanted_categories:
+        for key, res in provided.items():
+            have = sorted(str(c).strip().lower() for c in (res.metrics.get("categories") or []))
+            if have != wanted_categories:
+                raise SystemExit(
+                    f"复用产物 {key} 的题型过滤是 {have or '（不过滤）'}，与本次 "
+                    f"--category {'、'.join(wanted_categories)} 不一致：请换产物或去掉 --category"
+                )
 
     if specs is None:
         if provided:
@@ -1905,6 +1939,43 @@ def evaluate(
                 f"以下复用 run 不在目标数据集清单中: {', '.join(unknown)}"
                 "（请加入 --dataset 或删除对应 --from-runs）"
             )
+
+    # 题型过滤前置：没有该题型的数据集直接跳过（不补跑、不进报告的数据集表），
+    # 都在补跑之前收敛——否则"跳过一个数据集"仍会触发 adapter/judge 的缺口检查。
+    # 复用产物已在上面核对过口径，这里只筛要补跑的。
+    skipped: list[tuple[DatasetSpec, list[str]]] = []
+    if wanted_categories:
+        runnable: list[DatasetSpec] = []
+        for spec in specs:
+            if spec.key in provided:
+                runnable.append(spec)
+                continue
+            available = available_categories(load_dataset(spec.path))
+            hit = [c for c in wanted_categories if c in {category_key(a) for a in available}]
+            if hit:
+                runnable.append(spec)
+                if len(hit) < len(wanted_categories):
+                    print(
+                        f"[membench] 提示: {spec.key} 只有 {'、'.join(hit)}，"
+                        f"缺 {'、'.join(c for c in wanted_categories if c not in hit)}"
+                    )
+            else:
+                skipped.append((spec, available))
+        for spec, available in skipped:
+            print(
+                f"[membench] 跳过 {spec.key}：没有题型 {'、'.join(wanted_categories)}"
+                f"（实际题型：{'、'.join(available) or '（无 category 字段）'}）"
+            )
+        if not runnable:
+            detail = "；".join(
+                f"{spec.key}: {'、'.join(available) or '（无 category 字段）'}"
+                for spec, available in skipped
+            )
+            raise SystemExit(
+                f"--category {'、'.join(wanted_categories)} 在目标数据集里一道题都没有"
+                f"（{detail}）"
+            )
+        specs = runnable
 
     # 缺口前置检查：目标清单里有需要补跑的数据集时，adapter/judge 必须可用
     missing_keys = [s.key for s in specs if s.key not in provided]
@@ -1968,7 +2039,13 @@ def evaluate(
         print(f"[membench] 任务目录: {experiment_dir}")
     else:
         experiment_dir = layout.experiment_path(
-            report_out, layout.eval_subdir(adapter_name, platform, layout.ts_now(now))
+            report_out,
+            layout.eval_subdir(
+                adapter_name,
+                platform,
+                layout.ts_now(now),
+                layout.experiment_tags(1, 0, None, wanted_categories),
+            ),
         )
         print(f"[membench] 实验目录: {experiment_dir}")
 
@@ -2002,6 +2079,7 @@ def evaluate(
             snapshot=snapshot,
             trace_state=trace_state,
             abstention_recheck=abstention_recheck,
+            categories=wanted_categories,
         ):
             provided_by_key[r.spec.key] = r
 
@@ -2043,6 +2121,7 @@ def evaluate(
         gate=gate,
         fusion=fusion,
         extra_notes=[f"> ⚠️ **汇总模式**：{note}" for note in notes],
+        categories=wanted_categories,
     )
 
     print(f"[membench] 门禁结论: {gate['status']} — {gate['detail']}")

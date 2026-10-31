@@ -104,6 +104,7 @@ import shutil
 import statistics
 import sys
 from collections import OrderedDict
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Union
@@ -671,6 +672,47 @@ def _shard_units(dialogues: list[Any], shard_by: str) -> int:
     return sum(len(dialogue.questions) for dialogue in dialogues)
 
 
+def category_key(value: Any) -> str:
+    """题型比较口径：去空白 + 小写（数据里的 category 大小写不保证统一）。"""
+    return str(value or "").strip().lower()
+
+
+def available_categories(dialogues: list[Any]) -> list[str]:
+    """数据集里实际出现的题型（按首次出现顺序、去重）。"""
+    seen: dict[str, None] = {}
+    for dialogue in dialogues:
+        for question in dialogue.questions:
+            seen.setdefault(str(getattr(question, "category", "")), None)
+    return [name for name in seen if name]
+
+
+def filter_dialogues_by_category(
+    dialogues: list[Any], categories: Iterable[str]
+) -> list[Any]:
+    """按题型裁剪题目，返回新的对话列表（无匹配题的对话整段剔除）。
+
+    这是题型过滤的**唯一实现**：``Runner`` 在加载后立刻调用它，``fuse`` 复算
+    "每片本该有哪些题"时也调用它——两边必须同口径，否则融合的覆盖完整性校验会
+    把被过滤掉的题当成"缺片"。
+
+    过滤发生在分片与 ``--limit`` 之前：题型是**范围**，分片与截断是在这个范围内的
+    抽样（先截断再过滤会得到"某题型的第 N 题"这种不可预期的题集）。
+    无匹配题的对话整段剔除是刻意的：对话不再被某个分片 ingest，省掉与之相伴的
+    全部 ingest 成本。
+    """
+    wanted = {category_key(c) for c in categories if category_key(c)}
+    if not wanted:
+        return list(dialogues)
+    out: list[Any] = []
+    for dialogue in dialogues:
+        questions = [
+            q for q in dialogue.questions if category_key(getattr(q, "category", "")) in wanted
+        ]
+        if questions:
+            out.append(dataclasses.replace(dialogue, questions=questions))
+    return out
+
+
 def select_shard_questions(
     dialogues: list[Any],
     shards: int,
@@ -968,6 +1010,7 @@ class Runner:
         replay_verify_source: Union[str, None] = None,
         trace_state: Union[bool, None] = None,
         abstention_recheck: Union[bool, None] = None,
+        categories: "Iterable[str] | None" = None,
     ) -> None:
         if jobs < 1:
             raise ValueError(f"jobs 必须 >= 1，当前为 {jobs}")
@@ -1005,6 +1048,12 @@ class Runner:
         self.limit = limit
         self.shards = shards  # int 或 "max"（run() 按数据集上限解析）
         self.shard_index = int(shard_index)
+        # 题型过滤：规范化后去重保序；空 = 不过滤（范围 = 数据集全部题）
+        self.categories: list[str] = []
+        for category in categories or ():
+            key = category_key(category)
+            if key and key not in self.categories:
+                self.categories.append(key)
         self.adapter_meta = adapter_meta
         self.adapter = adapter
         self.dataset_path = dataset_path
@@ -1243,6 +1292,31 @@ class Runner:
         """
         dialogues = load_dataset(self.dataset_path)
 
+        # 题型过滤在分片 / limit 之前：题型是范围，分片与截断是范围内的抽样。
+        # 该数据集一道匹配题都没有时当场拒绝并列出实际有哪些题型——静默产出空结果
+        # 会被当成"跑过了"，而错写的题型名最容易这么溜过去。
+        if self.categories:
+            available = available_categories(dialogues)
+            missing = [c for c in self.categories if c not in {category_key(a) for a in available}]
+            filtered = filter_dialogues_by_category(dialogues, self.categories)
+            if not filtered:
+                raise SystemExit(
+                    f"--category {'、'.join(self.categories)} 在该数据集里没有匹配题目"
+                    f"（数据集 {os.path.basename(self.dataset_path)} 实际题型："
+                    f"{'、'.join(available) or '（无 category 字段）'}）"
+                )
+            if missing:
+                print(
+                    f"[membench] ⚠️ --category {'、'.join(missing)} 在该数据集里不存在，"
+                    f"已忽略（实际题型：{'、'.join(available)}）"
+                )
+            dialogues = filtered
+            kept = sum(len(d.questions) for d in dialogues)
+            print(
+                f"[membench] 题型过滤 {'、'.join(self.categories)}："
+                f"{len(dialogues)} 个对话 / {kept} 道题"
+            )
+
         # 分片解析：'max' 取数据集上限；超过上限的整数按上限执行（不报错）
         shard_units = _shard_units(dialogues, self.shard_by)
         unit_label = "对话数" if self.shard_by == "dialogue" else "题目数"
@@ -1391,7 +1465,9 @@ class Runner:
             dataset_name,
             now.strftime("%Y%m%d_%H%M%S"),
             commit=self.commit,
-            tags=layout.run_id_tags(shards, self.shard_index, self.shard_by, self.limit),
+            tags=layout.run_id_tags(
+                shards, self.shard_index, self.shard_by, self.limit, self.categories
+            ),
         )
         dialogue_ids = [str(d.dialogue_id) for d in dialogues]
         dataset_dir = os.path.abspath(layout.dataset_dir(self.out_dir, dataset_name))
@@ -1409,6 +1485,7 @@ class Runner:
                 shard_by=self.shard_by,
                 limit=self.limit,
                 fingerprint=dataset_fingerprint(self.dataset_path),
+                categories=self.categories,
             )
             ledger = layout.read_shard_ledger(dataset_dir)
             layout.check_shard_ledger(ledger, ledger_header, path=ledger_path)
@@ -1701,6 +1778,9 @@ class Runner:
                     "n_ignored": n_ignored,
                     "timestamp": now.isoformat(timespec="seconds"),
                     "limit": self.limit,
+                    # 题型过滤：只在真的过滤时落账（不过滤的产物不多出空键，
+                    # 与 limit=None 的重合口径一致）。compare 把它当关键维度。
+                    **({"categories": list(self.categories)} if self.categories else {}),
                     "shards": shards,
                     "shard_index": self.shard_index,
                     "shard_by": self.shard_by,

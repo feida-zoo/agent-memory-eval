@@ -77,6 +77,7 @@ python scripts/run_task.py eval --name <任务名> --adapter <适配器名> --da
 
 - 分片由脚本自动编排（共用一棵任务目录 → `fuse` 补齐），你只需给 `--shards`。
 - 共享任务目录只允许对话级分片（脚本默认 `--shard-by dialogue`）；题目级分片属非默认路径，见 `membench/README.md`「大数据集：冒烟与分片」。
+- **只跑一部分题**：`--limit N`（按条数）或 `--category <题型>`（可重复、大小写不敏感，先问用户要不要缩范围）。顺序固定「题型过滤 → 分片 → limit」；没有匹配题的对话整段跳过（省 ingest），一道都没有会报错并列出实际题型。过滤结果记进 `metrics.categories` 并作为 compare 关键维度——**题型过滤的分数不得与全量分数直接对比**，`evaluate --category` 下没有该题型的数据集会被跳过并打印实际题型。
 - 每片独占记忆实例（HTTP 桥 = 独立进程 + `BRIDGE_PORT` / `BRIDGE_DATA_DIR`）；分片产物只有对话目录 + `shards.<i>.json`，不是完整实验。
 
 ### 4. 回放（改了读取侧，免重跑 ingest）

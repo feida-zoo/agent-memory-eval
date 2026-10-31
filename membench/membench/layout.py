@@ -362,14 +362,16 @@ def run_id_tags(
     shard_index: int | None,
     shard_by: str,
     limit: int | None = None,
+    categories: "Iterable[str]" = (),
 ) -> list[str]:
-    """``run_id`` 里的分片 / 冒烟 / 融合标记词表（run_id 的字符串格式由此处唯一决定）。
+    """``run_id`` 里的分片 / 冒烟 / 题型 / 融合标记词表（run_id 格式由此处唯一决定）。
 
     ``shards`` 传**解析后**的有效分片数（``--shards max`` 由 Runner 按数据集上限
     结算），``<= 1`` 时不出分片标记；``shard_by="dialogue"`` 用 ``dshard`` 前缀与
     题目级分片区分。``shard_index=None`` 表示这不是某一分片而是**整体融合产物**
     （fuse 把 0..N-1 各片合并成一份），此时出 ``shard<N>`` / ``dshard<N>``（只记
-    片数、不记序号）——冒烟（``limitN``）、分片与融合结果都不能被误当全量结果。
+    片数、不记序号）——冒烟（``limitN``）、题型过滤（``cat-<题型>``）、分片与融合
+    结果都不能被误当全量结果。
     """
     tags: list[str] = []
     if shards > 1:
@@ -380,6 +382,8 @@ def run_id_tags(
             tags.append(f"{shard_mode}{shard_index}of{shards}")
     if limit is not None:
         tags.append(f"limit{limit}")
+    for category in categories:
+        tags.append(f"cat-{slug(str(category).strip().lower())}")
     return tags
 
 
@@ -405,14 +409,20 @@ def run_id(
     return f"{adapter}_{platform or 'default'}{commit_tag}_{dataset}{tag_text}_{ts}"
 
 
-def experiment_tags(shards: int | str, shard_index: int, limit: int | None = None) -> list[str]:
-    """实验目录名末尾的分片 / 冒烟标签：分片 ``s<i>``、冒烟 ``l<limit>``。
+def experiment_tags(
+    shards: int | str,
+    shard_index: int,
+    limit: int | None = None,
+    categories: "Iterable[str]" = (),
+) -> list[str]:
+    """实验目录名末尾的分片 / 冒烟 / 题型标签：``s<i>``、``l<limit>``、``c<题型>``。
 
     目录名只精确到秒，同一秒并行的两个分片否则会撞进同一目录被非空守卫拒绝，
     因此把分片序号写进目录名——两片可以共用同一个 ``--report-out``。只记序号不记
     分片总数：总数要解析数据集才知道（``--shards max``），且 ``s<i>`` 已足以区分
-    同一次评测的各片。不分片且无 limit 时返回空列表，目录名保持
-    ``eval_<name>_<platform>_<ts>`` 原样。
+    同一次评测的各片。题型过滤同理：同一秒并行跑「只跑 temporal」与「只跑 safety」
+    也是常规操作，各自带 ``c<题型>`` 才不会撞名。不分片、无 limit、无题型过滤时返回
+    空列表，目录名保持 ``eval_<name>_<platform>_<ts>`` 原样。
 
     已知取舍：``--shards max`` 在**单分片数据集**上实际只跑 1 片，但分片数要解析
     数据集才知道，CLI 建目录时已按"传了 --shards"记下 ``s<i>``，故目录名仍带
@@ -423,6 +433,10 @@ def experiment_tags(shards: int | str, shard_index: int, limit: int | None = Non
         tags.append(f"s{shard_index}")
     if limit is not None:
         tags.append(f"l{limit}")
+    for category in categories:
+        # 题型名大小写不敏感（Runner 落账时统一小写），目录标签必须同一口径，
+        # 否则 --category Temporal 的目录与 run_id 各是一种写法。
+        tags.append(f"c{slug(str(category).strip().lower())}")
     return tags
 
 
@@ -1262,12 +1276,15 @@ def shard_ledger_header(
     shard_by: str,
     limit: Union[int, None],
     fingerprint: Union[dict[str, Any], None],
+    categories: "Iterable[str]" = (),
 ) -> dict[str, Any]:
     """本次运行的分片口径（账本头部）：写入新账本时落盘，也是比对的基准。
 
     字段：``schema`` / ``dataset`` / ``shards`` / ``shard_by`` / ``limit`` /
-    ``dataset_fingerprint``。同一个数据集目录里的账本只能记**同一次评测**的各片：
-    口径或数据集指纹换了却写进同一目录，各片产物就不可归因（融合得到的是混片结果）。
+    ``categories`` / ``dataset_fingerprint``。同一个数据集目录里的账本只能记**同一次
+    评测**的各片：口径或数据集指纹换了却写进同一目录，各片产物就不可归因（融合得到
+    的是混片结果）。``categories`` 恒为列表（不过滤时为空列表），旧账本缺该字段按空
+    列表归一——否则加上过滤就会把在跑的旧任务全部判成口径不一致。
     """
     return {
         "schema": SHARD_LEDGER_SCHEMA,
@@ -1275,6 +1292,7 @@ def shard_ledger_header(
         "shards": shards,
         "shard_by": shard_by,
         "limit": limit,
+        "categories": [str(c) for c in categories],
         "dataset_fingerprint": fingerprint,
     }
 
@@ -1436,6 +1454,13 @@ def check_shard_ledger(
                 f"分片账本与本次运行不一致（{key}）：账本 {existing.get(key)!r} vs "
                 f"本次 {header.get(key)!r}（{path}）——同一个实验目录里只能放同一次评测的分片"
             )
+    # 题型过滤也是口径：旧账本没有该字段按空列表归一（那时还没有 --category）
+    if list(existing.get("categories") or []) != list(header.get("categories") or []):
+        raise SystemExit(
+            f"分片账本与本次运行的题型过滤不一致：账本 {existing.get('categories')!r} vs "
+            f"本次 {header.get('categories')!r}（{path}）——同一个实验目录里只能放同一次"
+            "评测的分片"
+        )
     known = (existing.get("dataset_fingerprint") or {}).get("sha256")
     want = (header.get("dataset_fingerprint") or {}).get("sha256")
     if known and want and known != want:

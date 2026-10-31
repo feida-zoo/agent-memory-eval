@@ -1188,6 +1188,16 @@ def _write_evaluate_compare_report(
         + version_display((groups[0].baseline if groups else {}).get("membench_version"))
     )
     lines.append(f"- 数据集数: {len(groups)}（{', '.join(r.spec.name for r in groups)}）")
+    # 题型过滤：两侧各数据集的口径必须一致（可比性维度已校验），这里给一行汇总，
+    # 读者不必逐份 metrics.json 去确认"这份报告只覆盖了哪几类题"。
+    filter_sets = {
+        tuple(sorted(str(c).strip().lower() for c in (m.get("categories") or [])))
+        for group in groups
+        for m in (group.baseline, group.candidate)
+    }
+    if any(filter_sets):
+        shown = "、".join(f"`{'/'.join(s) or '全量'}`" for s in sorted(filter_sets))
+        lines.append(f"- 题型过滤: {shown}（只覆盖这些题型，分数不代表全量题集）")
     match_modes = sorted(
         {
             str(metrics_dict.get("retrieval_match") or "substring")
