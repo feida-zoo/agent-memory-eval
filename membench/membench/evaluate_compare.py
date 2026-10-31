@@ -112,6 +112,86 @@ class ArmDatasetResult:
     capabilities: dict[str, bool] = field(default_factory=dict)
 
 
+#: 「提升 TOP N 题型」列多少条。
+TOP_IMPROVED_CATEGORIES = 5
+
+#: 进 TOP 榜的最小题量（两侧都要满足）：题型只有 2~4 题时，一两题的翻转就是
+#: +50~+100pt，会把真正的大样本改进挤出榜单。小样本题型仍在下方的逐数据集表里。
+TOP_CATEGORY_MIN_N = 10
+
+
+def _category_diff_rows(arm: ArmDatasetResult) -> list[dict[str, Any]]:
+    """把某数据集的 ``by_category`` 拉平成逐题型行（A/B 准确率与题数）。
+
+    两侧 category 取并集、按名称排序；两侧都没有准确率时跳过。某侧缺该题型时
+    记 ``None``（不按 0 处理——"没跑"不是"全错"）。
+    """
+    a_by_cat = arm.baseline.get("by_category", {}) or {}
+    b_by_cat = arm.candidate.get("by_category", {}) or {}
+    rows: list[dict[str, Any]] = []
+    for cat in sorted(set(a_by_cat) | set(b_by_cat)):
+        a_entry = a_by_cat.get(cat, {}) or {}
+        b_entry = b_by_cat.get(cat, {}) or {}
+        n_a = int(a_entry.get("n", 0) or 0)
+        n_b = int(b_entry.get("n", 0) or 0)
+        acc_a = (
+            float(a_entry["accuracy"])
+            if n_a and a_entry.get("accuracy") is not None
+            else None
+        )
+        acc_b = (
+            float(b_entry["accuracy"])
+            if n_b and b_entry.get("accuracy") is not None
+            else None
+        )
+        if acc_a is None and acc_b is None:
+            continue
+        rows.append(
+            {"category": cat, "n_a": n_a, "n_b": n_b, "acc_a": acc_a, "acc_b": acc_b}
+        )
+    return rows
+
+
+def top_improved_categories(
+    arms: "Sequence[ArmDatasetResult]", limit: Union[int, None] = None
+) -> list[dict[str, Any]]:
+    """按 Δ 准确率排出「提升最多」的 (数据集, 题型)。
+
+    只收**正向**改进、且两侧题量都达到 :data:`TOP_CATEGORY_MIN_N` 的组合——
+    小样本题型的一两题翻转会制造 +50pt 的假象，那类仍留在逐数据集表里。
+
+    Args:
+        arms: 各数据集两臂结果。
+        limit: 取前几条（缺省 :data:`TOP_IMPROVED_CATEGORIES`）。
+
+    Returns:
+        ``[{"dataset","category","n","acc_a","acc_b","delta"}, ...]``，按 Δ 降序；
+        同 Δ 按题量降序（题量大的更可信）。
+    """
+    found: list[dict[str, Any]] = []
+    for arm in arms:
+        for row in _category_diff_rows(arm):
+            if row["acc_a"] is None or row["acc_b"] is None:
+                continue
+            if min(row["n_a"], row["n_b"]) < TOP_CATEGORY_MIN_N:
+                continue
+            delta = float(row["acc_b"]) - float(row["acc_a"])
+            if delta <= 0:
+                continue
+            found.append(
+                {
+                    "dataset": arm.spec.name,
+                    "category": row["category"],
+                    "n": min(row["n_a"], row["n_b"]),
+                    "acc_a": float(row["acc_a"]),
+                    "acc_b": float(row["acc_b"]),
+                    "delta": delta,
+                }
+            )
+    found.sort(key=lambda item: (-item["delta"], -item["n"]))
+    return found[: (TOP_IMPROVED_CATEGORIES if limit is None else limit)]
+
+
 def _rescan_capabilities(dataset_dir: str, spec_path: str) -> tuple[dict[str, bool], str]:
     """重算 capabilities：数据集扫描（准确）→ results.jsonl 反推（近似）→ 缺失。
 
@@ -1180,42 +1260,59 @@ def _write_evaluate_compare_report(
         + "；题型集合按各数据集实际出现的 category 保留，不跨数据集强行合并。</sub>"
     )
     lines.append("")
+    # 提升 TOP N：先给头条结论，再下钻逐数据集表
+    top = top_improved_categories(arms)
+    if top:
+        lines.append(f"### 提升最多的题型（TOP {len(top)}）")
+        lines.append("")
+        lines.append(
+            f"<sub>按 Δ 准确率降序；只收**两侧题量都 ≥ {TOP_CATEGORY_MIN_N}** 且正向改进的"
+            "组合——小样本题型一两题翻转就能 +50pt，会盖住大样本的真实改进（它们仍在下方"
+            "各表里）。同 Δ 按题量降序。</sub>"
+        )
+        lines.append("")
+        top_rows = [
+            [
+                item["dataset"],
+                category_display(item["category"]),
+                str(item["n"]),
+                f"{item['acc_a'] * 100:.1f}%",
+                f"{item['acc_b'] * 100:.1f}%",
+                f"{item['delta'] * 100:+.1f}pt",
+            ]
+            for item in top
+        ]
+        lines.append(
+            _md_table(["数据集", "题型", "n", "A 准确率", "B 准确率", "Δ"], top_rows)
+        )
+        lines.append("")
+    else:
+        lines.append(
+            f"<sub>本次没有满足条件的提升项（要求两侧题量 ≥ {TOP_CATEGORY_MIN_N} 且 Δ > 0）。</sub>"
+        )
+        lines.append("")
     for arm in arms:
-        a_by_cat = arm.baseline.get("by_category", {})
-        b_by_cat = arm.candidate.get("by_category", {})
-        if not a_by_cat and not b_by_cat:
-            continue
-        all_cats = sorted(set(a_by_cat) | set(b_by_cat))
-        header = ["题型（category）", "n", "A 准确率", "B 准确率", "Δ"]
         rows_bc: list[list[str]] = []
-        for cat in all_cats:
-            a_entry = a_by_cat.get(cat, {})
-            b_entry = b_by_cat.get(cat, {})
-            n_a = int(a_entry.get("n", 0))
-            n_b = int(b_entry.get("n", 0))
-            n = n_a or n_b
-            acc_a = float(a_entry.get("accuracy", 0.0)) if n_a else None
-            acc_b = float(b_entry.get("accuracy", 0.0)) if n_b else None
-            if acc_a is None and acc_b is None:
-                continue
+        for row in _category_diff_rows(arm):
+            n = row["n_a"] or row["n_b"]
+            acc_a, acc_b = row["acc_a"], row["acc_b"]
             if acc_a is None:
+                a_str, b_str = "—", f"{acc_b * 100:.1f}%"
                 diff_str = "—"
-                a_str = "—"
-                b_str = f"{acc_b * 100:.1f}%" if acc_b is not None else "—"
             elif acc_b is None:
-                a_str = f"{acc_a * 100:.1f}%"
-                b_str = "—"
-                diff_str = "—"
+                a_str, b_str, diff_str = f"{acc_a * 100:.1f}%", "—", "—"
             else:
-                diff_str = f"{(acc_b - acc_a) * 100:+.1f}pt"
                 a_str = f"{acc_a * 100:.1f}%"
                 b_str = f"{acc_b * 100:.1f}%"
-            rows_bc.append([category_display(cat), str(n), a_str, b_str, diff_str])
+                diff_str = f"{(acc_b - acc_a) * 100:+.1f}pt"
+            rows_bc.append(
+                [category_display(row["category"]), str(n), a_str, b_str, diff_str]
+            )
         if not rows_bc:
             continue
         lines.append(f"### {arm.spec.name}")
         lines.append("")
-        lines.append(_md_table(header, rows_bc))
+        lines.append(_md_table(["题型（category）", "n", "A 准确率", "B 准确率", "Δ"], rows_bc))
         lines.append("")
 
     # 1.6 效率成本 diff：逐数据集 A/B/Δ（Δ 为相对变化，与门禁阈值口径一致）

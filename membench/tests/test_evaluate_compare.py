@@ -361,6 +361,8 @@ def test_evaluate_compare_writes_compare_layout(mini_datasets, scripts, tmp_path
     assert "逐数据集关键指标 diff" in md
     # by_category diff 段按数据集分别渲染（数据集小标题 + 中文题型名，不跨集合并）
     assert "逐数据集题型 diff" in md
+    # 题型 diff 段开头给「提升最多的题型 TOP N」概览（小样本集可能为空 → 出说明）
+    assert "提升最多的题型" in md or "本次没有满足条件的提升项" in md
     assert "### A（办公）" in md
     assert "单跳（single_hop）" in md
     assert "拒答（abstention）" in md
@@ -843,3 +845,68 @@ def test_evaluate_compare_forwards_snapshot_to_both_sides(
         snapshot=False,
     )
     assert sent == [False, False], "snapshot=False 要传到两侧的每个数据集 Runner"
+
+
+def _arm(name: str, a_cats: dict[str, tuple[int, float]], b_cats: dict[str, tuple[int, float]]):
+    """构造一个 ArmDatasetResult（只填 by_category 相关字段）。"""
+    from membench.evaluate import DatasetSpec
+    from membench.evaluate_compare import ArmDatasetResult
+
+    def by_cat(cats: dict[str, tuple[int, float]]) -> dict:
+        return {
+            cat: {"n": n, "accuracy": acc, "token_f1": None} for cat, (n, acc) in cats.items()
+        }
+
+    return ArmDatasetResult(
+        spec=DatasetSpec(key=name, name=name, path=f"/data/{name}.jsonl", source="fetch"),
+        baseline={"by_category": by_cat(a_cats)},
+        candidate={"by_category": by_cat(b_cats)},
+        baseline_dataset_dir=f"/a/{name}",
+        candidate_dataset_dir=f"/b/{name}",
+    )
+
+
+def test_top_improved_categories_orders_and_filters() -> None:
+    """TOP 榜：按 Δ 降序；小样本（<10 题）与负向改进不进榜。"""
+    from membench.evaluate_compare import top_improved_categories
+
+    arms = [
+        _arm(
+            "X",
+            {"single_hop": (100, 0.50), "multi_hop": (5, 0.0)},
+            {"single_hop": (100, 0.70), "multi_hop": (5, 1.0)},
+        ),
+        _arm(
+            "Y",
+            {"temporal": (20, 0.60), "abstention": (30, 0.90)},
+            {"temporal": (20, 0.75), "abstention": (30, 0.50)},
+        ),
+    ]
+    top = top_improved_categories(arms)
+    assert [(item["dataset"], item["category"]) for item in top] == [
+        ("X", "single_hop"),
+        ("Y", "temporal"),
+    ]
+    assert top[0]["delta"] == pytest.approx(0.2)
+    assert top[0]["n"] == 100
+    # 小样本 +100pt 不在榜上：会盖住大样本的真实改进
+    assert all(item["category"] != "multi_hop" for item in top)
+    # 负向改进不进榜
+    assert all(item["category"] != "abstention" for item in top)
+
+
+def test_top_improved_categories_empty_when_all_small() -> None:
+    from membench.evaluate_compare import top_improved_categories
+
+    arms = [_arm("X", {"single_hop": (3, 0.0)}, {"single_hop": (3, 1.0)})]
+    assert top_improved_categories(arms) == []
+
+
+def test_top_improved_categories_respects_limit() -> None:
+    from membench.evaluate_compare import top_improved_categories
+
+    cats_a = {f"c{i}": (20, 0.5) for i in range(8)}
+    cats_b = {f"c{i}": (20, 0.5 + i * 0.01) for i in range(8)}
+    top = top_improved_categories([_arm("X", cats_a, cats_b)], limit=3)
+    assert len(top) == 3
+    assert top[0]["category"] == "c7"  # Δ 最大
