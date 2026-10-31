@@ -531,7 +531,7 @@ python -m membench.cli run --adapter my-system --dataset membench/data/office_da
 - **WARN**：存在关键维度不一致（非 strict）或次要维度不一致——结果可疑但可继续；
 - **FAIL**：strict 下存在关键维度不一致或无法核验。
 
-不可比原因在两处可见：CLI 输出逐条 `[membench] 不可比原因: [关键] <维度>: <说明>`；`compare_<name>_<platform>_<ts>/reports/comparison.md` 的「可比性前置校验」小节给出逐维度对照表（A / B / 是否一致）与「不可比原因」列表。
+不可比原因在两处可见：CLI 输出逐条 `[membench] 不可比原因: [关键] <维度>: <说明>`；`compare_<name>_<platform>_<ts>/reports/comparison.md` 的「可比性前置校验」小节给出逐维度对照表（基线 / 候选 / 是否一致）与「不可比原因」列表。
 
 **多数据集对比（`evaluate-compare`）同样逐数据集核对**：报告头部有一行汇总，正文附「两侧可比性（逐数据集）」小节（只列不一致与缺失项，级别同上表——「关键缺失」表示两侧都未标注、核验不了）。两点与单数据集 `compare` 不同：两侧 `adapter / adapter_version` 跨侧不同是本实验的设计变量，不进清单；两侧都已复用的数据集对在**跑前**就把问题清单打到控制台，跑完再用最终产物（含本轮补跑的数据集）复核一遍。
 
@@ -620,7 +620,7 @@ python -m membench.cli run --adapter <你的适配器> --dataset <同一个数�
 
 ```
 <任务>/
-├── runs/ 或 A/ B/                       # 与普通任务相同（单组 runs/；双组 A/ B/）
+├── runs/ 或 baseline/ candidate/        # 与普通任务相同（单组 runs/；双组两个组目录 + groups.json）
 └── snapshots/
     ├── <sha256 前 12 位>/               # 桶（含适配器导出的内容 + 框架写的 manifest.json）
     ├── .tmp-<uuid>/                     # 导出中的临时目录（成功即整体移入桶；不是桶）
@@ -891,7 +891,7 @@ DIR/compare_<name>_<platform>_<ts>/
 
 # 回放任务（task init --replay）：任务根多一个内容寻址快照池
 DIR/{eval_<name>_<platform>_<ts> | compare_<name>_<platform>_<ts>}/
-├── runs/ 或 A/ B/                       # 与普通任务相同
+├── runs/ 或 baseline/ candidate/        # 与普通任务相同
 └── snapshots/
     ├── <sha256 前 12 位>/                # 桶：适配器导出的状态 + 框架写的 manifest.json（记来源）
     ├── entries/<组>/<数据集>/<对话>.json  # 逐对话条目（真源；并行分片各写各的）
