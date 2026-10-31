@@ -314,6 +314,32 @@ def group_dir(task_dir: str, role: str) -> str:
     raise SystemExit(f"任务目录 {task_dir} 里没有角色 {role!r}（现有：{available}）")
 
 
+def ensure_dir_name(value: str, *, what: str = "任务名") -> str:
+    """校验"会进目录名"的标签：``slug`` 后退化成 ``default`` 就报错。
+
+    目录名一律 ASCII（中文路径会在报告内链编码、跨工具、排序上各带一份麻烦）；
+    显示名可以中文，但它要和目录名分开给（组名有 ``--*-name`` / ``--*-dir`` 两套）。
+    任务名没有独立的显示名，所以这里要求它自身就能 slug 出可用片段，并在报错里
+    给出可操作示例——否则所有中文任务名都会撞进 ``eval_default_<ts>``。
+
+    Args:
+        value: 待进目录名的标签。
+        what: 报错里的称呼（任务名 / 对比标签 / 平台…）。
+
+    Returns:
+        原样返回 ``value``（便于链式使用）。
+
+    Raises:
+        ValueError: ``slug(value)`` 退化为 ``default``（纯中文 / 纯符号）。
+    """
+    if slug(value) == "default":
+        raise ValueError(
+            f"{what}需要含 ASCII 字符（目录名不用中文）：{value!r}；"
+            f"例如 --name index-opt，中文描述放在报告 / 提交信息里"
+        )
+    return value
+
+
 def eval_subdir(
     name: str,
     platform: str | None = None,
@@ -994,18 +1020,30 @@ def dataset_dirs(experiment_dir: str) -> list[str]:
 
 
 def series_line_dir(
-    series_dir: str, index: int, name: str, commit: str | None = None
+    series_dir: str,
+    index: int,
+    name: str,
+    commit: str | None = None,
+    dir_hint: str | None = None,
 ) -> str:
-    """多线对比实验里一条线的副本目录：``<series>/runs/<线序>-<slug>``。
+    """多线对比实验里一条线的副本目录：``<series>/runs/<线序>-<stem>``。
 
-    报告里的线名是中文（``slug`` 把整段中文替换掉、只剩 ``default``），只靠名字会
-    让所有线撞进同一个目录；线序前缀（``01-`` / ``02-``…）保证一条线一个目录。
-    名字里一个 ASCII 片段都没剩下时退回 commit 前 8 位（再退 ``line<i>``），目录名
-    至少能对应到一条可核对的来源。
+    ``stem`` 优先级：
+
+    1. ``dir_hint``——产物来自带 ``groups.json`` 的任务时，直接复用该组的**目录名**
+       （``baseline`` / ``index-opt``）：用户已经给过 ASCII 目录名，不该在多线对比里
+       又退化成 ``line1``；
+    2. ``slug(name)``——线名里有 ASCII 片段时用它；
+    3. ``commit`` 前 8 位 / ``line<i>``——中文线名且没有命中清单时的兜底。
+
+    线序前缀（``01-`` / ``02-``…）保证一条线一个目录，且顺序即时间顺序。
     """
-    stem = slug(name)
-    if stem == "default":
-        stem = str(commit)[:8] if commit else f"line{index + 1}"
+    if dir_hint:
+        stem = slug(dir_hint)
+    else:
+        stem = slug(name)
+        if stem == "default":
+            stem = str(commit)[:8] if commit else f"line{index + 1}"
     return os.path.join(runs_root(series_dir), f"{index + 1:02d}-{stem}")
 
 

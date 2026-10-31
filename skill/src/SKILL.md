@@ -101,8 +101,9 @@ python -m membench.cli matrix --runs "wx@<shaA>=<产物目录>" "fs@<shaA>=<产�
 
 ## 命名：任务名必填，组名与目录名分开
 
-- `run_task.py` 的 `--name` **必填**：写清这次实验是什么（如 `索引优化` / `基线复测`），
-  进任务目录名。不再回退 adapter 名——同 adapter 的多次实验必须靠名字区分。
+- `run_task.py` 的 `--name` **必填且需含 ASCII**（如 `index-opt` / `baseline-rerun`）：
+  它进任务目录名，纯中文会 slug 成 `default`、所有中文名撞在一起。中文描述写在报告 /
+  提交信息里。不再回退 adapter 名——同 adapter 的多次实验必须靠名字区分。
 - 对比任务：`--baseline-name` / `--candidate-name` 是**显示名（可中文）**（报告与
   `groups.json` 用它）；`--baseline-dir` / `--candidate-dir` 是**目录名（ASCII）**，
   缺省 `baseline` / `candidate`。中文名不进目录（内链、跨工具、排序都会带麻烦）。

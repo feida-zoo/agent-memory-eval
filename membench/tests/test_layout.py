@@ -497,3 +497,12 @@ def test_groups_manifest_roundtrip(tmp_path: Path) -> None:
     assert layout.read_groups_manifest(str(task)) is None
     with pytest.raises(SystemExit, match="groups.json"):
         layout.group_dir(str(task), layout.ROLE_BASELINE)
+
+
+def test_ensure_dir_name_requires_ascii() -> None:
+    """进目录名的标签必须能 slug 出 ASCII 片段；纯中文要报可操作错误。"""
+    assert layout.ensure_dir_name("index-opt") == "index-opt"
+    with pytest.raises(ValueError, match="ASCII"):
+        layout.ensure_dir_name("索引优化", what="任务名（--name）")
+    with pytest.raises(ValueError, match="ASCII"):
+        layout.ensure_dir_name("***")

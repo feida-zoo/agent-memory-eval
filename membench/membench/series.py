@@ -440,6 +440,7 @@ class SeriesLine:
         target: ``--line`` 右侧产物目录（绝对路径）。
         datasets: ``{数据集目录名: 该集结果}``（跨线键集合必须一致）。
         copy_dir: 落盘后的副本目录（:func:`run_series` 填）。
+        dir_hint: 副本目录名提示（源产物所属任务的组目录名；没有则 None）。
     """
 
     index: int
@@ -449,6 +450,7 @@ class SeriesLine:
     commit: Union[str, None]
     target: str
     datasets: dict[str, DatasetResult] = field(default_factory=dict)
+    dir_hint: Union[str, None] = None
     copy_dir: str = ""
 
     @property
@@ -573,6 +575,27 @@ def _manifest_label(target: str) -> Union[str, None]:
     return None
 
 
+def _manifest_dir(target: str) -> Union[str, None]:
+    """产物目录所属任务里该组的**目录名**（``groups.json`` 的 ``dir``），没有则 None。
+
+    与 :func:`_manifest_label` 同源：多线对比的副本目录直接用这个名字，
+    不再退化成 ``line<i>``。
+    """
+    path = os.path.abspath(target)
+    for _ in range(3):
+        parent = os.path.dirname(path)
+        groups = layout.read_groups_manifest(parent)
+        if groups:
+            base = os.path.basename(path)
+            for item in groups:
+                if str(item.get("dir")) == base:
+                    return base
+        path = parent
+        if path in (os.path.dirname(path), ""):
+            break
+    return None
+
+
 def load_lines(
     specs: Sequence[str],
     repo: Union[str, None] = None,
@@ -626,6 +649,7 @@ def load_lines(
             index=index,
             ref=ref,
             name=names[index],
+            dir_hint=_manifest_dir(target),
             name_source=source,
             commit=ref if is_commit_ref(ref) else None,
             target=os.path.abspath(target),
@@ -1122,7 +1146,9 @@ def run_series(
 
     series_dir = layout.experiment_path(report_out, layout.series_subdir())
     for line, entry in zip(lines, entries):
-        line_dir = layout.series_line_dir(series_dir, line.index, line.name, line.commit)
+        line_dir = layout.series_line_dir(
+            series_dir, line.index, line.name, line.commit, line.dir_hint
+        )
         for key, res in line.datasets.items():
             shutil.copytree(res.run_dir, os.path.join(line_dir, key))
         entry["copy_dir"] = line_dir

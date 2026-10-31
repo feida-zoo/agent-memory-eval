@@ -756,6 +756,19 @@ class Executor:
 # ---------------------------------------------------------------------------
 
 
+def _require_ascii_dir_name(value: str, *, what: str = "任务名") -> None:
+    """进目录名的标签必须含 ASCII 字符（中文名会 slug 成 ``default``，全撞一起）。
+
+    与 ``layout.ensure_dir_name`` 同口径；这里不 import membench——skill 脚本在
+    没有 membench 包的目录（如测试夹具）里也要能给出这条可操作报错。
+    """
+    if not re.search(r"[A-Za-z0-9]", str(value or "")):
+        raise UsageError(
+            f"{what}需要含 ASCII 字符（目录名不用中文）：{value!r}；"
+            "例如 --name index-opt，中文描述放在报告 / 提交信息里"
+        )
+
+
 def _resolve_group_labels(args) -> tuple[str, str]:
     """双组任务的组名：显式 > 按 commit 抽取（已有规则）> 兜底「候选」。
 
@@ -1855,6 +1868,7 @@ def _eval_options(args: argparse.Namespace) -> EvalOptions:
         adapter_args=list(args.adapter_arg),
     )
     name = args.name
+    _require_ascii_dir_name(name, what="任务名（--name）")
     return EvalOptions(
         common=common,
         group=group,
@@ -1885,6 +1899,7 @@ def _ab_options(args: argparse.Namespace) -> AbOptions:
         adapter_args=list(args.adapter_arg_b),
     )
     name = args.name
+    _require_ascii_dir_name(name, what="任务名（--name）")
     group_labels = _resolve_group_labels(args)
     if group_labels[0].casefold() == group_labels[1].casefold():
         raise UsageError(

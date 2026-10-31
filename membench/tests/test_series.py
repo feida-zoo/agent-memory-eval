@@ -822,3 +822,39 @@ def test_cli_series_requires_two_lines(tmp_path: Path) -> None:
         cli.main(["series", "--line", "abc1234=/tmp", "--report-out", str(tmp_path / "out")])
     assert "至少需要 2 条" in str(excinfo.value)
     assert not (tmp_path / "out").exists()
+
+
+def test_series_reuses_group_dir_from_task_manifest(tmp_path: Path, git_repo) -> None:
+    """产物来自带 groups.json 的任务：副本目录直接用组的 ASCII 目录名。
+
+    回归：中文线名曾让副本目录退化成 ``01-line1``，即使源任务里明明白白有
+    ``baseline`` / ``index-opt``。
+    """
+    repo, shas = git_repo
+    datasets = (str(SAMPLE_DATASET_PATH),)
+    runs = [_run(tmp_path, f"grp{i}", quality, datasets=datasets) for i, quality in enumerate((40, 80))]
+
+    # 造两个"有清单"的任务：各自把数据集产物放进 baseline / index-opt 组目录
+    task_dirs = []
+    for index, (run, group_dir) in enumerate(zip(runs, ("baseline", "index-opt"))):
+        task = tmp_path / f"compare_task_{index}"
+        group_path = task / group_dir
+        group_path.mkdir(parents=True)
+        shutil.copytree(Path(run) / layout.DIR_RUNS, group_path / layout.DIR_RUNS)
+        layout.write_groups_manifest(
+            str(task),
+            [
+                {"role": layout.ROLE_BASELINE, "label": "基线", "dir": "baseline"},
+                {"role": layout.ROLE_CANDIDATE, "label": "索引优化", "dir": "index-opt"},
+            ],
+        )
+        task_dirs.append(str(group_path))
+
+    result = series.run_series(
+        [f"基线={task_dirs[0]}", f"索引优化={task_dirs[1]}"],
+        repo=repo,
+        report_out=str(tmp_path / "out"),
+    )
+    series_dir = Path(result["series_dir"])
+    dirs = sorted(p.name for p in (series_dir / layout.DIR_RUNS).iterdir())
+    assert dirs == ["01-baseline", "02-index-opt"]

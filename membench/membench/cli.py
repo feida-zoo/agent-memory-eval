@@ -1407,6 +1407,10 @@ def _print_runtime(exp_root: str, label: str = "") -> None:
 
 def _cmd_task_init(args: argparse.Namespace) -> int:
     """task init：建任务目录骨架，stdout 只打印它的绝对路径（供 ``TASK=$(...)`` 接走）。"""
+    try:
+        layout.ensure_dir_name(args.name, what="任务名（--name）")
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     task_dir = layout.init_task_dir(
         args.report_out,
         args.name,
