@@ -27,7 +27,7 @@
 
 ``eval``：
 
-1. ``task init --arms 1`` 建任务目录；
+1. ``task init --groups 1`` 建任务目录；
 2. 单数据集：直接 ``run --task-dir``；多数据集且**无分片、无 limit**：直接走官方
    ``evaluate --task-dir --dataset ...``；多数据集但**有分片或 limit**：逐数据集
    ``run --task-dir``（数据集之间串行，分片之间并行），最后用
@@ -40,12 +40,12 @@
 
 ``ab``：
 
-1. ``task init --arms 2`` 建 ``A/``、``B/`` 两臂；
-2. 两臂各自按上面的方式跑同一批数据集（各自的 adapter / 版本 / driver 参数）；
-3. 每个数据集分片跑完后，对该臂的数据集目录 ``fuse --task-dir``；
+1. ``task init --groups 2`` 建 ``A/``、``B/`` 两组；
+2. 两组各自按上面的方式跑同一批数据集（各自的 adapter / 版本 / driver 参数）；
+3. 每个数据集分片跑完后，对该组的数据集目录 ``fuse --task-dir``；
 4. 单数据集：``compare --task-dir --require-comparable``；
    多数据集：先逐数据集 ``compare --task-dir --require-comparable`` 做 strict
-   门禁，再用 ``evaluate-compare --task-dir``（复用两臂已有产物）写一份跨数据集
+   门禁，再用 ``evaluate-compare --task-dir``（复用两组已有产物）写一份跨数据集
    融合对比报告；
 5. 交付前自检。
 
@@ -187,8 +187,8 @@ class DatasetArg:
 
 
 @dataclass
-class ArmArgs:
-    """一条臂的 adapter 与元数据。"""
+class GroupArgs:
+    """一条组的 adapter 与元数据。"""
 
     adapter: str
     driver_llm: Optional[str] = None
@@ -235,7 +235,7 @@ class FlowState:
     task_dir: str
     gate_fail: bool = False
     datasets: list[ResolvedDataset] = field(default_factory=list)
-    arm_datasets: dict[str, dict[str, ResolvedDataset]] = field(default_factory=dict)
+    group_datasets: dict[str, dict[str, ResolvedDataset]] = field(default_factory=dict)
 
 
 @dataclass
@@ -243,7 +243,7 @@ class EvalOptions:
     """``eval`` 模式的完整参数。"""
 
     common: CommonArgs
-    arm: ArmArgs
+    group: GroupArgs
     datasets: list[DatasetArg]
     name: str
     report_out: Optional[str]
@@ -273,8 +273,8 @@ class AbOptions:
     """``ab`` 模式的完整参数。"""
 
     common: CommonArgs
-    baseline: ArmArgs
-    candidate: ArmArgs
+    baseline: GroupArgs
+    candidate: GroupArgs
     datasets: list[DatasetArg]
     name: str
     report_out: Optional[str]
@@ -448,7 +448,7 @@ def _membench_module(root: Path, name: str) -> Any:
     return importlib.import_module(f"membench.{name}")
 
 
-def _validate_task_dir(task_dir: str, arms: int, root: Path) -> None:
+def _validate_task_dir(task_dir: str, groups: int, root: Path) -> None:
     """``--task-dir`` 必须是已有任务骨架（``runs/`` 或 ``A/`` ``B/``，且带 ``reports/``）。"""
     layout = _membench_module(root, "layout")
     if not os.path.isdir(task_dir):
@@ -456,7 +456,7 @@ def _validate_task_dir(task_dir: str, arms: int, root: Path) -> None:
             f"--task-dir 不存在: {task_dir}；先运行 task init 建任务目录，"
             "或去掉 --task-dir 让本脚本自己建"
         )
-    if arms == 2:
+    if groups == 2:
         groups = layout.read_groups_manifest(task_dir)
         if not groups:
             raise UsageError(
@@ -470,10 +470,10 @@ def _validate_task_dir(task_dir: str, arms: int, root: Path) -> None:
     missing = [name for name in needed if not os.path.isdir(os.path.join(task_dir, name))]
     if missing:
         shape = (
-            " ".join(f"{name}/" for name in needed) if arms == 2 else "runs/ reports/"
+            " ".join(f"{name}/" for name in needed) if groups == 2 else "runs/ reports/"
         )
         raise UsageError(
-            f"--task-dir 不是 arms={arms} 的任务目录（缺 {'、'.join(missing)}）: {task_dir}；"
+            f"--task-dir 不是 groups={groups} 的任务目录（缺 {'、'.join(missing)}）: {task_dir}；"
             f"该形态需要 {shape}"
         )
 
@@ -557,7 +557,7 @@ def _start_background(
     子进程以独立会话运行同一份参数（去掉 ``--background``，补上 ``--task-dir``），
     结束时由 :func:`_finish_orchestrator` 回写状态与退出码。
     """
-    arms = 1 if isinstance(options, EvalOptions) else 2
+    groups = 1 if isinstance(options, EvalOptions) else 2
     if options.task_dir is not None:
         task_dir = options.task_dir
     else:
@@ -565,7 +565,7 @@ def _start_background(
         task_dir = executor.init_task(
             _task_init_argv(
                 name=options.name,
-                arms=arms,
+                groups=groups,
                 platform=options.common.platform,
                 report_out=options.report_out,
                 group_labels=getattr(options, "group_labels", None),
@@ -784,15 +784,15 @@ def _resolve_group_labels(args) -> tuple[str, str]:
 def _task_init_argv(
     *,
     name: str,
-    arms: int,
+    groups: int,
     platform: Optional[str],
     report_out: Optional[str],
     group_labels: Optional[Sequence[str]] = None,
     group_dirs: Optional[Sequence[str]] = None,
 ) -> list[str]:
     """``task init`` 参数（双组任务带两个组名 + 两个 ASCII 目录名）。"""
-    argv = ["task", "init", "--groups", str(arms), "--name", name]
-    if arms == 2 and group_labels:
+    argv = ["task", "init", "--groups", str(groups), "--name", name]
+    if groups == 2 and group_labels:
         argv += ["--baseline-name", group_labels[0], "--candidate-name", group_labels[1]]
         if group_dirs:
             argv += ["--baseline-dir", group_dirs[0], "--candidate-dir", group_dirs[1]]
@@ -805,7 +805,7 @@ def _task_init_argv(
 
 def _run_argv(
     *,
-    arm: ArmArgs,
+    group: GroupArgs,
     dataset: DatasetArg,
     target_dir: str,
     common: CommonArgs,
@@ -816,7 +816,7 @@ def _run_argv(
     argv = [
         "run",
         "--adapter",
-        arm.adapter,
+        group.adapter,
         "--dataset",
         dataset.cli_value,
         "--judge",
@@ -830,10 +830,10 @@ def _run_argv(
         argv += ["--platform", common.platform]
     if common.commit:
         argv += ["--commit", common.commit]
-    if arm.driver_llm:
-        argv += ["--driver-llm", arm.driver_llm]
-    if arm.adapter_version:
-        argv += ["--adapter-version", arm.adapter_version]
+    if group.driver_llm:
+        argv += ["--driver-llm", group.driver_llm]
+    if group.adapter_version:
+        argv += ["--adapter-version", group.adapter_version]
     if common.jobs is not None:
         argv += ["--jobs", str(common.jobs)]
     if common.limit is not None:
@@ -860,7 +860,7 @@ def _run_argv(
         argv += ["--llm-timeout", str(common.llm_timeout)]
     if common.client_llm:
         argv += ["--client-llm", common.client_llm]
-    for item in arm.adapter_args:
+    for item in group.adapter_args:
         argv += ["--adapter-arg", item]
     if shards is not None:
         argv += [
@@ -885,7 +885,7 @@ def _evaluate_argv(
     ``--limit``，其余情况由 ``_execute_eval`` 逐数据集 run 后用 ``--from-runs`` 汇总。
     """
     common = options.common
-    argv = ["evaluate", "--adapter", options.arm.adapter]
+    argv = ["evaluate", "--adapter", options.group.adapter]
     for dataset in options.datasets:
         argv += ["--dataset", dataset.cli_value]
     argv += [
@@ -902,10 +902,10 @@ def _evaluate_argv(
         argv += ["--platform", common.platform]
     if common.commit:
         argv += ["--commit", common.commit]
-    if options.arm.driver_llm:
-        argv += ["--driver-llm", options.arm.driver_llm]
-    if options.arm.adapter_version:
-        argv += ["--adapter-version", options.arm.adapter_version]
+    if options.group.driver_llm:
+        argv += ["--driver-llm", options.group.driver_llm]
+    if options.group.adapter_version:
+        argv += ["--adapter-version", options.group.adapter_version]
     if common.jobs is not None:
         argv += ["--jobs", str(common.jobs)]
     if common.no_snapshot:
@@ -930,7 +930,7 @@ def _evaluate_argv(
         argv += ["--llm-timeout", str(common.llm_timeout)]
     if common.client_llm:
         argv += ["--client-llm", common.client_llm]
-    for item in options.arm.adapter_args:
+    for item in options.group.adapter_args:
         argv += ["--adapter-arg", item]
     return argv
 
@@ -956,7 +956,7 @@ def _compare_argv(
     baseline: Optional[str] = None,
     candidate: Optional[str] = None,
 ) -> list[str]:
-    """``compare --task-dir --require-comparable``；多数据集时显式给两臂目录。"""
+    """``compare --task-dir --require-comparable``；多数据集时显式给两组目录。"""
     argv = ["compare", "--task-dir", task_dir, "--require-comparable"]
     if baseline and candidate:
         argv += ["--baseline", baseline, "--candidate", candidate]
@@ -965,15 +965,15 @@ def _compare_argv(
 
 def _evaluate_compare_argv(
     task_dir: str,
-    arm_datasets: dict[str, dict[str, ResolvedDataset]],
+    group_datasets: dict[str, dict[str, ResolvedDataset]],
     datasets: Sequence[DatasetArg],
     fusion: str,
 ) -> list[str]:
-    """``evaluate-compare --task-dir`` 复用两臂已有产物，写跨数据集对比报告。"""
+    """``evaluate-compare --task-dir`` 复用两组已有产物，写跨数据集对比报告。"""
     argv = ["evaluate-compare", "--task-dir", task_dir, "--fusion", fusion]
     for dataset in datasets:
-        baseline = arm_datasets["A"][dataset.key]
-        candidate = arm_datasets["B"][dataset.key]
+        baseline = group_datasets["A"][dataset.key]
+        candidate = group_datasets["B"][dataset.key]
         argv += ["--baseline-run", f"{dataset.key}={baseline.directory}"]
         argv += ["--candidate-run", f"{dataset.key}={candidate.directory}"]
     return argv
@@ -1114,7 +1114,7 @@ def _run_shards_parallel(
     *,
     exp_root: str,
     dataset: DatasetArg,
-    arm: ArmArgs,
+    group: GroupArgs,
     common: CommonArgs,
     shards: int,
     task_dir: str,
@@ -1122,7 +1122,7 @@ def _run_shards_parallel(
     """并行跑 0..N-1 片；任一失败即整体失败（不提前杀其它片）。"""
     argvs = [
         _run_argv(
-            arm=arm,
+            group=group,
             dataset=dataset,
             target_dir=exp_root,
             common=common,
@@ -1147,7 +1147,7 @@ def _run_dataset(
     *,
     exp_root: str,
     dataset: DatasetArg,
-    arm: ArmArgs,
+    group: GroupArgs,
     common: CommonArgs,
     shards: int | str,
     state: FlowState,
@@ -1159,7 +1159,7 @@ def _run_dataset(
         # max 需要先跑 shard 0，从账本读有效分片数 N，再补 1..N-1
         result = executor.run_stream(
             _run_argv(
-                arm=arm,
+                group=group,
                 dataset=dataset,
                 target_dir=exp_root,
                 common=common,
@@ -1180,7 +1180,7 @@ def _run_dataset(
             )
             rest = [
                 _run_argv(
-                    arm=arm,
+                    group=group,
                     dataset=dataset,
                     target_dir=exp_root,
                     common=common,
@@ -1211,7 +1211,7 @@ def _run_dataset(
             executor,
             exp_root=exp_root,
             dataset=dataset,
-            arm=arm,
+            group=group,
             common=common,
             shards=shards_int,
             task_dir=state.task_dir,
@@ -1226,7 +1226,7 @@ def _run_dataset(
     # 不分片：run 自带完整数据集级 / 任务级产物，无需 fuse
     result = executor.run_stream(
         _run_argv(
-            arm=arm,
+            group=group,
             dataset=dataset,
             target_dir=exp_root,
             common=common,
@@ -1246,7 +1246,7 @@ def _execute_eval(options: EvalOptions, root: Path) -> FlowState:
         task_dir = executor.init_task(
             _task_init_argv(
                 name=options.name,
-                arms=1,
+                groups=1,
                 platform=options.common.platform,
                 report_out=options.report_out,
             )
@@ -1262,7 +1262,7 @@ def _execute_eval(options: EvalOptions, root: Path) -> FlowState:
             executor,
             exp_root=task_dir,
             dataset=dataset,
-            arm=options.arm,
+            group=options.group,
             common=options.common,
             shards=options.shards,
             state=state,
@@ -1286,7 +1286,7 @@ def _execute_ab(options: AbOptions, root: Path) -> FlowState:
         task_dir = executor.init_task(
             _task_init_argv(
                 name=options.name,
-                arms=2,
+                groups=2,
                 platform=options.common.platform,
                 report_out=options.report_out,
                 group_labels=getattr(options, "group_labels", None),
@@ -1297,25 +1297,25 @@ def _execute_ab(options: AbOptions, root: Path) -> FlowState:
     layout = _membench_module(root, "layout")
     baseline_dir = layout.group_dir(task_dir, layout.ROLE_BASELINE)
     candidate_dir = layout.group_dir(task_dir, layout.ROLE_CANDIDATE)
-    for label, arm, arm_dir in (
+    for label, group, group_path in (
         (os.path.basename(baseline_dir), options.baseline, baseline_dir),
         (os.path.basename(candidate_dir), options.candidate, candidate_dir),
     ):
         for dataset in options.datasets:
             print(
-                f"[run_task] 组 {label}（{arm.adapter}）数据集 {dataset.display}",
+                f"[run_task] 组 {label}（{group.adapter}）数据集 {dataset.display}",
                 file=sys.stderr,
             )
             directory = _run_dataset(
                 executor,
-                exp_root=arm_dir,
+                exp_root=group_path,
                 dataset=dataset,
-                arm=arm,
+                group=group,
                 common=options.common,
                 shards=options.shards,
                 state=state,
             )
-            state.arm_datasets.setdefault(label, {})[dataset.key] = ResolvedDataset(
+            state.group_datasets.setdefault(label, {})[dataset.key] = ResolvedDataset(
                 dataset, directory
             )
 
@@ -1326,8 +1326,8 @@ def _execute_ab(options: AbOptions, root: Path) -> FlowState:
 
     # 多数据集：逐数据集 strict 门禁 + evaluate-compare 融合报告
     for dataset in options.datasets:
-        baseline = state.arm_datasets["A"][dataset.key]
-        candidate = state.arm_datasets["B"][dataset.key]
+        baseline = state.group_datasets["A"][dataset.key]
+        candidate = state.group_datasets["B"][dataset.key]
         print(
             f"[run_task] 数据集 {dataset.display} 的可比性 strict 门禁",
             file=sys.stderr,
@@ -1342,7 +1342,7 @@ def _execute_ab(options: AbOptions, root: Path) -> FlowState:
         _handle_gate(result, "compare", state)
     result = executor.run_capture(
         _evaluate_compare_argv(
-            task_dir, state.arm_datasets, options.datasets, options.common.fusion
+            task_dir, state.group_datasets, options.datasets, options.common.fusion
         )
     )
     _handle_gate(result, "evaluate-compare", state)
@@ -1371,7 +1371,7 @@ def _print_run_steps(
     *,
     exp_ref: str,
     dataset: DatasetArg,
-    arm: ArmArgs,
+    group: GroupArgs,
     common: CommonArgs,
     shards: int | str,
 ) -> None:
@@ -1389,7 +1389,7 @@ def _print_run_steps(
             _display_argv(
                 root,
                 _run_argv(
-                    arm=arm,
+                    group=group,
                     dataset=dataset,
                     target_dir=exp_ref,
                     common=common,
@@ -1412,7 +1412,7 @@ def _print_run_steps(
             command = _display_argv(
                 root,
                 _run_argv(
-                    arm=arm,
+                    group=group,
                     dataset=dataset,
                     target_dir=exp_ref,
                     common=common,
@@ -1428,7 +1428,7 @@ def _print_run_steps(
         _display_argv(
             root,
             _run_argv(
-                arm=arm,
+                group=group,
                 dataset=dataset,
                 target_dir=exp_ref,
                 common=common,
@@ -1442,7 +1442,7 @@ def _print_task_ref(
     *,
     task_dir: Optional[str],
     name: str,
-    arms: int,
+    groups: int,
     platform: Optional[str],
     report_out: Optional[str],
     group_labels: Optional[Sequence[str]] = None,
@@ -1458,7 +1458,7 @@ def _print_task_ref(
             root,
             _task_init_argv(
                 name=name,
-                arms=arms,
+                groups=groups,
                 platform=platform,
                 report_out=report_out,
                 group_labels=group_labels,
@@ -1478,7 +1478,7 @@ def _print_dry_run_eval(options: EvalOptions, root: Path) -> None:
         root,
         task_dir=options.task_dir,
         name=options.name,
-        arms=1,
+        groups=1,
         platform=options.common.platform,
         report_out=options.report_out,
     )
@@ -1491,7 +1491,7 @@ def _print_dry_run_eval(options: EvalOptions, root: Path) -> None:
             root,
             exp_ref="$TASK",
             dataset=dataset,
-            arm=options.arm,
+            group=options.group,
             common=options.common,
             shards=options.shards,
         )
@@ -1515,24 +1515,24 @@ def _print_dry_run_ab(options: AbOptions, root: Path) -> None:
         root,
         task_dir=options.task_dir,
         name=options.name,
-        arms=2,
+        groups=2,
         platform=options.common.platform,
         report_out=options.report_out,
         group_labels=options.group_labels,
         group_dirs=options.group_dirs,
     )
     group_dirs = options.group_dirs or ("baseline", "candidate")
-    for label, arm, group_dir in (
+    for label, group, group_dir in (
         (group_dirs[0], options.baseline, group_dirs[0]),
         (group_dirs[1], options.candidate, group_dirs[1]),
     ):
-        print(f"# 组 {label}（{arm.adapter}）")
+        print(f"# 组 {label}（{group.adapter}）")
         for dataset in options.datasets:
             _print_run_steps(
                 root,
                 exp_ref=f"$TASK/{group_dir}",
                 dataset=dataset,
-                arm=arm,
+                group=group,
                 common=options.common,
                 shards=options.shards,
             )
@@ -1735,9 +1735,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_eval = sub.add_parser(
         "eval",
-        help="单臂评测：建任务目录 → 逐数据集 run（可并行分片）→ fuse → 自检",
+        help="单组评测：建任务目录 → 逐数据集 run（可并行分片）→ fuse → 自检",
         description=(
-            "单臂评测。单数据集：run --task-dir（分片则并行 + fuse）；"
+            "单组评测。单数据集：run --task-dir（分片则并行 + fuse）；"
             "多数据集且无分片 / limit：evaluate --task-dir --dataset；"
             "多数据集且分片或 limit：逐数据集 run → evaluate --from-runs 汇总。"
         ),
@@ -1757,7 +1757,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_ab = sub.add_parser(
         "ab",
-        help="A/B 评测：建双臂任务目录 → 两臂逐数据集 run → fuse → compare strict 门禁 → 自检",
+        help="A/B 评测：建双组任务目录 → 两组逐数据集 run → fuse → compare strict 门禁 → 自检",
         description=(
             "A/B 评测。单数据集：compare --task-dir --require-comparable；"
             "多数据集：逐数据集 strict compare + evaluate-compare 融合报告。"
@@ -1848,7 +1848,7 @@ def _eval_options(args: argparse.Namespace) -> EvalOptions:
     _validate_common(common)
     datasets = _select_datasets(args)
     report_out = _resolve_caller_path(args.report_out) if args.report_out else None
-    arm = ArmArgs(
+    group = GroupArgs(
         adapter=args.adapter,
         driver_llm=args.driver_llm,
         adapter_version=args.adapter_version,
@@ -1857,7 +1857,7 @@ def _eval_options(args: argparse.Namespace) -> EvalOptions:
     name = args.name
     return EvalOptions(
         common=common,
-        arm=arm,
+        group=group,
         datasets=datasets,
         name=name,
         report_out=report_out,
@@ -1872,13 +1872,13 @@ def _ab_options(args: argparse.Namespace) -> AbOptions:
     _validate_common(common)
     datasets = _select_datasets(args)
     report_out = _resolve_caller_path(args.report_out) if args.report_out else None
-    baseline = ArmArgs(
+    baseline = GroupArgs(
         adapter=args.baseline_adapter,
         driver_llm=args.driver_llm_a,
         adapter_version=args.baseline_version,
         adapter_args=list(args.adapter_arg_a),
     )
-    candidate = ArmArgs(
+    candidate = GroupArgs(
         adapter=args.candidate_adapter,
         driver_llm=args.driver_llm_b,
         adapter_version=args.candidate_version,

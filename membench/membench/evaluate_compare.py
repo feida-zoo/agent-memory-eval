@@ -94,7 +94,7 @@ from membench.version import version_display
 
 
 @dataclass
-class ArmDatasetResult:
+class GroupDatasetResult:
     """A/B 两组下某数据集的指标：包含 baseline 与 candidate 两侧 metrics。
 
     Attributes:
@@ -117,14 +117,14 @@ class ArmDatasetResult:
 TOP_IMPROVED_CATEGORIES = 5
 
 
-def _category_diff_rows(arm: ArmDatasetResult) -> list[dict[str, Any]]:
+def _category_diff_rows(group: GroupDatasetResult) -> list[dict[str, Any]]:
     """把某数据集的 ``by_category`` 拉平成逐题型行（A/B 准确率与题数）。
 
     两侧 category 取并集、按名称排序；两侧都没有准确率时跳过。某侧缺该题型时
     记 ``None``（不按 0 处理——"没跑"不是"全错"）。
     """
-    a_by_cat = arm.baseline.get("by_category", {}) or {}
-    b_by_cat = arm.candidate.get("by_category", {}) or {}
+    a_by_cat = group.baseline.get("by_category", {}) or {}
+    b_by_cat = group.candidate.get("by_category", {}) or {}
     rows: list[dict[str, Any]] = []
     for cat in sorted(set(a_by_cat) | set(b_by_cat)):
         a_entry = a_by_cat.get(cat, {}) or {}
@@ -150,7 +150,7 @@ def _category_diff_rows(arm: ArmDatasetResult) -> list[dict[str, Any]]:
 
 
 def top_improved_categories(
-    arms: "Sequence[ArmDatasetResult]", limit: Union[int, None] = None
+    groups: "Sequence[GroupDatasetResult]", limit: Union[int, None] = None
 ) -> list[dict[str, Any]]:
     """按 Δ 准确率排出「提升最多」的 (数据集, 题型)。
 
@@ -158,7 +158,7 @@ def top_improved_categories(
     小样本题型的一两题翻转会制造 +50pt 的假象，那类仍留在逐数据集表里。
 
     Args:
-        arms: 各数据集两组结果。
+        groups: 各数据集两组结果。
         limit: 取前几条（缺省 :data:`TOP_IMPROVED_CATEGORIES`）。
 
     Returns:
@@ -166,8 +166,8 @@ def top_improved_categories(
         同 Δ 按题量降序（题量大的更可信）。
     """
     found: list[dict[str, Any]] = []
-    for arm in arms:
-        for row in _category_diff_rows(arm):
+    for group in groups:
+        for row in _category_diff_rows(group):
             if row["acc_a"] is None or row["acc_b"] is None:
                 continue
             if min(row["n_a"], row["n_b"]) < CATEGORY_MIN_N:
@@ -177,7 +177,7 @@ def top_improved_categories(
                 continue
             found.append(
                 {
-                    "dataset": arm.spec.name,
+                    "dataset": group.spec.name,
                     "category": row["category"],
                     "n": min(row["n_a"], row["n_b"]),
                     "acc_a": float(row["acc_a"]),
@@ -328,7 +328,7 @@ def _stage_side_dir(
     provided: dict[str, DatasetResult],
     raw_runs: Union[dict[str, str], None],
 ) -> dict[str, DatasetResult]:
-    """把该侧复用的产物摆进 ``<container_dir>/<arm_label>/``，返回重定位后的结果。
+    """把该侧复用的产物摆进 ``<container_dir>/<group_label>/``，返回重定位后的结果。
 
     入参同为一个已存在的实验目录时整树复制（该侧的 ``runs/`` 与 ``reports/``
     一并带过来）；其余情形逐个把数据集产物并入该侧目录的 ``runs/`` 下。产物本就
@@ -420,7 +420,7 @@ def _precheck_side(
     )
 
 
-def _per_dataset_diff(results: list[ArmDatasetResult]) -> list[dict[str, Any]]:
+def _per_dataset_diff(results: list[GroupDatasetResult]) -> list[dict[str, Any]]:
     """逐数据集 diff：candidate.overall - baseline.overall + 门禁。"""
     rows: list[dict[str, Any]] = []
     for r in results:
@@ -537,7 +537,7 @@ def _fused_gates(
 
 
 def _per_dataset_gates(
-    arms: list[ArmDatasetResult],
+    groups: list[GroupDatasetResult],
     acc_threshold: float,
     stale_threshold: float,
     latency_warn: float,
@@ -548,9 +548,9 @@ def _per_dataset_gates(
     决定（任一 FAIL → FAIL；任一 WARN → WARN；否则 PASS）。
     """
     rows: list[dict[str, Any]] = []
-    for arm in arms:
-        a_overall = arm.baseline.get("overall", {})
-        b_overall = arm.candidate.get("overall", {})
+    for group in groups:
+        a_overall = group.baseline.get("overall", {})
+        b_overall = group.candidate.get("overall", {})
         gates = _eval_gates(a_overall, b_overall, acc_threshold, stale_threshold, latency_warn)
         verdict = "PASS"
         if any(g["status"] == "FAIL" for g in gates):
@@ -559,7 +559,7 @@ def _per_dataset_gates(
             verdict = "WARN"
         elif not any(g["status"] == "PASS" for g in gates):
             verdict = "SKIP"
-        rows.append({"spec": arm.spec, "verdict": verdict, "gates": gates})
+        rows.append({"spec": group.spec, "verdict": verdict, "gates": gates})
     return rows
 
 
@@ -732,7 +732,7 @@ def evaluate_compare(
         if not os.path.isdir(task_dir):
             raise SystemExit(
                 f"任务目录不存在: {task_dir}；"
-                "请先运行 python -m membench.cli task init --name <NAME> --arms 2"
+                "请先运行 python -m membench.cli task init --name <NAME> --groups 2"
             )
     if (
         (baseline_runs or candidate_runs)
@@ -975,12 +975,12 @@ def evaluate_compare(
     baseline_by_key = {r.spec.key: r for r in baseline_results}
     candidate_by_key = {r.spec.key: r for r in candidate_results}
     keys = [s.key for s in specs if s.key in baseline_by_key and s.key in candidate_by_key]
-    arms: list[ArmDatasetResult] = []
+    groups: list[GroupDatasetResult] = []
     for k in keys:
         b = baseline_by_key[k]
         c = candidate_by_key[k]
-        arms.append(
-            ArmDatasetResult(
+        groups.append(
+            GroupDatasetResult(
                 spec=b.spec,
                 baseline=b.metrics,
                 candidate=c.metrics,
@@ -997,7 +997,7 @@ def evaluate_compare(
 
     # 两侧可比性（逐数据集）：与单数据集 compare 同一套维度表；只测量差异、不进门禁结论
     comparability_findings = _cross_side_findings(
-        [(arm.spec, arm.baseline, arm.candidate) for arm in arms]
+        [(group.spec, group.baseline, group.candidate) for group in groups]
     )
 
     # 汇总模式的元数据一致性提示（混产物风险）；notes 直接作为报告顶部提示行
@@ -1017,7 +1017,7 @@ def evaluate_compare(
     _print_cross_side_findings(comparability_findings, "两侧可比性问题（详见报告「两侧可比性」）")
 
     # 逐数据集 diff
-    per_dataset = _per_dataset_diff(arms)
+    per_dataset = _per_dataset_diff(groups)
 
     # 两组融合（sources 记录 capabilities 来源，供报告标注）
     fused_baseline, cap_sources_a = _side_fuse(baseline_results, fusion)
@@ -1028,11 +1028,11 @@ def evaluate_compare(
     )
     # 办公域槽位不参与基准融合，但业务红线仍要进顶层门禁：把 office 移出融合
     # 不等于把红线移出结论（否则陈旧率回归会因融合值为 None 而 SKIP）。
-    office_arm = next((arm for arm in arms if arm.spec.is_office_slot), None)
-    if office_arm is not None:
+    office_group = next((group for group in groups if group.spec.is_office_slot), None)
+    if office_group is not None:
         for gate in _eval_gates(
-            office_arm.baseline.get("overall", {}),
-            office_arm.candidate.get("overall", {}),
+            office_group.baseline.get("overall", {}),
+            office_group.candidate.get("overall", {}),
             acc_threshold,
             stale_threshold,
             latency_warn,
@@ -1041,13 +1041,13 @@ def evaluate_compare(
                 {
                     **gate,
                     "name": f"office_{gate['name']}",
-                    "detail": f"办公域槽位（{office_arm.spec.name}）：{gate['detail']}",
+                    "detail": f"办公域槽位（{office_group.spec.name}）：{gate['detail']}",
                 }
             )
 
     # per-dataset 门禁：单数据集 spike 不被融合平均抹平
     per_dataset_gates = _per_dataset_gates(
-        arms, acc_threshold, stale_threshold, latency_warn
+        groups, acc_threshold, stale_threshold, latency_warn
     )
 
     if any(g["status"] == "FAIL" for g in gates):
@@ -1071,13 +1071,13 @@ def evaluate_compare(
     # 产物落位：A/B 两侧各写一份任务级 reports/（该侧自身就是一个完整 eval 实验形态），
     # 对比报告与两张对比图写输出容器的 reports/（就地模式下即任务目录的）。
     _check_plt()
-    for group_dir_path, arm_name, side_results, side_platform, side_fused in (
+    for group_dir_path, group_name, side_results, side_platform, side_fused in (
         (group_dirs[ROLE_BASELINE], baseline_name, baseline_results, platform_a, fused_baseline),
         (group_dirs[ROLE_CANDIDATE], candidate_name, candidate_results, platform_b, fused_candidate),
     ):
         write_task_reports(
             group_dir_path,
-            adapter_name=arm_name,
+            adapter_name=group_name,
             judge_name=judge_name,
             platform=side_platform,
             commit=commit,
@@ -1100,7 +1100,7 @@ def evaluate_compare(
         platform,
         commit,
         now,
-        arms,
+        groups,
         per_dataset,
         fused_baseline,
         fused_candidate,
@@ -1142,7 +1142,7 @@ def _write_evaluate_compare_report(
     platform: Union[str, None],
     commit: Union[str, None],
     timestamp: datetime,
-    arms: list[ArmDatasetResult],
+    groups: list[GroupDatasetResult],
     per_dataset: list[dict[str, Any]],
     fused_baseline: dict[str, dict[str, Any]],
     fused_candidate: dict[str, dict[str, Any]],
@@ -1185,14 +1185,14 @@ def _write_evaluate_compare_report(
     # 供回查（判分口径随代码变，历史分数差异要靠它对账）。
     lines.append(
         "- membench 版本: "
-        + version_display((arms[0].baseline if arms else {}).get("membench_version"))
+        + version_display((groups[0].baseline if groups else {}).get("membench_version"))
     )
-    lines.append(f"- 数据集数: {len(arms)}（{', '.join(r.spec.name for r in arms)}）")
+    lines.append(f"- 数据集数: {len(groups)}（{', '.join(r.spec.name for r in groups)}）")
     match_modes = sorted(
         {
             str(metrics_dict.get("retrieval_match") or "substring")
-            for arm in arms
-            for metrics_dict in (arm.baseline, arm.candidate)
+            for group in groups
+            for metrics_dict in (group.baseline, group.candidate)
         }
     )
     lines.append(f"- 检索匹配口径: `{', '.join(match_modes)}`")
@@ -1266,10 +1266,10 @@ def _write_evaluate_compare_report(
     lines.append("")
     # 检索指标全 0 警示：疑似 evidence 与被检索文本格式不一致（摘要式存储）
     zero_sets: list[str] = []
-    for arm in arms:
+    for group in groups:
         for metrics_dict, dataset_dir in (
-            (arm.baseline, arm.baseline_dataset_dir),
-            (arm.candidate, arm.candidate_dataset_dir),
+            (group.baseline, group.baseline_dataset_dir),
+            (group.candidate, group.candidate_dataset_dir),
         ):
             ov = metrics_dict.get("overall", {}) or {}
             if ov.get("evidence_recall") != 0.0 or ov.get("recall_at_5") != 0.0:
@@ -1277,10 +1277,10 @@ def _write_evaluate_compare_report(
             has_evidence = metrics_dict.get("has_evidence")
             if not isinstance(has_evidence, bool):
                 has_evidence = _resolve_capabilities(
-                    metrics_dict, dataset_dir, arm.spec.path
+                    metrics_dict, dataset_dir, group.spec.path
                 )[0].get("has_evidence", False)
-            if has_evidence and arm.spec.name not in zero_sets:
-                zero_sets.append(arm.spec.name)
+            if has_evidence and group.spec.name not in zero_sets:
+                zero_sets.append(group.spec.name)
     if zero_sets:
         lines.append(
             "<sub>⚠️ "
@@ -1299,9 +1299,9 @@ def _write_evaluate_compare_report(
     lines.append("")
     # 题型集合与类数都按本报告实际出现的 category 统计（不写死任何数据集的设计类数）
     counts = "、".join(
-        f"{arm.spec.name} {len(set(arm.baseline.get('by_category', {})) | set(arm.candidate.get('by_category', {})))} 类"
-        for arm in arms
-        if arm.baseline.get("by_category") or arm.candidate.get("by_category")
+        f"{group.spec.name} {len(set(group.baseline.get('by_category', {})) | set(group.candidate.get('by_category', {})))} 类"
+        for group in groups
+        if group.baseline.get("by_category") or group.candidate.get("by_category")
     )
     lines.append(
         "<sub>每个数据集按各自的 raw category 列出 A/B 准确率与差值"
@@ -1310,7 +1310,7 @@ def _write_evaluate_compare_report(
     )
     lines.append("")
     # 提升 TOP N：先给头条结论，再下钻逐数据集表
-    top = top_improved_categories(arms)
+    top = top_improved_categories(groups)
     if top:
         lines.append(f"### 提升最多的题型（TOP {len(top)}）")
         lines.append("")
@@ -1340,9 +1340,9 @@ def _write_evaluate_compare_report(
             f"<sub>本次没有满足条件的提升项（要求两侧题量 ≥ {CATEGORY_MIN_N} 且 Δ > 0）。</sub>"
         )
         lines.append("")
-    for arm in arms:
+    for group in groups:
         rows_bc: list[list[str]] = []
-        for row in _category_diff_rows(arm):
+        for row in _category_diff_rows(group):
             n = row["n_a"] or row["n_b"]
             acc_a, acc_b = row["acc_a"], row["acc_b"]
             if acc_a is None:
@@ -1359,7 +1359,7 @@ def _write_evaluate_compare_report(
             )
         if not rows_bc:
             continue
-        lines.append(f"### {arm.spec.name}")
+        lines.append(f"### {group.spec.name}")
         lines.append("")
         lines.append(_md_table(["题型（category）", "n", "A 准确率", "B 准确率", "Δ"], rows_bc))
         lines.append("")
@@ -1372,9 +1372,9 @@ def _write_evaluate_compare_report(
         "一致（基线为 0 或缺失时不给 Δ；延迟单位 ms、Token 为每题均值）。</sub>"
     )
     lines.append("")
-    for arm in arms:
-        a_ov = arm.baseline.get("overall", {})
-        b_ov = arm.candidate.get("overall", {})
+    for group in groups:
+        a_ov = group.baseline.get("overall", {})
+        b_ov = group.candidate.get("overall", {})
         rows_eff: list[list[str]] = []
         for metric in EFFICIENCY_DIFF_METRICS:
             a_val = a_ov.get(metric)
@@ -1392,7 +1392,7 @@ def _write_evaluate_compare_report(
             rows_eff.append([metric_label(metric), a_str, b_str, delta])
         if not rows_eff:
             continue
-        lines.append(f"### {arm.spec.name}")
+        lines.append(f"### {group.spec.name}")
         lines.append("")
         lines.append(_md_table(["指标", "A", "B", "Δ"], rows_eff))
         lines.append("")
@@ -1425,13 +1425,13 @@ def _write_evaluate_compare_report(
     # 2.5 业务结论 diff（办公域槽位单独一段）：业务红线不混进基准评级
     lines.append("## 业务结论 diff（办公域槽位，B - A）")
     lines.append("")
-    office_arm = next((arm for arm in arms if arm.spec.is_office_slot), None)
-    if office_arm is None:
+    office_group = next((group for group in groups if group.spec.is_office_slot), None)
+    if office_group is None:
         lines.append("（本次数据集清单无办公域槽位，业务结论与 stale 门禁跳过。）")
         lines.append("")
     else:
-        a_ov = office_arm.baseline.get("overall", {}) or {}
-        b_ov = office_arm.candidate.get("overall", {}) or {}
+        a_ov = office_group.baseline.get("overall", {}) or {}
+        b_ov = office_group.candidate.get("overall", {}) or {}
         biz_rows: list[list[str]] = []
         for key in ("accuracy", "stale_rate", "abstention_accuracy"):
             a_val = a_ov.get(key)
@@ -1443,7 +1443,7 @@ def _write_evaluate_compare_report(
             else:
                 delta_str = format_metric_delta(key, float(b_val) - float(a_val))
             biz_rows.append([metric_label(key), a_str, b_str, delta_str])
-        lines.append(f"### {office_arm.spec.name}")
+        lines.append(f"### {office_group.spec.name}")
         lines.append("")
         lines.append(_md_table(["指标", "A", "B", "Δ（B - A）"], biz_rows))
         lines.append("")
@@ -1585,10 +1585,10 @@ def _write_evaluate_compare_report(
     ]
     header_q = ["数据集", "组", *metric_labels(q_cols)]
     detail_rows: list[list[str]] = []
-    for arm in arms:
-        for side_label, metrics_dict in (("A", arm.baseline), ("B", arm.candidate)):
+    for group in groups:
+        for side_label, metrics_dict in (("A", group.baseline), ("B", group.candidate)):
             ov = metrics_dict.get("overall", {})
-            row = [arm.spec.name, side_label]
+            row = [group.spec.name, side_label]
             for m in q_cols:
                 row.append(format_metric_value(m, ov.get(m)))
             detail_rows.append(row)

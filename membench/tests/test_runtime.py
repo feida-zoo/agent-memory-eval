@@ -7,7 +7,7 @@
 - argv 脱敏：``--llm-api-key`` / ``--api-key=...`` / ``token=...``；
 - 并发：两个进程写同一个实验目录不丢条目（日志按 pid 分文件、commands 单行追加）；
 - CLI 面：``run`` 成功后 runtime 三件套存在且日志有控制台输出；``--task-dir`` 写到
-  该任务 / 臂目录下；失败命令在任务 runtime 里留下非零 ``exit_code``；
+  该任务 / 组目录下；失败命令在任务 runtime 里留下非零 ``exit_code``；
   只读的 ``task status`` 不产生 runtime。
 """
 
@@ -320,14 +320,14 @@ def test_concurrent_processes_append_without_loss(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _init_task(base: Path, name: str, arms: int = 1) -> Path:
+def _init_task(base: Path, name: str, groups: int = 1) -> Path:
     """走 CLI ``task init`` 建任务目录（并从 stdout 取回路径）。"""
     import io
     from contextlib import redirect_stdout
 
     buffer = io.StringIO()
     with redirect_stdout(buffer):
-        assert cli.main(["task", "init", "--name", name, "--groups", str(arms),
+        assert cli.main(["task", "init", "--name", name, "--groups", str(groups),
                          "--report-out", str(base)]) == 0
     return Path(buffer.getvalue().strip())
 
@@ -366,9 +366,9 @@ def test_cli_run_writes_runtime_trio(tmp_path: Path) -> None:
 
 
 def test_cli_run_task_dir_writes_runtime_under_arm(tmp_path: Path) -> None:
-    """--task-dir <任务>/A：runtime 落该臂目录；任务根只记 task init 的那条。"""
-    task = _init_task(tmp_path / "out", "ab", arms=2)
-    arm = task / layout.DIR_GROUP_BASELINE
+    """--task-dir <任务>/A：runtime 落该组目录；任务根只记 task init 的那条。"""
+    task = _init_task(tmp_path / "out", "ab", groups=2)
+    group = task / layout.DIR_GROUP_BASELINE
     assert (
         cli.main(
             [
@@ -382,16 +382,16 @@ def test_cli_run_task_dir_writes_runtime_under_arm(tmp_path: Path) -> None:
                 "--limit",
                 "3",
                 "--task-dir",
-                str(arm),
+                str(group),
             ]
         )
         == 0
     )
-    arm_commands = _commands(arm)
-    assert len(arm_commands) == 1
-    assert arm_commands[0]["command"] == "run"
-    assert arm_commands[0]["exit_code"] == 0
-    assert (arm / layout.DIR_RUNTIME / runtime.FILE_ENV).is_file()
+    group_commands = _commands(group)
+    assert len(group_commands) == 1
+    assert group_commands[0]["command"] == "run"
+    assert group_commands[0]["exit_code"] == 0
+    assert (group / layout.DIR_RUNTIME / runtime.FILE_ENV).is_file()
 
     task_commands = _commands(task)
     assert [record["command"] for record in task_commands] == ["task"]
@@ -400,7 +400,7 @@ def test_cli_run_task_dir_writes_runtime_under_arm(tmp_path: Path) -> None:
 
 def test_cli_failure_with_task_dir_records_exit_code(tmp_path: Path) -> None:
     """任务目录里的失败命令也要留痕：exit_code 非零 + 日志含报错原因。"""
-    task = _init_task(tmp_path / "out", "boom", arms=1)
+    task = _init_task(tmp_path / "out", "boom", groups=1)
     with pytest.raises(SystemExit, match="未知适配器"):
         cli.main(
             [
@@ -425,7 +425,7 @@ def test_cli_failure_with_task_dir_records_exit_code(tmp_path: Path) -> None:
 
 def test_task_status_is_read_only(tmp_path: Path) -> None:
     """task status 不产生 / 不追加 runtime（只读命令不记账）。"""
-    task = _init_task(tmp_path / "out", "solo", arms=1)
+    task = _init_task(tmp_path / "out", "solo", groups=1)
     before = _commands(task)
     log_files = sorted((task / layout.DIR_RUNTIME / "logs").glob("*.log"))
     assert cli.main(["task", "status", str(task)]) == 0

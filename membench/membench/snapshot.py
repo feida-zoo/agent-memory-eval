@@ -286,9 +286,9 @@ def _source_run_id(dataset_dir: str) -> str:
 def _replay_task_source(source: str) -> Union[tuple[str, str], None]:
     """``--replay`` 入参指向**回放任务**时返回 ``(任务目录, 组键)``，否则 None。
 
-    两种形态：任务根（自身带 ``snapshots/`` 池，臂待定）与组目录（``<任务>/A`` /
+    两种形态：任务根（自身带 ``snapshots/`` 池，组待定）与组目录（``<任务>/A`` /
     ``B``，父任务目录带池）。组键的口径与写条目时一致（见
-    :func:`membench.layout.snapshot_arm_key`），因此这里只把目录名交给后续解析，
+    :func:`membench.layout.snapshot_group_key`），因此这里只把目录名交给后续解析，
     不自己拼字符串。
     """
     if layout.has_snapshot_pool(source):
@@ -306,7 +306,7 @@ def _replay_task_source(source: str) -> Union[tuple[str, str], None]:
 
 def _read_pool_digest(
     pool_root: str,
-    arm: str,
+    group: str,
     dataset: str,
     dialogue_id: str,
     index_cache: list[Union[dict[str, Any], None]],
@@ -316,46 +316,46 @@ def _read_pool_digest(
     ``index_cache`` 是单元素缓存：只有真的有对话缺条目时才读一次索引，条目齐全的
     新产物完全不碰 ``index.json``（它是派生视图，可能还没被 fuse/status 刷新）。
     """
-    entry = layout.read_snapshot_entry(pool_root, arm, dataset, dialogue_id)
+    entry = layout.read_snapshot_entry(pool_root, group, dataset, dialogue_id)
     if entry is not None:
         return str(entry["digest"])
     if index_cache[0] is None:
         index_cache[0] = layout.read_snapshot_index(pool_root) or {}
     digest = (index_cache[0].get("entries") or {}).get(
-        layout.snapshot_entry_key(arm, dataset, dialogue_id)
+        layout.snapshot_entry_key(group, dataset, dialogue_id)
     )
     return str(digest) if digest else None
 
 
 def _pool_snapshot_dirs(
-    task_dir: str, arm: str, dataset: str, dialogue_ids: list[str]
+    task_dir: str, group: str, dataset: str, dialogue_ids: list[str]
 ) -> tuple[dict[str, str], str]:
     """按回放任务的条目树（旧产物回退索引）解析逐对话桶目录，返回 ``(snapshot_dirs, 组键)``。
 
-    任务根作源且池里只有**一个**臂时自动用它；多个臂必须传具体组目录——两组的
-    逐对话状态可能不同（那正是"回放不保真"的证据），替用户选一个臂就是替用户
+    任务根作源且池里只有**一个**组时自动用它；多个组必须传具体组目录——两组的
+    逐对话状态可能不同（那正是"回放不保真"的证据），替用户选一个组就是替用户
     选结论。
     """
     pool_root = os.path.join(task_dir, layout.DIR_SNAPSHOTS)
-    arms = layout.snapshot_pool_arms(pool_root)
-    if not arm:
-        if not arms:
+    groups = layout.snapshot_pool_groups(pool_root)
+    if not group:
+        if not groups:
             raise SystemExit(
                 f"回放任务 {task_dir} 的快照池里还没有任何快照（"
                 f"{layout.snapshot_entries_root(pool_root)} 为空）：请先把源回放到"
                 "该任务的某个组，再用它作源"
             )
-        if len(arms) != 1:
-            hint = "、".join(os.path.join(task_dir, name) for name in arms)
+        if len(groups) != 1:
+            hint = "、".join(os.path.join(task_dir, name) for name in groups)
             raise SystemExit(
-                f"回放任务 {task_dir} 有 {len(arms)} 个组，无法确定用哪一个：{hint}；"
-                f"请把 --replay 指向具体组目录（如 {os.path.join(task_dir, arms[0])}）"
+                f"回放任务 {task_dir} 有 {len(groups)} 个组，无法确定用哪一个：{hint}；"
+                f"请把 --replay 指向具体组目录（如 {os.path.join(task_dir, groups[0])}）"
             )
-        arm = arms[0]
-    elif arm not in arms:
+        group = groups[0]
+    elif group not in groups:
         raise SystemExit(
-            f"回放任务 {task_dir} 的快照池里没有组 {arm!r}（现有："
-            f"{'、'.join(arms) or '无'}）；请确认该组回放时导出了快照"
+            f"回放任务 {task_dir} 的快照池里没有组 {group!r}（现有："
+            f"{'、'.join(groups) or '无'}）；请确认该组回放时导出了快照"
         )
 
     index_cache: list[Union[dict[str, Any], None]] = [None]
@@ -363,7 +363,7 @@ def _pool_snapshot_dirs(
     missing: list[str] = []
     for dialogue_id in dialogue_ids:
         digest = _read_pool_digest(
-            pool_root, arm, dataset, dialogue_id, index_cache
+            pool_root, group, dataset, dialogue_id, index_cache
         )
         if not digest:
             missing.append(dialogue_id)
@@ -374,7 +374,7 @@ def _pool_snapshot_dirs(
             "回放任务的快照池缺少本 run 需要的对话，拒绝回放："
             + "、".join(missing[:5])
             + (f" 等 {len(missing)} 个" if len(missing) > 5 else "")
-            + f"——组 {arm or '单组'} 没有这些对话的桶（回放时要覆盖同一批对话，"
+            + f"——组 {group or '单组'} 没有这些对话的桶（回放时要覆盖同一批对话，"
             "链式回放也需上游导出过它们）"
         )
     absent = [f"{did} -> {path}" for did, path in snapshot_dirs.items() if not os.path.isdir(path)]
@@ -384,7 +384,7 @@ def _pool_snapshot_dirs(
             + "、".join(absent[:3])
             + (f" 等 {len(absent)} 个" if len(absent) > 3 else "")
         )
-    return snapshot_dirs, arm
+    return snapshot_dirs, group
 
 
 def plan_replay(
@@ -402,7 +402,7 @@ def plan_replay(
         root: 回放源，三种形态：
             - 实验目录（自动在其 ``runs/`` 下定位匹配 ``dataset`` 的数据集目录）；
             - 数据集目录（``<实验目录>/runs/<dataset>``）；
-            - **回放任务**（任务根带 ``snapshots/``）：任务根（池里只有一个臂时自动
+            - **回放任务**（任务根带 ``snapshots/``）：任务根（池里只有一个组时自动
               用它）或组目录 ``<任务>/A``（按组键取该组的桶）。组目录的源里，每个
               对话的状态都来自内容寻址池，而不是对话目录下的 ``memory_snapshot/``。
         dataset: 本次评测的数据集名（用于定位与身份校验）。
@@ -422,7 +422,7 @@ def plan_replay(
     Returns:
         ``{"root": 快照根（数据集目录，或回放任务的入参路径）, "source": --replay
         入参的绝对路径, "source_pool": 池源的任务级 snapshots/（非池源为 None）,
-        "source_arm": 池源的组键（非池源为 None）, "mode", "run_mode",
+        "source_group": 池源的组键（非池源为 None）, "mode", "run_mode",
         "format_version", "source_run", "manifest_sha256",
         "snapshots": {对话 id: 快照目录}}``。
 
@@ -433,11 +433,11 @@ def plan_replay(
     task_source = _replay_task_source(source)
     dialogue_ids = [str(d) for d in dialogue_ids]
     if task_source is not None:
-        task_dir, arm = task_source
-        snapshot_dirs, arm = _pool_snapshot_dirs(task_dir, arm, dataset, dialogue_ids)
+        task_dir, group = task_source
+        snapshot_dirs, group = _pool_snapshot_dirs(task_dir, group, dataset, dialogue_ids)
         root_label = source
         source_pool: Union[str, None] = os.path.join(task_dir, layout.DIR_SNAPSHOTS)
-        source_arm: Union[str, None] = arm
+        source_group: Union[str, None] = group
     else:
         dataset_root = layout.resolve_dataset_dir(root, dataset=dataset)
         snapshot_dirs = {
@@ -458,7 +458,7 @@ def plan_replay(
             )
         root_label = dataset_root
         source_pool = None
-        source_arm = None
+        source_group = None
 
     caps = read_capabilities(adapter)
     if not caps.get("supported"):
@@ -574,7 +574,7 @@ def plan_replay(
         "root": root_label,
         "source": source,
         "source_pool": source_pool,
-        "source_arm": source_arm,
+        "source_group": source_group,
         "mode": mode,
         "run_mode": f"replay-{mode}",
         "format_version": raw_versions[snap_version],

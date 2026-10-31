@@ -2,12 +2,12 @@
 
 一次评测 = 一个自包含的**任务目录**（报告与对应数据就近归属）：
 
-- 单组任务（``arms==1``）是 ``eval_<name>_<platform>_<ts>``，本身就是完整评测产物根；
-- 双组任务（``arms==2``）是 ``compare_<name>_<platform>_<ts>``，``A/`` 与 ``B/`` 是任务
+- 单组任务（``groups==1``）是 ``eval_<name>_<platform>_<ts>``，本身就是完整评测产物根；
+- 双组任务（``groups==2``）是 ``compare_<name>_<platform>_<ts>``，``A/`` 与 ``B/`` 是任务
   目录下的两个组，各为一个完整的单组评测产物根。
 
 任务目录的命名与骨架由 :func:`task_subdir` / :func:`init_task_dir` 唯一决定、组目录经
-:func:`arm_dir` 取；同一次评测的多个分片写进同一个任务目录时，各片的进度与归属记在
+:func:`group_path` 取；同一次评测的多个分片写进同一个任务目录时，各片的进度与归属记在
 分片账本里——**每个分片一个条目文件** ``shards.<i>.json``（:func:`shard_entry_path`，
 并行分片各写各的），``shards.json`` 是由条目物化的视图（:func:`read_shard_ledger` /
 :func:`update_shard_ledger` / :func:`check_shard_ledger`——写入方（Runner）与读取方
@@ -438,26 +438,26 @@ def experiment_path(base: str | None, name: str) -> str:
 def task_subdir(
     name: str,
     platform: str | None = None,
-    arms: int = 2,
+    groups: int = 2,
     ts: str | None = None,
 ) -> str:
-    """任务目录名：``arms==2`` 走 :func:`compare_subdir`，``arms==1`` 走 :func:`eval_subdir`。
+    """任务目录名：``groups==2`` 走 :func:`compare_subdir`，``groups==1`` 走 :func:`eval_subdir`。
 
-    任务目录的命名只有这一个来源：两种 arms 共用 ``<name>_<platform>_<ts>`` 词表，
+    任务目录的命名只有这一个来源：两种 groups 共用 ``<name>_<platform>_<ts>`` 词表，
     差别只在前缀（``eval_`` / ``compare_``）。
     """
-    if arms == 2:
+    if groups == 2:
         return compare_subdir(name, platform, ts)
-    if arms == 1:
+    if groups == 1:
         return eval_subdir(name, platform, ts)
-    raise ValueError(f"arms 必须是 1 或 2，当前为 {arms!r}")
+    raise ValueError(f"groups 必须是 1 或 2，当前为 {groups!r}")
 
 
 def init_task_dir(
     base: str | None,
     name: str,
     platform: str | None = None,
-    arms: int = 2,
+    groups: int = 2,
     ts: str | None = None,
     group_labels: "Sequence[str] | None" = None,
     group_dirs: "Sequence[str] | None" = None,
@@ -466,16 +466,16 @@ def init_task_dir(
 ) -> str:
     """在 ``base``（默认 :func:`membench.paths.output_root`）下建任务目录骨架，返回绝对路径。
 
-    骨架：``arms==2`` 按 ``group_dirs``（缺省 ``baseline`` / ``candidate``）建两个组目录
-    （各是一个完整评测产物根）并写 ``groups.json``（角色 → 目录名 → 显示名）；``arms==1``
+    骨架：``groups==2`` 按 ``group_dirs``（缺省 ``baseline`` / ``candidate``）建两个组目录
+    （各是一个完整评测产物根）并写 ``groups.json``（角色 → 目录名 → 显示名）；``groups==1``
     建 ``runs/``；两种形态都建任务级 ``reports/``。``replay=True``（回放任务）在任务根
     额外建内容寻址快照池 ``snapshots/``（见 :func:`snapshot_pool_root`）：回放导出的
     状态按内容去重后落在这里，A/B 两组共用同一批桶。目标**已存在且非空**时拒绝新建
     （守卫语义与报错文案复用 :func:`experiment_path`：上一次跑在校验阶段失败留下的
     空目录可以复用，已有产物的目录一律不覆盖）。
     """
-    path = experiment_path(base, task_subdir(name, platform, arms, ts))
-    if arms == 2:
+    path = experiment_path(base, task_subdir(name, platform, groups, ts))
+    if groups == 2:
         labels = list(group_labels or [DEFAULT_BASELINE_LABEL, "候选"])
         if len(labels) != 2:
             raise ValueError(
@@ -508,7 +508,8 @@ def init_task_dir(
 # ---------------------------------------------------------------------------
 
 #: 快照池索引结构版本：结构变了就 +1，读到不认识的版本即拒绝。
-SNAPSHOT_POOL_SCHEMA = 1
+#: v2（本版）：索引里的 ``groups`` 段取代旧的 ``groups`` 段（组目录名由用户给，不再固定 A/B）。
+SNAPSHOT_POOL_SCHEMA = 2
 
 #: 逐对话快照条目（``snapshots/entries/**/<对话>.json``）的结构版本。
 SNAPSHOT_ENTRY_SCHEMA = 1
@@ -520,7 +521,7 @@ SNAPSHOT_BUCKET_CHARS = 12
 SNAPSHOT_TMP_PREFIX = ".tmp-"
 
 #: 空组键（单组任务 / 普通实验根）在条目树里的目录名：目录名不能是空串。
-_EMPTY_ARM_SEGMENT = "_"
+_EMPTY_GROUP_SEGMENT = "_"
 
 #: 桶名只允许小写十六进制：索引里的条目指向什么目录必须能一眼校验，防止手改索引越出池。
 _BUCKET_RE = re.compile(r"^[0-9a-f]{%d}$" % SNAPSHOT_BUCKET_CHARS)
@@ -547,7 +548,7 @@ def snapshot_pool_root(target: str) -> str:
     return os.path.join(snapshot_task_root(target), DIR_SNAPSHOTS)
 
 
-def snapshot_arm_key(target: str) -> str:
+def snapshot_group_key(target: str) -> str:
     """组键（条目树目录名 / 索引键的来源）：目标产物根相对任务目录的路径。
 
     ``A`` / ``B``；任务自身（单组任务 / 普通实验根）为 ``""``（条目树里映射为 ``_``）。
@@ -556,13 +557,13 @@ def snapshot_arm_key(target: str) -> str:
     return "" if rel == os.curdir else rel.replace(os.sep, "/")
 
 
-def snapshot_entry_key(arm: str, dataset: str, dialogue_id: str) -> str:
-    """索引 ``entries`` 的键：``<arm>|<dataset>|<dialogue_id>``。
+def snapshot_entry_key(group: str, dataset: str, dialogue_id: str) -> str:
+    """索引 ``entries`` 的键：``<group>|<dataset>|<dialogue_id>``。
 
-    组键由 :func:`snapshot_arm_key` 决定（单组任务为空串），这三段拼起来才能唯一确定
+    组键由 :func:`snapshot_group_key` 决定（单组任务为空串），这三段拼起来才能唯一确定
     "哪个组的哪个对话指向哪个桶"——桶本身只按内容寻址，不含身份。
     """
-    return f"{arm}|{dataset}|{dialogue_id}"
+    return f"{group}|{dataset}|{dialogue_id}"
 
 
 def parse_snapshot_entry_key(key: str) -> Union[tuple[str, str, str], None]:
@@ -617,22 +618,22 @@ def snapshot_entries_root(pool_root: str) -> str:
     return os.path.join(pool_root, DIR_SNAPSHOT_ENTRIES)
 
 
-def snapshot_arm_segment(arm: str) -> str:
+def snapshot_arm_segment(group: str) -> str:
     """组键在条目树里的目录名：空组键（单组任务 / 普通实验根）用 ``_``。
 
-    目录名不能是空串；组键口径（``""`` / ``A`` / ``B``）仍由 :func:`snapshot_arm_key`
-    决定，反向解析见 :func:`snapshot_arm_from_segment`。
+    目录名不能是空串；组键口径（``""`` / ``A`` / ``B``）仍由 :func:`snapshot_group_key`
+    决定，反向解析见 :func:`snapshot_group_from_segment`。
     """
-    return tag_dir_name(arm) if arm else _EMPTY_ARM_SEGMENT
+    return tag_dir_name(group) if group else _EMPTY_GROUP_SEGMENT
 
 
-def snapshot_arm_from_segment(segment: str) -> str:
+def snapshot_group_from_segment(segment: str) -> str:
     """条目树目录名回到组键（``_`` → ``""``）。"""
-    return "" if segment == _EMPTY_ARM_SEGMENT else segment
+    return "" if segment == _EMPTY_GROUP_SEGMENT else segment
 
 
 def snapshot_entry_path(
-    pool_root: str, arm: str, dataset: str, dialogue_id: str
+    pool_root: str, group: str, dataset: str, dialogue_id: str
 ) -> str:
     """条目文件路径：``<池>/entries/<组>/<数据集>/<对话目录名>.json``。
 
@@ -642,7 +643,7 @@ def snapshot_entry_path(
     """
     return os.path.join(
         snapshot_entries_root(pool_root),
-        snapshot_arm_segment(arm),
+        snapshot_arm_segment(group),
         slug(dataset),
         f"{tag_dir_name(dialogue_id)}.json",
     )
@@ -661,7 +662,7 @@ def _load_snapshot_entry_file(path: str) -> dict[str, Any]:
             f"快照池条目结构版本不受支持（{path}）：schema={found!r}，"
             f"本版本支持 {SNAPSHOT_ENTRY_SCHEMA}；请换一个任务目录重跑"
         )
-    for key in ("digest", "dataset", "dialogue_id", "arm"):
+    for key in ("digest", "dataset", "dialogue_id", "group"):
         if not isinstance(entry.get(key), str):
             raise SystemExit(f"快照池条目结构非法（{path}）：缺少 {key} 字段")
     if not entry["dataset"] or not entry["dialogue_id"]:
@@ -675,14 +676,14 @@ def _load_snapshot_entry_file(path: str) -> dict[str, Any]:
 
 
 def read_snapshot_entry(
-    pool_root: str, arm: str, dataset: str, dialogue_id: str
+    pool_root: str, group: str, dataset: str, dialogue_id: str
 ) -> Union[dict[str, Any], None]:
     """读一个对话的条目（没有返回 None）；条目身份与所在位置不一致即报错。"""
-    path = snapshot_entry_path(pool_root, arm, dataset, dialogue_id)
+    path = snapshot_entry_path(pool_root, group, dataset, dialogue_id)
     if not os.path.isfile(path):
         return None
     entry = _load_snapshot_entry_file(path)
-    expected = {"arm": arm, "dataset": dataset, "dialogue_id": str(dialogue_id)}
+    expected = {"group": group, "dataset": dataset, "dialogue_id": str(dialogue_id)}
     for key, want in expected.items():
         if entry.get(key) != want:
             raise SystemExit(
@@ -704,15 +705,15 @@ def write_snapshot_entry(pool_root: str, entry: dict[str, Any]) -> str:
             f"快照池条目结构版本不受支持：schema={entry.get('schema')!r}，"
             f"本版本要求 {SNAPSHOT_ENTRY_SCHEMA}"
         )
-    arm = str(entry.get("arm") or "")
+    group = str(entry.get("group") or "")
     dataset = str(entry.get("dataset") or "")
     dialogue_id = str(entry.get("dialogue_id") or "")
     if not dataset or not dialogue_id:
         raise SystemExit("快照池条目缺少 dataset / dialogue_id，无法落盘")
     digest = str(entry.get("digest") or "")
     snapshot_bucket_dir(pool_root, digest)  # 只做桶名形状校验
-    path = snapshot_entry_path(pool_root, arm, dataset, dialogue_id)
-    existing = read_snapshot_entry(pool_root, arm, dataset, dialogue_id)
+    path = snapshot_entry_path(pool_root, group, dataset, dialogue_id)
+    existing = read_snapshot_entry(pool_root, group, dataset, dialogue_id)
     if existing is not None and existing.get("digest") != digest:
         raise SystemExit(
             f"快照池条目已存在且内容不同（{path}）：原桶 {existing.get('digest')} vs "
@@ -741,7 +742,7 @@ def iter_snapshot_entries(pool_root: str) -> list[dict[str, Any]]:
             if name.endswith(".json"):
                 entries.append(_load_snapshot_entry_file(os.path.join(dirpath, name)))
     entries.sort(
-        key=lambda e: (e["arm"], e["dataset"], e["dialogue_id"])
+        key=lambda e: (e["group"], e["dataset"], e["dialogue_id"])
     )
     return entries
 
@@ -761,19 +762,19 @@ def has_snapshot_entries(pool_root: str) -> bool:
     return False
 
 
-def snapshot_pool_arms(pool_root: str) -> list[str]:
-    """池里出现过的组键（条目树优先；只有旧产物、没有条目树时才读索引的 ``arms`` 段）。"""
+def snapshot_pool_groups(pool_root: str) -> list[str]:
+    """池里出现过的组键（条目树优先；只有旧产物、没有条目树时才读索引的 ``groups`` 段）。"""
     root = snapshot_entries_root(pool_root)
     if os.path.isdir(root):
-        arms = sorted(
-            snapshot_arm_from_segment(name)
+        groups = sorted(
+            snapshot_group_from_segment(name)
             for name in os.listdir(root)
             if os.path.isdir(os.path.join(root, name))
         )
-        if arms:
-            return arms
+        if groups:
+            return groups
     index = read_snapshot_index(pool_root)
-    return sorted(str(name) for name in index["arms"]) if index else []
+    return sorted(str(name) for name in index["groups"]) if index else []
 
 
 def list_snapshot_buckets(pool_root: str) -> list[str]:
@@ -831,7 +832,7 @@ def build_snapshot_index(pool_root: str) -> dict[str, Any]:
     ``index.json`` 只是便于人看、兼容旧读者的派生视图。并行回放时没有任何进程需要
     读-改-写它，因此不需要锁。
 
-    ``arms`` 段的 ``source`` 取该组**最近一次**写入的条目（同秒时按 run_id 定序），
+    ``groups`` 段的 ``source`` 取该组**最近一次**写入的条目（同秒时按 run_id 定序），
     计数是该组当前全部条目的 ``reused`` / ``reused=false`` 统计。
     """
     buckets: dict[str, Any] = {}
@@ -863,19 +864,19 @@ def build_snapshot_index(pool_root: str) -> dict[str, Any]:
     latest: dict[str, tuple[tuple[str, str], dict[str, Any]]] = {}
     counts: dict[str, list[int]] = {}
     for entry in entries:
-        arm = entry["arm"]
-        index_entries[snapshot_entry_key(arm, entry["dataset"], entry["dialogue_id"])] = (
+        group = entry["group"]
+        index_entries[snapshot_entry_key(group, entry["dataset"], entry["dialogue_id"])] = (
             entry["digest"]
         )
-        counts.setdefault(arm, [0, 0])[0 if entry.get("reused") else 1] += 1
+        counts.setdefault(group, [0, 0])[0 if entry.get("reused") else 1] += 1
         stamp = (str(entry.get("written_at") or ""), str(entry.get("run_id") or ""))
-        if arm not in latest or stamp >= latest[arm][0]:
-            latest[arm] = (stamp, entry)
+        if group not in latest or stamp >= latest[group][0]:
+            latest[group] = (stamp, entry)
 
-    arms: dict[str, Any] = {}
-    for arm, (reused, new) in counts.items():
-        source = latest[arm][1]
-        arms[arm] = {
+    groups: dict[str, Any] = {}
+    for group, (reused, new) in counts.items():
+        source = latest[group][1]
+        groups[group] = {
             "source": source.get("source"),
             "source_manifest_sha256": source.get("source_manifest_sha256"),
             "n_dialogues": reused + new,
@@ -886,7 +887,7 @@ def build_snapshot_index(pool_root: str) -> dict[str, Any]:
         "schema": SNAPSHOT_POOL_SCHEMA,
         "buckets": buckets,
         "entries": index_entries,
-        "arms": arms,
+        "groups": groups,
     }
 
 
@@ -905,8 +906,8 @@ def read_snapshot_index(pool_root: str) -> Union[dict[str, Any], None]:
     """读池索引（没有索引返回 None）；结构非法当场报错。
 
     结构：``buckets`` 按桶名登记内容身份（``dataset`` / ``dialogue_id`` / ``bytes`` /
-    ``n_files`` / ``state_sha256``），``entries`` 是 ``arm|dataset|dialogue -> 桶名``，
-    ``arms`` 记每个组的回放来源与计数。索引是**派生视图**（真源 = ``entries/`` 树 +
+    ``n_files`` / ``state_sha256``），``entries`` 是 ``group|dataset|dialogue -> 桶名``，
+    ``groups`` 记每个组的回放来源与计数。索引是**派生视图**（真源 = ``entries/`` 树 +
     各桶清单，见 :func:`build_snapshot_index`），只有旧产物才把它当真源读。
     """
     path = snapshot_index_path(pool_root)
@@ -923,7 +924,7 @@ def read_snapshot_index(pool_root: str) -> Union[dict[str, Any], None]:
             f"快照池索引结构版本不受支持（{path}）：schema={found!r}，"
             f"本版本支持 {SNAPSHOT_POOL_SCHEMA}；请换一个任务目录重跑"
         )
-    for key in ("buckets", "entries", "arms"):
+    for key in ("buckets", "entries", "groups"):
         if not isinstance(index.get(key), dict):
             raise SystemExit(f"快照池索引结构非法（{path}）：缺少 {key} 段")
     for digest in index["buckets"]:
@@ -1355,8 +1356,8 @@ def _looks_like_legacy_product(path: str) -> bool:
         return True
     # 旧版 A/B 实验目录（平铺 run）——历史产物识别用，与"组目录名由用户给"无关
     return any(
-        os.path.isfile(os.path.join(path, arm, FILE_METRICS))
-        for arm in ("A", "B")
+        os.path.isfile(os.path.join(path, group, FILE_METRICS))
+        for group in ("A", "B")
     )
 
 

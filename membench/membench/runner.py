@@ -753,7 +753,7 @@ class _SnapshotPoolWriter:
 
     def __init__(self, out_dir: str, plan: dict[str, Any], dataset: str) -> None:
         self.pool_root = layout.snapshot_pool_root(out_dir)
-        self.arm = layout.snapshot_arm_key(out_dir)
+        self.group = layout.snapshot_group_key(out_dir)
         self.dataset = dataset
         self.plan = plan
         #: 本 run 逐对话的桶登记：``{对话 id: {"bucket": digest12, "reused": bool}}``
@@ -812,7 +812,7 @@ class _SnapshotPoolWriter:
             if self.plan.get("source_pool"):
                 # 链式回放：上一轮也是回放任务，记下用的是哪个组的桶
                 manifest["source"]["source_pool"] = self.plan["source_pool"]
-                manifest["source"]["source_arm"] = self.plan.get("source_arm")
+                manifest["source"]["source_group"] = self.plan.get("source_group")
             entry = snapshot_mod.write_snapshot(
                 tmp,
                 adapter,
@@ -840,7 +840,7 @@ class _SnapshotPoolWriter:
                     "n_files": n_files,
                     "dataset": self.dataset,
                     "dialogue_id": str(dialogue_id),
-                    "arm": self.arm,
+                    "group": self.group,
                     "source": self.plan["source"],
                     "source_manifest_sha256": self.plan.get("manifest_sha256"),
                     "reused": reused,
@@ -1438,7 +1438,7 @@ class Runner:
             if replay_plan.get("source_pool"):
                 print(
                     f"[membench] 回放源是回放任务: {replay_plan['source_pool']}"
-                    f"（组 {replay_plan['source_arm'] or '单组'}）"
+                    f"（组 {replay_plan['source_group'] or '单组'}）"
                 )
         snapshot_caps: dict[str, Any] = {}
         # 快照默认导出；适配器没有这个能力就跳过（只打印一次警告，不中断评测），

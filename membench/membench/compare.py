@@ -23,7 +23,7 @@
 半个实验目录。
 
 **就地模式**（``task_dir``）：一次 A/B 本来就是**一个任务目录**，两组已在
-``<task_dir>/A`` 与 ``<task_dir>/B``（``task init --arms 2`` 建的骨架，各组各自跑过
+``<task_dir>/A`` 与 ``<task_dir>/B``（``task init --groups 2`` 建的骨架，各组各自跑过
 ``run`` / ``fuse``）。此时不新建 ``compare_*`` 目录、也不复制两组——只把
 ``comparison.md`` 与两张对比图写进 ``<task_dir>/reports/``，两组产物原样留在原位；
 两组缺省就是该任务目录的 A/ B/，也可显式给 ``dir_a`` / ``dir_b``。
@@ -461,9 +461,9 @@ def _require_dataset_product(dataset_dir: str) -> None:
             raise SystemExit(f"数据集目录缺少 {name}（产物不完整）: {dataset_dir}")
 
 
-def _ensure_task_reports(arm_dir: str, dataset_dir: str) -> None:
+def _ensure_task_reports(group_path: str, dataset_dir: str) -> None:
     """补齐 A/B 副本的任务级 ``reports/``（形态与 Runner 的 write_task_reports 一致）。"""
-    task_dir = layout.task_report_dir(arm_dir)
+    task_dir = layout.task_report_dir(group_path)
     if os.path.isfile(os.path.join(task_dir, layout.FILE_REPORT_MD)):
         return
     report_dir = os.path.join(dataset_dir, layout.DIR_REPORT)
@@ -475,24 +475,24 @@ def _ensure_task_reports(arm_dir: str, dataset_dir: str) -> None:
     )
 
 
-def _copy_arm(compare_dir: str, arm: str, target: str, metrics: dict[str, Any]) -> str:
-    """把一侧产物整理成 ``<compare_dir>/<arm>/``——一个完整的 eval 实验形态。
+def _copy_group(compare_dir: str, group: str, target: str, metrics: dict[str, Any]) -> str:
+    """把一侧产物整理成 ``<compare_dir>/<group>/``——一个完整的 eval 实验形态。
 
     入参是实验目录时整树复制（连同 ``runs/`` 与 ``reports/``）；入参是数据集目录时
     构造成 ``runs/<dataset>/`` 并从数据集报告生成任务级 ``reports/``，与
     :class:`membench.runner.Runner` 的产物形态一致。
     """
     src = os.path.abspath(target)
-    arm_dir = os.path.join(compare_dir, arm)
+    group_path = os.path.join(compare_dir, group)
     if os.path.isdir(layout.runs_root(src)):
-        shutil.copytree(src, arm_dir)
+        shutil.copytree(src, group_path)
         # 副本里的数据集目录：源实验目录内的相对位置原样保留
-        in_arm = os.path.join(arm_dir, os.path.relpath(resolve_dataset_dir(src), src))
+        in_group = os.path.join(group_path, os.path.relpath(resolve_dataset_dir(src), src))
     else:
-        in_arm = layout.dataset_dir(arm_dir, _dataset_name(metrics, src))
-        shutil.copytree(src, in_arm)
-    _ensure_task_reports(arm_dir, in_arm)
-    return arm_dir
+        in_group = layout.dataset_dir(group_path, _dataset_name(metrics, src))
+        shutil.copytree(src, in_group)
+    _ensure_task_reports(group_path, in_group)
+    return group_path
 
 
 def _append_sources_section(md_path: str, sources: dict[str, dict[str, str]]) -> None:
@@ -503,7 +503,7 @@ def _append_sources_section(md_path: str, sources: dict[str, dict[str, str]]) ->
             f"`{src['target']}`",
             f"`{src['dataset_dir']}`",
             f"`{src['run_id']}`",
-            f"`{os.path.basename(src['arm_dir'])}/`",
+            f"`{os.path.basename(src['group_path'])}/`",
         ]
         for role, src in sources.items()
     ]
@@ -554,7 +554,7 @@ def compare_runs(
 
     Returns:
         ``{"verdict", "diffs", "gates", "run_a", "run_b", "compare_dir",
-        "report_path", "arm_a", "arm_b", "sources", "comparability"}``；``gates``
+        "report_path", "group_a", "group_b", "sources", "comparability"}``；``gates``
         首位为 ``comparability`` 门禁，``compare_dir`` 指向本次输出容器
         （新建的 ``compare_<name>_<platform>_<ts>`` 实验目录，或就地模式下的
         ``task_dir``）。
@@ -565,7 +565,7 @@ def compare_runs(
         if not os.path.isdir(task_dir):
             raise SystemExit(
                 f"任务目录不存在: {task_dir}；"
-                "请先运行 python -m membench.cli task init --name <NAME> --arms 2"
+                "请先运行 python -m membench.cli task init --name <NAME> --groups 2"
             )
         # 就地：两组就在任务目录里，缺省按 groups.json 解析角色→目录
         container = os.path.abspath(task_dir)
@@ -611,8 +611,8 @@ def compare_runs(
     if task_dir is not None:
         # 就地：容器就是任务目录，两组已在位——只写 reports/，不新建目录也不复制
         compare_dir = container
-        arm_a = layout.group_dir(container, layout.ROLE_BASELINE)
-        arm_b = layout.group_dir(container, layout.ROLE_CANDIDATE)
+        group_a = layout.group_dir(container, layout.ROLE_BASELINE)
+        group_b = layout.group_dir(container, layout.ROLE_CANDIDATE)
     else:
         compare_dir = layout.experiment_path(
             out_dir or output_root(),
@@ -636,8 +636,8 @@ def compare_runs(
                 {"role": layout.ROLE_CANDIDATE, "label": labels[1], "dir": dirs[1]},
             ],
         )
-        arm_a = _copy_arm(compare_dir, dirs[0], dir_a, metrics_a)
-        arm_b = _copy_arm(compare_dir, dirs[1], dir_b, metrics_b)
+        group_a = _copy_group(compare_dir, dirs[0], dir_a, metrics_a)
+        group_b = _copy_group(compare_dir, dirs[1], dir_b, metrics_b)
     # 对比实验目录已确定（新建的 compare_* 或就地任务目录）：运行时数据归它
     runtime.set_dir(compare_dir)
     reports_dir = layout.task_report_dir(compare_dir)
@@ -650,13 +650,13 @@ def compare_runs(
             "target": dir_a,
             "dataset_dir": dataset_a,
             "run_id": id_a,
-            "arm_dir": arm_a,
+            "group_path": group_a,
         },
         "B（候选）": {
             "target": dir_b,
             "dataset_dir": dataset_b,
             "run_id": id_b,
-            "arm_dir": arm_b,
+            "group_path": group_b,
         },
     }
     _append_sources_section(report_path, sources)
@@ -669,9 +669,9 @@ def compare_runs(
     for gate in gates:
         print(f"[membench]   gate {gate['name']}: {gate['status']} ({gate['detail']})")
     print(f"[membench] report: {report_path}")
-    arm_role = "组（就地）" if task_dir is not None else "副本"
-    print(f"[membench] A {arm_role}: {arm_a}")
-    print(f"[membench] B {arm_role}: {arm_b}")
+    group_role = "组（就地）" if task_dir is not None else "副本"
+    print(f"[membench] A {group_role}: {group_a}")
+    print(f"[membench] B {group_role}: {group_b}")
 
     return {
         "verdict": verdict,
@@ -681,8 +681,8 @@ def compare_runs(
         "run_b": id_b,
         "compare_dir": compare_dir,
         "report_path": report_path,
-        "arm_a": arm_a,
-        "arm_b": arm_b,
+        "group_a": group_a,
+        "group_b": group_b,
         "sources": sources,
         "comparability": comparability,
     }

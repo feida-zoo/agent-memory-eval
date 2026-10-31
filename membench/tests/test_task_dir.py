@@ -2,7 +2,7 @@
 
 契约（见 :mod:`membench.layout` 与 :class:`membench.runner.Runner`）：
 
-- 一次评测 = 一个任务目录：单臂 ``eval_<name>_<platform>_<ts>``，双臂
+- 一次评测 = 一个任务目录：单组 ``eval_<name>_<platform>_<ts>``，双组
   ``compare_<name>_<platform>_<ts>``（``A/`` ``B/`` 各是一个完整评测产物根）；
 - 多个分片可以写进**同一个**任务目录：共享目录下只允许 ``shard_by="dialogue"``
   （题目级分片会让多片写同一对话目录），各片进度与归属记在分片账本
@@ -99,7 +99,7 @@ def _ledger(dataset_dir: Path) -> dict:
 
 
 def _run_shard(experiment_dir: str, dataset: Path, *, index: int, **kwargs) -> Path:
-    """在给定实验目录（任务目录或某个臂目录）里跑一个分片，返回数据集目录。"""
+    """在给定实验目录（任务目录或某个组目录）里跑一个分片，返回数据集目录。"""
     return Path(
         Runner(
             MockStrongAdapter(),
@@ -113,15 +113,15 @@ def _run_shard(experiment_dir: str, dataset: Path, *, index: int, **kwargs) -> P
 
 
 def test_shared_task_dir_accepts_dialogue_shards_from_several_processes(tmp_path: Path) -> None:
-    """两片写同一任务目录的同一臂：对话目录互补、账本累积两条 done、无数据集级产物。"""
+    """两片写同一任务目录的同一组：对话目录互补、账本累积两条 done、无数据集级产物。"""
     dataset = _dataset(tmp_path / f"{DATASET}.jsonl")
-    task = Path(layout.init_task_dir(str(tmp_path), "a_vs_b", "t", arms=2, ts="20260101-120000"))
-    arm_a = Path(layout.group_dir(str(task), layout.ROLE_BASELINE))
+    task = Path(layout.init_task_dir(str(tmp_path), "a_vs_b", "t", groups=2, ts="20260101-120000"))
+    group_a = Path(layout.group_dir(str(task), layout.ROLE_BASELINE))
 
     for index in (0, 1):
-        _run_shard(str(arm_a), dataset, index=index, shards=2, shard_by="dialogue", shared=True)
+        _run_shard(str(group_a), dataset, index=index, shards=2, shard_by="dialogue", shared=True)
 
-    dataset_dir = Path(layout.dataset_dir(str(arm_a), DATASET))
+    dataset_dir = Path(layout.dataset_dir(str(group_a), DATASET))
     ledger = _ledger(dataset_dir)
     assert ledger["schema"] == 1
     assert ledger["dataset"] == DATASET and ledger["shards"] == 2
@@ -137,9 +137,9 @@ def test_shared_task_dir_accepts_dialogue_shards_from_several_processes(tmp_path
 
     # 分片不写数据集级 report/，也不写任何一层的任务级 reports/
     assert not (dataset_dir / layout.DIR_REPORT).exists()
-    assert not (arm_a / layout.DIR_REPORTS).exists()
+    assert not (group_a / layout.DIR_REPORTS).exists()
     assert list((task / layout.DIR_REPORTS).iterdir()) == []
-    # 另一条臂没被本次评测碰过
+    # 另一条组没被本次评测碰过
     assert list((task / layout.DIR_GROUP_CANDIDATE).iterdir()) == []
 
     # 共享树完整（两片写完之后四个对话目录都在），且每个对话目录只由一片写过：
@@ -160,7 +160,7 @@ def test_shared_task_dir_accepts_dialogue_shards_from_several_processes(tmp_path
 def test_shared_task_dir_rejects_repeat_shard(tmp_path: Path) -> None:
     """同一分片重复跑：按账本拒绝，且拒绝发生在写盘之前（现场不被改动）。"""
     dataset = _dataset(tmp_path / f"{DATASET}.jsonl")
-    task = layout.init_task_dir(str(tmp_path), "one", "t", arms=1, ts="20260101-120000")
+    task = layout.init_task_dir(str(tmp_path), "one", "t", groups=1, ts="20260101-120000")
     dataset_dir = _run_shard(
         task, dataset, index=0, shards=2, shard_by="dialogue", shared=True
     )
@@ -175,7 +175,7 @@ def test_shared_task_dir_rejects_repeat_shard(tmp_path: Path) -> None:
 def test_shared_task_dir_rejects_question_shard(tmp_path: Path) -> None:
     """共享任务目录只收 dialogue 分片：题目级分片会让多片写同一对话目录。"""
     dataset = _dataset(tmp_path / f"{DATASET}.jsonl")
-    task = layout.init_task_dir(str(tmp_path), "one", "t", arms=1, ts="20260101-120000")
+    task = layout.init_task_dir(str(tmp_path), "one", "t", groups=1, ts="20260101-120000")
     with pytest.raises(SystemExit, match="只支持 --shard-by dialogue"):
         _run_shard(task, dataset, index=0, shards=2, shard_by="question", shared=True)
     # 拒绝在建任何产物之前（任务目录里只有 init_task_dir 建出的空骨架）
@@ -185,7 +185,7 @@ def test_shared_task_dir_rejects_question_shard(tmp_path: Path) -> None:
 def test_shared_task_dir_rejects_ledger_mismatch(tmp_path: Path) -> None:
     """账本与本次不一致（shards / shard_by / limit / 数据集指纹）逐项拒绝：混片不可归因。"""
     dataset = _dataset(tmp_path / f"{DATASET}.jsonl")
-    task = layout.init_task_dir(str(tmp_path), "one", "t", arms=1, ts="20260101-120000")
+    task = layout.init_task_dir(str(tmp_path), "one", "t", groups=1, ts="20260101-120000")
     dataset_dir = _run_shard(
         task, dataset, index=0, shards=2, shard_by="dialogue", shared=True
     )
@@ -210,7 +210,7 @@ def test_shared_task_dir_rejects_ledger_mismatch(tmp_path: Path) -> None:
 def test_shard_ledger_marks_running_before_finish(tmp_path: Path) -> None:
     """分片开跑即落 status=running：中途失败也能看出哪片在跑、覆盖哪些对话。"""
     dataset = _dataset(tmp_path / f"{DATASET}.jsonl")
-    task = layout.init_task_dir(str(tmp_path), "one", "t", arms=1, ts="20260101-120000")
+    task = layout.init_task_dir(str(tmp_path), "one", "t", groups=1, ts="20260101-120000")
     with pytest.raises(RuntimeError, match="boom"):
         Runner(
             _BoomAdapter(),

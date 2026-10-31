@@ -130,7 +130,7 @@ def test_evaluate_forwards_trace_state(
 def test_evaluate_compare_forwards_trace_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """evaluate_compare(trace_state=True) 两侧都透传，两臂各自产出逐时点状态。"""
+    """evaluate_compare(trace_state=True) 两侧都透传，两组各自产出逐时点状态。"""
     dataset = _interleaved_dataset(tmp_path / "trace.jsonl")
     calls: list[bool] = []
     real = evaluate_compare_mod.run_datasets
@@ -154,9 +154,9 @@ def test_evaluate_compare_forwards_trace_state(
     )
     assert calls == [True, True]
     compare_dir = Path(result["compare_dir"])
-    for arm in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
-        arm_dataset = next((compare_dir / arm / layout.DIR_RUNS).iterdir())
-        assert (arm_dataset / "d1" / layout.DIR_TRACE_STATE / "t1").is_dir()
+    for group in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
+        group_dataset = next((compare_dir / group / layout.DIR_RUNS).iterdir())
+        assert (group_dataset / "d1" / layout.DIR_TRACE_STATE / "t1").is_dir()
 
 
 def test_cli_evaluate_parses_trace_state(

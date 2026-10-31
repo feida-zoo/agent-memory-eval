@@ -116,7 +116,7 @@ def test_naming_helpers() -> None:
     assert layout.compare_subdir("a1_vs_b1", "wx", ts="20260101-120000") == (
         "compare_a1_vs_b1_wx_20260101-120000"
     )
-    # platform 缺省（两臂同平台时也走这里）固定为 default
+    # platform 缺省（两组同平台时也走这里）固定为 default
     assert layout.compare_subdir("a1_vs_b1", ts="20260101-120000") == (
         "compare_a1_vs_b1_default_20260101-120000"
     )
@@ -252,22 +252,22 @@ def test_experiment_path_defaults_to_output_root(tmp_path: Path, monkeypatch: py
 # ---------------------------------------------------------------------------
 
 
-def test_task_subdir_reuses_single_arm_and_two_arm_naming() -> None:
-    """task_subdir：arms==2 就是 compare_*，arms==1 就是 eval_*（任务目录命名只有一个来源）。"""
+def test_task_subdir_reuses_single_group_and_two_arm_naming() -> None:
+    """task_subdir：groups==2 就是 compare_*，groups==1 就是 eval_*（任务目录命名只有一个来源）。"""
     assert layout.task_subdir("a1_vs_b1", "wx", ts="20260101-120000") == layout.compare_subdir(
         "a1_vs_b1", "wx", ts="20260101-120000"
     )
     assert layout.task_subdir(
-        "mock-strong", "wx", arms=1, ts="20260101-120000"
+        "mock-strong", "wx", groups=1, ts="20260101-120000"
     ) == layout.eval_subdir("mock-strong", "wx", ts="20260101-120000")
-    with pytest.raises(ValueError, match="arms"):
-        layout.task_subdir("x", arms=3)
+    with pytest.raises(ValueError, match="groups"):
+        layout.task_subdir("x", groups=3)
 
 
 def test_init_task_dir_skeleton_and_non_empty_guard(tmp_path: Path) -> None:
     """双组任务建 baseline/ candidate/ + groups.json，单组任务建 runs/ reports/；非空目录拒绝复用。"""
     base = tmp_path / "output"
-    task = Path(layout.init_task_dir(str(base), "a1_vs_b1", "wx", arms=2, ts="20260101-120000"))
+    task = Path(layout.init_task_dir(str(base), "a1_vs_b1", "wx", groups=2, ts="20260101-120000"))
     assert task.is_absolute() and task.name == "compare_a1_vs_b1_wx_20260101-120000"
     assert sorted(p.name for p in task.iterdir()) == ["baseline", "candidate", "groups.json", "reports"]
     groups = layout.read_groups_manifest(str(task))
@@ -280,20 +280,20 @@ def test_init_task_dir_skeleton_and_non_empty_guard(tmp_path: Path) -> None:
         layout.group_dir(str(task), "third")
 
     single = Path(
-        layout.init_task_dir(str(base), "mock-strong", "wx", arms=1, ts="20260101-120000")
+        layout.init_task_dir(str(base), "mock-strong", "wx", groups=1, ts="20260101-120000")
     )
     assert single.name == "eval_mock-strong_wx_20260101-120000"
     assert sorted(p.name for p in single.iterdir()) == ["reports", "runs"]
 
     # 已有骨架（非空）的任务目录拒绝复用：上一场评测的现场不被覆盖
     with pytest.raises(SystemExit, match="非空"):
-        layout.init_task_dir(str(base), "a1_vs_b1", "wx", arms=2, ts="20260101-120000")
+        layout.init_task_dir(str(base), "a1_vs_b1", "wx", groups=2, ts="20260101-120000")
 
     # 校验阶段失败留下的空目录可以复用（与 experiment_path 同一套守卫语义）
-    (base / layout.task_subdir("empty-task", "wx", arms=1, ts="20260101-130000")).mkdir(
+    (base / layout.task_subdir("empty-task", "wx", groups=1, ts="20260101-130000")).mkdir(
         parents=True
     )
-    reused = layout.init_task_dir(str(base), "empty-task", "wx", arms=1, ts="20260101-130000")
+    reused = layout.init_task_dir(str(base), "empty-task", "wx", groups=1, ts="20260101-130000")
     assert reused == str(base / "eval_empty-task_wx_20260101-130000")
     assert sorted(p.name for p in Path(reused).iterdir()) == ["reports", "runs"]
 
@@ -304,7 +304,7 @@ def test_init_task_dir_defaults_to_output_root(
     """base 缺省时落 MEMBENCH_OUTPUT_DIR（默认产物根的唯一入口）。"""
     root = tmp_path / "custom-root"
     monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(root))
-    task = Path(layout.init_task_dir(None, "x", arms=1, ts="20260101-120000"))
+    task = Path(layout.init_task_dir(None, "x", groups=1, ts="20260101-120000"))
     assert task.parent == root
     assert task.name == "eval_x_default_20260101-120000"
 
@@ -394,10 +394,10 @@ def test_resolve_dataset_dir_rejects_legacy_layout(tmp_path: Path) -> None:
 
     # 2) 旧版 A/B 实验目录：A/ B/ 各是一份平铺 run，根层没有 runs/
     legacy_ab = tmp_path / "ab_a1_vs_b1_20250101_000000"
-    for arm in ("A", "B"):
-        (legacy_ab / arm).mkdir(parents=True)
-        (legacy_ab / arm / layout.FILE_METRICS).write_text(
-            json.dumps({"run_id": arm}), encoding="utf-8"
+    for group in ("A", "B"):
+        (legacy_ab / group).mkdir(parents=True)
+        (legacy_ab / group / layout.FILE_METRICS).write_text(
+            json.dumps({"run_id": group}), encoding="utf-8"
         )
     with pytest.raises(SystemExit) as excinfo_ab:
         layout.resolve_dataset_dir(str(legacy_ab))
@@ -479,7 +479,7 @@ def test_groups_manifest_roundtrip(tmp_path: Path) -> None:
             str(tmp_path),
             "ab",
             "mac",
-            arms=2,
+            groups=2,
             ts="20260101-000000",
             group_labels=["基线", "索引优化"],
             group_dirs=["baseline", "index-opt"],

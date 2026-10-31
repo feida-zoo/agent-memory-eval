@@ -5,7 +5,7 @@
 
     python watch_task.py TASK [--interval 20] [--until-done] [--max-wait 3600] [--json]
 
-每次轮询打印一行紧凑进度：已运行时长、各臂 / 各数据集的分片进度（读分片账本）、
+每次轮询打印一行紧凑进度：已运行时长、各组 / 各数据集的分片进度（读分片账本）、
 数据集级产物是否齐备、快照池桶数（回放任务）、``orchestrator.json`` 的状态与退出码、
 最后一条命令的退出码。``--until-done`` 持续轮询直到完成（成功或失败）或超时。
 
@@ -123,7 +123,7 @@ def _orchestrator_state(task: str) -> Optional[dict[str, Any]]:
     }
 
 
-def _arm_roots(task: str, layout: Any) -> list[tuple[str, str]]:
+def _group_roots(task: str, layout: Any) -> list[tuple[str, str]]:
     """任务下的组目录（与 ``task status`` 同口径；单组任务把任务根当唯一实验根）。
 
     组目录名由用户给（可以是中文，记在 ``groups.json``），不假设固定词表。
@@ -137,9 +137,9 @@ def _arm_roots(task: str, layout: Any) -> list[tuple[str, str]]:
     return roots or [("", task)]
 
 
-def _dataset_progress(arm_root: str, layout: Any) -> list[dict[str, Any]]:
-    """一个臂下各数据集的分片进度与数据集级产物状态（账本读取全走 layout）。"""
-    runs = os.path.join(arm_root, layout.DIR_RUNS)
+def _dataset_progress(group_root: str, layout: Any) -> list[dict[str, Any]]:
+    """一个组下各数据集的分片进度与数据集级产物状态（账本读取全走 layout）。"""
+    runs = os.path.join(group_root, layout.DIR_RUNS)
     if not os.path.isdir(runs):
         return []
     progress: list[dict[str, Any]] = []
@@ -186,10 +186,10 @@ def _dataset_progress(arm_root: str, layout: Any) -> list[dict[str, Any]]:
     return progress
 
 
-def _collect_commands(task: str, arms: list[tuple[str, str]], runtime: Any) -> list[dict]:
-    """任务根与各臂 runtime 里的全部命令记录（按开始时间排序）。"""
+def _collect_commands(task: str, groups: list[tuple[str, str]], runtime: Any) -> list[dict]:
+    """任务根与各组 runtime 里的全部命令记录（按开始时间排序）。"""
     records: list[dict] = []
-    roots = [task] + [root for label, root in arms if label]
+    roots = [task] + [root for label, root in groups if label]
     for root in roots:
         records.extend(runtime.read_commands(root))
     records.sort(key=lambda item: (str(item.get("started_at") or ""), int(item.get("pid") or 0)))
@@ -201,21 +201,21 @@ def collect(task: str) -> dict[str, Any]:
     root = find_membench_root()
     layout, runtime = _modules(root)
     task = os.path.abspath(task)
-    arms = _arm_roots(task, layout)
-    arm_snapshots: list[dict[str, Any]] = []
-    for label, arm_root in arms:
-        datasets = _dataset_progress(arm_root, layout)
-        arm_snapshots.append(
+    groups = _group_roots(task, layout)
+    group_snapshots: list[dict[str, Any]] = []
+    for label, group_root in groups:
+        datasets = _dataset_progress(group_root, layout)
+        group_snapshots.append(
             {
                 "label": label,
-                "root": arm_root,
+                "root": group_root,
                 "datasets": datasets,
                 "datasets_ready": sum(1 for item in datasets if item["ready"]),
                 "datasets_total": len(datasets),
             }
         )
 
-    commands = _collect_commands(task, arms, runtime)
+    commands = _collect_commands(task, groups, runtime)
     last = commands[-1] if commands else None
     orchestrator = _orchestrator_state(task)
 
@@ -245,7 +245,7 @@ def collect(task: str) -> dict[str, Any]:
         "task": task,
         "elapsed_seconds": elapsed,
         "orchestrator": orchestrator,
-        "arms": arm_snapshots,
+        "groups": group_snapshots,
         "snapshot_pool": snapshot_pool,
         "last_command": (
             {
@@ -301,10 +301,10 @@ def _format_elapsed(seconds: Optional[float]) -> str:
     return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
 
 
-def _arm_text(arm: dict[str, Any]) -> str:
-    """一个臂的分片进度片段：``A: office 2/4(跑1)✗``。"""
-    label = arm["label"] or "单组"
-    datasets = arm["datasets"]
+def _group_text(group: dict[str, Any]) -> str:
+    """一个组的分片进度片段：``A: office 2/4(跑1)✗``。"""
+    label = group["label"] or "单组"
+    datasets = group["datasets"]
     if not datasets:
         return f"{label}: 无数据集"
     parts = []
@@ -322,7 +322,7 @@ def _arm_text(arm: dict[str, Any]) -> str:
 def format_line(snapshot: dict[str, Any]) -> str:
     """单行紧凑进度（人读）。"""
     pieces = [f"[watch] {_format_elapsed(snapshot['elapsed_seconds'])}"]
-    pieces.extend(_arm_text(arm) for arm in snapshot["arms"])
+    pieces.extend(_group_text(group) for group in snapshot["groups"])
     if snapshot["snapshot_pool"] is not None:
         pieces.append(f"快照池 {snapshot['snapshot_pool']['buckets']} 桶")
     orchestrator = snapshot["orchestrator"]

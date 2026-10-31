@@ -9,7 +9,7 @@
 
 1. 任务目录命名与骨架：``eval_*`` 有 ``runs/`` + ``reports/``；``compare_*`` 有
    ``A/`` + ``B/`` + ``reports/``；``matrix_*`` 有 ``reports/`` + ``runs/``。
-2. 每个臂 / 实验目录下的每个数据集：``report/{metrics.json,results.jsonl,report.md}``
+2. 每个组 / 实验目录下的每个数据集：``report/{metrics.json,results.jsonl,report.md}``
    齐备且非空，``metrics.json`` 可解析。
 3. 一致性：数据集级 ``results.jsonl`` 行数 == 各对话 ``report/results.jsonl`` 行数
    之和；qid 集合无缺失、无重复；逐对话 ``n_questions`` 之和 == 数据集级
@@ -132,7 +132,7 @@ class Issue:
 class DatasetInfo:
     """一个数据集产物的摘要（JSON 的 ``datasets`` 段）。"""
 
-    arm: str
+    group: str
     dataset: str
     path: str
     n_questions: Optional[int] = None
@@ -142,7 +142,7 @@ class DatasetInfo:
     def as_dict(self) -> dict[str, Any]:
         """转成可 JSON 序列化的结构。"""
         return {
-            "arm": self.arm,
+            "group": self.group,
             "dataset": self.dataset,
             "path": self.path,
             "n_questions": self.n_questions,
@@ -416,7 +416,7 @@ def _check_partial_flags(
 
 def _check_dataset(
     dataset_dir: str,
-    arm: str,
+    group: str,
     result: Verification,
     *,
     allow_limit: bool,
@@ -424,7 +424,7 @@ def _check_dataset(
 ) -> None:
     """校验单个数据集目录（第 2、3、4 项）。"""
     dataset_name = os.path.basename(os.path.normpath(dataset_dir))
-    where = f"数据集 {dataset_name}" + (f"（臂 {arm}）" if arm else "")
+    where = f"数据集 {dataset_name}" + (f"（组 {group}）" if group else "")
     _check_required_files(dataset_dir, result, check="dataset_files", where=where)
 
     metrics_path = os.path.join(dataset_dir, DIR_REPORT, "metrics.json")
@@ -483,12 +483,12 @@ def _check_dataset(
             dialogue_dir,
             result,
             check="dialogue_files",
-            where=f"对话 {dialogue_id}" + (f"（臂 {arm}）" if arm else ""),
+            where=f"对话 {dialogue_id}" + (f"（组 {group}）" if group else ""),
         )
         _check_dialogue_entries(
             dialogue_dir,
             result,
-            where=f"对话 {dialogue_id}" + (f"（臂 {arm}）" if arm else ""),
+            where=f"对话 {dialogue_id}" + (f"（组 {group}）" if group else ""),
         )
         dialogue_metrics_path = os.path.join(dialogue_dir, DIR_REPORT, "metrics.json")
         dialogue_metrics: Optional[dict[str, Any]] = None
@@ -533,7 +533,7 @@ def _check_dataset(
             dialogue_n_known = False
 
     info = DatasetInfo(
-        arm=arm,
+        group=group,
         dataset=dataset_name,
         path=os.path.abspath(dataset_dir),
         n_questions=_n_questions(metrics) if metrics is not None else None,
@@ -726,29 +726,29 @@ def _check_compare(task: str, result: Verification) -> None:
                 f"{report_path} 里没有门禁结论关键词（{' / '.join(GATE_KEYWORDS)}）",
                 report_path,
             )
-    for arm in _task_group_dirs(task):
-        arm_dir = os.path.join(task, arm)
-        if not os.path.isdir(arm_dir):
+    for group in _task_group_dirs(task):
+        group_path = os.path.join(task, group)
+        if not os.path.isdir(group_path):
             continue  # 骨架检查已报
-        datasets = _dataset_dirs(arm_dir)
+        datasets = _dataset_dirs(group_path)
         if not datasets:
             result.fail(
                 "compare",
-                "missing_arm_dataset",
-                f"compare 任务的组 {arm}/ 下没有数据集级报告",
-                arm_dir,
+                "missing_group_dataset",
+                f"compare 任务的组 {group}/ 下没有数据集级报告",
+                group_path,
             )
 
 
 def _experiment_roots(task: str, kind: str) -> list[tuple[str, str]]:
-    """任务下的实验根：``[(根目录, 臂标签)]``；matrix 的 label 本身是数据集目录。"""
+    """任务下的实验根：``[(根目录, 组标签)]``；matrix 的 label 本身是数据集目录。"""
     if kind == "eval":
         return [(task, "")]
     if kind == "compare":
         return [
-            (os.path.join(task, arm), arm)
-            for arm in _task_group_dirs(task)
-            if os.path.isdir(os.path.join(task, arm))
+            (os.path.join(task, group), group)
+            for group in _task_group_dirs(task)
+            if os.path.isdir(os.path.join(task, group))
         ]
     # matrix: runs/<label>/ 是数据集树本身
     runs = os.path.join(task, DIR_RUNS)
@@ -833,15 +833,15 @@ def verify_task(
     # 8. 未登记条目（警告级）：框架产物之外的东西，多半是接入侧副产物
     _check_root_entries(task, result, where="任务目录")
 
-    # 2/3/4. 每个臂 / 实验目录下的数据集
+    # 2/3/4. 每个组 / 实验目录下的数据集
     roots = _experiment_roots(task, kind)
     if not roots:
         result.fail("skeleton", "no_experiment", "任务目录里没有任何实验根（A/B 或 runs/<label>）", task)
         return result
-    for exp_root, arm in roots:
+    for exp_root, group in roots:
         if kind in ("eval", "compare"):
             if os.path.normpath(exp_root) != task:
-                _check_root_entries(exp_root, result, where=f"臂目录 {arm}")
+                _check_root_entries(exp_root, result, where=f"组目录 {group}")
             datasets = _dataset_dirs(exp_root)
             if not datasets:
                 result.fail(
@@ -865,7 +865,7 @@ def verify_task(
                     continue
                 _check_dataset(
                     dataset_dir,
-                    arm,
+                    group,
                     result,
                     allow_limit=allow_limit,
                     allow_partial=allow_partial,
@@ -881,7 +881,7 @@ def verify_task(
                 continue
             _check_dataset(
                 exp_root,
-                arm,
+                group,
                 result,
                 allow_limit=allow_limit,
                 allow_partial=allow_partial,

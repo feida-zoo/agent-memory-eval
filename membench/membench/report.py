@@ -1868,7 +1868,7 @@ def write_run_report_md(
         if role == "replayed" and state.get("snapshots_dir"):
             lines.append(
                 "本次回放的状态已按内容去重写入任务级快照池（桶名 = 状态内容 sha256 前 "
-                "12 位）：同一源回放到另一臂时内容一致的对话共用同一个桶，差异即"
+                "12 位）：同一源回放到另一组时内容一致的对话共用同一个桶，差异即"
                 "「回放不保真」的证据；回放任务本身也可继续作为 `--replay` 源（链式回放）。"
             )
             lines.append("")

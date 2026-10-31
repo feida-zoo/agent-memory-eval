@@ -857,7 +857,7 @@ def test_evaluate_task_dir_writes_into_given_dir(
 ) -> None:
     """``evaluate(task_dir=...)``：产物直接写进该任务目录，不新建 ``eval_*``。"""
     base = tmp_path / "out"
-    task = layout.init_task_dir(str(base), "solo", platform="t", arms=1)
+    task = layout.init_task_dir(str(base), "solo", platform="t", groups=1)
 
     rc = evaluate(
         ScriptedAdapter(script), "heuristic", task_dir=task, specs=_specs(mini_datasets)
@@ -895,7 +895,7 @@ def test_evaluate_snapshot_default_export_and_no_snapshot(
     specs = [_specs(mini_datasets)[0]]
     base = tmp_path / "out"
 
-    with_snap = layout.init_task_dir(str(base), "with_snap", platform="t", arms=1)
+    with_snap = layout.init_task_dir(str(base), "with_snap", platform="t", groups=1)
     evaluate(SnapshotScriptedAdapter(script), "heuristic", task_dir=with_snap, specs=specs)
     dataset_dir = Path(layout.dataset_dir(with_snap, "a"))
     snapshots = [p for p in dataset_dir.iterdir() if (p / layout.DIR_SNAPSHOT).is_dir()]
@@ -906,7 +906,7 @@ def test_evaluate_snapshot_default_export_and_no_snapshot(
     )
     assert exported["state_snapshot"]["role"] == "exported"
 
-    quiet = layout.init_task_dir(str(base), "no_snap", platform="t", arms=1)
+    quiet = layout.init_task_dir(str(base), "no_snap", platform="t", groups=1)
     evaluate(
         SnapshotScriptedAdapter(script),
         "heuristic",

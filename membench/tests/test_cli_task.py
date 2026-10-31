@@ -1,10 +1,10 @@
 """task 子命令与 --task-dir / --no-snapshot 的 CLI 面（冻结契约）。
 
-- ``task init --name NAME [--platform P] [--arms 1|2] [--report-out DIR] [--replay]``：建任务
-  目录骨架（arms=2 -> ``A/`` ``B/``；arms=1 -> ``runs/``，都带 ``reports/``；``--replay``
+- ``task init --name NAME [--platform P] [--groups 1|2] [--report-out DIR] [--replay]``：建任务
+  目录骨架（groups=2 -> ``A/`` ``B/``；groups=1 -> ``runs/``，都带 ``reports/``；``--replay``
   额外建任务级快照池 ``snapshots/``，见 ``tests/test_replay_snapshots.py``），**stdout
   只有一行绝对路径**（脚本 ``TASK=$(...)`` 要能直接接走），非空目标目录拒绝；
-- ``task status DIR``：进度视图——骨架、各臂各数据集的分片账本进度（s<i> 的 status /
+- ``task status DIR``：进度视图——骨架、各组各数据集的分片账本进度（s<i> 的 status /
   题数 / 对话数 / run_id）、数据集级产物是否齐备、快照目录数与体积、下一步该做什么；
 - ``--task-dir DIR``（与 ``--report-out`` 互斥）：把产物写进已存在的任务目录而不是新建
   ``eval_*`` / ``compare_*``——``run``/``evaluate``/``evaluate-compare`` 直接写进该目录，
@@ -75,9 +75,9 @@ def _dataset(path: Path, *, n_dialogues: int = 4, per: int = 2) -> Path:
     return path
 
 
-def _init_task(base: Path, name: str, *, platform: str | None = "t", arms: int = 2) -> Path:
+def _init_task(base: Path, name: str, *, platform: str | None = "t", groups: int = 2) -> Path:
     """跑 ``task init`` 并返回它打印到 stdout 的任务目录（stdout 必须只有这一行路径）。"""
-    argv = ["task", "init", "--name", name, "--report-out", str(base), "--groups", str(arms)]
+    argv = ["task", "init", "--name", name, "--report-out", str(base), "--groups", str(groups)]
     if platform is not None:
         argv += ["--platform", platform]
     buffer = io.StringIO()
@@ -89,7 +89,7 @@ def _init_task(base: Path, name: str, *, platform: str | None = "t", arms: int =
 
 
 def _run_shard(task_or_arm: Path, dataset: Path, *, shards: int, index: int) -> int:
-    """在给定任务目录 / 臂目录里跑一个分片（对话级分片，共享写入）。"""
+    """在给定任务目录 / 组目录里跑一个分片（对话级分片，共享写入）。"""
     return cli.main(
         [
             "run",
@@ -154,7 +154,7 @@ def test_task_init_arms2_prints_only_abs_path(
 
 def test_task_init_arms1_builds_runs_skeleton(tmp_path: Path) -> None:
     """groups=1：单组骨架 runs/ + reports/，目录名前缀 eval_。"""
-    task = _init_task(tmp_path / "out", "solo", arms=1)
+    task = _init_task(tmp_path / "out", "solo", groups=1)
     assert task.name.startswith("eval_solo_t_")
     assert sorted(p.name for p in task.iterdir()) == ["reports", "runs", "runtime"]
 
@@ -162,7 +162,7 @@ def test_task_init_arms1_builds_runs_skeleton(tmp_path: Path) -> None:
 def test_task_init_default_report_out_is_output_root(
     _isolated_env: Path,
 ) -> None:
-    """缺省 --report-out 落 output_root()（MEMBENCH_OUTPUT_DIR），缺省 arms=2。"""
+    """缺省 --report-out 落 output_root()（MEMBENCH_OUTPUT_DIR），缺省 groups=2。"""
     buffer = io.StringIO()
     with redirect_stdout(buffer):
         assert cli.main(["task", "init", "--name", "solo"]) == 0
@@ -214,11 +214,11 @@ def test_task_status_progress_then_fuse_in_place(
     dataset = _dataset(tmp_path / "dense.jsonl")
     base = tmp_path / "out"
     task = _init_task(base, "ab")
-    arm_a = task / layout.DIR_GROUP_BASELINE
+    group_a = task / layout.DIR_GROUP_BASELINE
     capsys.readouterr()
 
     # ① 部分完成：只跑了 s0
-    assert _run_shard(arm_a, dataset, shards=2, index=0) == 0
+    assert _run_shard(group_a, dataset, shards=2, index=0) == 0
     capsys.readouterr()
     assert cli.main(["task", "status", str(task)]) == 0
     out = capsys.readouterr().out
@@ -229,22 +229,22 @@ def test_task_status_progress_then_fuse_in_place(
     assert "对话目录 2 个" in out
 
     # ② 分片跑齐但还没融合：提示补齐数据集级产物
-    assert _run_shard(arm_a, dataset, shards=2, index=1) == 0
+    assert _run_shard(group_a, dataset, shards=2, index=1) == 0
     capsys.readouterr()
     assert cli.main(["task", "status", str(task)]) == 0
     out = capsys.readouterr().out
     assert "分片 2/2 完成" in out
-    assert f"python -m membench.cli fuse --task-dir {arm_a}" in out
+    assert f"python -m membench.cli fuse --task-dir {group_a}" in out
 
     # ③ fuse --task-dir 就地融合：补齐数据集级与任务级产物，不新建目录
-    assert cli.main(["fuse", "--task-dir", str(arm_a)]) == 0
+    assert cli.main(["fuse", "--task-dir", str(group_a)]) == 0
     fuse_out = capsys.readouterr().out
     assert "融合完成: 8 题" in fuse_out
-    assert (arm_a / layout.DIR_RUNS / "dense" / layout.DIR_REPORT / layout.FILE_METRICS).is_file()
-    assert (arm_a / layout.DIR_REPORTS / layout.FILE_REPORT_MD).is_file()
+    assert (group_a / layout.DIR_RUNS / "dense" / layout.DIR_REPORT / layout.FILE_METRICS).is_file()
+    assert (group_a / layout.DIR_REPORTS / layout.FILE_REPORT_MD).is_file()
     assert [p.name for p in base.iterdir()] == [task.name], "就地融合不该新建实验目录"
 
-    # ④ B 臂跑一遍（不分片），status 显示两臂齐备并给出 compare 提示
+    # ④ B 组跑一遍（不分片），status 显示两组齐备并给出 compare 提示
     assert (
         cli.main(
             [
@@ -275,7 +275,7 @@ def test_task_status_reports_running_shard(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """分片仍在跑（账本 status=running）：显示未跑完并提示等它结束，不催融合。"""
-    task = _init_task(tmp_path / "out", "solo", arms=1)
+    task = _init_task(tmp_path / "out", "solo", groups=1)
     dataset_dir = layout.dataset_dir(str(task), "dense")
     layout.update_shard_ledger(
         dataset_dir,
@@ -316,7 +316,7 @@ def test_task_status_rejects_dir_without_skeleton(tmp_path: Path) -> None:
 
 def test_run_task_dir_writes_into_given_dir(tmp_path: Path) -> None:
     """run --task-dir：产物直接落该目录（不分片时数据集级 + 任务级报告齐备）。"""
-    task = _init_task(tmp_path / "out", "solo", arms=1)
+    task = _init_task(tmp_path / "out", "solo", groups=1)
     assert (
         cli.main(
             [
@@ -364,7 +364,7 @@ def test_run_task_dir_missing_dir_errors(tmp_path: Path) -> None:
 def test_run_task_dir_question_shard_rejected(tmp_path: Path) -> None:
     """共享任务目录下题目级分片被拒（多片会写同一对话目录并互相覆盖）。"""
     dataset = _dataset(tmp_path / "dense.jsonl")
-    task = _init_task(tmp_path / "out", "solo", arms=1)
+    task = _init_task(tmp_path / "out", "solo", groups=1)
     with pytest.raises(SystemExit, match="只支持 --shard-by dialogue"):
         cli.main(
             [
@@ -389,7 +389,7 @@ def test_run_task_dir_question_shard_rejected(tmp_path: Path) -> None:
 
 def test_run_task_dir_and_report_out_are_mutually_exclusive(tmp_path: Path) -> None:
     """--task-dir 与 --report-out 二选一（argparse 拒绝，退出码 2）。"""
-    task = _init_task(tmp_path / "out", "solo", arms=1)
+    task = _init_task(tmp_path / "out", "solo", groups=1)
     with pytest.raises(SystemExit) as excinfo:
         cli.main(
             [
@@ -586,7 +586,7 @@ def test_task_status_counts_snapshot_bytes(
 ) -> None:
     """task status 统计快照目录数与总字节数（扫 <对话>/memory_snapshot/）。"""
     dataset = _dataset(tmp_path / "dense.jsonl")
-    task = _init_task(tmp_path / "out", "solo", arms=1)
+    task = _init_task(tmp_path / "out", "solo", groups=1)
     capsys.readouterr()
     assert (
         cli.main(
@@ -618,10 +618,10 @@ def test_task_status_counts_snapshot_bytes(
 
 
 def _two_arm_task_with_products(tmp_path: Path) -> tuple[Path, Path]:
-    """建一个双臂任务目录并在两臂各跑一次（不分片），返回 (任务目录, 产物根)。"""
+    """建一个双组任务目录并在两组各跑一次（不分片），返回 (任务目录, 产物根)。"""
     base = tmp_path / "out"
     task = _init_task(base, "ab")
-    for arm in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
+    for group in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
         assert (
             cli.main(
                 [
@@ -633,7 +633,7 @@ def _two_arm_task_with_products(tmp_path: Path) -> tuple[Path, Path]:
                     "--judge",
                     "heuristic",
                     "--task-dir",
-                    str(task / arm),
+                    str(task / group),
                 ]
             )
             == 0
@@ -642,7 +642,7 @@ def _two_arm_task_with_products(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def test_compare_task_dir_in_place(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """compare --task-dir：就地读 A/ 与 B/（不必再传两臂），comparison.md 落任务目录的 reports/。"""
+    """compare --task-dir：就地读 A/ 与 B/（不必再传两组），comparison.md 落任务目录的 reports/。"""
     task, base = _two_arm_task_with_products(tmp_path)
     capsys.readouterr()
     assert cli.main(["compare", "--task-dir", str(task)]) == 0
@@ -650,16 +650,16 @@ def test_compare_task_dir_in_place(tmp_path: Path, capsys: pytest.CaptureFixture
     comparison = task / layout.DIR_REPORTS / layout.FILE_COMPARISON_MD
     assert comparison.is_file(), "对比报告应落任务目录的 reports/"
     assert "门禁结论： PASS" in comparison.read_text(encoding="utf-8")
-    # 不新建 compare_* 目录、不复制两臂：任务目录结构与内容保持原位
+    # 不新建 compare_* 目录、不复制两组：任务目录结构与内容保持原位
     assert [p.name for p in base.iterdir()] == [task.name]
-    arm_a_metrics = (
+    group_a_metrics = (
         task / layout.DIR_GROUP_BASELINE / layout.DIR_RUNS / "sample_dataset" / layout.DIR_REPORT / layout.FILE_METRICS
     )
-    assert arm_a_metrics.is_file()
+    assert group_a_metrics.is_file()
 
 
 def test_compare_argument_contract(tmp_path: Path) -> None:
-    """两臂入参校验：无 --task-dir 时必填；--task-dir 时缺臂 / 目录不存在都当场报错。"""
+    """两组入参校验：无 --task-dir 时必填；--task-dir 时缺组 / 目录不存在都当场报错。"""
     under_task = _init_task(tmp_path / "out", "ab")
     with pytest.raises(SystemExit, match="compare 需要 --baseline"):
         cli.main(["compare"])
@@ -676,7 +676,7 @@ def test_compare_argument_contract(tmp_path: Path) -> None:
 def test_evaluate_task_dir_writes_into_given_dir(tmp_path: Path) -> None:
     """evaluate --task-dir：产物直接写进该目录（各数据集 runs/<dataset>/ + reports/）。"""
     dataset = _dataset(tmp_path / "dense.jsonl")
-    task = _init_task(tmp_path / "out", "solo", arms=1)
+    task = _init_task(tmp_path / "out", "solo", groups=1)
     assert (
         cli.main(
             [
@@ -725,7 +725,7 @@ def test_evaluate_no_snapshot_passthrough(tmp_path: Path, _snapshot_adapter: str
 
 
 def test_evaluate_compare_task_dir_writes_into_arms(tmp_path: Path) -> None:
-    """evaluate-compare --task-dir：两臂分别写 DIR/A、DIR/B，对比报告落 DIR/reports/。"""
+    """evaluate-compare --task-dir：两组分别写 DIR/A、DIR/B，对比报告落 DIR/reports/。"""
     dataset = _dataset(tmp_path / "dense.jsonl", n_dialogues=2, per=1)
     base = tmp_path / "out"
     task = _init_task(base, "ab")
@@ -747,11 +747,11 @@ def test_evaluate_compare_task_dir_writes_into_arms(tmp_path: Path) -> None:
         )
         == 0
     )
-    for arm in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
+    for group in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
         assert (
-            task / arm / layout.DIR_RUNS / "dense" / layout.DIR_REPORT / layout.FILE_METRICS
+            task / group / layout.DIR_RUNS / "dense" / layout.DIR_REPORT / layout.FILE_METRICS
         ).is_file()
-        assert (task / arm / layout.DIR_REPORTS / layout.FILE_SUMMARY).is_file()
+        assert (task / group / layout.DIR_REPORTS / layout.FILE_SUMMARY).is_file()
     assert (task / layout.DIR_REPORTS / layout.FILE_COMPARISON_MD).is_file()
     assert [p.name for p in base.iterdir()] == [task.name], "就地对比不该另建 compare_* 目录"
 

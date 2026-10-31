@@ -339,7 +339,7 @@ def test_fuse_in_place_after_dialogue_shards_in_one_task_dir(tmp_path: Path) -> 
     只补数据集级 ``report/`` 与任务级 ``reports/``；``fuse_runs([task], task)``
     与 ``fuse_runs([], task)`` 等价。
     """
-    task = Path(layout.init_task_dir(str(tmp_path), "inplace", "t", arms=1, ts="20260101-120000"))
+    task = Path(layout.init_task_dir(str(tmp_path), "inplace", "t", groups=1, ts="20260101-120000"))
     for index in (0, 1):
         _shard_run(
             tmp_path,

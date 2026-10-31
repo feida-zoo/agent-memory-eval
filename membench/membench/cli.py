@@ -4,7 +4,7 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
 用法（SPEC 第 6 节）：
     python -m membench.cli task init --name NAME [--platform P] [--groups 1|2] \
         [--report-out DIR] [--replay]
-        # 建任务目录骨架（arms=2 -> A/ B/；arms=1 -> runs/，都带任务级 reports/）并
+        # 建任务目录骨架（groups=2 -> A/ B/；groups=1 -> runs/，都带任务级 reports/）并
         # 打印它的绝对路径；--replay 额外建任务级快照池 snapshots/（回放任务的
         # 内容寻址桶 + index.json）；stdout 只有这一行路径，可 TASK=$(...) 接走
     python -m membench.cli task status DIR
@@ -143,7 +143,7 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
   ``evidence_in_state``，metrics 与报告给出失败归因四桶
   （not_written / not_retrieved / wrong_answer / unknown）。
 
-任务目录的共同形态是 ``arms`` 决定的前缀（``eval_*`` / ``compare_*``），骨架由
+任务目录的共同形态是 ``groups`` 决定的前缀（``eval_*`` / ``compare_*``），骨架由
 :func:`membench.layout.init_task_dir` 唯一决定。
 """
 
@@ -1026,10 +1026,10 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         candidate = args.candidate or layout.group_dir(
             args.task_dir, layout.ROLE_CANDIDATE
         )
-        for arm_path in (baseline, candidate):
-            if not os.path.isdir(arm_path):
+        for group_path in (baseline, candidate):
+            if not os.path.isdir(group_path):
                 raise SystemExit(
-                    f"任务目录里的组目录不存在: {arm_path}；"
+                    f"任务目录里的组目录不存在: {group_path}；"
                     "--task-dir 就地对比要求两组（见 groups.json）都有产物，"
                     "或显式给 --baseline / --candidate"
                 )
@@ -1189,20 +1189,20 @@ def _cmd_series(args: argparse.Namespace) -> int:
 # task：任务目录骨架与进度视图
 # ---------------------------------------------------------------------------
 
-def _task_arm_roots(task_dir: str) -> list[tuple[str, str]]:
-    """任务目录下的组：``[(臂标签, 臂根目录)]``。
+def _task_group_roots(task_dir: str) -> list[tuple[str, str]]:
+    """任务目录下的组：``[(组标签, 组根目录)]``。
 
     双组任务目录（``task init --groups 2``）取 ``groups.json`` 里实际存在的组目录；都不存在
     时把任务目录本身当单组实验根（``runs/`` 就在它下面）。骨架只建了一半（例如只跑
     了 ``A/``）时只报存在的那一个——status 是进度视图，不该因为另一半还没建就拒绝。
     """
     groups = layout.read_groups_manifest(task_dir) or []
-    arms = [
+    groups = [
         (str(item["dir"]), os.path.join(task_dir, str(item["dir"])))
         for item in groups
         if os.path.isdir(os.path.join(task_dir, str(item["dir"])))
     ]
-    return arms or [("", task_dir)]
+    return groups or [("", task_dir)]
 
 
 def _subdirs(path: str) -> list[str]:
@@ -1216,9 +1216,9 @@ def _subdirs(path: str) -> list[str]:
     )
 
 
-def _dataset_dirs_of(arm_root: str) -> list[str]:
-    """臂根 ``runs/`` 下的数据集目录。"""
-    return _subdirs(layout.runs_root(arm_root))
+def _dataset_dirs_of(group_root: str) -> list[str]:
+    """组根 ``runs/`` 下的数据集目录。"""
+    return _subdirs(layout.runs_root(group_root))
 
 
 def _dialogue_dirs_of(dataset_dir: str) -> list[str]:
@@ -1310,16 +1310,16 @@ def _snapshot_pool_lines(target: str) -> list[str]:
         return [f"快照池: ⚠️ {exc}"]
     buckets = index["buckets"]
     entries = index["entries"]
-    arms = index["arms"]
+    groups = index["groups"]
     total_bytes = sum(
         int(item.get("bytes") or 0)
         for item in buckets.values()
         if isinstance(item, dict)
     )
     lines = [f"快照池: {pool_root}（{len(buckets)} 个桶 / {_human_bytes(total_bytes)}）"]
-    for arm in sorted(str(name) for name in arms):
-        info = arms.get(arm) if isinstance(arms.get(arm), dict) else {}
-        label = f"组 {arm}" if arm else "单组"
+    for group in sorted(str(name) for name in groups):
+        info = groups.get(group) if isinstance(groups.get(group), dict) else {}
+        label = f"组 {group}" if group else "单组"
         source = str(info.get("source") or "n/a")
         manifest_sha = str(info.get("source_manifest_sha256") or "")
         lines.append(
@@ -1328,12 +1328,12 @@ def _snapshot_pool_lines(target: str) -> list[str]:
             f"源 {source}"
             + (f"（源清单 sha256 {manifest_sha[:12]}）" if manifest_sha else "")
         )
-    if len(arms) >= 2:
-        lines.extend(_arm_consistency_lines(entries))
+    if len(groups) >= 2:
+        lines.extend(_group_consistency_lines(entries))
     return lines
 
 
-def _arm_consistency_lines(entries: dict[str, Any]) -> list[str]:
+def _group_consistency_lines(entries: dict[str, Any]) -> list[str]:
     """两组逐对话比对快照桶：全部指向同一批桶就是"回放保真"，否则列出差异规模。
 
     组名由用户在 ``groups.json`` 里给（可以是中文），这里不假设固定词表：取
@@ -1344,32 +1344,32 @@ def _arm_consistency_lines(entries: dict[str, Any]) -> list[str]:
         parsed = layout.parse_snapshot_entry_key(key)
         if parsed is None:
             continue
-        arm, dataset, dialogue_id = parsed
-        by_dataset.setdefault(dataset, {}).setdefault(arm, {})[dialogue_id] = str(digest)
+        group, dataset, dialogue_id = parsed
+        by_dataset.setdefault(dataset, {}).setdefault(group, {})[dialogue_id] = str(digest)
     lines: list[str] = []
     for dataset in sorted(by_dataset):
-        per_arm = by_dataset[dataset]
-        keys = sorted(per_arm)
+        per_group = by_dataset[dataset]
+        keys = sorted(per_group)
         if len(keys) < 2:
             continue
-        arm_a = per_arm.get(keys[0]) or {}
-        arm_b = per_arm.get(keys[1]) or {}
-        if not arm_a or not arm_b:
+        group_a = per_group.get(keys[0]) or {}
+        group_b = per_group.get(keys[1]) or {}
+        if not group_a or not group_b:
             continue
-        all_ids = set(arm_a) | set(arm_b)
-        same = [did for did in all_ids if arm_a.get(did) == arm_b.get(did)]
-        diff = [did for did in all_ids if did in arm_a and did in arm_b and arm_a[did] != arm_b[did]]
-        only_a = [did for did in arm_a if did not in arm_b]
-        only_b = [did for did in arm_b if did not in arm_a]
+        all_ids = set(group_a) | set(group_b)
+        same = [did for did in all_ids if group_a.get(did) == group_b.get(did)]
+        diff = [did for did in all_ids if did in group_a and did in group_b and group_a[did] != group_b[did]]
+        only_a = [did for did in group_a if did not in group_b]
+        only_b = [did for did in group_b if did not in group_a]
         if len(same) == len(all_ids):
-            shared = len({arm_a[did] for did in all_ids})
+            shared = len({group_a[did] for did in all_ids})
             lines.append(
-                f"  数据集 {dataset}: A 臂与 B 臂快照 {len(same)}/{len(all_ids)} 逐对话一致"
+                f"  数据集 {dataset}: A 组与 B 组快照 {len(same)}/{len(all_ids)} 逐对话一致"
                 f"（共用 {shared} 个桶）"
             )
         else:
             lines.append(
-                f"  数据集 {dataset}: A 臂与 B 臂快照有差异——一致 {len(same)}/{len(all_ids)}，"
+                f"  数据集 {dataset}: A 组与 B 组快照有差异——一致 {len(same)}/{len(all_ids)}，"
                 f"内容不同 {len(diff)}、仅 A {len(only_a)}、仅 B {len(only_b)}"
                 "（差异即回放不保真的证据）"
             )
@@ -1432,7 +1432,7 @@ def _cmd_task_init(args: argparse.Namespace) -> int:
     )
     if args.replay:
         shape += f" {layout.DIR_SNAPSHOTS}/"
-    first_arm = (
+    first_group = (
         layout.group_dir(task_dir, layout.ROLE_BASELINE) if args.groups == 2 else task_dir
     )
     # 人看的说明全部走 stderr：stdout 只有一行路径，脚本 $() 才能直接接走
@@ -1442,9 +1442,9 @@ def _cmd_task_init(args: argparse.Namespace) -> int:
         print(
             f"[membench] 下一步: 回放同一个源到该任务 —— "
             f"python -m membench.cli run --adapter <适配器> --dataset <数据集> "
-            f"--task-dir {first_arm} --replay <源：实验目录 / 数据集目录 / 回放任务>"
+            f"--task-dir {first_group} --replay <源：实验目录 / 数据集目录 / 回放任务>"
             "（两组分别 --task-dir <任务>/A、<任务>/B 回放同一源时，状态相同的对话共用"
-            "同一个桶；同一臂可再加 --shards <N> --shard-index <I> --shard-by dialogue "
+            "同一个桶；同一组可再加 --shards <N> --shard-index <I> --shard-by dialogue "
             "让多个进程并行回放，各进程只写自己对话的条目）；进度用 "
             f"python -m membench.cli task status {task_dir}",
             file=sys.stderr,
@@ -1453,7 +1453,7 @@ def _cmd_task_init(args: argparse.Namespace) -> int:
         print(
             f"[membench] 下一步: 各分片写进同一任务目录 —— "
             f"python -m membench.cli run --adapter <适配器> --dataset <数据集> "
-            f"--task-dir {first_arm} --shards <N> --shard-index <I> --shard-by dialogue"
+            f"--task-dir {first_group} --shards <N> --shard-index <I> --shard-by dialogue"
             f"（I 取 0..N-1）；进度用 python -m membench.cli task status {task_dir}",
             file=sys.stderr,
         )
@@ -1466,10 +1466,10 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
     target = os.path.abspath(args.dir)
     if not os.path.isdir(target):
         raise SystemExit(f"任务目录不存在: {args.dir}")
-    arms = _task_arm_roots(target)
-    arm_labels = [label for label, _ in arms if label]
-    if arm_labels:
-        skeleton = f"groups={len(arm_labels)}（{' '.join(f'{label}/' for label in arm_labels)} + {layout.DIR_REPORTS}/）"
+    groups = _task_group_roots(target)
+    group_labels_list = [label for label, _ in groups if label]
+    if group_labels_list:
+        skeleton = f"groups={len(group_labels_list)}（{' '.join(f'{label}/' for label in group_labels_list)} + {layout.DIR_REPORTS}/）"
     elif os.path.isdir(layout.runs_root(target)):
         skeleton = f"groups=1（{layout.DIR_RUNS}/ + {layout.DIR_REPORTS}/）"
     else:
@@ -1482,35 +1482,35 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
     is_replay_task = layout.has_snapshot_pool(layout.snapshot_task_root(target))
     for line in _snapshot_pool_lines(target):
         print(f"[membench] {line}")
-    if arm_labels:
+    if group_labels_list:
         # 任务根的 runtime 记的是 task init / evaluate / fuse / compare 等任务级命令；
         # 各组的 runtime 记写进该组的 run（分片）命令
         _print_runtime(target, "任务")
 
     next_steps: list[str] = []
     n_datasets = 0
-    arms_all_ready = True
-    for label, arm_root in arms:
+    groups_all_ready = True
+    for label, group_root in groups:
         where = f"组 {label}" if label else "单组实验目录"
-        print(f"[membench] {where}: {arm_root}")
-        _print_runtime(arm_root, f"组 {label}" if label else "")
-        datasets = _dataset_dirs_of(arm_root)
+        print(f"[membench] {where}: {group_root}")
+        _print_runtime(group_root, f"组 {label}" if label else "")
+        datasets = _dataset_dirs_of(group_root)
         if not datasets:
             print("[membench]   数据集: （尚无产物）")
-            arms_all_ready = False
+            groups_all_ready = False
             next_steps.append(
                 f"{where} 尚无产物：先跑分片，例如 python -m membench.cli run "
-                f"--adapter <适配器> --dataset <数据集> --task-dir {arm_root} "
+                f"--adapter <适配器> --dataset <数据集> --task-dir {group_root} "
                 f"--shards 2 --shard-index 0 --shard-by dialogue"
             )
             continue
-        arm_ready = True
+        group_ready = True
         for dataset_dir in datasets:
             n_datasets += 1
             name = os.path.basename(dataset_dir)
             metrics_path = os.path.join(dataset_dir, layout.DIR_REPORT, layout.FILE_METRICS)
             ready = os.path.isfile(metrics_path)
-            arm_ready = arm_ready and ready
+            group_ready = group_ready and ready
             ledger, error = _read_ledger_for_status(dataset_dir)
             if error is not None:
                 print(f"[membench]   数据集 {name}: ⚠️ {error}")
@@ -1558,13 +1558,13 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
                 if missing:
                     next_steps.append(
                         f"还有 {len(missing)} 片未完成（{'、'.join(missing)}）：补跑 "
-                        f"python -m membench.cli run --task-dir {arm_root} "
+                        f"python -m membench.cli run --task-dir {group_root} "
                         f"--shards {shards_n} --shard-index <I> --shard-by {shard_by}"
                     )
                 elif not running and not ready:
                     next_steps.append(
                         f"数据集 {name} 的分片已跑齐：补齐数据集级与任务级产物 "
-                        f"python -m membench.cli fuse --task-dir {arm_root}"
+                        f"python -m membench.cli fuse --task-dir {group_root}"
                     )
             if is_replay_task:
                 snapshot_text = "快照: 任务级池（见上）"
@@ -1576,11 +1576,11 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
                 f"对话目录 {len(_dialogue_dirs_of(dataset_dir))} 个；"
                 f"{snapshot_text}"
             )
-        arms_all_ready = arms_all_ready and arm_ready
+        groups_all_ready = groups_all_ready and group_ready
 
     if n_datasets == 0:
         next_steps.append("任务目录里还没有数据集产物——按上面的示例跑分片后再 status 看进度")
-    if len(arms) == 2 and arms_all_ready:
+    if len(groups) == 2 and groups_all_ready:
         next_steps.append(
             f"两组数据集级产物已齐备：python -m membench.cli compare --task-dir {target}"
         )

@@ -387,7 +387,7 @@ def test_replay_exports_to_task_pool_not_dialogue_dirs(tmp_path: Path) -> None:
     replay_dataset = _replay_run(tmp_path, name="replay", replay=exp)
     assert _metrics(replay_dataset)["state_snapshot"]["role"] == "replayed"
     assert not list(Path(replay_dataset).glob(f"*/{layout.DIR_SNAPSHOT}"))
-    # 池在实验目录（单臂任务根）下：两个对话各一个桶 + 各一个逐对话条目
+    # 池在实验目录（单组任务根）下：两个对话各一个桶 + 各一个逐对话条目
     task_dir = tmp_path / "replay"
     pool = task_dir / layout.DIR_SNAPSHOTS
     assert layout.has_snapshot_pool(str(task_dir))

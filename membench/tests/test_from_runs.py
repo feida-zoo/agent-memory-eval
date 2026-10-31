@@ -310,7 +310,7 @@ def test_metadata_inconsistency_note(tmp_path: Path, capsys: pytest.CaptureFixtu
 
 
 def test_evaluate_mixed_judge_rejected_before_run(tmp_path: Path) -> None:
-    """单臂汇总：judge 混用 → 跑前拒绝，且不创建报告目录。"""
+    """单组汇总：judge 混用 → 跑前拒绝，且不创建报告目录。"""
     _, _, runs = _make_runs(tmp_path)
     metrics_path = Path(runs["b"]) / "report" / "metrics.json"
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -377,7 +377,7 @@ def _make_compare(tmp_path: Path) -> tuple[dict[str, str], dict[str, str]]:
         specs=_specs(a, b),
     )
     ab_dir = Path(result["compare_dir"])
-    # A/B 两侧各是一个完整 eval 实验形态：产物在 <compare>/<arm>/runs/<dataset>/
+    # A/B 两侧各是一个完整 eval 实验形态：产物在 <compare>/<group>/runs/<dataset>/
     baseline = {k: str(ab_dir / "baseline" / "runs" / k) for k in ("a", "b")}
     candidate = {k: str(ab_dir / "candidate" / "runs" / k) for k in ("a", "b")}
     for target in (*baseline.values(), *candidate.values()):
@@ -403,10 +403,10 @@ def test_evaluate_compare_pure_aggregate(tmp_path: Path) -> None:
     assert "mock-weak vs mock-strong" in md
     assert result["verdict"] in ("PASS", "WARN", "FAIL")
     # 对比实验目录的形态：A/ 与 B/ 各含 runs/ + 任务级 reports/，对比报告落根层 reports/
-    for arm in ("baseline", "candidate"):
-        assert (ab_dir / arm / "reports" / "report.md").is_file()
+    for group in ("baseline", "candidate"):
+        assert (ab_dir / group / "reports" / "report.md").is_file()
         for key in ("a", "b"):
-            assert (ab_dir / arm / "runs" / key / "report" / "metrics.json").is_file()
+            assert (ab_dir / group / "runs" / key / "report" / "metrics.json").is_file()
     assert (ab_dir / "reports" / "fig_per_dataset_diff.png").is_file()
     assert (ab_dir / "reports" / "fig_fused_diff.png").is_file()
     assert "](fig_per_dataset_diff.png)" in md and "](fig_fused_diff.png)" in md
@@ -495,11 +495,11 @@ def test_sharded_ab_official_path(tmp_path: Path) -> None:
     assert result["verdict"] in ("PASS", "WARN", "FAIL")
     # 融合产物的数据集突进两侧各自的 runs/<dataset>/ 下，逐题明细随之带过来
     dataset_name = Path(SAMPLE_DATASET_PATH).stem
-    for arm in ("baseline", "candidate"):
-        dataset_dir = Path(result["compare_dir"]) / arm / "runs" / dataset_name
+    for group in ("baseline", "candidate"):
+        dataset_dir = Path(result["compare_dir"]) / group / "runs" / dataset_name
         assert (dataset_dir / "report" / "metrics.json").is_file()
         assert (dataset_dir / "report" / "results.jsonl").is_file()
-        assert (Path(result["compare_dir"]) / arm / "reports" / "report.md").is_file()
+        assert (Path(result["compare_dir"]) / group / "reports" / "report.md").is_file()
 
 
 def test_evaluate_compare_side_identity_unique(tmp_path: Path) -> None:
@@ -524,7 +524,7 @@ def test_evaluate_compare_side_identity_unique(tmp_path: Path) -> None:
 
 
 def test_evaluate_mixed_adapter_version_rejected(tmp_path: Path) -> None:
-    """单臂汇总：adapter_version 不一致 → 直接拒绝。"""
+    """单组汇总：adapter_version 不一致 → 直接拒绝。"""
     from membench.runner import Runner
 
     a = _write_dataset(tmp_path / "a.jsonl", "d_a", "q_a")

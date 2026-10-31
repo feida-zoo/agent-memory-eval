@@ -23,7 +23,7 @@ from membench.evaluate import DatasetResult, DatasetSpec, fuse_metrics
 from membench.evaluate_compare import (
     FIG_FUSED_DIFF,
     FIG_PER_DATASET_DIFF,
-    ArmDatasetResult,
+    GroupDatasetResult,
     _fused_diff,
     _fused_gates,
     _per_dataset_diff,
@@ -197,33 +197,33 @@ def _specs(mini: dict[str, Path]) -> list[DatasetSpec]:
     ]
 
 
-def _arm_results(arms: list[ArmDatasetResult], side: str) -> list[DatasetResult]:
-    """把双臂结果拆成某一侧的 DatasetResult 列表（``_side_fuse`` 的入参形态）。"""
+def _arm_results(groups: list[GroupDatasetResult], side: str) -> list[DatasetResult]:
+    """把双组结果拆成某一侧的 DatasetResult 列表（``_side_fuse`` 的入参形态）。"""
     out: list[DatasetResult] = []
-    for arm in arms:
+    for group in groups:
         if side == "baseline":
             out.append(
                 DatasetResult(
-                    spec=arm.spec,
-                    run_dir=arm.baseline_dataset_dir,
-                    metrics=arm.baseline,
-                    capabilities=arm.capabilities,
+                    spec=group.spec,
+                    run_dir=group.baseline_dataset_dir,
+                    metrics=group.baseline,
+                    capabilities=group.capabilities,
                 )
             )
         else:
             out.append(
                 DatasetResult(
-                    spec=arm.spec,
-                    run_dir=arm.candidate_dataset_dir,
-                    metrics=arm.candidate,
-                    capabilities=arm.capabilities,
+                    spec=group.spec,
+                    run_dir=group.candidate_dataset_dir,
+                    metrics=group.candidate,
+                    capabilities=group.capabilities,
                 )
             )
     return out
 
 
-def _build_arms(mini: dict[str, Path], scripts: dict[str, dict[str, tuple[str, list[str]]]]) -> list[ArmDatasetResult]:
-    """跑两侧真实 run 构造 ArmDatasetResult；两侧各占一个实验目录。"""
+def _build_arms(mini: dict[str, Path], scripts: dict[str, dict[str, tuple[str, list[str]]]]) -> list[GroupDatasetResult]:
+    """跑两侧真实 run 构造 GroupDatasetResult；两侧各占一个实验目录。"""
     base = ScriptedAdapter(scripts["baseline"], name="base")
     cand = ScriptedAdapter(scripts["candidate"], name="cand")
     from membench.evaluate import run_datasets
@@ -231,15 +231,15 @@ def _build_arms(mini: dict[str, Path], scripts: dict[str, dict[str, tuple[str, l
     root = mini["A"].parent
     specs = _specs(mini)
     base_results = run_datasets(
-        base, "heuristic", specs=specs, experiment_dir=str(root / "arm_base")
+        base, "heuristic", specs=specs, experiment_dir=str(root / "group_base")
     )
     cand_results = run_datasets(
-        cand, "heuristic", specs=specs, experiment_dir=str(root / "arm_cand")
+        cand, "heuristic", specs=specs, experiment_dir=str(root / "group_cand")
     )
-    arms: list[ArmDatasetResult] = []
+    groups: list[GroupDatasetResult] = []
     for b, c in zip(base_results, cand_results):
-        arms.append(
-            ArmDatasetResult(
+        groups.append(
+            GroupDatasetResult(
                 spec=b.spec,
                 baseline=b.metrics,
                 candidate=c.metrics,
@@ -248,14 +248,14 @@ def _build_arms(mini: dict[str, Path], scripts: dict[str, dict[str, tuple[str, l
                 capabilities=b.capabilities,
             )
         )
-    return arms
+    return groups
 
 
 def test_side_fuse_matches_side_metrics(mini_datasets, scripts) -> None:
     """_side_fuse 与 evaluate.fuse_metrics 在两侧应分别得到一致的融合值。"""
-    arms = _build_arms(mini_datasets, scripts)
-    base_results = _arm_results(arms, "baseline")
-    cand_results = _arm_results(arms, "candidate")
+    groups = _build_arms(mini_datasets, scripts)
+    base_results = _arm_results(groups, "baseline")
+    cand_results = _arm_results(groups, "candidate")
     fused_base, sources_base = _side_fuse(base_results)
     fused_cand, _ = _side_fuse(cand_results)
 
@@ -301,8 +301,8 @@ def test_fused_gates_skips_when_no_metrics() -> None:
 
 
 def test_per_dataset_diff_returns_one_row_per_dataset(mini_datasets, scripts) -> None:
-    arms = _build_arms(mini_datasets, scripts)
-    rows = _per_dataset_diff(arms)
+    groups = _build_arms(mini_datasets, scripts)
+    rows = _per_dataset_diff(groups)
     assert len(rows) == 3
     keys = [r["spec"].key for r in rows]
     assert keys == ["a", "b", "c"]
@@ -341,19 +341,19 @@ def test_evaluate_compare_writes_compare_layout(mini_datasets, scripts, tmp_path
     assert (reports / FIG_FUSED_DIFF).is_file()
 
     # 两组各是完整 eval 形态：runs/<dataset>/report/... + 任务级 reports/
-    for arm in ("baseline", "candidate"):
+    for group in ("baseline", "candidate"):
         for key in ("a", "b", "c"):
-            dataset_report = compare_dir / arm / layout.DIR_RUNS / key / layout.DIR_REPORT
+            dataset_report = compare_dir / group / layout.DIR_RUNS / key / layout.DIR_REPORT
             assert (dataset_report / layout.FILE_METRICS).is_file()
             assert (dataset_report / layout.FILE_RESULTS).is_file()
-        task_dir = compare_dir / arm / layout.DIR_REPORTS
+        task_dir = compare_dir / group / layout.DIR_REPORTS
         for name in (
             layout.FILE_REPORT_MD,
             layout.FILE_METRICS,
             layout.FILE_SUMMARY,
             layout.FIG_DATASET_OVERVIEW,
         ):
-            assert (task_dir / name).is_file(), f"{arm} 缺少 reports/{name}"
+            assert (task_dir / name).is_file(), f"{group} 缺少 reports/{name}"
 
     md = (reports / layout.FILE_COMPARISON_MD).read_text(encoding="utf-8")
     assert "**门禁结论：" in md
@@ -404,7 +404,7 @@ def test_evaluate_compare_precheck_failure_leaves_no_experiment_dir(
     ``report_out`` 下不留任何实验目录——连父目录都不建，更没有 A/B 半成品树。
     """
     monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(tmp_path / "output"))
-    arms = _build_arms(mini_datasets, scripts)
+    groups = _build_arms(mini_datasets, scripts)
     report_out = tmp_path / "out_precheck"
 
     with pytest.raises(SystemExit, match="补跑参数与已有 run 不一致"):
@@ -416,8 +416,8 @@ def test_evaluate_compare_precheck_failure_leaves_no_experiment_dir(
             tag="base_vs_cand",
             specs=_specs(mini_datasets),
             # 基线侧只复用 a：b / c 需补跑，补跑标注与已有产物不一致即拒绝
-            baseline_runs={arms[0].spec.key: arms[0].baseline_dataset_dir},
-            candidate_runs={arm.spec.key: arm.candidate_dataset_dir for arm in arms},
+            baseline_runs={groups[0].spec.key: groups[0].baseline_dataset_dir},
+            candidate_runs={group.spec.key: group.candidate_dataset_dir for group in groups},
             adapter_version_baseline="v9",
         )
 
@@ -594,10 +594,10 @@ def test_per_dataset_gates_flags_single_dataset_spike() -> None:
     且门禁明细包含 stale_rate_regression。
     """
     from membench.evaluate import DatasetSpec
-    from membench.evaluate_compare import ArmDatasetResult, _per_dataset_gates
+    from membench.evaluate_compare import GroupDatasetResult, _per_dataset_gates
 
-    arms = [
-        ArmDatasetResult(
+    groups = [
+        GroupDatasetResult(
             spec=DatasetSpec(key="a", name="A", path="x", source="builtin"),
             baseline={"overall": {"accuracy": 0.9, "stale_rate": 0.01, "latency_p95_ms": 100.0}},
             candidate={"overall": {"accuracy": 0.9, "stale_rate": 0.10, "latency_p95_ms": 100.0}},
@@ -605,7 +605,7 @@ def test_per_dataset_gates_flags_single_dataset_spike() -> None:
             candidate_dataset_dir="y",
         )
     ]
-    rows = _per_dataset_gates(arms, acc_threshold=0.02, stale_threshold=0.02, latency_warn=0.30)
+    rows = _per_dataset_gates(groups, acc_threshold=0.02, stale_threshold=0.02, latency_warn=0.30)
     assert len(rows) == 1
     assert rows[0]["verdict"] == "FAIL"
     assert any(g["name"] == "stale_rate_regression" for g in rows[0]["gates"])
@@ -749,7 +749,7 @@ def test_cli_evaluate_compare_dataset_flag(tmp_path, monkeypatch) -> None:
 def test_evaluate_compare_task_dir_in_place(
     mini_datasets, scripts, tmp_path, monkeypatch
 ) -> None:
-    """就地模式：两臂写 ``DIR/A`` ``DIR/B``，对比报告落 ``DIR/reports/``，不建 ``compare_*``。"""
+    """就地模式：两组写 ``DIR/A`` ``DIR/B``，对比报告落 ``DIR/reports/``，不建 ``compare_*``。"""
     monkeypatch.setenv("MEMBENCH_OUTPUT_DIR", str(tmp_path / "output"))
     base = tmp_path / "out"
     task = Path(layout.init_task_dir(str(base), "ab", platform="t"))
@@ -766,10 +766,10 @@ def test_evaluate_compare_task_dir_in_place(
     )
 
     assert result["compare_dir"] == str(task)
-    for arm in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
-        arm_dir = task / arm
+    for group in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
+        group_path = task / group
         for key in ("a", "b", "c"):
-            dataset_report = arm_dir / layout.DIR_RUNS / key / layout.DIR_REPORT
+            dataset_report = group_path / layout.DIR_RUNS / key / layout.DIR_REPORT
             assert (dataset_report / layout.FILE_METRICS).is_file()
             assert (dataset_report / layout.FILE_RESULTS).is_file()
         for name in (
@@ -778,12 +778,12 @@ def test_evaluate_compare_task_dir_in_place(
             layout.FILE_SUMMARY,
             layout.FIG_DATASET_OVERVIEW,
         ):
-            assert (arm_dir / layout.DIR_REPORTS / name).is_file(), f"{arm} 缺少 reports/{name}"
-        # 该臂自身就是一个完整单臂实验形态：summary 里的 experiment_dir 就是它
-        arm_summary = json.loads(
-            (arm_dir / layout.DIR_REPORTS / layout.FILE_SUMMARY).read_text(encoding="utf-8")
+            assert (group_path / layout.DIR_REPORTS / name).is_file(), f"{group} 缺少 reports/{name}"
+        # 该组自身就是一个完整单组实验形态：summary 里的 experiment_dir 就是它
+        group_summary = json.loads(
+            (group_path / layout.DIR_REPORTS / layout.FILE_SUMMARY).read_text(encoding="utf-8")
         )
-        assert Path(arm_summary["experiment_dir"]) == arm_dir
+        assert Path(group_summary["experiment_dir"]) == group_path
 
     reports = task / layout.DIR_REPORTS
     for name in (layout.FILE_COMPARISON_MD, FIG_PER_DATASET_DIFF, FIG_FUSED_DIFF):
@@ -848,16 +848,16 @@ def test_evaluate_compare_forwards_snapshot_to_both_sides(
 
 
 def _arm(name: str, a_cats: dict[str, tuple[int, float]], b_cats: dict[str, tuple[int, float]]):
-    """构造一个 ArmDatasetResult（只填 by_category 相关字段）。"""
+    """构造一个 GroupDatasetResult（只填 by_category 相关字段）。"""
     from membench.evaluate import DatasetSpec
-    from membench.evaluate_compare import ArmDatasetResult
+    from membench.evaluate_compare import GroupDatasetResult
 
     def by_cat(cats: dict[str, tuple[int, float]]) -> dict:
         return {
             cat: {"n": n, "accuracy": acc, "token_f1": None} for cat, (n, acc) in cats.items()
         }
 
-    return ArmDatasetResult(
+    return GroupDatasetResult(
         spec=DatasetSpec(key=name, name=name, path=f"/data/{name}.jsonl", source="fetch"),
         baseline={"by_category": by_cat(a_cats)},
         candidate={"by_category": by_cat(b_cats)},
@@ -870,7 +870,7 @@ def test_top_improved_categories_orders_and_filters() -> None:
     """TOP 榜：按 Δ 降序；小样本（<10 题）与负向改进不进榜。"""
     from membench.evaluate_compare import top_improved_categories
 
-    arms = [
+    groups = [
         _arm(
             "X",
             {"single_hop": (100, 0.50), "multi_hop": (5, 0.0)},
@@ -882,7 +882,7 @@ def test_top_improved_categories_orders_and_filters() -> None:
             {"temporal": (20, 0.75), "abstention": (30, 0.50)},
         ),
     ]
-    top = top_improved_categories(arms)
+    top = top_improved_categories(groups)
     assert [(item["dataset"], item["category"]) for item in top] == [
         ("X", "single_hop"),
         ("Y", "temporal"),
@@ -898,8 +898,8 @@ def test_top_improved_categories_orders_and_filters() -> None:
 def test_top_improved_categories_empty_when_all_small() -> None:
     from membench.evaluate_compare import top_improved_categories
 
-    arms = [_arm("X", {"single_hop": (3, 0.0)}, {"single_hop": (3, 1.0)})]
-    assert top_improved_categories(arms) == []
+    groups = [_arm("X", {"single_hop": (3, 0.0)}, {"single_hop": (3, 1.0)})]
+    assert top_improved_categories(groups) == []
 
 
 def test_top_improved_categories_respects_limit() -> None:

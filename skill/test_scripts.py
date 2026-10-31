@@ -425,7 +425,7 @@ def test_eval_common_dry_run_passes_trace_state(
     assert "--trace-state" in shlex.split(line)
 
 
-def test_ab_dry_run_arm_and_compare_order(
+def test_ab_dry_run_group_and_compare_order(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """ab --shards 2：基线组两片 → fuse → 候选组两片 → fuse → compare strict 最后。"""
@@ -825,8 +825,8 @@ def test_ab_common_dry_run_covers_both_arms(
         path = str((datasets / f"{key}.jsonl").resolve())
         hits = [line for line in run_lines if f"--dataset {path}" in line]
         assert len(hits) == 2, f"{key}: {hits}"
-        arms = {line.split("--task-dir ")[1].split()[0] for line in hits}
-        assert arms == {"$TASK/baseline", "$TASK/candidate"}
+        groups = {line.split("--task-dir ")[1].split()[0] for line in hits}
+        assert groups == {"$TASK/baseline", "$TASK/candidate"}
     compare_line = next(
         line for line in out.splitlines() if "-m membench.cli evaluate-compare" in line
     )
@@ -959,7 +959,7 @@ def test_run_task_task_dir_requires_skeleton(
     empty.mkdir()
     code = run_task.main(_background_eval_argv(tmp_path, "--task-dir", str(empty), "--dry-run"))
     assert code == run_task.EXIT_FLOW_FAIL
-    assert "不是 arms=1 的任务目录" in capsys.readouterr().err
+    assert "不是 groups=1 的任务目录" in capsys.readouterr().err
 
 
 def test_watch_task_format_and_json(
@@ -979,7 +979,7 @@ def test_watch_task_format_and_json(
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload["task"] == str(task)
     assert payload["orchestrator"]["status"] == "done"
-    assert payload["arms"][0]["datasets"][0]["ready"] is True
+    assert payload["groups"][0]["datasets"][0]["ready"] is True
     assert payload["snapshot_pool"] is None
     assert payload["done"] is True and payload["ok"] is True
 

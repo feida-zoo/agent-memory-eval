@@ -3,9 +3,9 @@
 回放（``--replay``）在恢复每个对话之后、第一道 query 之前把状态导出到**任务级**
 内容寻址池 ``<任务>/snapshots/``：桶名 = 状态内容 sha256 前 12 位（内容哈希沿用
 ``snapshot.dir_sha256``，排除 manifest 自身），每个对话一个**自足条目文件**
-``snapshots/entries/<臂>/<数据集>/<对话>.json``（真源），``snapshots/index.json``
+``snapshots/entries/<组>/<数据集>/<对话>.json``（真源），``snapshots/index.json``
 由条目 + 桶清单重算（派生视图，fuse / task status 收尾刷新）。A/B 回放同一源时
-两臂指向同一批桶（只存一份），内容不同则各存一份——差异本身就是"回放不保真"的证据。
+两组指向同一批桶（只存一份），内容不同则各存一份——差异本身就是"回放不保真"的证据。
 
 条目一对话一文件，对话级分片的各进程只写自己的对话；桶落位只靠一次原子
 ``os.replace`` 判"新建 / 复用" ⇒ 并行回放无锁，这里用**真子进程**两片并跑来验证。
@@ -188,15 +188,15 @@ def _replay(
     return Path(out)
 
 
-def _init_task(base: Path, name: str, *, arms: int = 2, replay: bool = True) -> Path:
+def _init_task(base: Path, name: str, *, groups: int = 2, replay: bool = True) -> Path:
     """``task init``（或 layout 的同一入口），返回任务目录。stdout 只允许一行路径。"""
     if replay:
-        task = layout.init_task_dir(str(base), name, "t", arms=arms, replay=True)
+        task = layout.init_task_dir(str(base), name, "t", groups=groups, replay=True)
         return Path(task)
     buffer = io.StringIO()
     with redirect_stdout(buffer):
         assert cli.main(["task", "init", "--name", name, "--platform", "t",
-                         "--report-out", str(base), "--groups", str(arms)]) == 0
+                         "--report-out", str(base), "--groups", str(groups)]) == 0
     return Path(buffer.getvalue().strip())
 
 
@@ -205,19 +205,19 @@ def _index(task: Path) -> dict:
     return layout.materialize_snapshot_index(str(task / layout.DIR_SNAPSHOTS))
 
 
-def _entry_path(task: Path, arm: str, dialogue_id: str) -> Path:
-    """逐对话条目文件路径（``snapshots/entries/<臂>/<数据集>/<对话>.json``）。"""
+def _entry_path(task: Path, group: str, dialogue_id: str) -> Path:
+    """逐对话条目文件路径（``snapshots/entries/<组>/<数据集>/<对话>.json``）。"""
     return Path(
         layout.snapshot_entry_path(
-            str(task / layout.DIR_SNAPSHOTS), arm, DATASET, dialogue_id
+            str(task / layout.DIR_SNAPSHOTS), group, DATASET, dialogue_id
         )
     )
 
 
-def _entries(task: Path, arm: str) -> dict[str, dict]:
-    """某臂的全部条目：``{对话 id: 条目内容}``（按文件路径读，不经过索引）。"""
+def _entries(task: Path, group: str) -> dict[str, dict]:
+    """某组的全部条目：``{对话 id: 条目内容}``（按文件路径读，不经过索引）。"""
     root = task / layout.DIR_SNAPSHOTS / layout.DIR_SNAPSHOT_ENTRIES / (
-        layout.snapshot_arm_segment(arm)
+        layout.snapshot_arm_segment(group)
     )
     if not root.is_dir():
         return {}
@@ -246,7 +246,7 @@ def _run_cli(argv: list[str]) -> tuple[str, str, int]:
 
 
 def test_task_init_replay_builds_snapshots_dir(tmp_path: Path) -> None:
-    """双臂回放任务骨架 {A,B,reports,snapshots}；单臂 {runs,reports,snapshots}。"""
+    """双组回放任务骨架 {A,B,reports,snapshots}；单组 {runs,reports,snapshots}。"""
     base = tmp_path / "out"
     out, err, code = _run_cli(
         ["task", "init", "--name", "ab", "--platform", "t", "--report-out", str(base),
@@ -266,26 +266,26 @@ def test_task_init_replay_builds_snapshots_dir(tmp_path: Path) -> None:
     ]
     assert "snapshots/" in err and "--replay" in err
 
-    single = _init_task(base, "one", arms=1)
+    single = _init_task(base, "one", groups=1)
     assert sorted(path.name for path in single.iterdir()) == ["reports", "runs", "snapshots"]
 
 
 def test_task_init_without_replay_has_no_snapshots_dir(tmp_path: Path) -> None:
     """不带 --replay 时行为不变：不建 snapshots/（普通任务不落池）。"""
-    task = _init_task(tmp_path / "out", "plain", arms=2, replay=False)
+    task = _init_task(tmp_path / "out", "plain", groups=2, replay=False)
     assert sorted(path.name for path in task.iterdir()) == ["baseline", "candidate", "groups.json", "reports", "runtime"]
 
 
 # ---------------------------------------------------------------------------
-# 单臂回放：桶 + 索引
+# 单组回放：桶 + 索引
 # ---------------------------------------------------------------------------
 
 
 def test_single_arm_replay_exports_content_addressed_pool(tmp_path: Path) -> None:
-    """单臂回放：逐对话落桶与条目、派生索引三段齐备、metrics 记 snapshots_dir 与计数。"""
+    """单组回放：逐对话落桶与条目、派生索引三段齐备、metrics 记 snapshots_dir 与计数。"""
     dataset = _dataset(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    task = _init_task(tmp_path / "out", "solo", arms=1)
+    task = _init_task(tmp_path / "out", "solo", groups=1)
 
     dataset_dir = _replay(
         tmp_path, name="replay", out_dir=task, replay=source, dataset=dataset
@@ -305,7 +305,7 @@ def test_single_arm_replay_exports_content_addressed_pool(tmp_path: Path) -> Non
         entry = entries[dialogue_id]
         digest = index["entries"][layout.snapshot_entry_key("", DATASET, dialogue_id)]
         assert entry["digest"] == digest
-        assert entry["arm"] == "" and entry["dataset"] == DATASET
+        assert entry["group"] == "" and entry["dataset"] == DATASET
         assert entry["state_sha256"] == index["buckets"][digest]["state_sha256"]
         assert entry["bytes"] == index["buckets"][digest]["bytes"]
         assert entry["n_files"] >= 1
@@ -327,9 +327,9 @@ def test_single_arm_replay_exports_content_addressed_pool(tmp_path: Path) -> Non
         assert manifest["source"]["replay_mode"] == "restore"
         assert manifest["source"]["source_manifest_sha256"]
 
-    arm = index["arms"][""]
-    assert arm["source"] == str(source)
-    assert (arm["n_dialogues"], arm["n_reused"], arm["n_new"]) == (2, 0, 2)
+    group = index["groups"][""]
+    assert group["source"] == str(source)
+    assert (group["n_dialogues"], group["n_reused"], group["n_new"]) == (2, 0, 2)
 
     state = _metrics(dataset_dir)["state_snapshot"]
     assert state["role"] == "replayed"
@@ -342,21 +342,21 @@ def test_single_arm_replay_exports_content_addressed_pool(tmp_path: Path) -> Non
 
 
 # ---------------------------------------------------------------------------
-# 两臂
+# 两组
 # ---------------------------------------------------------------------------
 
 
 def test_two_arms_same_source_share_one_bucket_per_dialogue(tmp_path: Path) -> None:
-    """A/B 回放同一源：只产生一份桶，两臂在索引里指向同一 digest，status 报"共用"。"""
+    """A/B 回放同一源：只产生一份桶，两组在索引里指向同一 digest，status 报"共用"。"""
     dataset = _dataset(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    task = _init_task(tmp_path / "out", "ab", arms=2)
+    task = _init_task(tmp_path / "out", "ab", groups=2)
 
     _replay(tmp_path, name="a", out_dir=task / layout.DIR_GROUP_BASELINE, replay=source, dataset=dataset)
     buckets_after_a = [path.name for path in _bucket_dirs(task)]
     _replay(tmp_path, name="b", out_dir=task / layout.DIR_GROUP_CANDIDATE, replay=source, dataset=dataset)
 
-    # B 臂没有新增桶：状态内容一致 → 复用 A 臂写下的桶
+    # B 组没有新增桶：状态内容一致 → 复用 A 组写下的桶
     assert [path.name for path in _bucket_dirs(task)] == buckets_after_a
     assert len(buckets_after_a) == 2
 
@@ -365,10 +365,10 @@ def test_two_arms_same_source_share_one_bucket_per_dialogue(tmp_path: Path) -> N
         digest_a = index["entries"][layout.snapshot_entry_key("baseline", DATASET, dialogue_id)]
         digest_b = index["entries"][layout.snapshot_entry_key("candidate", DATASET, dialogue_id)]
         assert digest_a == digest_b
-    assert index["arms"]["baseline"]["n_new"] == 2 and index["arms"]["baseline"]["n_reused"] == 0
-    assert index["arms"]["candidate"]["n_new"] == 0 and index["arms"]["candidate"]["n_reused"] == 2
+    assert index["groups"]["baseline"]["n_new"] == 2 and index["groups"]["baseline"]["n_reused"] == 0
+    assert index["groups"]["candidate"]["n_new"] == 0 and index["groups"]["candidate"]["n_reused"] == 2
 
-    # 条目也是两臂各一份：A 新写、B 复用同一个桶
+    # 条目也是两组各一份：A 新写、B 复用同一个桶
     entries_a = _entries(task, layout.DIR_GROUP_BASELINE)
     entries_b = _entries(task, layout.DIR_GROUP_CANDIDATE)
     assert sorted(entries_a) == ["d1", "d2"] and sorted(entries_b) == ["d1", "d2"]
@@ -380,16 +380,16 @@ def test_two_arms_same_source_share_one_bucket_per_dialogue(tmp_path: Path) -> N
     out, _err, code = _run_cli(["task", "status", str(task)])
     assert code == 0
     assert "2 个桶" in out
-    assert "A 臂与 B 臂快照 2/2 逐对话一致（共用 2 个桶）" in out
+    assert "A 组与 B 组快照 2/2 逐对话一致（共用 2 个桶）" in out
 
 
 def test_two_arms_different_sources_keep_separate_buckets(tmp_path: Path) -> None:
-    """两臂回放不同源：内容不同 → 各存一份桶，status 列出差异对话数。"""
+    """两组回放不同源：内容不同 → 各存一份桶，status 列出差异对话数。"""
     dataset_a = _dataset(tmp_path / "a" / "ds.jsonl", marker="（甲）")
     dataset_b = _dataset(tmp_path / "b" / "ds.jsonl", marker="（乙）")
     source_a = _full_run(tmp_path, name="src-a", dataset=dataset_a)
     source_b = _full_run(tmp_path, name="src-b", dataset=dataset_b)
-    task = _init_task(tmp_path / "out", "ab", arms=2)
+    task = _init_task(tmp_path / "out", "ab", groups=2)
 
     _replay(tmp_path, name="a", out_dir=task / layout.DIR_GROUP_BASELINE, replay=source_a, dataset=dataset_a)
     _replay(tmp_path, name="b", out_dir=task / layout.DIR_GROUP_CANDIDATE, replay=source_b, dataset=dataset_b)
@@ -403,7 +403,7 @@ def test_two_arms_different_sources_keep_separate_buckets(tmp_path: Path) -> Non
 
     out, _err, code = _run_cli(["task", "status", str(task)])
     assert code == 0
-    assert "A 臂与 B 臂快照有差异" in out
+    assert "A 组与 B 组快照有差异" in out
     assert "内容不同 2" in out
 
 
@@ -416,7 +416,7 @@ def test_no_snapshot_replay_writes_no_pool(tmp_path: Path) -> None:
     """--no-snapshot 回放：不写桶、不写索引，metrics 也不声称有池。"""
     dataset = _dataset(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    task = _init_task(tmp_path / "out", "solo", arms=1)
+    task = _init_task(tmp_path / "out", "solo", groups=1)
 
     dataset_dir = _replay(
         tmp_path, name="replay", out_dir=task, replay=source, dataset=dataset, snapshot=False
@@ -433,18 +433,18 @@ def test_chained_replay_from_replay_task(tmp_path: Path) -> None:
     """链式回放：run --task-dir <task2>/A --replay <task1>/A（源是上一轮回放任务）。"""
     dataset = _dataset(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    task1 = _init_task(tmp_path / "out", "first", arms=2)
+    task1 = _init_task(tmp_path / "out", "first", groups=2)
     _replay(
         tmp_path, name="t1-a", out_dir=task1 / layout.DIR_GROUP_BASELINE, replay=source, dataset=dataset
     )
 
-    task2 = _init_task(tmp_path / "out", "second", arms=2)
+    task2 = _init_task(tmp_path / "out", "second", groups=2)
     dataset_dir = _replay(
         tmp_path, name="t2-a", out_dir=task2 / layout.DIR_GROUP_BASELINE,
         replay=task1 / layout.DIR_GROUP_BASELINE, dataset=dataset,
     )
 
-    # 源解析走了池：记录用的是哪个任务 / 哪个臂
+    # 源解析走了池：记录用的是哪个任务 / 哪个组
     state = _metrics(dataset_dir)["state_snapshot"]
     assert state["root"] == str(task1 / layout.DIR_GROUP_BASELINE)
 
@@ -455,11 +455,11 @@ def test_chained_replay_from_replay_task(tmp_path: Path) -> None:
         ).read_text(encoding="utf-8")
     )
     assert bucket_manifest["source"]["source_pool"] == str(task1 / layout.DIR_SNAPSHOTS)
-    assert bucket_manifest["source"]["source_arm"] == layout.DIR_GROUP_BASELINE
+    assert bucket_manifest["source"]["source_group"] == layout.DIR_GROUP_BASELINE
     assert len(_bucket_dirs(task2)) == 2
 
-    # 单臂任务根作源（索引里只有一个臂）也自动可用
-    task3 = _init_task(tmp_path / "out", "third", arms=2)
+    # 单组任务根作源（索引里只有一个组）也自动可用
+    task3 = _init_task(tmp_path / "out", "third", groups=2)
     _replay(
         tmp_path, name="t3-a", out_dir=task3 / layout.DIR_GROUP_BASELINE,
         replay=task1, dataset=dataset,
@@ -467,14 +467,14 @@ def test_chained_replay_from_replay_task(tmp_path: Path) -> None:
     assert len(_bucket_dirs(task3)) == 2
 
 
-def test_multi_arm_task_root_as_source_requires_arm_dir(tmp_path: Path) -> None:
-    """任务根有多个臂时拒绝并提示改传具体臂目录（两臂状态可能不同）。"""
+def test_multi_arm_task_root_as_source_requires_group_path(tmp_path: Path) -> None:
+    """任务根有多个组时拒绝并提示改传具体组目录（两组状态可能不同）。"""
     dataset = _dataset(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    task = _init_task(tmp_path / "out", "ab", arms=2)
-    for arm in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
+    task = _init_task(tmp_path / "out", "ab", groups=2)
+    for group in (layout.DIR_GROUP_BASELINE, layout.DIR_GROUP_CANDIDATE):
         _replay(
-            tmp_path, name=f"m-{arm}", out_dir=task / arm, replay=source, dataset=dataset
+            tmp_path, name=f"m-{group}", out_dir=task / group, replay=source, dataset=dataset
         )
 
     with pytest.raises(SystemExit, match="有 2 个组") as excinfo:
@@ -487,7 +487,7 @@ def test_missing_bucket_and_corrupt_entry_are_reported(tmp_path: Path) -> None:
     """池源不全时拒绝：条目指向的桶缺失 / 条目损坏都给出可操作的报错。"""
     dataset = _dataset(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    task = _init_task(tmp_path / "out", "first", arms=2)
+    task = _init_task(tmp_path / "out", "first", groups=2)
     _replay(tmp_path, name="t1-a", out_dir=task / layout.DIR_GROUP_BASELINE, replay=source, dataset=dataset)
 
     dropped = _bucket_dirs(task)[0]
@@ -520,11 +520,11 @@ def test_bucket_hash_collision_is_rejected(tmp_path: Path) -> None:
     """同名桶内容哈希对不上（前缀撞车 / 桶被改）：拒绝，不静默复用。"""
     dataset = _dataset(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    first = _init_task(tmp_path / "out", "first", arms=1)
+    first = _init_task(tmp_path / "out", "first", groups=1)
     _replay(tmp_path, name="first", out_dir=first, replay=source, dataset=dataset)
 
     bucket = _bucket_dirs(first)[0]
-    second = _init_task(tmp_path / "out", "second", arms=1)
+    second = _init_task(tmp_path / "out", "second", groups=1)
     copied = _copy_bucket(first, bucket, second)
     manifest = json.loads((copied / snapshot_mod.MANIFEST_NAME).read_text(encoding="utf-8"))
     manifest["entry"]["sha256"] = "0" * 64
@@ -540,11 +540,11 @@ def test_bucket_corrupt_manifest_is_rejected(tmp_path: Path) -> None:
     """桶内清单损坏：报"快照清单损坏"，而不是当成可复用桶。"""
     dataset = _dataset(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    first = _init_task(tmp_path / "out", "first", arms=1)
+    first = _init_task(tmp_path / "out", "first", groups=1)
     _replay(tmp_path, name="first", out_dir=first, replay=source, dataset=dataset)
 
     bucket = _bucket_dirs(first)[0]
-    second = _init_task(tmp_path / "out", "second", arms=1)
+    second = _init_task(tmp_path / "out", "second", groups=1)
     copied = _copy_bucket(first, bucket, second)
     (copied / snapshot_mod.MANIFEST_NAME).write_text("{broken", encoding="utf-8")
 
@@ -561,7 +561,7 @@ def test_entry_overwrite_must_keep_same_digest(tmp_path: Path) -> None:
     """同一对话重复写条目按"覆盖自己的条目"处理，但 digest 变了必须报错。"""
     dataset = _dataset(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    task = _init_task(tmp_path / "out", "solo", arms=1)
+    task = _init_task(tmp_path / "out", "solo", groups=1)
     _replay(tmp_path, name="replay", out_dir=task, replay=source, dataset=dataset)
 
     pool = str(task / layout.DIR_SNAPSHOTS)
@@ -583,7 +583,7 @@ def test_materialize_snapshot_index_is_idempotent(tmp_path: Path) -> None:
     """派生索引连跑两次结果一致（同字节落盘），且等于 build 的纯计算结果。"""
     dataset = _dataset(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    task = _init_task(tmp_path / "out", "solo", arms=1)
+    task = _init_task(tmp_path / "out", "solo", groups=1)
     _replay(tmp_path, name="replay", out_dir=task, replay=source, dataset=dataset)
 
     pool = str(task / layout.DIR_SNAPSHOTS)
@@ -604,7 +604,7 @@ def test_legacy_pool_without_entries_still_replays(tmp_path: Path) -> None:
     """旧产物（只有 index.json、没有 entries/）仍可作 --replay 源。"""
     dataset = _dataset(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    first = _init_task(tmp_path / "out", "first", arms=2)
+    first = _init_task(tmp_path / "out", "first", groups=2)
     _replay(
         tmp_path, name="t1-a", out_dir=first / layout.DIR_GROUP_BASELINE,
         replay=source, dataset=dataset,
@@ -621,7 +621,7 @@ def test_legacy_pool_without_entries_still_replays(tmp_path: Path) -> None:
     assert "2 个桶" in out
     assert layout.read_snapshot_index(str(first / layout.DIR_SNAPSHOTS)) == legacy_index
 
-    second = _init_task(tmp_path / "out", "second", arms=1)
+    second = _init_task(tmp_path / "out", "second", groups=1)
     _replay(
         tmp_path, name="t2", out_dir=second,
         replay=first / layout.DIR_GROUP_BASELINE, dataset=dataset,
@@ -634,7 +634,7 @@ def test_entry_tree_wins_over_stale_or_corrupt_index(tmp_path: Path) -> None:
     """条目齐全时完全不读 index.json：索引坏了也能回放，status 还会顺手重建它。"""
     dataset = _dataset(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    task = _init_task(tmp_path / "out", "first", arms=2)
+    task = _init_task(tmp_path / "out", "first", groups=2)
     _replay(
         tmp_path, name="t1-a", out_dir=task / layout.DIR_GROUP_BASELINE,
         replay=source, dataset=dataset,
@@ -643,7 +643,7 @@ def test_entry_tree_wins_over_stale_or_corrupt_index(tmp_path: Path) -> None:
     index_path.write_text("{not json", encoding="utf-8")
 
     # 条目齐全：回放成功（不碰坏索引）
-    second = _init_task(tmp_path / "out", "second", arms=1)
+    second = _init_task(tmp_path / "out", "second", groups=1)
     _replay(
         tmp_path, name="t2", out_dir=second,
         replay=task / layout.DIR_GROUP_BASELINE, dataset=dataset,
@@ -668,7 +668,7 @@ def test_entry_tree_wins_over_stale_or_corrupt_index(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 真并发：两个分片进程同时回放到同一任务目录的同一臂
+# 真并发：两个分片进程同时回放到同一任务目录的同一组
 # ---------------------------------------------------------------------------
 
 #: 子进程用的文件型适配器（放进 MEMBENCH_ADAPTERS_DIR，经持久化适配器机制加载）。
@@ -799,18 +799,18 @@ def test_parallel_sharded_replay_writes_one_entry_per_dialogue(tmp_path: Path) -
     """两个分片进程并行回放：桶数 / 条目数正确，fuse 物化索引后两片一致。"""
     dataset = _dataset(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    task = _init_task(tmp_path / "out", "par", arms=2)
+    task = _init_task(tmp_path / "out", "par", groups=2)
     _install_plugin()
 
-    arm_a = task / layout.DIR_GROUP_BASELINE
+    group_a = task / layout.DIR_GROUP_BASELINE
     processes = [
-        _spawn_shard(tmp_path, dataset=dataset, task=arm_a, source=source, shard_index=index)
+        _spawn_shard(tmp_path, dataset=dataset, task=group_a, source=source, shard_index=index)
         for index in (0, 1)
     ]
     _wait_shards(processes)
 
     # 分片账本必须两片齐全（并行写账本不能丢条目）
-    ledger = layout.read_shard_ledger(str(arm_a / layout.DIR_RUNS / DATASET))
+    ledger = layout.read_shard_ledger(str(group_a / layout.DIR_RUNS / DATASET))
     assert ledger is not None
     assert sorted(ledger["entries"]) == ["s0", "s1"]
     assert all(entry["status"] == "done" for entry in ledger["entries"].values())
@@ -821,13 +821,13 @@ def test_parallel_sharded_replay_writes_one_entry_per_dialogue(tmp_path: Path) -
     assert all(entry["reused"] is False for entry in entries.values())
 
     # fuse 是分片流程的收尾：物化派生索引，两片信息合到同一份视图
-    _out, err, code = _run_cli(["fuse", "--task-dir", str(arm_a)])
+    _out, err, code = _run_cli(["fuse", "--task-dir", str(group_a)])
     assert code == 0, err
     index = json.loads(
         (task / layout.DIR_SNAPSHOTS / layout.FILE_SNAPSHOT_INDEX).read_text(encoding="utf-8")
     )
     assert len(index["buckets"]) == 2
-    assert index["arms"][layout.DIR_GROUP_BASELINE]["n_dialogues"] == 2
+    assert index["groups"][layout.DIR_GROUP_BASELINE]["n_dialogues"] == 2
     assert index["entries"] == {
         layout.snapshot_entry_key(layout.DIR_GROUP_BASELINE, DATASET, dialogue_id): entries[dialogue_id][
             "digest"
@@ -880,12 +880,12 @@ def test_parallel_shards_racing_on_same_bucket_reuse_it(tmp_path: Path) -> None:
     """两片恰好导出相同内容：只产生一个桶，另一片经 os.replace 失败路径记复用。"""
     dataset = _dataset_same_state(tmp_path / "ds.jsonl")
     source = _full_run(tmp_path, name="src", dataset=dataset)
-    task = _init_task(tmp_path / "out", "race", arms=2)
+    task = _init_task(tmp_path / "out", "race", groups=2)
     _install_plugin()
 
-    arm_a = task / layout.DIR_GROUP_BASELINE
+    group_a = task / layout.DIR_GROUP_BASELINE
     processes = [
-        _spawn_shard(tmp_path, dataset=dataset, task=arm_a, source=source, shard_index=index)
+        _spawn_shard(tmp_path, dataset=dataset, task=group_a, source=source, shard_index=index)
         for index in (0, 1)
     ]
     _wait_shards(processes)
@@ -900,5 +900,5 @@ def test_parallel_shards_racing_on_same_bucket_reuse_it(tmp_path: Path) -> None:
 
     index = layout.materialize_snapshot_index(str(task / layout.DIR_SNAPSHOTS))
     assert len(index["buckets"]) == 1
-    arm = index["arms"][layout.DIR_GROUP_BASELINE]
-    assert (arm["n_dialogues"], arm["n_reused"], arm["n_new"]) == (2, 1, 1)
+    group = index["groups"][layout.DIR_GROUP_BASELINE]
+    assert (group["n_dialogues"], group["n_reused"], group["n_new"]) == (2, 1, 1)

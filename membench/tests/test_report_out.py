@@ -197,7 +197,7 @@ def test_cli_run_report_out_subdir(tmp_path: Path) -> None:
 def test_cli_compare_report_out_subdir(tmp_path: Path) -> None:
     """compare --report-out：DIR/compare_<name>_<platform>_<ts>/ 含 A/B 完整产物与对比报告。
 
-    A 臂传实验目录、B 臂传数据集目录——两种「产物目录」入参形态都要能解析。
+    A 组传实验目录、B 组传数据集目录——两种「产物目录」入参形态都要能解析。
     """
     exp_a = tmp_path / "exp_a"
     _run(exp_a)
@@ -230,22 +230,22 @@ def test_cli_compare_report_out_subdir(tmp_path: Path) -> None:
     assert "](fig_category_diff.png)" in comparison
 
     # A / B 各为完整评测实验形态：runs/<dataset>/report/... + 任务级 reports/
-    for arm in ("baseline", "candidate"):
-        arm_dir = cmp_dir / arm
-        assert sorted(p.name for p in arm_dir.iterdir()) == ["reports", "runs"]
+    for group in ("baseline", "candidate"):
+        group_path = cmp_dir / group
+        assert sorted(p.name for p in group_path.iterdir()) == ["reports", "runs"]
         for fname in ("report.md", "metrics.json", "fig_category_accuracy.png"):
-            assert (arm_dir / "reports" / fname).is_file(), f"{arm} 任务级报告缺少 {fname}"
-        dataset_dir = arm_dir / "runs" / "sample_dataset"
+            assert (group_path / "reports" / fname).is_file(), f"{group} 任务级报告缺少 {fname}"
+        dataset_dir = group_path / "runs" / "sample_dataset"
         for fname in ("report.md", "metrics.json", "results.jsonl"):
-            assert (dataset_dir / "report" / fname).is_file(), f"{arm} 数据集报告缺少 {fname}"
+            assert (dataset_dir / "report" / fname).is_file(), f"{group} 数据集报告缺少 {fname}"
         # 对话级产物随副本整体搬运
         assert (dataset_dir / "d001" / "report" / "metrics.json").is_file()
 
-    # A 臂是实验目录入参：整树原样复制
+    # A 组是实验目录入参：整树原样复制
     assert (cmp_dir / "baseline" / "reports" / "report.md").read_text(
         encoding="utf-8"
     ) == (exp_a / "reports" / "report.md").read_text(encoding="utf-8")
-    # B 臂是数据集目录入参：先构造 runs/<dataset>/，再据数据集报告补任务级 reports/
+    # B 组是数据集目录入参：先构造 runs/<dataset>/，再据数据集报告补任务级 reports/
     assert (cmp_dir / "candidate" / "reports" / "metrics.json").read_text(
         encoding="utf-8"
     ) == (dataset_b / "report" / "metrics.json").read_text(encoding="utf-8")
