@@ -405,3 +405,77 @@ def test_evaluate_report_shows_per_dataset_and_pooled(tmp_path: Path) -> None:
     assert "**池化（基准集，Σ分子/Σ分母）**" in report
     # plain 没有三支柱题型（无 official 块）→ 列进"未纳入官方口径"
     assert "未纳入官方口径：plain" in report
+
+
+def test_evaluate_task_report_lists_worst_categories_per_dataset(tmp_path: Path) -> None:
+    """任务级报告也要给「最需要优化的题型」——否则排查得挨个数据集翻。"""
+    from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
+    from membench.evaluate import DatasetSpec, evaluate
+
+    class _Adapter(BaseMemoryAdapter):
+        name = "worst-eval"
+
+        def reset(self) -> None:
+            return None
+
+        def ingest(self, messages: list[dict]) -> IngestStats:
+            return IngestStats()
+
+        def query(self, question: str) -> QueryResult:
+            return QueryResult(answer="不知道", retrieved=[])
+
+    def write(path: Path, questions: list[dict]) -> Path:
+        path.write_text(
+            json.dumps(
+                {
+                    "dialogue_id": "d1",
+                    "sessions": [[{"role": "user", "content": "记一下。", "timestamp": None}]],
+                    "questions": questions,
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def q(qid: str, cat: str) -> dict:
+        return {
+            "qid": qid,
+            "question": f"{qid}？",
+            "gold_answer": "不知道",
+            "category": cat,
+            "evidence": [],
+        }
+
+    big = write(tmp_path / "big.jsonl", [q(f"b{i}", "utility_answer") for i in range(12)])
+    small = write(tmp_path / "small.jsonl", [q(f"s{i}", "single_hop") for i in range(3)])
+    specs = [
+        DatasetSpec(key="big", name="big", path=str(big), source="fetch"),
+        DatasetSpec(key="small", name="small", path=str(small), source="fetch"),
+    ]
+    report_out = tmp_path / "out"
+    assert evaluate(adapter=_Adapter(), judge="heuristic", specs=specs, report_out=str(report_out)) == 0
+    report = next(report_out.glob("*/reports/report.md")).read_text(encoding="utf-8")
+    assert "## 最需要优化的题型（按数据集" in report
+    # 大题量数据集出具体题型行；小样本数据集给说明（不是静默省略）
+    assert "| big | 实用-应答（utility_answer） | 12 |" in report
+    assert "（无题量 ≥ 10 的题型）" in report
+
+
+def test_task_report_marks_dataset_without_records(tmp_path: Path) -> None:
+    """没有逐题记录（旧产物 / 纯复用）的数据集要单列说明，不能看起来"没问题"。"""
+    import os
+
+    from membench.evaluate import DatasetResult, DatasetSpec, _worst_category_rows
+
+    res = DatasetResult(
+        spec=DatasetSpec(key="old", name="old", path="/data/old.jsonl", source="fetch"),
+        run_dir=str(tmp_path / "missing"),
+        metrics={"overall": {}},
+        capabilities={},
+    )
+    rows = _worst_category_rows([res])
+    assert rows and rows[0][0] == "old"
+    assert "无逐题记录" in rows[0][1]
+    assert os.path.isdir(str(tmp_path / "missing")) is False

@@ -199,6 +199,12 @@ run 报告含 **「Token 消耗（全流程）」** 小节，取自 `metrics.jso
 里的既有字段做可机检粗分——拒答类看「未拒答 N/判错」与「状态未遗忘 N」，其余看
 「证据未命中 N」/「检索到仍答错 N」。
 
+`evaluate` 的**任务级**报告（`reports/report.md`，对比任务的 A/B 两臂各有一份）另有一节
+**「最需要优化的题型（按数据集，各取前 5）」**：跨数据集一张表，省得逐个数据集翻报告；
+没有逐题记录的数据集（旧产物 / 纯汇总复用）单列一行「无逐题记录，无法计算」，小样本数据集
+写「无题量 ≥10 的题型」——都不静默省略。`comparison.md` 本身不放这项（对比视角看的是
+「提升了哪些题型」）。
+
 report.md 中比率型指标以 **"评价（百分比）"** 呈现（如 `优秀（92.3%）`，四级：优秀/良好/中等/较差），开头附 **综合评级**（四项质量指标——accuracy / evidence_recall / abstention_accuracy / stale_rate——连续点数均值，1.0~4.0，档内随数值线性变化，阈值 3.5/2.5/1.5）；效率成本指标不参与评级（依赖部署环境）；**诊断指标**（token_f1 / bleu1、检索召回率@5、过度拒答率、要点命中率 `rubric_item_recall`）仅展示与归因，不参与评级——token_f1 / bleu1 只测字面重合，LLM 判分下 accuracy 已判语义正确性（如 gold「周五」答「项目截止日是周五」正确且完整，token_f1 仅 0.25，按字面重合会与答错一样落到"较差"）；检索召回率@5 是前 5 条检索的证据覆盖率，过度拒答率是非拒答题的误拒比例，与 `evidence_recall` / `abstention_accuracy` 配合分诊（检索 vs 生成、漏拒 vs 误拒）；要点命中率是 `judge_spec.include` 的逐条命中比例，与"全命中才算对"的 accuracy 并列，差距越大说明判分口径把"只差一条要点"记成了完全答错。检索小节另给**检索诊断**：条数中位（`recall@5` 的窗口只有 5 条）、检索为空（`retrieved=[]`，多因 ingest 未落盘）、LLM 命中口径的回退次数。评级规则见 `membench/ratings.py` 的 `METRIC_THRESHOLDS` 表（四项质量指标），可按团队标准调整。
 compare 产物（`compare_<name>_<platform>_<ts>/`，见「产物布局」）：`A/`、`B/` 各为完整评测产物（自带 `runs/` 与 `reports/`），对比结论 `reports/comparison.md` + `reports/fig_metric_diff.png`（质量指标高亮明显变化 + 效率成本）+ `reports/fig_category_diff.png`（分题型准确率对比）。两张图的图例写明 **A（基线）· 短名 / B（候选）· 短名**（短名取 `adapter@commit`，run_id 见报告头部），B 条的绿/红只表示"明显优化/劣化"，另有独立图例项说明——别把高亮色当身份色。
 

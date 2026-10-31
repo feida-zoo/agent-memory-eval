@@ -52,12 +52,16 @@ from membench.data.schema import load_dataset, question_capabilities
 from membench.layout import resolve_dataset_dir
 from membench.ratings import format_metric, overall_rating
 from membench.report import (
+    WORST_CATEGORY_MIN_N,
+    WORST_CATEGORY_TOP,
     _md_table,
     _fmt_opt,
+    category_display,
     fig_dataset_overview,
     metric_label,
     metric_label_with_role,
     stale_rate_display,
+    worst_categories,
     token_usage_totals,
 )
 from membench.runner import Runner
@@ -1453,6 +1457,26 @@ def _render_task_report_md(
     )
     lines.append("")
 
+    # 最需要优化的题型：跨数据集一张表，省得挨个数据集翻报告
+    worst_rows = _worst_category_rows(results)
+    if worst_rows:
+        lines.append(f"## 最需要优化的题型（按数据集，各取前 {WORST_CATEGORY_TOP}）")
+        lines.append("")
+        lines.append(
+            f"<sub>每个数据集取准确率最低的至多 {WORST_CATEGORY_TOP} 个题型，只收题量 ≥ "
+            f"{WORST_CATEGORY_MIN_N} 的题型（小样本一两题翻转就是 25~50pt，会挤掉真正该修的"
+            "大题型）。「主要问题」是逐题记录里的可机检粗分：拒答类看「未拒答」「状态未遗忘」，"
+            "其余看「证据未命中」「检索到仍答错」；完整分题型数据见各自数据集报告。</sub>"
+        )
+        lines.append("")
+        lines.append(
+            _md_table(
+                ["数据集", "题型", "题数", metric_label("accuracy"), "判错题数", "主要问题"],
+                worst_rows,
+            )
+        )
+        lines.append("")
+
     # 诊断指标明细（不参与评级）：严格检索召回、过度拒答、忽略题、判分回退
     lines.append("## 诊断指标（不参与评级）")
     lines.append("")
@@ -1616,6 +1640,72 @@ def _render_task_report_md(
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return out_path
+
+
+def _load_dataset_records(run_dir: str) -> Union[list[dict[str, Any]], None]:
+    """读某数据集产物的逐题记录；缺失 / 损坏返回 ``None``（不猜）。
+
+    任务级报告要出「最需要优化的题型」就必须拿到逐题记录（``evidence_hit`` /
+    ``abstained_pred`` / ``evidence_in_state``），这些只在数据集级产物里。
+    """
+    path = os.path.join(run_dir, layout.DIR_REPORT, layout.FILE_RESULTS)
+    if not os.path.isfile(path):
+        return None
+    records: list[dict[str, Any]] = []
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    return None
+    except OSError:
+        return None
+    return records
+
+
+def _worst_category_rows(
+    results: list[DatasetResult],
+) -> list[list[str]]:
+    """跨数据集汇总「最需要优化的题型」表行（每个数据集各取前 N）。
+
+    数据源是各数据集的 ``results.jsonl``：没有逐题记录（旧产物 / 纯汇总复用）的
+    数据集单列一行说明，不留空——否则读者会以为它"没有问题"。
+    """
+    rows: list[list[str]] = []
+    for res in results:
+        records = _load_dataset_records(res.run_dir)
+        if records is None:
+            rows.append([res.spec.name, "（无逐题记录，无法计算）", "—", "—", "—", "—"])
+            continue
+        worst = worst_categories(records)
+        if not worst:
+            rows.append(
+                [
+                    res.spec.name,
+                    f"（无题量 ≥ {WORST_CATEGORY_MIN_N} 的题型）",
+                    "—",
+                    "—",
+                    "—",
+                    "—",
+                ]
+            )
+            continue
+        for item in worst:
+            rows.append(
+                [
+                    res.spec.name,
+                    category_display(item["category"]),
+                    str(item["n"]),
+                    format_metric("accuracy", item["accuracy"]),
+                    str(item["n_wrong"]),
+                    item["issue"] or "—",
+                ]
+            )
+    return rows
 
 
 def write_task_reports(
