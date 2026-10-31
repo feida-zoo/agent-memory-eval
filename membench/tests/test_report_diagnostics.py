@@ -224,3 +224,44 @@ def test_abstention_question_has_no_token_f1(tmp_path: Path) -> None:
     assert record["token_f1"] is None and record["bleu1"] is None
     metrics = json.loads((report_dir / layout.FILE_METRICS).read_text(encoding="utf-8"))
     assert metrics["by_category"]["abstention"]["token_f1"] is None
+
+
+def test_worst_categories_ranking_and_issue() -> None:
+    """最需要优化榜：按准确率升序、题量 <10 不进榜、失败形态可机检。"""
+    from membench.report import worst_categories
+
+    def rec(cat, correct, *, abstained=False, ev=None, state=None, gold="x"):
+        return {
+            "category": cat,
+            "gold_answer": gold,
+            "judge": {"correct": correct, "abstained_pred": abstained},
+            "evidence_hit": ev,
+            "evidence_in_state": state,
+        }
+
+    records = [rec("utility_answer", False, ev=False) for _ in range(12)]
+    records += [rec("safety_no_memory", False, gold="<ABSTAIN>") for _ in range(10)]
+    records += [rec("privacy_answer_redacted", True, ev=True, abstained=True) for _ in range(11)]
+    records += [rec("tiny", False, ev=False) for _ in range(3)]  # 题量不够，不进榜
+
+    rows = worst_categories(records)
+    cats = [row["category"] for row in rows]
+    # 同为 0%：题量大的排在前面（utility 12 题 > safety 10 题）
+    assert cats[:2] == ["utility_answer", "safety_no_memory"]
+    assert "tiny" not in cats
+    by_cat = {row["category"]: row for row in rows}
+    assert by_cat["utility_answer"]["issue"] == "证据未命中 12"
+    assert by_cat["safety_no_memory"]["issue"] == "未拒答 10/10"
+    assert by_cat["privacy_answer_redacted"]["accuracy"] == pytest.approx(1.0)
+
+
+def test_worst_categories_empty_when_all_small() -> None:
+    from membench.report import worst_categories
+
+    assert worst_categories([{"category": "c", "judge": {"correct": False}}]) == []
+
+
+def test_report_renders_worst_categories_section(tmp_path: Path) -> None:
+    """单版本评估报告要有「最需要优化的题型」小节（题量不足时给说明）。"""
+    _dir, _metrics, _records, report = _run(tmp_path)
+    assert "## 最需要优化的题型（TOP 5）" in report

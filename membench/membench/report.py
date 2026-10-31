@@ -56,6 +56,7 @@ from .ratings import (
     overall_rating,
     rate_metric,
 )
+from .data.schema import is_abstention
 from .metrics.summary import ATTRIBUTION_BUCKETS
 from .version import version_display
 
@@ -132,6 +133,93 @@ METRIC_LABEL_ZH: dict[str, str] = {
 def category_display(cat: str) -> str:
     """category 的显示名：已知题型返回「中文（英文）」，未知题型原样返回。"""
     return CATEGORY_ZH.get(cat, cat)
+
+
+#: 「最需要优化的题型」列多少条、最少多少题才进榜。
+WORST_CATEGORY_TOP = 5
+WORST_CATEGORY_MIN_N = 10
+
+
+def worst_categories(
+    records: list[dict[str, Any]],
+    *,
+    limit: int = WORST_CATEGORY_TOP,
+    min_n: int = WORST_CATEGORY_MIN_N,
+) -> list[dict[str, Any]]:
+    """按准确率升序排出最需要优化的题型，并标出该题型的主要失败形态。
+
+    为什么设题量门槛：题型只有 2~4 题时，一两题答错就是 25~50pt 的落差，会把
+    真正该修的大题型挤下去。小样本题型仍在「分题型准确率」表里，只是不进榜。
+
+    失败形态只做**可机检**的粗分（都是逐题记录里已有的字段，不额外调用判分器）：
+
+    - 拒答类（``is_abstention``）：判错里"未识别为拒答"的题数 → ``未拒答 N``
+    - 其余：判错里 ``evidence_hit=False``（``证据未命中``）与 ``True``
+      （``检索到仍答错``）各计一份；状态红线命中（``evidence_in_state=True`` 且 safety）
+      记 ``状态未遗忘``
+
+    Args:
+        records: 逐题记录（``results.jsonl`` 风格）。
+        limit: 取前几名。
+        min_n: 进榜的最小题目数。
+
+    Returns:
+        ``[{"category","n","accuracy","n_wrong","issue"}, ...]``，按准确率升序；
+        同准确率按题量降序（大题优先）。
+    """
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        buckets.setdefault(str(record.get("category", "unknown")), []).append(record)
+
+    rows: list[dict[str, Any]] = []
+    for cat, items in buckets.items():
+        n = len(items)
+        if n < min_n:
+            continue
+        wrong = [r for r in items if not bool((r.get("judge") or {}).get("correct"))]
+        accuracy = (n - len(wrong)) / n if n else 0.0
+        issue = ""
+        if wrong:
+            if is_abstention(
+                cat, str((wrong[0].get("gold_answer") or ""))
+            ):
+                missed = sum(
+                    1
+                    for r in wrong
+                    if not bool((r.get("judge") or {}).get("abstained_pred"))
+                )
+                state_leak = sum(
+                    1 for r in wrong if r.get("evidence_in_state") is True
+                )
+                parts = [f"未拒答 {missed}/{len(wrong)}"] if missed else []
+                if state_leak:
+                    parts.append(f"状态未遗忘 {state_leak}")
+                issue = "；".join(parts)
+            else:
+                not_retrieved = sum(1 for r in wrong if r.get("evidence_hit") is False)
+                retrieved_wrong = sum(1 for r in wrong if r.get("evidence_hit") is True)
+                state_leak = sum(
+                    1 for r in wrong if r.get("evidence_in_state") is True
+                )
+                parts = []
+                if not_retrieved:
+                    parts.append(f"证据未命中 {not_retrieved}")
+                if retrieved_wrong:
+                    parts.append(f"检索到仍答错 {retrieved_wrong}")
+                if state_leak:
+                    parts.append(f"状态未遗忘 {state_leak}")
+                issue = "；".join(parts) if parts else "无法归因（无证据标注）"
+        rows.append(
+            {
+                "category": cat,
+                "n": n,
+                "accuracy": accuracy,
+                "n_wrong": len(wrong),
+                "issue": issue,
+            }
+        )
+    rows.sort(key=lambda item: (item["accuracy"], -item["n"]))
+    return rows[:limit]
 
 
 def metric_label(key: str, with_key: bool = True) -> str:
@@ -1548,6 +1636,40 @@ def write_run_report_md(
     if with_figures:
         lines.append(f"![分题型准确率]({FIG_CATEGORY})")
         lines.append("")
+    # 2.1 最需要优化的题型：头条结论 + 可机检的失败形态
+    worst = worst_categories(records)
+    lines.append(f"## 最需要优化的题型（TOP {WORST_CATEGORY_TOP}）")
+    lines.append("")
+    if worst:
+        lines.append(
+            f"<sub>按准确率升序；只收题量 ≥ {WORST_CATEGORY_MIN_N} 的题型（小样本一两题"
+            "翻转就是 25~50pt，会挤掉真正该修的大题型——它们仍在上一张表里）。"
+            "「主要问题」只做可机检的粗分：拒答类看是否识别为拒答，其余看证据是否进过"
+            "检索上下文、状态是否仍含敏感串。</sub>"
+        )
+        lines.append("")
+        worst_rows = [
+            [
+                category_display(item["category"]),
+                str(item["n"]),
+                format_metric("accuracy", item["accuracy"]),
+                str(item["n_wrong"]),
+                item["issue"] or "—",
+            ]
+            for item in worst
+        ]
+        lines.append(
+            _md_table(
+                ["题型", "题数", metric_label("accuracy"), "判错题数", "主要问题"],
+                worst_rows,
+            )
+        )
+    else:
+        lines.append(
+            f"<sub>没有题量 ≥ {WORST_CATEGORY_MIN_N} 的题型（或该数据集无逐题记录），"
+            "不列榜。</sub>"
+        )
+    lines.append("")
 
     # 3. 效率统计
     lines.append("## 效率统计")
