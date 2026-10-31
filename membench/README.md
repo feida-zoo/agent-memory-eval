@@ -862,15 +862,17 @@ python -m membench.cli series \
 # 任务目录可以"预定"（可选）：run / evaluate 各自跑会各建一个 eval_*；要让**同一次
 # 评测的多片**或 **A/B 两组**写进同一棵树，先建任务目录再传 --task-dir：
 #   --groups 1 → runs/ + reports/（单组）；--groups 2 --baseline-name 基线 --candidate-name 候选 → baseline/ candidate/ + groups.json + reports/（双组）
+#   --name 进目录名（必须含 ASCII）；--display-name 是任务中文显示名（进报告「任务名」，落 task.json）
 #   stdout 只有任务目录的绝对路径（说明走 stderr），可直接 TASK=$(...) 接走
-python -m membench.cli task init --name beam --platform wx --groups 1
+python -m membench.cli task init --name beam --platform wx --groups 1 --display-name 长记忆冒烟
 python -m membench.cli task status <任务目录>   # 只读进度：骨架 / 分片账本 / 快照 / 下一步该跑什么
 
 # 单次评测（run / evaluate --report-out DIR）：DIR 是任务目录的父目录（缺省 output_root()）；
 # --task-dir DIR：写进**已存在**的任务目录（不新建）；fuse --out DIR 直接给完整任务目录
 DIR/eval_<adapter>_<platform>_<ts>[_s<i>][_l<limit>]/   # ts = YYYYMMDD-HHMMSS；分片/冒烟后缀见上
+├── task.json                            # 任务元信息：{name, display_name, platform, created_at}
 ├── runtime/                             # 实验级运行时数据：commands.jsonl + logs/ + env.json（见下）
-├── runs/<dataset>/                      # 每个数据集一棵子树
+├── runs/<dataset>/                      # 每个数据集一棵子树（目录名 = slug(数据集 stem)；纯中文退 dataset-<sha1 前 8 位>）
 │   ├── report/{report.md,metrics.json,results.jsonl,fig_category_accuracy.png,fig_latency_hist.png}
 │   ├── shards.<i>.json, shards.json     # 分片账本：逐片条目 + 物化视图（分片评测才有，见「冒烟与分片」）
 │   └── <对话目录>/                       # 对话 id 归一成安全目录名（非法字符换 `_`，空值回退 dialogue）
@@ -883,6 +885,7 @@ DIR/eval_<adapter>_<platform>_<ts>[_s<i>][_l<limit>]/   # ts = YYYYMMDD-HHMMSS�
 
 # A/B 对比任务目录（compare / evaluate-compare --report-out DIR：同为任务目录的父目录）
 DIR/compare_<name>_<platform>_<ts>/
+├── task.json                            # 任务元信息（同单组；报告据此显示中文任务名）
 ├── A/  B/                               # 各为一个完整 eval 实验形态（含自身 runs/ 与 reports/）
 └── reports/comparison.md                # 结论；另有两张对比图：
                                          # compare → fig_metric_diff.png / fig_category_diff.png
@@ -891,6 +894,7 @@ DIR/compare_<name>_<platform>_<ts>/
 
 # 回放任务（task init --replay）：任务根多一个内容寻址快照池
 DIR/{eval_<name>_<platform>_<ts> | compare_<name>_<platform>_<ts>}/
+├── task.json                           # 任务元信息（同普通任务）
 ├── runs/ 或 baseline/ candidate/        # 与普通任务相同
 └── snapshots/
     ├── <sha256 前 12 位>/                # 桶：适配器导出的状态 + 框架写的 manifest.json（记来源）

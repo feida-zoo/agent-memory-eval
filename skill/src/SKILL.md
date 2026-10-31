@@ -102,13 +102,18 @@ python -m membench.cli matrix --runs "wx@<shaA>=<产物目录>" "fs@<shaA>=<产�
 ## 命名：任务名必填，组名与目录名分开
 
 - `run_task.py` 的 `--name` **必填且需含 ASCII**（如 `index-opt` / `baseline-rerun`）：
-  它进任务目录名，纯中文会 slug 成 `default`、所有中文名撞在一起。中文描述写在报告 /
-  提交信息里。不再回退 adapter 名——同 adapter 的多次实验必须靠名字区分。
+  它进任务目录名，纯中文会被拒（slug 后全是 `default`，任务目录会撞名）。中文描述
+  用 `--display-name <中文>`，只进报告「任务名」，不进目录名。不再回退 adapter 名——
+  同 adapter 的多次实验必须靠名字区分。
 - 对比任务：`--baseline-name` / `--candidate-name` 是**显示名（可中文）**（报告与
   `groups.json` 用它）；`--baseline-dir` / `--candidate-dir` 是**目录名（ASCII）**，
   缺省 `baseline` / `candidate`。中文名不进目录（内链、跨工具、排序都会带麻烦）。
 - 名字写进任务根的 `groups.json` 后，后续报告、`task status`、多线对比都直接复用它，
   不再从 commit 重新推导。
+- 任务中文名写进任务根 `task.json`（`name` / `display_name`）：报告「任务名」行、
+  `evaluate` 任务级报告都直接读它，重出报告 / 复制产物都不会丢。
+- 数据集目录名同样 ASCII 口径：`slug(文件 stem)`，纯中文文件退 `dataset-<sha1 前 8 位>`
+  （不再全部落进 `runs/default`）。
 
 ## 三个检查点
 

@@ -174,9 +174,9 @@ def _copy_label_trees(
 ) -> dict[str, str]:
     """把各 label 的数据集树复制到 ``<out_dir>/runs/<label>/``。
 
-    label 目录名按 :func:`membench.layout.slug` 归一（``platform@commit`` →
-    ``platform-commit``）；两个不同源的 label 归一成同一目录名即报错，避免一份副本
-    被另一份覆盖。
+    label 目录名按 :func:`membench.layout.dir_name` 归一（``platform@commit`` →
+    ``platform-commit``；纯中文 label 退 ``label-<hash>``）；两个不同源的 label 归一
+    成同一目录名即报错，避免一份副本被另一份覆盖。
 
     Raises:
         ValueError: 目标目录冲突。
@@ -185,7 +185,9 @@ def _copy_label_trees(
     seen: dict[str, str] = {}
     for label in labels:
         source = dataset_dirs[label]
-        dest = os.path.join(layout.runs_root(out_dir), layout.slug(label))
+        dest = os.path.join(
+            layout.runs_root(out_dir), layout.dir_name(label, fallback_prefix="label")
+        )
         prev = seen.get(dest)
         if prev is not None and os.path.abspath(prev) != os.path.abspath(source):
             raise ValueError(

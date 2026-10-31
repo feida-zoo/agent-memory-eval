@@ -232,6 +232,7 @@ def test_cli_compare_report_out_subdir(tmp_path: Path) -> None:
     # A / B 各为完整评测实验形态：runs/<dataset>/report/... + 任务级 reports/
     for group in ("baseline", "candidate"):
         group_path = cmp_dir / group
+        # 组目录只承载 runs/ 与 reports/；task.json 在任务根（不在这里）
         assert sorted(p.name for p in group_path.iterdir()) == ["reports", "runs"]
         for fname in ("report.md", "metrics.json", "fig_category_accuracy.png"):
             assert (group_path / "reports" / fname).is_file(), f"{group} 任务级报告缺少 {fname}"

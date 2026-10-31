@@ -75,11 +75,20 @@ def _dataset(path: Path, *, n_dialogues: int = 4, per: int = 2) -> Path:
     return path
 
 
-def _init_task(base: Path, name: str, *, platform: str | None = "t", groups: int = 2) -> Path:
+def _init_task(
+    base: Path,
+    name: str,
+    *,
+    platform: str | None = "t",
+    groups: int = 2,
+    display_name: str | None = None,
+) -> Path:
     """跑 ``task init`` 并返回它打印到 stdout 的任务目录（stdout 必须只有这一行路径）。"""
     argv = ["task", "init", "--name", name, "--report-out", str(base), "--groups", str(groups)]
     if platform is not None:
         argv += ["--platform", platform]
+    if display_name is not None:
+        argv += ["--display-name", display_name]
     buffer = io.StringIO()
     with redirect_stdout(buffer):
         assert cli.main(argv) == 0
@@ -145,7 +154,7 @@ def test_task_init_arms2_prints_only_abs_path(
     assert task.is_absolute(), f"stdout 必须是绝对路径，实际 {task}"
     assert task.is_dir() and task.parent == base
     assert task.name.startswith("compare_ab_t_")
-    assert sorted(p.name for p in task.iterdir()) == ["baseline", "candidate", "groups.json", "reports", "runtime"]
+    assert sorted(p.name for p in task.iterdir()) == ["baseline", "candidate", "groups.json", "reports", "runtime", "task.json"]
     # 骨架 / 下一步提示都在 stderr（不污染 stdout）
     assert "骨架: groups=2（baseline/ candidate/ + reports/）" in captured.err
     assert f"--task-dir {task / layout.DIR_GROUP_BASELINE}" in captured.err
@@ -156,7 +165,7 @@ def test_task_init_arms1_builds_runs_skeleton(tmp_path: Path) -> None:
     """groups=1：单组骨架 runs/ + reports/，目录名前缀 eval_。"""
     task = _init_task(tmp_path / "out", "solo", groups=1)
     assert task.name.startswith("eval_solo_t_")
-    assert sorted(p.name for p in task.iterdir()) == ["reports", "runs", "runtime"]
+    assert sorted(p.name for p in task.iterdir()) == ["reports", "runs", "runtime", "task.json"]
 
 
 def test_task_init_default_report_out_is_output_root(
@@ -340,6 +349,38 @@ def test_run_task_dir_writes_into_given_dir(tmp_path: Path) -> None:
     assert _metrics(dataset_dir)["dataset_dir"] == str(dataset_dir)
     # 没有另外新建 eval_* 实验目录
     assert [p.name for p in (tmp_path / "out").iterdir()] == [task.name]
+
+
+def test_task_display_name_reaches_report(tmp_path: Path) -> None:
+    """--display-name 落 task.json，并出现在报告「任务名」行（目录名仍是 ASCII）。"""
+    task = _init_task(tmp_path / "out", "index-opt", groups=1, display_name="索引优化")
+    assert task.name == f"eval_index-opt_t_{task.name.rsplit('_', 1)[-1]}"
+    meta = layout.read_task_meta(str(task))
+    assert meta is not None and meta["display_name"] == "索引优化"
+    assert (
+        cli.main(
+            [
+                "run",
+                "--adapter",
+                "mock-strong",
+                "--dataset",
+                str(SAMPLE_DATASET_PATH),
+                "--judge",
+                "heuristic",
+                "--task-dir",
+                str(task),
+            ]
+        )
+        == 0
+    )
+    dataset_report = (
+        task / layout.DIR_RUNS / "sample_dataset" / layout.DIR_REPORT / layout.FILE_REPORT_MD
+    ).read_text(encoding="utf-8")
+    assert "| 任务名 | 索引优化 |" in dataset_report
+    task_report = (task / layout.DIR_REPORTS / layout.FILE_REPORT_MD).read_text(
+        encoding="utf-8"
+    )
+    assert "| 任务名 | 索引优化 |" in task_report
 
 
 def test_run_task_dir_missing_dir_errors(tmp_path: Path) -> None:

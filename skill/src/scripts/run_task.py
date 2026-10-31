@@ -253,6 +253,8 @@ class EvalOptions:
     group_labels: Optional[tuple[str, str]] = None
     #: 组目录名（ASCII；缺省 baseline / candidate，中文组名不会进目录）
     group_dirs: Optional[tuple[str, str]] = None
+    #: 任务中文显示名（进报告；缺省同 name）
+    display_name: Optional[str] = None
 
     @property
     def use_evaluate(self) -> bool:
@@ -284,6 +286,8 @@ class AbOptions:
     group_labels: Optional[tuple[str, str]] = None
     #: 组目录名（ASCII；缺省 baseline / candidate）
     group_dirs: Optional[tuple[str, str]] = None
+    #: 任务中文显示名（进报告；缺省同 name）
+    display_name: Optional[str] = None
 
 
 @dataclass
@@ -570,6 +574,7 @@ def _start_background(
                 report_out=options.report_out,
                 group_labels=getattr(options, "group_labels", None),
                 group_dirs=getattr(options, "group_dirs", None),
+                display_name=options.display_name,
             )
         )
 
@@ -802,9 +807,12 @@ def _task_init_argv(
     report_out: Optional[str],
     group_labels: Optional[Sequence[str]] = None,
     group_dirs: Optional[Sequence[str]] = None,
+    display_name: Optional[str] = None,
 ) -> list[str]:
     """``task init`` 参数（双组任务带两个组名 + 两个 ASCII 目录名）。"""
     argv = ["task", "init", "--groups", str(groups), "--name", name]
+    if display_name:
+        argv += ["--display-name", display_name]
     if groups == 2 and group_labels:
         argv += ["--baseline-name", group_labels[0], "--candidate-name", group_labels[1]]
         if group_dirs:
@@ -1262,6 +1270,7 @@ def _execute_eval(options: EvalOptions, root: Path) -> FlowState:
                 groups=1,
                 platform=options.common.platform,
                 report_out=options.report_out,
+                display_name=options.display_name,
             )
         )
     state = FlowState(task_dir=task_dir)
@@ -1304,6 +1313,7 @@ def _execute_ab(options: AbOptions, root: Path) -> FlowState:
                 report_out=options.report_out,
                 group_labels=getattr(options, "group_labels", None),
                 group_dirs=getattr(options, "group_dirs", None),
+                display_name=options.display_name,
             )
         )
     state = FlowState(task_dir=task_dir)
@@ -1460,6 +1470,7 @@ def _print_task_ref(
     report_out: Optional[str],
     group_labels: Optional[Sequence[str]] = None,
     group_dirs: Optional[Sequence[str]] = None,
+    display_name: Optional[str] = None,
 ) -> None:
     """dry-run 的任务目录来源：给了 --task-dir 就直接用，否则 ``TASK=$(task init ...)``。"""
     if task_dir:
@@ -1476,6 +1487,7 @@ def _print_task_ref(
                 report_out=report_out,
                 group_labels=group_labels,
                 group_dirs=group_dirs,
+                display_name=display_name,
             ),
         )
         + ")"
@@ -1494,6 +1506,7 @@ def _print_dry_run_eval(options: EvalOptions, root: Path) -> None:
         groups=1,
         platform=options.common.platform,
         report_out=options.report_out,
+        display_name=options.display_name,
     )
     if options.use_evaluate:
         print("# 多数据集且无分片 / limit：直接走官方 evaluate --dataset 路径")
@@ -1533,6 +1546,7 @@ def _print_dry_run_ab(options: AbOptions, root: Path) -> None:
         report_out=options.report_out,
         group_labels=options.group_labels,
         group_dirs=options.group_dirs,
+        display_name=options.display_name,
     )
     group_dirs = options.group_dirs or ("baseline", "candidate")
     for label, group, group_dir in (
@@ -1664,13 +1678,19 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--name",
         required=True,
-        help="任务名（进目录名，必填）：说明这次实验是什么，如 索引优化 / 基线复测；"
-        "不再回退 adapter 名——同 adapter 的多次实验必须能靠名字区分",
+        help="任务名（进目录名，必填，必须含 ASCII）：如 index-opt / baseline-retest；"
+        "不再回退 adapter 名——同 adapter 的多次实验必须能靠名字区分；"
+        "中文描述请用 --display-name（只进报告，不进目录名）",
+    )
+    parser.add_argument(
+        "--display-name",
+        default=None,
+        help="任务中文显示名（进报告「任务名」，可中文；缺省同 --name）",
     )
     parser.add_argument(
         "--baseline-name",
         default=None,
-        help="基线组名（进组目录名，允许中文；缺省「基线」）",
+        help="基线组显示名（进报告与 groups.json，允许中文；缺省「基线」；目录名见 --baseline-dir）",
     )
     parser.add_argument(
         "--candidate-name",
@@ -1877,6 +1897,7 @@ def _eval_options(args: argparse.Namespace) -> EvalOptions:
         report_out=report_out,
         shards=args.shards,
         task_dir=_resolve_caller_path(args.task_dir) if args.task_dir else None,
+        display_name=(args.display_name or None),
     )
 
 
@@ -1920,6 +1941,7 @@ def _ab_options(args: argparse.Namespace) -> AbOptions:
             args.baseline_dir or "baseline",
             args.candidate_dir or "candidate",
         ),
+        display_name=(args.display_name or None),
     )
 
 

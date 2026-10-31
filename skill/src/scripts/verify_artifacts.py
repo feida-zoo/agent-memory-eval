@@ -65,7 +65,7 @@ _DIALOGUE_ENTRIES: frozenset[str] = frozenset(
 #: 任务根里**与组无关**的框架条目；组目录名由 ``groups.json`` 给（可以是中文），
 #: 校验时动态并入，不能再写死 ``A`` / ``B``。
 _ROOT_ENTRIES: frozenset[str] = frozenset(
-    {DIR_RUNS, DIR_REPORTS, DIR_RUNTIME, "snapshots", "groups.json"}
+    {DIR_RUNS, DIR_REPORTS, DIR_RUNTIME, "snapshots", "groups.json", "task.json"}
 )
 
 

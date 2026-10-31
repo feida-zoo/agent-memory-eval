@@ -934,6 +934,12 @@ def fuse_runs(
     }
     if ref_metrics.get("retrieval_match_threshold") is not None:
         base["retrieval_match_threshold"] = ref_metrics["retrieval_match_threshold"]
+    # 任务显示名透传：融合产物与普通 run 同构，报告「任务名」行不能丢。只在源分片
+    # 有值时写——没任务清单的产物不该凭空多出两个 None 键（与 Runner 口径一致）。
+    for task_key in ("task_name", "task_name_display"):
+        value = ref_metrics.get(task_key)
+        if value is not None:
+            base[task_key] = value
 
     # 逐对话 token 记账：同一对话各片各记各的（question 分片下同一对话可能被多片
     # ingest，只有各片自己的计数才是真实成本），故直接相加、不去重。

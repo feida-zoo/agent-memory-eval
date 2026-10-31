@@ -1019,6 +1019,8 @@ class Runner:
         self.dataset_source = (
             dataset_source or infer_dataset_source(dataset_path) or "user-specified"
         )
+        # 任务元信息（task init 写的 task.json）：任务名与中文显示名，报告据此显示
+        self.task_meta: dict[str, Any] = layout.read_task_meta(out_dir) or {}
         if isinstance(judge, str):
             self.judge_name = judge
             self.judge = get_judge(judge)
@@ -1705,6 +1707,14 @@ class Runner:
                     "adapter_meta": self.adapter_meta,
                     "adapter_describe": adapter_describe,
                     "schema_version": "0.2",
+                    **(
+                        {
+                            "task_name": self.task_meta.get("name"),
+                            "task_name_display": self.task_meta.get("display_name"),
+                        }
+                        if self.task_meta
+                        else {}
+                    ),
                     # 评测代码自身的版本标识（语义版本 + 包内容指纹 + git 短
                     # commit）：判分口径随代码变化，光有被测系统的 commit 无法
                     # 解释历史分数漂移（见 membench/version.py）。

@@ -269,7 +269,13 @@ def test_init_task_dir_skeleton_and_non_empty_guard(tmp_path: Path) -> None:
     base = tmp_path / "output"
     task = Path(layout.init_task_dir(str(base), "a1_vs_b1", "wx", groups=2, ts="20260101-120000"))
     assert task.is_absolute() and task.name == "compare_a1_vs_b1_wx_20260101-120000"
-    assert sorted(p.name for p in task.iterdir()) == ["baseline", "candidate", "groups.json", "reports"]
+    assert sorted(p.name for p in task.iterdir()) == [
+        "baseline",
+        "candidate",
+        "groups.json",
+        "reports",
+        "task.json",
+    ]
     groups = layout.read_groups_manifest(str(task))
     assert groups is not None
     assert [g["role"] for g in groups] == [layout.ROLE_BASELINE, layout.ROLE_CANDIDATE]
@@ -283,7 +289,7 @@ def test_init_task_dir_skeleton_and_non_empty_guard(tmp_path: Path) -> None:
         layout.init_task_dir(str(base), "mock-strong", "wx", groups=1, ts="20260101-120000")
     )
     assert single.name == "eval_mock-strong_wx_20260101-120000"
-    assert sorted(p.name for p in single.iterdir()) == ["reports", "runs"]
+    assert sorted(p.name for p in single.iterdir()) == ["reports", "runs", "task.json"]
 
     # 已有骨架（非空）的任务目录拒绝复用：上一场评测的现场不被覆盖
     with pytest.raises(SystemExit, match="非空"):
@@ -295,7 +301,7 @@ def test_init_task_dir_skeleton_and_non_empty_guard(tmp_path: Path) -> None:
     )
     reused = layout.init_task_dir(str(base), "empty-task", "wx", groups=1, ts="20260101-130000")
     assert reused == str(base / "eval_empty-task_wx_20260101-130000")
-    assert sorted(p.name for p in Path(reused).iterdir()) == ["reports", "runs"]
+    assert sorted(p.name for p in Path(reused).iterdir()) == ["reports", "runs", "task.json"]
 
 
 def test_init_task_dir_defaults_to_output_root(
@@ -506,3 +512,48 @@ def test_ensure_dir_name_requires_ascii() -> None:
         layout.ensure_dir_name("索引优化", what="任务名（--name）")
     with pytest.raises(ValueError, match="ASCII"):
         layout.ensure_dir_name("***")
+
+
+def test_dir_name_falls_back_to_hash_for_non_ascii() -> None:
+    """纯非 ASCII 的取值退 ``<prefix>-<sha1 前 8 位>``，不再全落 ``default``。"""
+    label = layout.dir_name("索引优化", fallback_prefix="label")
+    assert label.startswith("label-") and len(label) == len("label-") + 8
+    # 稳定：同名同哈希；不同名不同目录
+    assert label == layout.dir_name("索引优化", fallback_prefix="label")
+    assert label != layout.dir_name("候选优化", fallback_prefix="label")
+    # ASCII 取值仍走 slug，不受影响
+    assert layout.dir_name("mac@abc1234") == layout.slug("mac@abc1234")
+
+    dataset = layout.dataset_dir_name("中文数据集")
+    assert dataset.startswith("dataset-") and len(dataset) == len("dataset-") + 8
+    assert layout.dataset_dir_name("locomo") == "locomo"
+
+
+def test_task_meta_roundtrip_and_display_name(tmp_path: Path) -> None:
+    """任务元信息落 ``task.json``：中文显示名只进报告；从任意层目录都能向上找回来。"""
+    base = tmp_path / "output"
+    task = layout.init_task_dir(
+        str(base),
+        "index-opt",
+        "wx",
+        groups=1,
+        ts="20260101-120000",
+        display_name="索引优化",
+    )
+    meta = layout.read_task_meta(task)
+    assert meta is not None
+    assert meta["name"] == "index-opt"
+    assert meta["display_name"] == "索引优化"
+    assert meta["platform"] == "wx"
+    assert meta["created_at"] == "20260101-120000"
+    # 深层目录（数据集目录 / 对话目录）也能读到任务级元信息
+    deep = Path(task) / "runs" / "locomo" / "conv-26"
+    deep.mkdir(parents=True)
+    assert layout.read_task_meta(str(deep))["display_name"] == "索引优化"
+    # 不给显示名时缺省同任务名（报告仍有「任务名」行）
+    plain = layout.init_task_dir(
+        str(base), "smoke", "wx", groups=1, ts="20260101-130000"
+    )
+    assert layout.read_task_meta(plain)["display_name"] == "smoke"
+    # 没有 task.json 的目录返回 None（不猜、不抛）
+    assert layout.read_task_meta(str(tmp_path)) is None

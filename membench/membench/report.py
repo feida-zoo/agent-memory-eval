@@ -371,6 +371,7 @@ METADATA_FIELD_ZH: dict[str, str] = {
     "dataset_source": "测试集来源",
     "platform": "平台",
     "commit": "commit",
+    "task_name": "任务名",
     "judge": "判分器",
     "driver_llm": "驱动 LLM",
     "judge_model": "判分模型",
@@ -1347,6 +1348,11 @@ def write_run_report_md(
         [metadata_label("dataset_source"), str(metrics.get("dataset_source", "n/a"))],
         [metadata_label("platform"), str(metrics.get("platform", "default"))],
         [metadata_label("commit"), str(metrics.get("commit") or "n/a")],
+        *(
+            [[metadata_label("task_name"), str(metrics["task_name_display"])]]
+            if metrics.get("task_name_display")
+            else []
+        ),
         [metadata_label("membench_version"), version_display(metrics.get("membench_version"))],
         [metadata_label("judge"), str(metrics.get("judge", "n/a"))],
         [metadata_label("driver_llm"), _fmt_opt(metrics.get("driver_llm"))],

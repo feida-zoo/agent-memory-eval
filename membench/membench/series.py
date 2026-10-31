@@ -487,14 +487,14 @@ def _line_datasets(target: str, dataset: Union[str, None]) -> dict[str, str]:
     if not found:
         single = layout.resolve_dataset_dir(abspath, dataset)
         key = os.path.basename(single)
-        if dataset is not None and key != layout.slug(dataset):
+        if dataset is not None and key != layout.dataset_dir_name(dataset):
             raise SystemExit(
                 f"--dataset {dataset!r} 与产物数据集 {key!r} 不一致: {abspath}"
             )
         return {key: single}
     if dataset is None:
         return {os.path.basename(path): path for path in found}
-    wanted = layout.slug(dataset)
+    wanted = layout.dataset_dir_name(dataset)
     hit = [path for path in found if os.path.basename(path) == wanted]
     if not hit:
         names = "、".join(os.path.basename(path) for path in found)

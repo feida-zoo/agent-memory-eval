@@ -94,10 +94,11 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
 产物一律落「一次实验一个自包含子目录」（见 :mod:`membench.layout`）::
 
     <report-out>/eval_<name>_<platform>_<ts>[_s<i>][_l<limit>]/   # 单组任务目录，例 eval_mock-strong_default_20261024-193000（分片/冒烟带后缀，见 layout.experiment_tags）
+    ├── task.json                               # 任务元信息（name / display_name / platform；报告「任务名」读它）
     ├── runtime/{commands.jsonl,logs/,env.json}  # 实验级运行时数据（命令 / 全量日志 / 环境快照）
     ├── runs/<dataset>/{report/,shards.json,<对话>/{report/,runtime/,memory_snapshot/,trace_state/}}
     └── reports/                                # 任务级（report.md / metrics.json / evaluate_summary.json / fig_dataset_overview.png）
-    <report-out>/compare_<name>_<platform>_<ts>/{A/,B/,runtime/,reports/comparison.md}   # 双组任务目录
+    <report-out>/compare_<name>_<platform>_<ts>/{task.json,A/,B/,runtime/,reports/comparison.md}   # 双组任务目录
     <report-out>/matrix_<ts>/{runtime/,reports/,runs/<label>/}
     <report-out>/series_<ts>/{runtime/,reports/,runs/<线序>-<slug>/<dataset>/}   # 多线对比
 
@@ -429,6 +430,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--candidate-dir",
         default=None,
         help="候选组目录名（ASCII，缺省 candidate）；中文组名请在这里给英文目录名",
+    )
+    p_task_init.add_argument(
+        "--display-name",
+        default=None,
+        help="任务中文显示名（进报告「评测配置」，可中文；缺省同 --name）",
     )
     p_task_init.add_argument("--report-out", default=None, help="任务目录的父目录（缺省 output_root()）")
     p_task_init.add_argument(
@@ -1429,6 +1435,7 @@ def _cmd_task_init(args: argparse.Namespace) -> int:
             if args.groups == 2
             else None
         ),
+        display_name=getattr(args, "display_name", None),
         replay=args.replay,
     )
     # 任务目录从这一刻起就是本次命令的产物根：task init 自己也记一条命令与日志

@@ -113,11 +113,11 @@ def test_compare_matrix_pivot_and_files(tmp_path: Path) -> None:
         assert pair["verdict"] in {"PASS", "WARN", "FAIL"}
         assert len(pair["gates"]) == 3
 
-    # 各 label 的数据集树副本：runs/<slug(label)>/，含数据集级报告与对话目录
+    # 各 label 的数据集树副本：runs/<dir_name(label)>/，含数据集级报告与对话目录
     assert sorted(result["label_dirs"]) == sorted(l for l, _ in labeled)
     for label, _exp in labeled:
         label_dir = Path(result["label_dirs"][label])
-        assert label_dir == out_dir / layout.DIR_RUNS / layout.slug(label)
+        assert label_dir == out_dir / layout.DIR_RUNS / layout.dir_name(label)
         assert (label_dir / layout.DIR_REPORT / layout.FILE_METRICS).is_file()
         assert (label_dir / layout.DIR_REPORT / layout.FILE_REPORT_MD).is_file()
         # 整树复制：对话目录（runtime/ + 对话级 report/）一并带过来

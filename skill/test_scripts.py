@@ -367,6 +367,18 @@ def test_eval_dry_run_shards_are_parallel(
     assert not any(path.name.startswith(("eval_", "compare_")) for path in tmp_path.iterdir())
 
 
+def test_eval_dry_run_passes_task_display_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--display-name 透传到 task init（中文只进报告，不进目录名）。"""
+    assert _eval_dry_run(tmp_path, "--display-name", "索引优化") == 0
+    out = capsys.readouterr().out
+    # 命令经 shlex.quote 转义（非 ASCII 会被单引号包住），按同一口径断言
+    assert (
+        f"--name smoke --display-name {shlex.quote('索引优化')} --report-out" in out
+    )
+
+
 def test_eval_dry_run_without_shards_has_no_fuse(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

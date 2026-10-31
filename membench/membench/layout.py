@@ -14,6 +14,7 @@
 （fuse 等）共用同一套账本口径）。::
 
     <root>/eval_<name>_<platform>_<ts>[_s<i>][_l<limit>]/
+    ├── task.json                        # 任务元信息（name / display_name / platform；报告据此显示中文任务名）
     ├── runtime/                          # 实验级运行时数据（命令 / 日志 / 环境；见 membench.runtime）
     ├── runs/<dataset>/
     │   ├── report/                      # 数据集级聚合报告（md + metrics + 逐题明细 + 图）
@@ -51,6 +52,7 @@ helper，不要手写字面量。helper 只计算路径、不建目录——需�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -487,6 +489,7 @@ def init_task_dir(
     ts: str | None = None,
     group_labels: "Sequence[str] | None" = None,
     group_dirs: "Sequence[str] | None" = None,
+    display_name: Union[str, None] = None,
     *,
     replay: bool = False,
 ) -> str:
@@ -500,6 +503,8 @@ def init_task_dir(
     （守卫语义与报错文案复用 :func:`experiment_path`：上一次跑在校验阶段失败留下的
     空目录可以复用，已有产物的目录一律不覆盖）。
     """
+    # 时间戳在进入命名前定稿：目录名与 task.json 的 created_at 必须是同一个值
+    ts = ts or ts_now()
     path = experiment_path(base, task_subdir(name, platform, groups, ts))
     if groups == 2:
         labels = list(group_labels or [DEFAULT_BASELINE_LABEL, "候选"])
@@ -526,6 +531,9 @@ def init_task_dir(
         subdirs = (*subdirs, DIR_SNAPSHOTS)
     for subdir in (*subdirs, DIR_REPORTS):
         os.makedirs(os.path.join(path, subdir), exist_ok=True)
+    write_task_meta(
+        path, name=name, display_name=display_name, platform=platform, created_at=ts
+    )
     return os.path.abspath(path)
 
 
@@ -986,14 +994,93 @@ def write_snapshot_index(pool_root: str, index: dict[str, Any]) -> str:
 # 实验目录内的路径
 # ---------------------------------------------------------------------------
 
+#: 任务元信息文件名：``<任务>/task.json``（任务名与中文显示名，报告据此显示）。
+FILE_TASK_META = "task.json"
+
+
+def write_task_meta(
+    task_dir: str,
+    *,
+    name: str,
+    display_name: Union[str, None] = None,
+    platform: Union[str, None] = None,
+    created_at: Union[str, None] = None,
+) -> str:
+    """写任务元信息（原子替换），返回路径。
+
+    为什么单独落一个文件：任务目录名必须是 ASCII（``index-opt``），但人看报告时
+    想看到中文描述（``索引优化``）；组可以靠 ``groups.json`` 的 label 承载显示名，
+    单组任务没有清单，所以任务级也留一份 ``task.json``。
+    """
+    path = os.path.join(task_dir, FILE_TASK_META)
+    payload = {
+        "schema": 1,
+        "name": str(name),
+        "display_name": str(display_name or name),
+        "platform": platform,
+        "created_at": created_at,
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(tmp, path)
+    return path
+
+
+def read_task_meta(path: str) -> "dict[str, Any] | None":
+    """读任务元信息：从 ``path`` 起向上最多 4 层找 ``task.json``；没有返回 None。
+
+    产物目录层级不一（数据集目录 ``<任务>/runs/<ds>``、实验目录、任务根），
+    报告与 runner 都从这里取一次，读不到就按"没有显示名"处理（不猜）。
+    """
+    current = os.path.abspath(path)
+    for _ in range(5):
+        candidate = os.path.join(current, FILE_TASK_META)
+        if os.path.isfile(candidate):
+            try:
+                with open(candidate, encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                return None
+            return payload if isinstance(payload, dict) else None
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
 def runs_root(experiment_dir: str) -> str:
     """实验目录下的 ``runs/``。"""
     return os.path.join(experiment_dir, DIR_RUNS)
 
 
+def dir_name(value: str, *, fallback_prefix: str = "item") -> str:
+    """产物目录名：``slug(value)``；纯非 ASCII 时退 ``<prefix>-<sha1 前 8 位>``。
+
+    目录名统一 ASCII 口径（与任务名、组目录名一致）。纯中文取值若直接 slug 会压成
+    ``default``，多个这样的取值会互相覆盖——用取值哈希兜底，既稳定又能区分。
+    """
+    stem = slug(value)
+    if stem != "default":
+        return stem
+    digest = hashlib.sha1(str(value).encode("utf-8")).hexdigest()[:8]
+    return f"{fallback_prefix}-{digest}"
+
+
+def dataset_dir_name(dataset: str) -> str:
+    """数据集目录名：``dir_name(dataset, fallback_prefix="dataset")``。
+
+    **所有比对数据集身份的代码都必须用本函数**，不能各自 ``slug()``（否则
+    引擎写下的 ``runs/dataset-1a2b3c4d`` 会对不上 key）。
+    """
+    return dir_name(dataset, fallback_prefix="dataset")
+
+
 def dataset_dir(experiment_dir: str, dataset: str) -> str:
-    """数据集产物目录：``<exp>/runs/<slug(dataset)>``。"""
-    return os.path.join(runs_root(experiment_dir), slug(dataset))
+    """数据集产物目录：``<exp>/runs/<dataset_dir_name(dataset)>``。"""
+    return os.path.join(runs_root(experiment_dir), dataset_dir_name(dataset))
 
 
 def dataset_report_dir(experiment_dir: str, dataset: str) -> str:

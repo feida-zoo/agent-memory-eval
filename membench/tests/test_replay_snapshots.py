@@ -263,17 +263,18 @@ def test_task_init_replay_builds_snapshots_dir(tmp_path: Path) -> None:
         "reports",
         "runtime",
         "snapshots",
+        "task.json",
     ]
     assert "snapshots/" in err and "--replay" in err
 
     single = _init_task(base, "one", groups=1)
-    assert sorted(path.name for path in single.iterdir()) == ["reports", "runs", "snapshots"]
+    assert sorted(path.name for path in single.iterdir()) == ["reports", "runs", "snapshots", "task.json"]
 
 
 def test_task_init_without_replay_has_no_snapshots_dir(tmp_path: Path) -> None:
     """不带 --replay 时行为不变：不建 snapshots/（普通任务不落池）。"""
     task = _init_task(tmp_path / "out", "plain", groups=2, replay=False)
-    assert sorted(path.name for path in task.iterdir()) == ["baseline", "candidate", "groups.json", "reports", "runtime"]
+    assert sorted(path.name for path in task.iterdir()) == ["baseline", "candidate", "groups.json", "reports", "runtime", "task.json"]
 
 
 # ---------------------------------------------------------------------------

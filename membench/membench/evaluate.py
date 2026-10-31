@@ -281,13 +281,13 @@ def office_slot_dataset_stems() -> set[str]:
     current, _source = resolve_dataset(None)
     if current:
         stems.add(Path(current).stem)
-    return {layout.slug(stem) for stem in stems}
+    return {layout.dataset_dir_name(stem) for stem in stems}
 
 
 def _identity_name(dataset_path: str, dataset_dir: str) -> str:
     """数据集身份名：优先取数据集文件 stem，缺路径（旧产物）时退回产物目录名。"""
     if dataset_path:
-        return layout.slug(Path(dataset_path).stem)
+        return layout.dataset_dir_name(Path(dataset_path).stem)
     return layout.slug(os.path.basename(os.path.normpath(dataset_dir)))
 
 
@@ -393,8 +393,8 @@ def _expected_dataset_dir_names(key: str) -> Union[set[str], None]:
     except KeyError:
         return None
     if info.builtin_file is None:
-        return {layout.slug(key)}
-    stem = layout.slug(Path(info.builtin_file).stem)
+        return {layout.dataset_dir_name(key)}
+    stem = layout.dataset_dir_name(Path(info.builtin_file).stem)
     office_stems = office_slot_dataset_stems()
     # 内置办公集与用户测试集都满足办公域槽位，两条通道都算命中
     return office_stems if stem in office_stems else {stem}
@@ -415,7 +415,7 @@ def _assert_dataset_identity(key: str, dataset_dir: str) -> None:
     actual = layout.slug(os.path.basename(os.path.normpath(dataset_dir)))
     expected = _expected_dataset_dir_names(key)
     if expected is None:
-        if actual != layout.slug(key):
+        if actual != layout.dataset_dir_name(key):
             print(
                 f"[membench] ⚠️ 汇总模式：key {key!r} 不在数据集注册表里，无法核对身份，"
                 f"已采用 {actual!r}（{dataset_dir}）——不是想要的数据集请改 KEY"
@@ -1171,6 +1171,11 @@ def _render_task_report_md(
         ["judge", f"`{judge_name}`"],
         ["platform", str(platform or "default")],
         ["commit", str(commit or "n/a")],
+        *(
+            [["任务名", str(first_metrics["task_name_display"])]]
+            if first_metrics.get("task_name_display")
+            else []
+        ),
         [
             "membench 版本",
             version_display(first_metrics.get("membench_version")) if results else "n/a",
