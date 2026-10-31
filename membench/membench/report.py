@@ -641,8 +641,8 @@ def fig_metric_diff(
     eff_b = [float(overall_b[k]) for k in eff_keys]
 
     id_handles = [
-        Patch(facecolor=PALETTE[0], label=f"A（基线）· {label_a}"),
-        Patch(facecolor=PALETTE[1], label=f"B（候选）· {label_b}"),
+        Patch(facecolor=PALETTE[0], label=f"基线 · {label_a}"),
+        Patch(facecolor=PALETTE[1], label=f"候选 · {label_b}"),
     ]
 
     fig, (ax, ax2) = plt.subplots(1, 2, figsize=(max(12, 1.4 * len(keys)), 4.8))
@@ -732,8 +732,8 @@ def fig_category_diff(
     ax.set_title("分题型准确率对比 (A vs B)")
     ax.legend(
         handles=[
-            Patch(facecolor=PALETTE[0], label=f"A（基线）· {label_a}"),
-            Patch(facecolor=PALETTE[1], label=f"B（候选）· {label_b}"),
+            Patch(facecolor=PALETTE[0], label=f"基线 · {label_a}"),
+            Patch(facecolor=PALETTE[1], label=f"候选 · {label_b}"),
         ],
         loc="lower right",
         fontsize=8,
@@ -2165,11 +2165,11 @@ def write_compare_report_md(
     verdict_icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌"}.get(verdict, "")
     lines.append(f"**门禁结论： {verdict} {verdict_icon}**")
     lines.append("")
-    lines.append(f"- 基线 A: `{id_a}`")
+    lines.append(f"- 基线: `{id_a}`")
     rated_a = overall_rating(metrics_a.get("overall", {}))
     if rated_a is not None:
         lines.append(f"- A 综合评级：{rated_a[0]}（{rated_a[1]:.2f}/4.0）")
-    lines.append(f"- 候选 B: `{id_b}`")
+    lines.append(f"- 候选: `{id_b}`")
     rated_b = overall_rating(metrics_b.get("overall", {}))
     if rated_b is not None:
         lines.append(f"- B 综合评级：{rated_b[0]}（{rated_b[1]:.2f}/4.0）")
@@ -2197,7 +2197,7 @@ def write_compare_report_md(
                 format_metric_delta(key, d["diff"]) if "diff" in d else "n/a",
             ]
         )
-    lines.append(_md_table(["指标", "A (基线)", "B (候选)", "diff"], rows or [["(无)", "", "", ""]]))
+    lines.append(_md_table(["指标", "基线", "候选", "diff"], rows or [["(无)", "", "", ""]]))
     lines.append("")
     lines.append(f"![关键指标对比]({FIG_METRIC_DIFF})")
     lines.append("")

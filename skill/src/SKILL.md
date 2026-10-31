@@ -51,7 +51,7 @@ description: >
 ### 1. 评测（单集 / 多集）
 
 ```bash
-python scripts/run_task.py eval --adapter <适配器名> --dataset <key|路径> --recall-mode llm --judge llm
+python scripts/run_task.py eval --name <任务名> --adapter <适配器名> --dataset <key|路径> --recall-mode llm --judge llm
 ```
 
 - 多数据集重复 `--dataset`；`--dataset` 接受数据集 key（如 `--dataset office`）或 JSONL 路径，按需下载集先 `dataset fetch <key>`；全量宏平均走原生 `evaluate`。`--recall-mode` 与 `--judge` 必填，`--judge heuristic` 只能配 `--limit`。
@@ -61,7 +61,7 @@ python scripts/run_task.py eval --adapter <适配器名> --dataset <key|路径> 
 ### 2. A/B（两个 commit、两版系统）
 
 ```bash
-python scripts/run_task.py ab --baseline-adapter <基线> --candidate-adapter <候选> --dataset <数据集> --recall-mode llm --judge llm --name <标签> --baseline-version <版本A> --candidate-version <版本B> --driver-llm-a none --driver-llm-b none
+python scripts/run_task.py ab --name <任务名> --baseline-name <基线组名> --candidate-name <候选组名> --baseline-adapter <基线> --candidate-adapter <候选> --dataset <数据集> --recall-mode llm --judge llm --baseline-version <版本A> --candidate-version <版本B> --driver-llm-a none --driver-llm-b none
 ```
 
 - 两个 commit：先 `git worktree` 各检出并构建，再传两个 adapter（步骤见 `references/compare_workflows.md`）。
@@ -72,7 +72,7 @@ python scripts/run_task.py ab --baseline-adapter <基线> --candidate-adapter <�
 ### 3. 分片（大数据集）
 
 ```bash
-python scripts/run_task.py eval --adapter <适配器名> --dataset ~/.membench/datasets/beam_1m.jsonl --shards 4 --recall-mode llm --judge llm
+python scripts/run_task.py eval --name <任务名> --adapter <适配器名> --dataset ~/.membench/datasets/beam_1m.jsonl --shards 4 --recall-mode llm --judge llm
 ```
 
 - 分片由脚本自动编排（共用一棵任务目录 → `fuse` 补齐），你只需给 `--shards`。
@@ -98,6 +98,16 @@ python -m membench.cli matrix --runs "wx@<shaA>=<产物目录>" "fs@<shaA>=<产�
 
 - 四个组合必须同测试集、同判分器、同驱动模型、同 adapter 版本，否则矩阵不可归因。
 - 任一两两门禁 FAIL → 退出码 1；解读顺序：同平台跨 commit（回归）→ 同 commit 跨平台（平台差）→ 对角线（交互效应）。
+
+## 命名：任务名必填，组名与目录名分开
+
+- `run_task.py` 的 `--name` **必填**：写清这次实验是什么（如 `索引优化` / `基线复测`），
+  进任务目录名。不再回退 adapter 名——同 adapter 的多次实验必须靠名字区分。
+- 对比任务：`--baseline-name` / `--candidate-name` 是**显示名（可中文）**（报告与
+  `groups.json` 用它）；`--baseline-dir` / `--candidate-dir` 是**目录名（ASCII）**，
+  缺省 `baseline` / `candidate`。中文名不进目录（内链、跨工具、排序都会带麻烦）。
+- 名字写进任务根的 `groups.json` 后，后续报告、`task status`、多线对比都直接复用它，
+  不再从 commit 重新推导。
 
 ## 三个检查点
 
@@ -150,7 +160,7 @@ python -m membench.cli matrix --runs "wx@<shaA>=<产物目录>" "fs@<shaA>=<产�
 ## 长跑：后台执行 + 定时监控
 
 ```bash
-python scripts/run_task.py eval ... --background      # stdout 只一行任务目录
+python scripts/run_task.py eval --name <任务名> ... --background   # stdout 只一行任务目录
 python scripts/watch_task.py <任务目录> --until-done --interval 300
 ```
 

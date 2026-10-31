@@ -177,7 +177,7 @@ class TestCompareFigureLegend:
             for t in leg.get_texts()
         ]
 
-    def test_metric_diff_legend_marks_ab_and_short_names(
+    def test_metric_diff_legend_marks_baseline_candidate_and_short_names(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         pytest.importorskip("matplotlib")
@@ -193,13 +193,13 @@ class TestCompareFigureLegend:
         )
         texts = self._legend_texts(plt.gcf())
         plt.close(plt.gcf())
-        assert any("A（基线）· mock-a@v1" in t for t in texts)
-        assert any("B（候选）· mock-b@v2" in t for t in texts)
+        assert any("基线 · mock-a@v1" in t for t in texts)
+        assert any("候选 · mock-b@v2" in t for t in texts)
         # B 的明显优化/劣化另立图例项（accuracy +0.30 优化、evidence_recall -0.30 劣化）
         assert any("B 明显优化" in t for t in texts)
         assert any("B 明显劣化" in t for t in texts)
 
-    def test_category_diff_legend_marks_ab(
+    def test_category_diff_legend_marks_baseline_candidate(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         pytest.importorskip("matplotlib")
@@ -215,8 +215,8 @@ class TestCompareFigureLegend:
         )
         texts = self._legend_texts(plt.gcf())
         plt.close(plt.gcf())
-        assert any("A（基线）· mock-a@v1" in t for t in texts)
-        assert any("B（候选）· mock-b@v2" in t for t in texts)
+        assert any("基线 · mock-a@v1" in t for t in texts)
+        assert any("候选 · mock-b@v2" in t for t in texts)
 
     def test_ab_series_labels_prefers_adapter_and_commit(self) -> None:
         """短名首选 adapter@commit；两侧完全相同才退回 run_id 以免图例分不出。"""

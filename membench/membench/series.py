@@ -552,6 +552,27 @@ def _check_same_datasets(lines: list[SeriesLine]) -> None:
         )
 
 
+def _manifest_label(target: str) -> Union[str, None]:
+    """产物目录所属任务里该组的**显示名**（``groups.json``），没有则 None。
+
+    AB 任务的组名是用户在 ``task init`` 时给的、落在清单里；多线对比直接沿用，
+    不再从 commit 重新抽取——否则重出报告 / 仓库被 rebase 后名字会漂移。
+    """
+    path = os.path.abspath(target)
+    for _ in range(3):  # 数据集目录 → 组目录 → 任务根
+        parent = os.path.dirname(path)
+        groups = layout.read_groups_manifest(parent)
+        if groups:
+            base = os.path.basename(path)
+            for item in groups:
+                if str(item.get("dir")) == base:
+                    return str(item.get("label") or base)
+        path = parent
+        if path in (os.path.dirname(path), ""):
+            break
+    return None
+
+
 def load_lines(
     specs: Sequence[str],
     repo: Union[str, None] = None,
@@ -584,10 +605,17 @@ def load_lines(
     repo_path = os.path.abspath(repo or os.getcwd())
     parsed = [_parse_spec(raw) for raw in specs]
     naming = _NamingState(repo_path, llm, warn) if llm and llm.enabled else None
-    resolved = [
-        _resolve_name(ref, repo_path, index, None, warn, naming)
-        for index, (ref, _target) in enumerate(parsed)
-    ]
+    resolved = []
+    for index, (ref, target) in enumerate(parsed):
+        if not is_commit_ref(ref):
+            resolved.append((ref, "显式名"))
+            continue
+        label = _manifest_label(target)
+        if label and index > 0:
+            # 该产物来自一个有 groups.json 的任务：直接复用当时的组名
+            resolved.append((label, "任务清单"))
+            continue
+        resolved.append(_resolve_name(ref, repo_path, index, None, warn, naming))
     names = _dedupe_names(
         [name for name, _source in resolved],
         [ref if is_commit_ref(ref) else None for ref, _target in parsed],
@@ -1157,6 +1185,29 @@ def run_series(
             # 所有数据集的四项质量指标都为 None（例如整批只跑拒答题）：不画图，
             # 报告里的表格仍是完整事实，不因此中断。
             pass
+    # 线名清单（一次性落盘）：后续复核 / 重出报告直接读它，不再从 commit 推导
+    manifest_path = os.path.join(series_dir, "series.json")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "schema": 1,
+                "lines": [
+                    {
+                        "index": entry["index"],
+                        "name": entry["name"],
+                        "name_source": entry["name_source"],
+                        "commit": entry["commit"],
+                        "target": entry["target"],
+                        "dir": os.path.basename(entry["copy_dir"]),
+                    }
+                    for entry in entries
+                ],
+            },
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+        handle.write("\n")
     report_path = _write_series_report(
         reports_dir,
         entries,
