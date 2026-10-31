@@ -52,7 +52,7 @@ from membench.data.schema import load_dataset, question_capabilities
 from membench.layout import resolve_dataset_dir
 from membench.ratings import format_metric, overall_rating
 from membench.report import (
-    WORST_CATEGORY_MIN_N,
+    CATEGORY_MIN_N,
     WORST_CATEGORY_TOP,
     _md_table,
     _fmt_opt,
@@ -1464,9 +1464,11 @@ def _render_task_report_md(
         lines.append("")
         lines.append(
             f"<sub>每个数据集取准确率最低的至多 {WORST_CATEGORY_TOP} 个题型，只收题量 ≥ "
-            f"{WORST_CATEGORY_MIN_N} 的题型（小样本一两题翻转就是 25~50pt，会挤掉真正该修的"
-            "大题型）。「主要问题」是逐题记录里的可机检粗分：拒答类看「未拒答」「状态未遗忘」，"
-            "其余看「证据未命中」「检索到仍答错」；完整分题型数据见各自数据集报告。</sub>"
+            f"{CATEGORY_MIN_N} 的题型（小样本一两题翻转就是 25~50pt，会挤掉真正该修的"
+            "大题型）。「主要问题」是逐题记录里的可机检粗分，每个判错题**只归一类**（各分桶"
+            "加总等于判错题数）：拒答类看「未拒答 / 泄露红线 / 状态未遗忘 / 其他」，其余看"
+            "「证据未命中 / 检索到仍答错 / 状态未遗忘 / 无判定依据（无证据标注）」；"
+            "完整分题型数据见各自数据集报告。</sub>"
         )
         lines.append("")
         lines.append(
@@ -1686,7 +1688,7 @@ def _worst_category_rows(
             rows.append(
                 [
                     res.spec.name,
-                    f"（无题量 ≥ {WORST_CATEGORY_MIN_N} 的题型）",
+                    f"（无题量 ≥ {CATEGORY_MIN_N} 的题型）",
                     "—",
                     "—",
                     "—",

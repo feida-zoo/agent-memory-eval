@@ -77,6 +77,7 @@ from membench.layout import (
     FIG_PER_DATASET_DIFF,
 )
 from membench.report import (
+    CATEGORY_MIN_N,
     PALETTE,
     EFFICIENCY_DIFF_METRICS,
     _fmt_opt,
@@ -114,10 +115,6 @@ class ArmDatasetResult:
 
 #: 「提升 TOP N 题型」列多少条。
 TOP_IMPROVED_CATEGORIES = 5
-
-#: 进 TOP 榜的最小题量（两侧都要满足）：题型只有 2~4 题时，一两题的翻转就是
-#: +50~+100pt，会把真正的大样本改进挤出榜单。小样本题型仍在下方的逐数据集表里。
-TOP_CATEGORY_MIN_N = 10
 
 
 def _category_diff_rows(arm: ArmDatasetResult) -> list[dict[str, Any]]:
@@ -157,7 +154,7 @@ def top_improved_categories(
 ) -> list[dict[str, Any]]:
     """按 Δ 准确率排出「提升最多」的 (数据集, 题型)。
 
-    只收**正向**改进、且两侧题量都达到 :data:`TOP_CATEGORY_MIN_N` 的组合——
+    只收**正向**改进、且两侧题量都达到 :data:`membench.report.CATEGORY_MIN_N` 的组合——
     小样本题型的一两题翻转会制造 +50pt 的假象，那类仍留在逐数据集表里。
 
     Args:
@@ -173,7 +170,7 @@ def top_improved_categories(
         for row in _category_diff_rows(arm):
             if row["acc_a"] is None or row["acc_b"] is None:
                 continue
-            if min(row["n_a"], row["n_b"]) < TOP_CATEGORY_MIN_N:
+            if min(row["n_a"], row["n_b"]) < CATEGORY_MIN_N:
                 continue
             delta = float(row["acc_b"]) - float(row["acc_a"])
             if delta <= 0:
@@ -1266,7 +1263,7 @@ def _write_evaluate_compare_report(
         lines.append(f"### 提升最多的题型（TOP {len(top)}）")
         lines.append("")
         lines.append(
-            f"<sub>按 Δ 准确率降序；只收**两侧题量都 ≥ {TOP_CATEGORY_MIN_N}** 且正向改进的"
+            f"<sub>按 Δ 准确率降序；只收**两侧题量都 ≥ {CATEGORY_MIN_N}** 且正向改进的"
             "组合——小样本题型一两题翻转就能 +50pt，会盖住大样本的真实改进（它们仍在下方"
             "各表里）。同 Δ 按题量降序。</sub>"
         )
@@ -1288,7 +1285,7 @@ def _write_evaluate_compare_report(
         lines.append("")
     else:
         lines.append(
-            f"<sub>本次没有满足条件的提升项（要求两侧题量 ≥ {TOP_CATEGORY_MIN_N} 且 Δ > 0）。</sub>"
+            f"<sub>本次没有满足条件的提升项（要求两侧题量 ≥ {CATEGORY_MIN_N} 且 Δ > 0）。</sub>"
         )
         lines.append("")
     for arm in arms:

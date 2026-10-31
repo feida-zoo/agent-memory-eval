@@ -251,7 +251,7 @@ def test_worst_categories_ranking_and_issue() -> None:
     assert "tiny" not in cats
     by_cat = {row["category"]: row for row in rows}
     assert by_cat["utility_answer"]["issue"] == "证据未命中 12"
-    assert by_cat["safety_no_memory"]["issue"] == "未拒答 10/10"
+    assert by_cat["safety_no_memory"]["issue"] == "未拒答 10"
     assert by_cat["privacy_answer_redacted"]["accuracy"] == pytest.approx(1.0)
 
 
@@ -265,3 +265,58 @@ def test_report_renders_worst_categories_section(tmp_path: Path) -> None:
     """单版本评估报告要有「最需要优化的题型」小节（题量不足时给说明）。"""
     _dir, _metrics, _records, report = _run(tmp_path)
     assert "## 最需要优化的题型（TOP 5）" in report
+
+
+def test_worst_categories_issue_partitions_all_wrong() -> None:
+    """「主要问题」的分桶互斥且覆盖全部判错题（不会被读者当成漏算）。"""
+    from membench.report import worst_categories
+
+    # 12 题：4 无证据标注 / 4 证据未命中 / 4 检索到仍答错
+    records = []
+    for i in range(12):
+        records.append(
+            {
+                "category": "utility_answer",
+                "gold_answer": "x",
+                "judge": {"correct": False, "abstained_pred": False},
+                "evidence_hit": False if i < 4 else (True if i < 8 else None),
+                "evidence_in_state": None,
+            }
+        )
+    issue = worst_categories(records)[0]["issue"]
+    assert issue == "证据未命中 4；检索到仍答错 4；无判定依据 4"
+
+    # 拒答类：未拒答 4 / 泄露红线 3 / 状态未遗忘 3 / 其他 2（合计 12）
+    abstain_records = []
+    for label in ["miss"] * 4 + ["leak"] * 3 + ["state"] * 3 + ["other"] * 2:
+        record = {
+            "category": "safety_no_memory",
+            "gold_answer": "<ABSTAIN>",
+            "evidence_in_state": None,
+            "judge": {"correct": False, "abstained_pred": True, "leak": False},
+        }
+        if label == "miss":
+            record["judge"]["abstained_pred"] = False
+        if label == "leak":
+            record["judge"]["leak"] = True
+        if label == "state":
+            record["evidence_in_state"] = True
+        abstain_records.append(record)
+    issue = worst_categories(abstain_records)[0]["issue"]
+    assert issue == "未拒答 4；泄露红线 3；状态未遗忘 3；其他 2"
+
+
+def test_load_dataset_records_handles_missing_and_corrupt(tmp_path: Path) -> None:
+    """任务级报告的逐题记录读取：缺失 / JSON 坏行都要返回 None（不猜）。"""
+    from membench.evaluate import _load_dataset_records
+
+    run_dir = tmp_path / "run"
+    assert _load_dataset_records(str(run_dir)) is None  # 目录都不存在
+    report_dir = run_dir / "report"
+    report_dir.mkdir(parents=True)
+    assert _load_dataset_records(str(run_dir)) is None  # 缺 results.jsonl
+    (report_dir / "results.jsonl").write_text('{"qid": "q1"}\n{坏行\n', encoding="utf-8")
+    assert _load_dataset_records(str(run_dir)) is None
+    (report_dir / "results.jsonl").write_text('{"qid": "q1"}\n{"qid": "q2"}\n', encoding="utf-8")
+    records = _load_dataset_records(str(run_dir))
+    assert records is not None and [r["qid"] for r in records] == ["q1", "q2"]

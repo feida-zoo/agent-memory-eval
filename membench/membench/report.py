@@ -135,28 +135,45 @@ def category_display(cat: str) -> str:
     return CATEGORY_ZH.get(cat, cat)
 
 
-#: 「最需要优化的题型」列多少条、最少多少题才进榜。
+#: 题型进榜的最小题量（「最需要优化的题型」与「提升最多的题型」共用）：
+#: 只有 2~4 题的题型，一两题翻转就是 25~50pt，会挤掉真正该修的大题型。
+CATEGORY_MIN_N = 10
+
+#: 「最需要优化的题型」列多少条。
 WORST_CATEGORY_TOP = 5
-WORST_CATEGORY_MIN_N = 10
 
 
 def worst_categories(
     records: list[dict[str, Any]],
     *,
     limit: int = WORST_CATEGORY_TOP,
-    min_n: int = WORST_CATEGORY_MIN_N,
+    min_n: int = CATEGORY_MIN_N,
 ) -> list[dict[str, Any]]:
-    """按准确率升序排出最需要优化的题型，并标出该题型的主要失败形态。
+    """按准确率升序排出最需要优化的题型，并标出该题型的失败形态。
 
     为什么设题量门槛：题型只有 2~4 题时，一两题答错就是 25~50pt 的落差，会把
     真正该修的大题型挤下去。小样本题型仍在「分题型准确率」表里，只是不进榜。
 
-    失败形态只做**可机检**的粗分（都是逐题记录里已有的字段，不额外调用判分器）：
+    失败形态只做**可机检**的粗分（字段都已在逐题记录里，不额外调用判分器），
+    且**每个判错题只归一类**（分桶互斥、加总等于判错题数，不会被读者误当成漏算）：
 
-    - 拒答类（``is_abstention``）：判错里"未识别为拒答"的题数 → ``未拒答 N``
-    - 其余：判错里 ``evidence_hit=False``（``证据未命中``）与 ``True``
-      （``检索到仍答错``）各计一份；状态红线命中（``evidence_in_state=True`` 且 safety）
-      记 ``状态未遗忘``
+    拒答类（``is_abstention``）按优先级：
+
+    1. ``未拒答``——``abstained_pred`` 为假（该拒答却没拒）；
+    2. ``泄露红线``——``judge.leak`` 为真（拒答了但说出了敏感内容）；
+    3. ``状态未遗忘``——``evidence_in_state`` 为真（回答没问题，记忆里还留着）；
+    4. ``其他``——以上都不成立（例如 rubric 的 include 要点没满足）。
+
+    其余题型：
+
+    1. ``状态未遗忘``——``evidence_in_state`` 为真；
+    2. ``证据未命中``——``evidence_hit`` 为假（证据没进过检索上下文）；
+    3. ``检索到仍答错``——``evidence_hit`` 为真；
+    4. ``无判定依据``——``evidence_hit`` 为 ``None``（该数据集没有证据标注）。
+
+    拒答类的判定按 category + 该题型**第一条判错题**的 ``gold_answer``：数据集里
+    category 与 gold 类型是绑定的（``abstention`` / ``safety_no_memory`` /
+    ``privacy_refuse``），不会出现同题型混杂。
 
     Args:
         records: 逐题记录（``results.jsonl`` 风格）。
@@ -171,44 +188,49 @@ def worst_categories(
     for record in records:
         buckets.setdefault(str(record.get("category", "unknown")), []).append(record)
 
+    def _judge(record: dict[str, Any]) -> dict[str, Any]:
+        return record.get("judge") or {}
+
     rows: list[dict[str, Any]] = []
     for cat, items in buckets.items():
         n = len(items)
         if n < min_n:
             continue
-        wrong = [r for r in items if not bool((r.get("judge") or {}).get("correct"))]
+        wrong = [r for r in items if not bool(_judge(r).get("correct"))]
         accuracy = (n - len(wrong)) / n if n else 0.0
         issue = ""
         if wrong:
-            if is_abstention(
+            abstain_category = is_abstention(
                 cat, str((wrong[0].get("gold_answer") or ""))
-            ):
-                missed = sum(
-                    1
-                    for r in wrong
-                    if not bool((r.get("judge") or {}).get("abstained_pred"))
-                )
-                state_leak = sum(
-                    1 for r in wrong if r.get("evidence_in_state") is True
-                )
-                parts = [f"未拒答 {missed}/{len(wrong)}"] if missed else []
-                if state_leak:
-                    parts.append(f"状态未遗忘 {state_leak}")
-                issue = "；".join(parts)
-            else:
-                not_retrieved = sum(1 for r in wrong if r.get("evidence_hit") is False)
-                retrieved_wrong = sum(1 for r in wrong if r.get("evidence_hit") is True)
-                state_leak = sum(
-                    1 for r in wrong if r.get("evidence_in_state") is True
-                )
-                parts = []
-                if not_retrieved:
-                    parts.append(f"证据未命中 {not_retrieved}")
-                if retrieved_wrong:
-                    parts.append(f"检索到仍答错 {retrieved_wrong}")
-                if state_leak:
-                    parts.append(f"状态未遗忘 {state_leak}")
-                issue = "；".join(parts) if parts else "无法归因（无证据标注）"
+            )
+            counts: dict[str, int] = {}
+            for record in wrong:
+                if abstain_category:
+                    if not bool(_judge(record).get("abstained_pred")):
+                        label = "未拒答"
+                    elif bool(_judge(record).get("leak")):
+                        label = "泄露红线"
+                    elif record.get("evidence_in_state") is True:
+                        label = "状态未遗忘"
+                    else:
+                        label = "其他"
+                else:
+                    if record.get("evidence_in_state") is True:
+                        label = "状态未遗忘"
+                    elif record.get("evidence_hit") is False:
+                        label = "证据未命中"
+                    elif record.get("evidence_hit") is True:
+                        label = "检索到仍答错"
+                    else:
+                        label = "无判定依据"
+                counts[label] = counts.get(label, 0) + 1
+            # 分桶互斥：按固定顺序输出，加总恒等于判错题数
+            order = (
+                ("未拒答", "泄露红线", "状态未遗忘", "其他")
+                if abstain_category
+                else ("证据未命中", "检索到仍答错", "状态未遗忘", "无判定依据")
+            )
+            issue = "；".join(f"{label} {counts[label]}" for label in order if counts.get(label))
         rows.append(
             {
                 "category": cat,
@@ -1642,10 +1664,11 @@ def write_run_report_md(
     lines.append("")
     if worst:
         lines.append(
-            f"<sub>按准确率升序；只收题量 ≥ {WORST_CATEGORY_MIN_N} 的题型（小样本一两题"
+            f"<sub>按准确率升序；只收题量 ≥ {CATEGORY_MIN_N} 的题型（小样本一两题"
             "翻转就是 25~50pt，会挤掉真正该修的大题型——它们仍在上一张表里）。"
-            "「主要问题」只做可机检的粗分：拒答类看是否识别为拒答，其余看证据是否进过"
-            "检索上下文、状态是否仍含敏感串。</sub>"
+            "「主要问题」只做可机检的粗分，且每个判错题**只归一类**（各分桶加总等于判错题数）："
+            "拒答类看「未拒答 / 泄露红线 / 状态未遗忘」，其余看「证据未命中 / 检索到仍答错 / "
+            "状态未遗忘 / 无判定依据（无证据标注）」。</sub>"
         )
         lines.append("")
         worst_rows = [
@@ -1666,7 +1689,7 @@ def write_run_report_md(
         )
     else:
         lines.append(
-            f"<sub>没有题量 ≥ {WORST_CATEGORY_MIN_N} 的题型（或该数据集无逐题记录），"
+            f"<sub>没有题量 ≥ {CATEGORY_MIN_N} 的题型（或该数据集无逐题记录），"
             "不列榜。</sub>"
         )
     lines.append("")
