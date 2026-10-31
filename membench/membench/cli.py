@@ -1490,8 +1490,18 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
     next_steps: list[str] = []
     n_datasets = 0
     groups_all_ready = True
+    # 组目录名是 ASCII，显示名在 groups.json 里：进度视图两个都给（"组 基线（baseline）"）
+    manifest_labels = {
+        str(item["dir"]): str(item.get("label") or item["dir"])
+        for item in (layout.read_groups_manifest(target) or [])
+    }
     for label, group_root in groups:
-        where = f"组 {label}" if label else "单组实验目录"
+        display = manifest_labels.get(label)
+        where = (
+            f"组 {display}（{label}）"
+            if label and display and display != label
+            else (f"组 {label}" if label else "单组实验目录")
+        )
         print(f"[membench] {where}: {group_root}")
         _print_runtime(group_root, f"组 {label}" if label else "")
         datasets = _dataset_dirs_of(group_root)

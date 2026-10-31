@@ -201,7 +201,7 @@ def test_task_status_fresh_task_dir(
     out = capsys.readouterr().out
     assert f"任务目录: {task}" in out
     assert "骨架: groups=2（baseline/ candidate/ + reports/）" in out
-    assert "组 baseline:" in out and "组 candidate:" in out
+    assert "组 基线（baseline）:" in out and "组 候选（candidate）:" in out
     assert out.count("数据集: （尚无产物）") == 2
     assert "下一步:" in out
     assert "--task-dir" in out and "--shard-by dialogue" in out
