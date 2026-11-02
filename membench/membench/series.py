@@ -39,6 +39,9 @@
     <out_dir>/reports/{report.md, fig_series_accuracy.png, fig_series_delta.png,
                        fig_series_fused.png, fig_series_per_dataset.png}
     <out_dir>/runs/<线序>-<slug>/<dataset>/   # 各线的数据集树副本（报告内相对链接）
+    <out_dir>/runs/<线序>-<slug>/reports/     # **该线自己的融合报告**（与 evaluate 的
+                                              # 任务级报告同构：融合指标 / 评级 / 门禁 /
+                                              # 逐数据集表；融合口径与本次 series 一致）
 
 **只读**：各线的产物目录（实验目录或 ``runs/<dataset>`` 数据集目录）原样不动；本模块
 只读 ``<数据集目录>/report/metrics.json`` 并复制副本，不改 A/B（compare）、
@@ -56,6 +59,7 @@ import sys
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Union
 
 from membench import layout, runtime
@@ -68,8 +72,11 @@ from membench.evaluate import (
     DatasetResult,
     DatasetSpec,
     _capabilities_from_metrics,
+    evaluate_gate,
     fuse_metrics,
     is_office_slot_dataset,
+    metadata_inconsistencies,
+    write_task_reports,
 )
 from membench.judges.llm import chat_completion
 from membench.paths import output_root
@@ -680,6 +687,67 @@ def _overall_of(line: SeriesLine, fused: dict[str, dict[str, Any]]) -> dict[str,
     return {key: item["value"] for key, item in fused.items() if item.get("value") is not None}
 
 
+def _write_line_report(
+    line_dir: str,
+    line: SeriesLine,
+    *,
+    total_lines: int,
+    fused: dict[str, dict[str, Any]],
+    fusion: str,
+    timestamp: datetime,
+) -> str:
+    """写一条线自己的融合报告到 ``<线目录>/reports/``，返回 ``report.md`` 路径。
+
+    为什么逐线也要一份：多线对比报告回答"哪一步涨了多少"，但排查"这一线到底哪里
+    不行"（评级 / 门禁 / 逐数据集表 / 最难题型）需要该线自己的任务级报告——缺了它
+    就只剩逐数据集报告，得手工拼。这里复用 :func:`membench.evaluate.write_task_reports`
+    （与 ``evaluate`` 的任务级报告**同一份实现**），所以字段、评级规则、门禁口径与
+    一次正常 `evaluate` 完全一致，唯一差别是：
+
+    - 链接指向本次 series 树里的副本（``../<dataset>/report/report.md``）；
+    - 融合口径用**本次 series 的** ``fusion``（源产物可能是别的口径，重算才对得上）；
+    - 报告头多一条说明：这是第几线、跨线对比在 ``../../reports/report.md``。
+
+    数据集目录在副本里是 ``<线目录>/<dataset>/``（不是 ``runs/<dataset>/``），
+    报告内的相对链接由 :func:`write_task_reports` 按 ``run_dir`` 现算，不需要特判。
+    """
+    copies = [
+        DatasetResult(
+            spec=res.spec,
+            run_dir=os.path.join(line_dir, key),
+            metrics=res.metrics,
+            capabilities=res.capabilities,
+        )
+        for key, res in line.datasets.items()
+    ]
+    first = next(iter(line.datasets.values()))
+    notes = [
+        f"> 本报告是多线对比中「{line.name}」这一线的融合报告"
+        f"（第 {line.index + 1}/{total_lines} 线，融合口径 `{fusion}`）；"
+        # 报告在 <series>/runs/<线>/reports/ 下：上三级才回到 <series>/reports/
+        "跨线对比见 [主报告](../../../reports/report.md)。"
+    ]
+    for note in metadata_inconsistencies(copies):
+        notes.append(f"> ⚠️ 跨数据集元数据不一致 —— {note}")
+    write_task_reports(
+        line_dir,
+        adapter_name=str(first.metrics.get("adapter") or "unknown"),
+        judge_name=str(first.metrics.get("judge") or "heuristic"),
+        platform=first.metrics.get("platform"),
+        commit=line.commit or first.metrics.get("commit"),
+        timestamp=timestamp,
+        results=copies,
+        fused=fused,
+        gate=evaluate_gate(copies),
+        fusion=fusion,
+        extra_notes=notes,
+        categories=first.metrics.get("categories") or (),
+        # 副本目录名是 01-<slug>（ASCII）；报告抬头显示人看的线名
+        title=line.name,
+    )
+    return os.path.join(line_dir, layout.DIR_REPORTS, layout.FILE_REPORT_MD)
+
+
 def _comparability(base: SeriesLine, line: SeriesLine) -> dict[str, Any]:
     """一条线 vs 基线的可比性：逐数据集各跑 ``check_comparability`` 再汇总。
 
@@ -1009,6 +1077,12 @@ def _write_series_report(
                 reports_dir,
             ).replace(os.sep, "/")
             copies.append(f"[{key}]({rel})")
+        line_report = entry.get("report_path")
+        fused_link = "—"
+        if line_report:
+            fused_link = "[该线融合报告]({})".format(
+                os.path.relpath(line_report, reports_dir).replace(os.sep, "/")
+            )
         source_rows.append(
             [
                 str(entry["index"] + 1),
@@ -1016,12 +1090,21 @@ def _write_series_report(
                 entry["name_source"],
                 entry["commit"] or "—",
                 f"`{entry['target']}`",
+                fused_link,
                 "、".join(copies),
             ]
         )
     lines.append(
         _md_table(
-            ["线序", "名称", "命名来源", "commit", "产物目录", "副本（数据集报告）"],
+            [
+                "线序",
+                "名称",
+                "命名来源",
+                "commit",
+                "产物目录",
+                "该线融合报告",
+                "副本（数据集报告）",
+            ],
             source_rows,
         )
     )
@@ -1145,6 +1228,7 @@ def run_series(
         prev_acc = acc
 
     series_dir = layout.experiment_path(report_out, layout.series_subdir())
+    now = datetime.now()
     for line, entry in zip(lines, entries):
         line_dir = layout.series_line_dir(
             series_dir, line.index, line.name, line.commit, line.dir_hint
@@ -1152,6 +1236,14 @@ def run_series(
         for key, res in line.datasets.items():
             shutil.copytree(res.run_dir, os.path.join(line_dir, key))
         entry["copy_dir"] = line_dir
+        entry["report_path"] = _write_line_report(
+            line_dir,
+            line,
+            total_lines=len(lines),
+            fused=fused_by_line[line.index],
+            fusion=fusion,
+            timestamp=now,
+        )
     runtime.set_dir(os.path.abspath(series_dir))
 
     reports_dir = layout.task_report_dir(series_dir)
@@ -1264,6 +1356,9 @@ def run_series(
         "series_dir": series_dir,
         "report_path": report_path,
         "fig_path": fig_path,
+        "line_reports": {
+            entry["index"]: entry.get("report_path") for entry in entries
+        },
         "lines": entries,
         "verdict": verdict,
         "fusion": fusion,

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -858,3 +859,54 @@ def test_series_reuses_group_dir_from_task_manifest(tmp_path: Path, git_repo) ->
     series_dir = Path(result["series_dir"])
     dirs = sorted(p.name for p in (series_dir / layout.DIR_RUNS).iterdir())
     assert dirs == ["01-baseline", "02-index-opt"]
+
+
+def test_series_writes_per_line_fused_report(tmp_path: Path, git_repo) -> None:
+    """每条线都有一份自己的融合报告（与 evaluate 任务级报告同构，不是只有数据集报告）。
+
+    用户视角：多线报告回答"哪一步涨了多少"，但"这一线到底哪里不行"（评级 / 门禁 /
+    逐数据集表 / 最难题型）要看该线自己的任务级报告。缺了它，series 树里每条线只剩
+    逐数据集报告，只能手工拼。
+    """
+    from membench.evaluate import fuse_metrics
+
+    repo, shas = git_repo
+    runs = [
+        _run(tmp_path, "exp0", 40),
+        _run(tmp_path, "exp1", 80),
+    ]
+    specs = [f"{sha}={run}" for sha, run in zip(shas, runs)]
+    result = series.run_series(specs, repo=repo, report_out=str(tmp_path / "out"))
+
+    assert set(result["line_reports"]) == {0, 1}
+    for entry in result["lines"]:
+        line_dir = Path(entry["copy_dir"])
+        reports = line_dir / layout.DIR_REPORTS
+        # 与 evaluate 的任务级报告同构：md + metrics.json + 概览图 + summary
+        for name in (
+            layout.FILE_REPORT_MD,
+            layout.FILE_METRICS,
+            layout.FIG_DATASET_OVERVIEW,
+            layout.FILE_SUMMARY,
+        ):
+            assert (reports / name).is_file(), f"缺少 reports/{name}"
+        assert entry["report_path"] == str(reports / layout.FILE_REPORT_MD)
+
+        text = reports.joinpath(layout.FILE_REPORT_MD).read_text(encoding="utf-8")
+        # 抬头点出这是哪一线，并链回跨线主报告
+        assert f"「{entry['name']}」这一线的融合报告" in text
+        assert "../../../reports/report.md" in text
+        # 该线自己的融合指标表：数值与 series 报告用的同口径融合值一致
+        expected = fuse_metrics(list(entry["datasets"].values()))
+        accuracy = expected["accuracy"]["value"]
+        assert f"{accuracy * 100:.1f}%" in text
+        # 数据集报告链接指向副本（不是源产物），且不是死链
+        assert "../sample_dataset/report/report.md" in text
+        _assert_links_alive(reports / layout.FILE_REPORT_MD)
+
+    # 主报告的「来源与产物」表给每线一个入口
+    main = Path(result["report_path"]).read_text(encoding="utf-8")
+    for line in result["lines"]:
+        assert "该线融合报告" in main
+        rel = os.path.relpath(line["report_path"], Path(result["report_path"]).parent)
+        assert rel.replace(os.sep, "/") in main

@@ -104,7 +104,7 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
     └── reports/                                # 任务级（report.md / metrics.json / evaluate_summary.json / fig_dataset_overview.png）
     <report-out>/compare_<name>_<platform>_<ts>/{task.json,A/,B/,runtime/,reports/comparison.md}   # 双组任务目录
     <report-out>/matrix_<ts>/{runtime/,reports/,runs/<label>/}
-    <report-out>/series_<ts>/{runtime/,reports/,runs/<线序>-<slug>/<dataset>/}   # 多线对比
+    <report-out>/series_<ts>/{runtime/,reports/,runs/<线序>-<slug>/{<dataset>/,reports/}}   # 多线对比（每条线自带融合报告）
 
 回放任务（``task init --replay``）在任务目录根多一个内容寻址快照池 ``snapshots/``：
 回放导出的状态按内容哈希去重成桶 ``snapshots/<sha256 前 12 位>/``，每个对话一个

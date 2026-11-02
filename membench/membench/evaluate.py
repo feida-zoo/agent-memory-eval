@@ -1132,6 +1132,7 @@ def _render_task_report_md(
     fusion: str = FUSION_WEIGHTED,
     extra_notes: Union[list[str], None] = None,
     categories: "Iterable[str]" = (),
+    title: Union[str, None] = None,
 ) -> str:
     """生成任务级 ``report.md``（中文，全量评估报告），返回报告路径。
 
@@ -1141,6 +1142,8 @@ def _render_task_report_md(
         reports_dir: 任务级报告目录（``<实验目录>/reports``）。
         fusion: 融合口径（决定标题、权重列与评级小注的措辞）。
         extra_notes: 报告顶部追加的提示行（Markdown，如汇总模式的元数据不一致告警）。
+        categories: 题型过滤口径（``--category``）；空 = 全量。
+        title: 报告标题里的对象名；缺省用实验目录名（series 的逐线报告传线名）。
         results: 各数据集评测结果（spec 提供数据集范围、来源与路径）。
     """
     gate_status = str(gate["status"])
@@ -1151,7 +1154,12 @@ def _render_task_report_md(
     verdict = "不达标" if gate_status == "FAIL" else "达标"
 
     lines: list[str] = []
-    lines.append(f"# membench 全量评估报告 — {os.path.basename(os.path.normpath(experiment_dir))}")
+    # 标题缺省用目录名（一次正常评测就是它）；series 的逐线报告目录名是 01-line1，
+    # 由调用方传线名，报告抬头才对得上人看的那一列
+    lines.append(
+        f"# membench 全量评估报告 — "
+        f"{title or os.path.basename(os.path.normpath(experiment_dir))}"
+    )
     lines.append("")
 
     # 门禁结论（报告顶部显著呈现）
@@ -1740,6 +1748,7 @@ def write_task_reports(
     fusion: str = FUSION_WEIGHTED,
     extra_notes: Union[list[str], None] = None,
     categories: "Iterable[str]" = (),
+    title: Union[str, None] = None,
 ) -> dict[str, Any]:
     """写任务级报告到 ``<实验目录>/reports/``，返回 evaluate_summary.json 的内容。
 
@@ -1769,6 +1778,7 @@ def write_task_reports(
         fusion=fusion,
         extra_notes=extra_notes,
         categories=categories,
+        title=title,
     )
 
     metrics = {

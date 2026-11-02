@@ -863,6 +863,13 @@ python -m membench.cli series \
   图未生成时报告不写引用（不留死链）。
   各线的数据集树副本落 `runs/<线序>-<slug>/<dataset>/`（中文名经 `slug` 会退化成
   `default`，所以目录名带线序前缀；报告里给可点击的相对链接）。
+- **每条线另有一份自己的融合报告** `runs/<线序>-<slug>/reports/{report.md,metrics.json,
+  evaluate_summary.json,fig_dataset_overview.png}`：与 `evaluate` 的任务级报告**同一份
+  实现**（多数据集融合 / 基准评级 / 办公域业务结论 / 融合指标表 / 各数据集 run 目录链接），
+  所以排查"这一线到底哪里不行"不用回去翻源产物。三处差异：融合口径用**本次 series 的**
+  `--fusion`（源产物可能是别的口径，重算才对得上）、链接指向 series 树里的副本、
+  抬头标题写线名，并链回主报告 `../../../reports/report.md`。主报告的「来源与产物」表
+  给每条线一个「该线融合报告」入口。
 - 门禁与 `compare` 同口径（accuracy 降 >0.02 / stale_rate 升 >0.02 判 FAIL，
   latency_p95 升 >30% 记 WARN）；**任一线的门禁 FAIL → 退出码 1**。`--require-comparable`
   时每条线 vs 基线跑可比性校验，关键维度不一致 / 无法核验计入 FAIL。多线对比里
@@ -928,7 +935,10 @@ DIR/matrix_<ts>/
 DIR/series_<ts>/
 ├── reports/{report.md, fig_series_accuracy.png, fig_series_delta.png,
 │             fig_series_fused.png, fig_series_per_dataset.png}
-└── runs/<线序>-<slug>/<dataset>/        # 各线的数据集树副本（报告内相对链接可点）
+└── runs/<线序>-<slug>/
+    ├── <dataset>/                       # 各线的数据集树副本（报告内相对链接可点）
+    └── reports/{report.md,metrics.json,evaluate_summary.json,fig_dataset_overview.png}
+                                         # **该线自己的融合报告**（与 evaluate 任务级报告同构）
 
 ```
 
