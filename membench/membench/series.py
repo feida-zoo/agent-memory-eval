@@ -32,7 +32,10 @@
   对比出不了报告）；
 - 重名时追加 ``（<sha8>）`` 区分（没有 sha 的显式名退 ``（第N线）``）；
 - 报告「来源与产物」表的「命名来源」列标出 ``llm`` / ``code`` / ``显式名`` /
-  ``基线`` / ``回退短 sha``，便于追溯每条线名是怎么来的。
+  ``基线`` / ``任务清单`` / ``回退短 sha``，便于追溯每条线名是怎么来的。
+- 副本目录名（``runs/<线序>-<slug>``）优先复用**任务清单里的 ASCII 名**（双组任务的
+  组目录名 / 单组任务的 ``task.json`` 任务名），其次线名的 ASCII 片段，最后才退
+  commit 短哈希或 ``line<i>``——中文名 slug 成 ``default`` 时顺延，不会得到 ``01-default``。
 
 产物写到 ``out_dir``（完整实验目录，见 :mod:`membench.layout`）::
 
@@ -561,11 +564,17 @@ def _check_same_datasets(lines: list[SeriesLine]) -> None:
         )
 
 
-def _manifest_label(target: str) -> Union[str, None]:
-    """产物目录所属任务里该组的**显示名**（``groups.json``），没有则 None。
+def _manifest_names(target: str) -> tuple[Union[str, None], Union[str, None]]:
+    """线所属任务给的 ``(显示名, 目录名)``：组清单优先，其次任务级 ``task.json``。
 
-    AB 任务的组名是用户在 ``task init`` 时给的、落在清单里；多线对比直接沿用，
-    不再从 commit 重新抽取——否则重出报告 / 仓库被 rebase 后名字会漂移。
+    两个来源都算"用户已经给过名字"，多线对比直接沿用，不再从 commit 重新抽取——
+    否则重出报告 / 仓库被 rebase 后名字会漂移：
+
+    - **AB 任务**：``groups.json`` 里该组的 ``label`` / ``dir``（组名与 ASCII 目录名）；
+    - **单组任务**：``task.json`` 的 ``display_name`` / ``name``——单组任务没有
+      ``groups.json``，只看清单的话这里会退化成 commit 短哈希（```01-2e634b21```）。
+
+    找不到（裸 ``eval_*`` 实验目录、直接给 ``runs/<dataset>``）时返回 ``(None, None)``。
     """
     path = os.path.abspath(target)
     for _ in range(3):  # 数据集目录 → 组目录 → 任务根
@@ -575,32 +584,31 @@ def _manifest_label(target: str) -> Union[str, None]:
             base = os.path.basename(path)
             for item in groups:
                 if str(item.get("dir")) == base:
-                    return str(item.get("label") or base)
+                    return (str(item.get("label") or base), base)
+        # read_task_meta 自己会向上找（含 path 本身），所以一次调用即可命中任务根
+        meta = layout.read_task_meta(path)
+        if meta:
+            name = str(meta.get("name") or "").strip()
+            display = str(meta.get("display_name") or name).strip()
+            return (display or None, name or None)
         path = parent
         if path in (os.path.dirname(path), ""):
             break
-    return None
+    return (None, None)
+
+
+def _manifest_label(target: str) -> Union[str, None]:
+    """产物目录所属任务里该组的**显示名**（``groups.json`` / ``task.json``），没有则 None。"""
+    return _manifest_names(target)[0]
 
 
 def _manifest_dir(target: str) -> Union[str, None]:
-    """产物目录所属任务里该组的**目录名**（``groups.json`` 的 ``dir``），没有则 None。
+    """产物目录所属任务给的**目录名**（组的 ``dir`` / 任务名），没有则 None。
 
     与 :func:`_manifest_label` 同源：多线对比的副本目录直接用这个名字，
-    不再退化成 ``line<i>``。
+    不再退化成 ``line<i>`` / commit 短哈希。
     """
-    path = os.path.abspath(target)
-    for _ in range(3):
-        parent = os.path.dirname(path)
-        groups = layout.read_groups_manifest(parent)
-        if groups:
-            base = os.path.basename(path)
-            for item in groups:
-                if str(item.get("dir")) == base:
-                    return base
-        path = parent
-        if path in (os.path.dirname(path), ""):
-            break
-    return None
+    return _manifest_names(target)[1]
 
 
 def load_lines(

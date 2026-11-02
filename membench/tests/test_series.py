@@ -910,3 +910,56 @@ def test_series_writes_per_line_fused_report(tmp_path: Path, git_repo) -> None:
         assert "该线融合报告" in main
         rel = os.path.relpath(line["report_path"], Path(result["report_path"]).parent)
         assert rel.replace(os.sep, "/") in main
+
+
+def test_series_reuses_single_group_task_name(tmp_path: Path, git_repo) -> None:
+    """单组任务（只有 ``task.json``、没有 ``groups.json``）也复用任务名做副本目录。
+
+    回归：此前只认 ``groups.json``，单组任务因此全部退化成 ``01-<commit8>``——明明
+    用户已经在 ``task init --name`` 给了 ASCII 名字（``perf-base``），目录却只剩哈希。
+    """
+    repo, shas = git_repo
+    runs = [_run(tmp_path, f"solo{i}", quality) for i, quality in enumerate((40, 80))]
+
+    tasks = []
+    for index, (run, name, display) in enumerate(
+        zip(runs, ("perf-base", "perf-fast"), ("基线跑", "降延迟"))
+    ):
+        task = Path(layout.init_task_dir(str(tmp_path / "tasks"), name, "t", groups=1, ts=f"2026010{index + 1}-120000", display_name=display))
+        # task init 已建好 runs/：把数据集子树逐个并进去（copytree 不能覆盖已有目录）
+        for dataset_dir in (Path(run) / layout.DIR_RUNS).iterdir():
+            shutil.copytree(dataset_dir, task / layout.DIR_RUNS / dataset_dir.name)
+        tasks.append(str(task))
+
+    result = series.run_series(
+        [f"{sha}={target}" for sha, target in zip(shas, tasks)],
+        repo=repo,
+        report_out=str(tmp_path / "out"),
+    )
+    series_dir = Path(result["series_dir"])
+    dirs = sorted(p.name for p in (series_dir / layout.DIR_RUNS).iterdir())
+    assert dirs == ["01-perf-base", "02-perf-fast"]
+    # 线名沿用任务显示名（用户给的），不再从 commit 抽取；第一条按约定叫「基线」
+    assert [line["name"] for line in result["lines"]] == ["基线", "降延迟"]
+    assert [line["name_source"] for line in result["lines"]] == ["基线", "任务清单"]
+
+
+def test_series_line_dir_falls_back_when_manifest_names_are_not_ascii() -> None:
+    """清单里的名字是纯中文（老产物）时顺延下一级，不产出 ``01-default``。"""
+    from membench import layout as layout_mod
+
+    series_dir = "/tmp/series-demo"
+    # 老产物：组目录名 / 任务名是中文 → slug 退化成 default，顺延到线名
+    assert layout_mod.series_line_dir(series_dir, 0, "基线", None, "中文目录") .endswith(
+        "01-line1"
+    )
+    assert layout_mod.series_line_dir(series_dir, 1, "index-opt", None, "索引优化").endswith(
+        "02-index-opt"
+    )
+    # 线名也是中文 → 退 commit8；没有 commit 才退 line<i>
+    assert layout_mod.series_line_dir(series_dir, 2, "基线", "abcdef1234", "索引优化").endswith(
+        "03-abcdef12"
+    )
+    assert layout_mod.series_line_dir(series_dir, 3, "基线", None, "索引优化").endswith(
+        "04-line4"
+    )

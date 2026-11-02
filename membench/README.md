@@ -861,8 +861,10 @@ python -m membench.cli series \
     拒答准确 / 陈旧率）的分组柱，每个指标一个面板、柱按线分组。
   柱顶标数值（比率按百分比），**未计算的指标不画柱**（"没算"不是 0），
   图未生成时报告不写引用（不留死链）。
-  各线的数据集树副本落 `runs/<线序>-<slug>/<dataset>/`（中文名经 `slug` 会退化成
-  `default`，所以目录名带线序前缀；报告里给可点击的相对链接）。
+  各线的数据集树副本落 `runs/<线序>-<slug>/<dataset>/`（`<slug>` 取"任务清单里的名字"：
+  双组任务用组的 ASCII 目录名（`baseline` / `index-opt`），单组任务用 `task.json` 的任务名；
+  任务目录不可用时才退线名的 ASCII 片段、commit 短哈希或 `line<i>`。中文名 slug 后是
+  `default`，因此会顺延到下一级，不会出现一排 `01-default`；报告里给可点击的相对链接）。
 - **每条线另有一份自己的融合报告** `runs/<线序>-<slug>/reports/{report.md,metrics.json,
   evaluate_summary.json,fig_dataset_overview.png}`：与 `evaluate` 的任务级报告**同一份
   实现**（多数据集融合 / 基准评级 / 办公域业务结论 / 融合指标表 / 各数据集 run 目录链接），

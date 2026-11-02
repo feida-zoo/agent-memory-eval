@@ -1129,22 +1129,32 @@ def series_line_dir(
 ) -> str:
     """多线对比实验里一条线的副本目录：``<series>/runs/<线序>-<stem>``。
 
-    ``stem`` 优先级：
+    ``stem`` 优先级（**每一级都要 slug 出 ASCII 片段，否则顺延下一级**）：
 
-    1. ``dir_hint``——产物来自带 ``groups.json`` 的任务时，直接复用该组的**目录名**
-       （``baseline`` / ``index-opt``）：用户已经给过 ASCII 目录名，不该在多线对比里
-       又退化成 ``line1``；
+    1. ``dir_hint``——产物来自带清单的任务时，复用那份清单给的**目录名**：AB 任务的组
+       目录名（``groups.json`` 的 ``dir``，如 ``baseline`` / ``index-opt``）或单组任务的
+       任务名（``task.json`` 的 ``name``）。用户已经给过 ASCII 目录名，不该在多线对比里
+       又退化成 ``line1`` / commit 短哈希；
     2. ``slug(name)``——线名里有 ASCII 片段时用它；
-    3. ``commit`` 前 8 位 / ``line<i>``——中文线名且没有命中清单时的兜底。
+    3. ``commit`` 前 8 位 / ``line<i>``——中文线名且没有清单可复用时的兜底。
+
+    为什么要"顺延"而不是直接用：老产物的任务名 / 组目录名可能是中文（本特性之前没有
+    ASCII 约束），``slug`` 之后会变成 ``default``，直接拿来会得到一堆 ``01-default``——
+    那比 commit 短哈希更难分辨。
 
     线序前缀（``01-`` / ``02-``…）保证一条线一个目录，且顺序即时间顺序。
     """
+    stem = ""
     if dir_hint:
-        stem = slug(dir_hint)
-    else:
-        stem = slug(name)
-        if stem == "default":
-            stem = str(commit)[:8] if commit else f"line{index + 1}"
+        candidate = slug(dir_hint)
+        if candidate != "default":
+            stem = candidate
+    if not stem:
+        candidate = slug(name)
+        if candidate != "default":
+            stem = candidate
+    if not stem:
+        stem = str(commit)[:8] if commit else f"line{index + 1}"
     return os.path.join(runs_root(series_dir), f"{index + 1:02d}-{stem}")
 
 
