@@ -150,6 +150,8 @@ FIG_SERIES_FUSED = "fig_series_fused.png"
 FIG_SERIES_PER_DATASET = "fig_series_per_dataset.png"
 #: 多线对比：每条线的 accuracy 差值（vs 基线 / vs 上一步）。
 FIG_SERIES_DELTA = "fig_series_delta.png"
+#: 多线对比：提升最多的题型 TOP N（柱 = 该题型 Δaccuracy，按线着色）。
+FIG_SERIES_CATEGORY_TOP = "fig_series_category_top.png"
 
 #: 实验目录名安全化：非字母数字与 ``._-`` 的字符替换为 ``-``。
 _UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")

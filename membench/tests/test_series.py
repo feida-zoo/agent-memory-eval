@@ -1053,6 +1053,29 @@ def test_series_report_has_top_improved_categories(tmp_path: Path, git_repo) -> 
     assert "| 单跳（single_hop） | 12 |" in report
     assert "(+" in report
 
+    # TOP N 柱状图：只画榜内题型，且报告引用它
+    fig = Path(result["report_path"]).parent / layout.FIG_SERIES_CATEGORY_TOP
+    assert fig.is_file()
+    assert layout.FIG_SERIES_CATEGORY_TOP in report
+    _assert_links_alive(Path(result["report_path"]))
+
+
+def test_series_no_category_chart_without_improvements(tmp_path: Path, git_repo) -> None:
+    """没有达标的提升项时不画图、也不写引用（不留死链，与其它图同一规矩）。"""
+    repo, shas = git_repo
+    runs = [_run(tmp_path, f"flat{i}", 80) for i in range(2)]
+    result = series.run_series(
+        [f"{sha}={run}" for sha, run in zip(shas, runs)],
+        repo=repo,
+        report_out=str(tmp_path / "out"),
+    )
+    report = Path(result["report_path"]).read_text(encoding="utf-8")
+    assert "没有满足条件的提升项" in report
+    assert layout.FIG_SERIES_CATEGORY_TOP not in report
+    assert not (
+        Path(result["report_path"]).parent / layout.FIG_SERIES_CATEGORY_TOP
+    ).is_file()
+
 
 def test_series_report_has_efficiency_table(tmp_path: Path, git_repo) -> None:
     """效率成本逐数据集对照（与 evaluate-compare 的「效率成本 diff」同口径）。"""

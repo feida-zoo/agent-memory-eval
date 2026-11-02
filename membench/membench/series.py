@@ -16,7 +16,9 @@
 6. 门禁：每条线 vs 基线，复用 compare 的阈值与
    :func:`membench.compare._eval_gates`（accuracy 降 >0.02 / stale 升 >0.02 /
    latency_p95 +30%）；任一 FAIL → 命令退出码 1；
-7. 图表：accuracy 随线序的走势（多数据集时逐数据集多条折线 + 融合值一条粗线）；
+7. 图表：accuracy 随线序的走势（多数据集时逐数据集多条折线 + 融合值一条粗线）、
+   效率/融合层各指标（按线分组）、逐数据集四项质量指标，以及**提升最多的题型
+   TOP 5** 柱状图（``fig_series_category_top.png``）；
 8. 每条线自己的融合报告（``runs/<线序>-<slug>/reports/``，与 evaluate 任务级报告同构）。
 
 线名规则（:func:`line_name`）：
@@ -99,6 +101,7 @@ from membench.report import (
     category_display,
     dim_label,
     fig_series_accuracy,
+    fig_series_category_top,
     fig_series_delta,
     fig_series_fused,
     fig_series_per_dataset,
@@ -1146,6 +1149,17 @@ def _write_series_report(
             )
         )
         lines.append("")
+        # 柱状图只看榜内的 TOP N：表能读全，柱能一眼比出"涨得最快的是哪个题型"
+        try:
+            fig_series_category_top(
+                top,
+                os.path.join(reports_dir, layout.FIG_SERIES_CATEGORY_TOP),
+                line_names=[entry["name"] for entry in entries],
+                multi_dataset=len(dataset_keys) > 1,
+            )
+        except ValueError:
+            pass
+        figure("提升最多的题型（按 Δ）", layout.FIG_SERIES_CATEGORY_TOP)
     else:
         lines.append(
             f"<sub>本次没有满足条件的提升项（要求两侧题量 ≥ {CATEGORY_MIN_N} 且 Δ > 0）。</sub>"

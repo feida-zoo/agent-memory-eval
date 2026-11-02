@@ -884,6 +884,75 @@ def fig_series_fused(
     return out_path
 
 
+def fig_series_category_top(
+    items: "list[dict[str, Any]]",
+    out_path: str,
+    *,
+    line_names: "list[str]",
+    multi_dataset: bool = False,
+) -> str:
+    """多线对比用：提升最多的题型 TOP N（柱 = 该题型 Δaccuracy，按线着色）。
+
+    为什么单独画：``fig_series_delta`` 只看"每条线总体涨了多少"，看不出"涨在哪个
+    题型"；题型表行数多，一眼比不出谁涨得最快。这里只画 TOP N（与报告表格同一份
+    排序：Δ 降序、同 Δ 按题量降序，两侧题量门槛已在选榜时过滤），柱色按线区分，
+    多数据集时柱标签带数据集前缀（跨数据集的同名题型是两回事）。
+
+    Args:
+        items: ``[{"line","dataset","category","delta","n"}, ...]``（已排序、已截断）。
+        out_path: 输出 png 路径。
+        line_names: 全部线名（决定配色，保证同一条线在系列图里颜色一致）。
+        multi_dataset: 柱标签是否带数据集前缀。
+
+    Raises:
+        RuntimeError: 没有 matplotlib（与其它报告图一致的可操作报错）。
+        ValueError: items 为空（调用方不该画空图；报告据此不写引用）。
+    """
+    if not items:
+        raise ValueError("提升最多的题型为空时不画图")
+    _setup_fonts()
+    labels = []
+    for item in items:
+        text = category_display(str(item["category"]))
+        if multi_dataset:
+            text = f"{item['dataset']}\n{text}"
+        labels.append(text)
+    colors = [
+        PALETTE[line_names.index(str(item["line"])) % len(PALETTE)]
+        if str(item["line"]) in line_names
+        else PALETTE[3]
+        for item in items
+    ]
+    fig, ax = plt.subplots(figsize=(max(7.0, 1.5 * len(items)), 4.0))
+    bars = ax.bar(
+        range(len(items)),
+        [_nan_or(float(item["delta"])) for item in items],
+        color=colors,
+        width=0.6,
+    )
+    _annotate_bars(ax, bars, decimals=1)
+    ax.axhline(0, color="#444444", linewidth=0.8)
+    ax.margins(y=0.24)
+    # 只有 1~2 条时 matplotlib 的自动 xlim 会让柱撑满整幅图，给两侧留点边
+    ax.set_xlim(-0.6, max(1, len(items)) - 0.4)
+    ax.set_xticks(range(len(items)))
+    ax.set_xticklabels(labels, fontsize=8, rotation=20, ha="right")
+    ax.set_ylabel("Δaccuracy")
+    ax.set_title("提升最多的题型（正=该线优于基线）")
+    # 图例只放实际出现过的线（TOP N 里可能只有部分线），颜色与其它系列图一致
+    used = [name for name in line_names if any(str(i["line"]) == name for i in items)]
+    handles = [
+        Patch(color=PALETTE[line_names.index(name) % len(PALETTE)], label=name)
+        for name in used
+    ]
+    if handles:
+        ax.legend(handles=handles, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
+
+
 def fig_series_per_dataset(
     names: list[str],
     per_dataset: "dict[str, dict[str, list[Any]]]",
