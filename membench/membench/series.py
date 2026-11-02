@@ -6,11 +6,18 @@
 
 1. 结论表：每线的 accuracy / 证据召回率 / ↑vs 基线 / ↑vs 上一步 / 门禁结论；
 2. 逐指标表：行=指标、列=各线（另给每线 vs 基线的差值，始终保留基线一列）；
-3. 逐数据集 accuracy 表（多数据集时）：单元格为值 + (vs 基线)；
-4. 门禁：每条线 vs 基线，复用 compare 的阈值与
+3. 逐数据集 accuracy / 逐数据集关键指标表（多数据集时）：单元格为值 + (vs 基线)；
+4. **题型 diff**：与 compare / evaluate-compare 同一口径（
+   :func:`membench.evaluate_compare.category_diff_rows` + ``CATEGORY_MIN_N``）——
+   先给「提升最多的题型」榜（每条线 vs 基线，只收两侧题量达标且 Δ>0 的组合），
+   再给逐数据集题型准确率表；
+5. **逐数据集效率成本**：延迟 P50/P95、Token、ingest 耗时、LLM 调用次数，括号内为
+   相对基线的变化率（与 evaluate-compare 的「效率成本 diff」同一口径，不参与评级）；
+6. 门禁：每条线 vs 基线，复用 compare 的阈值与
    :func:`membench.compare._eval_gates`（accuracy 降 >0.02 / stale 升 >0.02 /
    latency_p95 +30%）；任一 FAIL → 命令退出码 1；
-5. 图表：accuracy 随线序的走势（多数据集时逐数据集多条折线 + 融合值一条粗线）。
+7. 图表：accuracy 随线序的走势（多数据集时逐数据集多条折线 + 融合值一条粗线）；
+8. 每条线自己的融合报告（``runs/<线序>-<slug>/reports/``，与 evaluate 任务级报告同构）。
 
 线名规则（:func:`line_name`）：
 
@@ -81,11 +88,15 @@ from membench.evaluate import (
     metadata_inconsistencies,
     write_task_reports,
 )
+from membench.evaluate_compare import TOP_IMPROVED_CATEGORIES, category_diff_rows
 from membench.judges.llm import chat_completion
 from membench.paths import output_root
-from membench.ratings import RATE_METRICS, format_metric_value
+from membench.ratings import RATE_METRICS, format_metric_delta, format_metric_value
 from membench.report import (
+    CATEGORY_MIN_N,
+    EFFICIENCY_DIFF_METRICS,
     _md_table,
+    category_display,
     dim_label,
     fig_series_accuracy,
     fig_series_delta,
@@ -796,10 +807,13 @@ def _verdict(gates: list[dict[str, Any]]) -> str:
 
 
 def _pp(diff: Any) -> str:
-    """百分点差值：``+2.3pp`` / ``-1.0pp``；``None`` 返回 ``n/a``。"""
-    if diff is None:
-        return "n/a"
-    return f"{float(diff) * 100:+.1f}pp"
+    """百分点差值：``+2.3pt`` / ``-1.0pt``；``None`` 返回 ``n/a``。
+
+    单位与 compare / evaluate-compare 一致（都走
+    :func:`membench.ratings.format_metric_delta`）——同一批产物在两份报告里不该
+    出现 ``pp`` / ``pt`` 两种写法。
+    """
+    return format_metric_delta("accuracy", diff)
 
 
 def _fusion_text(fusion: str, cap: int) -> str:
@@ -845,6 +859,76 @@ _GATE_NAMES = (
     "stale_rate_regression",
     "latency_p95_regression",
 )
+
+
+def _num_cell(value: Any) -> str:
+    """效率成本单元格：数值保留 1 位小数，缺失显示「—」（不按 0 处理）。"""
+    return f"{float(value):.1f}" if isinstance(value, (int, float)) else "—"
+
+
+def _category_profile(
+    entries: list[dict[str, Any]], dataset_keys: list[str]
+) -> dict[str, Any]:
+    """题型口径：逐数据集题型行 + 跨线「提升最多」榜（与 compare 同一份判定）。
+
+    - 逐数据集行：题型 → 各线 ``{"n", "accuracy"}``（union 各线出现过的题型，
+      这样"某线缺这个题型"也能显示出来，而不是被基线一列悄悄裁掉）；
+    - 提升榜：**每条线 vs 基线**，只收两侧题量 ≥ :data:`CATEGORY_MIN_N` 且 Δ > 0，
+      按 Δ 降序、同 Δ 按题量降序，取前 :data:`TOP_IMPROVED_CATEGORIES` 条。
+
+    口径来源：:func:`membench.evaluate_compare.category_diff_rows` 与
+    :data:`membench.report.CATEGORY_MIN_N`——多线对比是"多几条线"，题型判定不该
+    另写一份，否则同一批产物在 compare 与 series 里会给出不同的"提升最大题型"。
+    """
+    base = entries[0]
+    details: dict[str, list[dict[str, Any]]] = {}
+    top: list[dict[str, Any]] = []
+    for key in dataset_keys:
+        categories: set[str] = set()
+        for entry in entries:
+            categories |= set(
+                entry["datasets"][key].metrics.get("by_category") or {}
+            )
+        rows: list[dict[str, Any]] = []
+        for category in sorted(categories):
+            per_line: list[dict[str, Any]] = []
+            for entry in entries:
+                bucket = (
+                    entry["datasets"][key].metrics.get("by_category") or {}
+                ).get(category) or {}
+                n = int(bucket.get("n") or 0)
+                accuracy = (
+                    float(bucket["accuracy"])
+                    if n and bucket.get("accuracy") is not None
+                    else None
+                )
+                per_line.append({"n": n, "accuracy": accuracy})
+            if all(item["accuracy"] is None for item in per_line):
+                continue
+            rows.append({"category": category, "lines": per_line})
+            for index, entry in enumerate(entries[1:], start=1):
+                base_item, line_item = per_line[0], per_line[index]
+                if base_item["accuracy"] is None or line_item["accuracy"] is None:
+                    continue
+                if min(base_item["n"], line_item["n"]) < CATEGORY_MIN_N:
+                    continue
+                delta = line_item["accuracy"] - base_item["accuracy"]
+                if delta <= 0:
+                    continue
+                top.append(
+                    {
+                        "line": entry["name"],
+                        "dataset": key,
+                        "category": category,
+                        "n": min(base_item["n"], line_item["n"]),
+                        "base": base_item["accuracy"],
+                        "value": line_item["accuracy"],
+                        "delta": delta,
+                    }
+                )
+        details[key] = rows
+    top.sort(key=lambda item: (-item["delta"], -item["n"]))
+    return {"top": top[:TOP_IMPROVED_CATEGORIES], "details": details}
 
 
 def _write_series_report(
@@ -1024,6 +1108,131 @@ def _write_series_report(
             lines.append(_md_table(ds_headers, ds_metric_rows))
             lines.append("")
         figure("逐数据集关键指标（按线）", layout.FIG_SERIES_PER_DATASET)
+
+    # 3.2 题型：多线不过是"多几条线"，口径与 compare / evaluate-compare 同一份实现
+    profile = _category_profile(entries, dataset_keys)
+    lines.append("## 题型 diff（vs 基线）")
+    lines.append("")
+    lines.append(
+        "<sub>题型集合按各数据集实际出现的 raw category 分别保留，不跨数据集合并；"
+        "n 为该题型的题量。</sub>"
+    )
+    lines.append("")
+    top = profile["top"]
+    if top:
+        lines.append(f"### 提升最多的题型（TOP {len(top)}）")
+        lines.append("")
+        lines.append(
+            f"<sub>按 Δ 准确率降序；只收**两侧题量都 ≥ {CATEGORY_MIN_N}** 且正向改进的"
+            "（线 vs 基线）组合——小样本题型一两题翻转就能 +50pt，会盖住大样本的真实"
+            "改进（它们仍在下方各表里）。同 Δ 按题量降序。</sub>"
+        )
+        lines.append("")
+        lines.append(
+            _md_table(
+                ["线", "数据集", "题型", "n", "基线准确率", "该线准确率", "Δ"],
+                [
+                    [
+                        item["line"],
+                        item["dataset"],
+                        category_display(item["category"]),
+                        str(item["n"]),
+                        f"{item['base'] * 100:.1f}%",
+                        f"{item['value'] * 100:.1f}%",
+                        _pp(item["delta"]),
+                    ]
+                    for item in top
+                ],
+            )
+        )
+        lines.append("")
+    else:
+        lines.append(
+            f"<sub>本次没有满足条件的提升项（要求两侧题量 ≥ {CATEGORY_MIN_N} 且 Δ > 0）。</sub>"
+        )
+        lines.append("")
+    lines.append("### 逐数据集题型准确率（vs 基线）")
+    lines.append("")
+    lines.append(
+        "<sub>每个数据集一张表：行是题型，列是各线；非基线列括号内是该题型相对基线的"
+        "差值（pt = 百分点，与 compare 同一单位）。某线缺该题型时显示「—」，"
+        "不当 0 处理。</sub>"
+    )
+    lines.append("")
+    for key in dataset_keys:
+        rows = profile["details"].get(key) or []
+        lines.append(f"#### {key} · 题型准确率")
+        lines.append("")
+        if not rows:
+            lines.append("（两侧均无 by_category 数据）")
+            lines.append("")
+            continue
+        headers = ["题型", "n", base["name"]]
+        for entry in entries[1:]:
+            headers.append(f"{entry['name']}（Δ vs 基线）")
+        body: list[list[str]] = []
+        for row in rows:
+            per_line = row["lines"]
+            n_text = str(max(item["n"] for item in per_line))
+            first = per_line[0]["accuracy"]
+            cells = [
+                category_display(row["category"]),
+                n_text,
+                "—" if first is None else f"{first * 100:.1f}%",
+            ]
+            for item in per_line[1:]:
+                value = item["accuracy"]
+                if value is None:
+                    cells.append("—")
+                elif first is None:
+                    cells.append(f"{value * 100:.1f}%")
+                else:
+                    cells.append(f"{value * 100:.1f}% ({_pp(value - first)})")
+            body.append(cells)
+        lines.append(_md_table(headers, body))
+        lines.append("")
+
+    # 3.3 效率成本：与 evaluate-compare 的「效率成本 diff」同口径（逐数据集、相对变化）
+    lines.append("## 逐数据集效率成本（vs 基线）")
+    lines.append("")
+    lines.append(
+        "<sub>逐数据集对照；括号内为相对变化（该线−基线）/基线，与 latency_p95 门禁的"
+        "阈值口径一致（基线为 0 或缺失时不给 Δ）；延迟单位 ms、Token 为每题均值。"
+        "效率成本依赖部署环境，不参与融合与评级。</sub>"
+    )
+    lines.append("")
+    for key in dataset_keys:
+        base_overall = base["datasets"][key].metrics.get("overall", {}) or {}
+        headers = ["指标", base["name"]]
+        for entry in entries[1:]:
+            headers.append(f"{entry['name']}（Δ vs 基线）")
+        body: list[list[str]] = []
+        for metric in EFFICIENCY_DIFF_METRICS:
+            base_value = base_overall.get(metric)
+            cells = [metric_label(metric), _num_cell(base_value)]
+            any_value = isinstance(base_value, (int, float))
+            for entry in entries[1:]:
+                value = (
+                    (entry["datasets"][key].metrics.get("overall", {}) or {}).get(metric)
+                )
+                cell = _num_cell(value)
+                if (
+                    isinstance(base_value, (int, float))
+                    and isinstance(value, (int, float))
+                    and base_value
+                ):
+                    cell = f"{cell} ({(value - base_value) / base_value:+.1%})"
+                any_value = any_value or isinstance(value, (int, float))
+                cells.append(cell)
+            if any_value:
+                body.append(cells)
+        lines.append(f"#### {key} · 效率成本")
+        lines.append("")
+        if body:
+            lines.append(_md_table(headers, body))
+        else:
+            lines.append("（各线均未落账效率成本指标）")
+        lines.append("")
 
     # 4. 图表
     lines.append("## accuracy 走势")

@@ -117,14 +117,20 @@ class GroupDatasetResult:
 TOP_IMPROVED_CATEGORIES = 5
 
 
-def _category_diff_rows(group: GroupDatasetResult) -> list[dict[str, Any]]:
-    """把某数据集的 ``by_category`` 拉平成逐题型行（A/B 准确率与题数）。
+def category_diff_rows(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """两侧指标 dict 的 ``by_category`` 拉平成逐题型行（准确率与题数）。
 
     两侧 category 取并集、按名称排序；两侧都没有准确率时跳过。某侧缺该题型时
     记 ``None``（不按 0 处理——"没跑"不是"全错"）。
+
+    输入是**数据集级 metrics**（``overall`` 的兄弟字段 ``by_category``），所以
+    compare / evaluate-compare / series 都能用同一套口径（多线对比是"多一条线"，
+    题型口径不该各写一份）。字段约定：``{题型: {"n": int, "accuracy": float}}``。
     """
-    a_by_cat = group.baseline.get("by_category", {}) or {}
-    b_by_cat = group.candidate.get("by_category", {}) or {}
+    a_by_cat = baseline.get("by_category", {}) or {}
+    b_by_cat = candidate.get("by_category", {}) or {}
     rows: list[dict[str, Any]] = []
     for cat in sorted(set(a_by_cat) | set(b_by_cat)):
         a_entry = a_by_cat.get(cat, {}) or {}
@@ -147,6 +153,11 @@ def _category_diff_rows(group: GroupDatasetResult) -> list[dict[str, Any]]:
             {"category": cat, "n_a": n_a, "n_b": n_b, "acc_a": acc_a, "acc_b": acc_b}
         )
     return rows
+
+
+def _category_diff_rows(group: GroupDatasetResult) -> list[dict[str, Any]]:
+    """一组 A/B 结果的逐题型行（:func:`category_diff_rows` 的组级包装）。"""
+    return category_diff_rows(group.baseline, group.candidate)
 
 
 def top_improved_categories(

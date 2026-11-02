@@ -134,7 +134,8 @@ def _accuracy(experiment_dir: str, dataset: str = "sample_dataset") -> float:
 
 
 def _pp(diff: float) -> str:
-    return f"{diff * 100:+.1f}pp"
+    """与 membench.ratings.format_metric_delta 同口径（比率差值用 pt）。"""
+    return f"{diff * 100:+.1f}pt"
 
 
 def _section_rows(markdown: str, title: str) -> list[list[str]]:
@@ -963,3 +964,109 @@ def test_series_line_dir_falls_back_when_manifest_names_are_not_ascii() -> None:
     assert layout_mod.series_line_dir(series_dir, 3, "基线", None, "索引优化").endswith(
         "04-line4"
     )
+
+
+def _big_category_dataset(path: Path, *, per_category: int = 12) -> Path:
+    """单一题型、题量够进榜（≥ CATEGORY_MIN_N）的数据集：用来验证「提升最多」榜。"""
+    from membench.report import CATEGORY_MIN_N
+
+    assert per_category >= CATEGORY_MIN_N
+    questions = [
+        {
+            "qid": f"q{i}",
+            "question": f"第 {i} 题：项目截止日是哪天？",
+            "gold_answer": "周五",
+            "category": "single_hop",
+            "evidence": ["项目截止日是周五"],
+        }
+        for i in range(per_category)
+    ]
+    record = {
+        "dialogue_id": "big",
+        "sessions": [
+            [{"role": "user", "content": "记录：项目截止日是周五。", "timestamp": None}]
+        ],
+        "questions": questions,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
+def test_series_report_has_top_improved_categories(tmp_path: Path, git_repo) -> None:
+    """series 报告要有「提升最多的题型」榜与逐数据集题型表——与 compare 同一份口径。
+
+    用户视角：series 只是"多几条线"，题型 diff / 提升 TOP 这类结论不该只有 compare 有。
+    判定（两侧题量 ≥ CATEGORY_MIN_N、Δ > 0、按 Δ 降序）由
+    :func:`membench.evaluate_compare.category_diff_rows` 与 series 共用。
+    """
+    from membench.evaluate_compare import top_improved_categories, GroupDatasetResult
+
+    repo, shas = git_repo
+    dataset = _big_category_dataset(tmp_path / "ds" / "big.jsonl")
+    weak = _run(tmp_path, "big-weak", 40, datasets=(str(dataset),))
+    strong = _run(tmp_path, "big-strong", 80, datasets=(str(dataset),))
+    result = series.run_series(
+        [f"{shas[0]}={weak}", f"{shas[1]}={strong}"],
+        repo=repo,
+        report_out=str(tmp_path / "out"),
+    )
+    report = Path(result["report_path"]).read_text(encoding="utf-8")
+
+    assert "## 题型 diff（vs 基线）" in report
+    top_title = next(
+        line
+        for line in report.splitlines()
+        if line.startswith("### 提升最多的题型")
+    )
+    top_rows = _section_rows(report, top_title)
+    assert top_rows, "题量够、Δ>0 时必须给出提升榜"
+    assert top_rows[0][0] == result["lines"][1]["name"]
+    assert top_rows[0][2].startswith("单跳")  # category_display('single_hop')
+    # 与 compare 的同一份判定对齐：同一对产物的提升榜第一条一致
+    baseline_metrics = json.loads(
+        (Path(result["lines"][0]["datasets"]["big"].run_dir) / "report" / "metrics.json")
+        .read_text(encoding="utf-8")
+    )
+    candidate_metrics = json.loads(
+        (Path(result["lines"][1]["datasets"]["big"].run_dir) / "report" / "metrics.json")
+        .read_text(encoding="utf-8")
+    )
+    from membench.evaluate_compare import DatasetSpec as _Spec
+
+    spec = _Spec(key="big", name="big", path=str(dataset), source="user-specified")
+    compare_top = top_improved_categories(
+        [
+            GroupDatasetResult(
+                spec=spec,
+                baseline=baseline_metrics,
+                candidate=candidate_metrics,
+                baseline_dataset_dir="",
+                candidate_dataset_dir="",
+            )
+        ]
+    )
+    assert compare_top and f"{compare_top[0]['delta'] * 100:+.1f}pt" == top_rows[0][6]
+
+    # 逐数据集题型表：列出该数据集的题型与各线准确率（括号内是 vs 基线的差值）
+    assert "### 逐数据集题型准确率（vs 基线）" in report
+    assert "| 单跳（single_hop） | 12 |" in report
+    assert "(+" in report
+
+
+def test_series_report_has_efficiency_table(tmp_path: Path, git_repo) -> None:
+    """效率成本逐数据集对照（与 evaluate-compare 的「效率成本 diff」同口径）。"""
+    repo, shas = git_repo
+    weak = _run(tmp_path, "eff-weak", 40)
+    strong = _run(tmp_path, "eff-strong", 80)
+    result = series.run_series(
+        [f"{shas[0]}={weak}", f"{shas[1]}={strong}"],
+        repo=repo,
+        report_out=str(tmp_path / "out"),
+    )
+    report = Path(result["report_path"]).read_text(encoding="utf-8")
+    assert "## 逐数据集效率成本（vs 基线）" in report
+    rows = _section_rows(report, "#### sample_dataset · 效率成本")
+    metrics = [row[0] for row in rows]
+    assert any("延迟 P95" in m for m in metrics)
+    assert any("平均输入 Token" in m for m in metrics)
