@@ -530,11 +530,14 @@ python -m membench.cli run --adapter my-system --dataset membench/data/office_da
 
 | 级别 | 维度 | 不一致的后果 |
 |---|---|---|
-| 关键 | `adapter`、`adapter_version`、`dataset_sha256`（取 `dataset_fingerprint.sha256`）、`judge`、`judge_model`、`driver_llm`、`platform`、`run_mode`（全量 / 快照回放）、`ingest_strategy`（sequence / interleaved：问的是"结尾时知道什么"还是"当时知道什么"）、`n_questions`（分数算在哪个题集上：`--limit` 冒烟 vs 全量即走这里）、`categories`（题型过滤：题数相同但题型不同，同样是不同题目总体） | 非 strict 下门禁降级 WARN；`--require-comparable`（strict）下直接 FAIL |
+| 关键 | `adapter`、`adapter_version`、`dataset_sha256`（取 `dataset_fingerprint.sha256`）、`judge`、`judge_model`、`driver_llm`、`platform`、`run_mode`（全量 / 快照回放；**有保真校验证明状态等价时放行**，见下）、`ingest_strategy`（sequence / interleaved：问的是"结尾时知道什么"还是"当时知道什么"）、`n_questions`（分数算在哪个题集上：`--limit` 冒烟 vs 全量即走这里）、`categories`（题型过滤：题数相同但题型不同，同样是不同题目总体） | 非 strict 下门禁降级 WARN；`--require-comparable`（strict）下直接 FAIL |
 | 次要 | `limit`、`shards`、`shard_index`、`adapter_meta`、`retrieval_match`、`fusion`、`membench_hash`（评测代码版本：判分口径随代码变化，两侧不同必须提醒，但不 FAIL 回归对比） | 降级 WARN，不 FAIL |
 | 提示 | `commit`、`dataset_path`、`dataset` | 仅记录（`same=false`），不影响结论 |
 
 - 关键维度**任一值缺失**（如旧 run 没有 `driver_llm`）记入 `unverifiable`：非 strict 下不判不可比，strict 下与不一致同等处理（判 FAIL）——没填就核验不了，strict 模式不允许"没填当通过"。`n_questions` 取自 `overall.n_questions`（`aggregate` 的落账位置，顶层没有该字段）。
+- 「全量 vs 回放」的可归因性以**保真校验**为前提（见「状态快照与回放」）：只认
+  `--replay-verify-source` 校验过、且校验源正是对侧那份全量产物的，校验结果三项差异为 0
+  才放行；没做校验的回放产物仍然不可比。
 - `commit` 不同是 A/B 的被测变量本身，**不算**不可比；`run_mode` 缺省按 `full` 归一、`ingest_strategy` 缺省按 `sequence` 归一（本特性之前的所有 run 都是全量 + 整段 ingest），故历史 run 不会因缺字段被误判。
 - **`--limit` 冒烟产物不得与全量产物对比**：`fuse` 把各分片一致的 `limit` 透传到融合产物，`run_id` 另带 `_fused` / `_shard<N>` / `_limitN` 标记；两侧题目数不同（关键维度）时 strict 直接判 FAIL——冒烟分部署到全量门槛上会被拦下。
 
@@ -617,7 +620,13 @@ python -m membench.cli run --adapter <你的适配器> --dataset <同一个数�
   写进报告与 `metrics.json` 的 `replay_verify`——这就是**回放误差地板**，读取侧 A/B
   的差值必须大于它才有意义；未改代码时答案应 100% 一致；
 - **口径（重要）**：回放固定写入侧，结论只覆盖**读取/检索/回答层**，不得当"完整评测"
-  汇报；`run_mode` 是 compare 的**关键维度**，回放分与全量分会被判不可比；融合
+  汇报；`run_mode` 是 compare 的**关键维度**，但「全量 vs 回放」**不是天然不可比**：
+  回放侧满足三条证据（`metrics.replay_verify` 存在、`source_run` 等于对侧全量产物的
+  `run_id`、答案 / 检索 / 判分不一致均为 0）时，状态等价已被证明，差异可归因到读取层，
+  compare 放行并记为「等价（已验证）」；任一条不满足仍判关键维度不一致。无论放行与否，
+  **效率成本（延迟 / Token / 调用次数）都不可比**：回放不 ingest（token 记 0 并标
+  `ingest_skipped`），compare 会把效率行从逐指标表移除、延迟门禁记 SKIP，
+  `evaluate-compare` / `series` 的效率段整体跳过并说明；融合
   （`fuse`）也拒绝混融两种模式的分片；回放的 token 账里 ingest 记 0 并标
   `ingest_skipped`（"没跑"≠"零成本"）；
 - **该重跑的场景**：改动落在**写入侧**（抽取提示词、更新/去重决策、写入成本）或

@@ -505,3 +505,143 @@ def test_membench_hash_missing_on_both_sides_is_not_a_mismatch() -> None:
     check = _membench_hash_check(result)
     assert check["same"] is True
     assert check["a"] is None and check["b"] is None
+
+
+# ---------------------------------------------------------------------------
+# 全量 vs 回放：只有保真校验证明状态等价时才可归因到读取层
+# ---------------------------------------------------------------------------
+
+
+def _metrics_pair(**overrides) -> tuple[dict, dict]:
+    """一对最小 metrics：A 全量、B 回放（默认已证明状态等价）。"""
+    full = {
+        "run_id": "full-run",
+        "run_mode": "full",
+        "adapter": "a",
+        "judge": "heuristic",
+        "platform": "t",
+        "overall": {"accuracy": 0.5, "latency_p95_ms": 100.0},
+    }
+    replay = {
+        "run_id": "replay-run",
+        "run_mode": "replay-restore",
+        "adapter": "a",
+        "judge": "heuristic",
+        "platform": "t",
+        "overall": {"accuracy": 0.6, "latency_p95_ms": 0.0},
+        "replay_verify": {
+            "source_run": "full-run",
+            "n_common": 10,
+            "n_answer_diff": 0,
+            "n_retrieved_diff": 0,
+            "n_correct_diff": 0,
+        },
+    }
+    for key, value in overrides.items():
+        target, field = key.split("__", 1)
+        (replay if target == "replay" else full)[field] = value
+    return full, replay
+
+
+def test_replay_equivalence_requires_verified_state() -> None:
+    """三条证据缺一不可：有校验、校验源是对侧全量、三项差异为 0。"""
+    from membench.compare import replay_equivalence
+
+    full, replay = _metrics_pair()
+    outcome = replay_equivalence(full, replay)
+    assert outcome and outcome["verified"] is True
+    assert (outcome["full_side"], outcome["replay_side"]) == ("A", "B")
+
+    # 没做保真校验
+    no_verify = {k: v for k, v in replay.items() if k != "replay_verify"}
+    outcome = replay_equivalence(full, no_verify)
+    assert outcome and outcome["verified"] is False
+    assert "没有保真校验" in outcome["detail"]
+
+    # 校验的源 run 不是对侧这一次全量
+    wrong_source = dict(replay, replay_verify=dict(replay["replay_verify"], source_run="other"))
+    outcome = replay_equivalence(full, wrong_source)
+    assert outcome and outcome["verified"] is False
+    assert "不是对侧全量产物" in outcome["detail"]
+
+    # 状态不等价（答案不一致）
+    unequal = dict(replay, replay_verify=dict(replay["replay_verify"], n_answer_diff=3))
+    outcome = replay_equivalence(full, unequal)
+    assert outcome and outcome["verified"] is False
+    assert "状态不等价" in outcome["detail"]
+
+    # 两侧同为回放（restore vs rebuild）：方法仍不同，不在这层放行
+    both_replay = dict(replay, run_mode="replay-rebuild")
+    assert replay_equivalence(dict(full, run_mode="replay-restore"), both_replay) is None
+    # 两侧同模式：不是"全量 vs 回放"
+    assert replay_equivalence(full, dict(full, run_id="x")) is None
+
+
+def test_comparability_accepts_verified_replay_and_rejects_unverified() -> None:
+    """状态等价已验证 -> run_mode 不再是不可比原因；未验证 -> 仍判关键不一致。"""
+    from membench.compare import check_comparability
+
+    full, replay = _metrics_pair()
+    result = check_comparability(full, replay)
+    run_mode = next(c for c in result["checks"] if c["dimension"] == "run_mode")
+    assert run_mode["same"] is True
+    assert run_mode["severity"] == "info"
+    assert "已验证" in run_mode["detail"]
+    assert not any(
+        m["dimension"] == "run_mode" for m in result["mismatches"]
+    ), "已验证的等价不该进 mismatch"
+
+    no_verify = {k: v for k, v in replay.items() if k != "replay_verify"}
+    result = check_comparability(full, no_verify)
+    run_mode = next(c for c in result["checks"] if c["dimension"] == "run_mode")
+    assert run_mode["same"] is False
+    assert run_mode["severity"] == "critical"
+    assert "没有保真校验" in run_mode["detail"]
+    assert any(m["dimension"] == "run_mode" for m in result["mismatches"])
+
+
+def test_latency_gate_skips_when_efficiency_not_comparable() -> None:
+    """两侧运行模式不同：延迟门禁 SKIP（不是 PASS——回放不 ingest）。"""
+    from membench.compare import _eval_gates
+
+    overall_a = {"accuracy": 0.5, "stale_rate": None, "latency_p95_ms": 100.0}
+    overall_b = {"accuracy": 0.6, "stale_rate": None, "latency_p95_ms": 0.0}
+    gates = {
+        gate["name"]: gate
+        for gate in _eval_gates(
+            overall_a, overall_b, 0.02, 0.02, 0.30, efficiency_comparable=False
+        )
+    }
+    assert gates["latency_p95_regression"]["status"] == "SKIP"
+    assert "回放不 ingest" in gates["latency_p95_regression"]["detail"]
+    # 质量门禁照常判定
+    assert gates["accuracy_regression"]["status"] == "PASS"
+
+
+def test_compare_report_hides_efficiency_and_notes_run_mode(tmp_path: Path) -> None:
+    """全量 vs 回放的对比报告：抬头写运行模式、逐指标表移除效率行并说明。"""
+    from membench.report import write_compare_report_md
+
+    full, replay = _metrics_pair()
+    diffs = {
+        "accuracy": {"a": 0.5, "b": 0.6, "diff": 0.1},
+        "latency_p95_ms": {"a": 100.0, "b": 0.0, "diff": -100.0},
+    }
+    write_compare_report_md(
+        str(tmp_path),
+        full,
+        replay,
+        diffs,
+        [{"name": "accuracy_regression", "status": "PASS", "detail": "ok"}],
+        "PASS",
+        replay_note="A 为全量、B 为回放（`replay-restore`）；回放状态已证明等价：…",
+        efficiency_comparable=False,
+    )
+    report = (
+        tmp_path / layout.FILE_COMPARISON_MD
+    ).read_text(encoding="utf-8")
+    assert "- 运行模式：A 为全量、B 为回放" in report
+    assert "已从本表移除" in report
+    # 效率指标行被移除，质量指标仍在
+    assert "latency_p95_ms" not in report
+    assert "accuracy" in report

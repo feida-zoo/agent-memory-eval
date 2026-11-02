@@ -71,7 +71,7 @@ docs/                     # 深度研究报告 + 配图
    - CLI 各命令在创建实验目录后失败时要把**本次新建且仍为空**的目录清掉（`cli._no_leftover_experiment` / `_discard_empty_experiment`）：`Runner` 层"失败不留半成品"的约定不能被 CLI 的提前建目录破坏；有任何产物的目录保留现场。
    - **每个实验目录（含作为命令容器的组目录）自带 `runtime/`**（`commands.jsonl` + `logs/` + `env.json`，与 `runs/`、`reports/` 平级；记录命令、脱敏后的参数、起止 / 耗时 / 退出码、环境快照与全量日志）——排查"这次到底怎么跑的"先看它；它与 `runs/<dataset>/<对话>/runtime/`（对话级运行时数据）不是一回事。
 2. **默认根目录只由 `membench/paths.py` 判定**（`output_root()`；`MEMBENCH_OUTPUT_DIR` > skill 的 `output/` > 工程根）。历史上的多处 SKILL.md 探测已收敛到这里，不要再复制一份。
-3. **可比性前置校验**：`compare` 按 `membench/compare.py` 的维度表核对 A/B 元数据（关键维度不一致 → 不可比）。新增关键维度要同步三处：维度表、`Runner` 的元数据写入、文档。**`commit` 不同是 A/B 的被测变量，不得判为不可比。** 纪律：compare 只测量差异，不判定两组是否只差一个变量。
+3. **可比性前置校验**：`compare` 按 `membench/compare.py` 的维度表核对 A/B 元数据（关键维度不一致 → 不可比）。**`run_mode` 有唯一例外**：`full` vs `replay-*` 在回放侧 `metrics.replay_verify` 证明状态等价时放行（`compare.replay_equivalence`：有校验、`source_run` 等于对侧全量产物的 `run_id`、答案/检索/判分三项差异为 0，三条缺一不可），否则仍判不可比；放行与否**效率成本都不可比**（回放不 ingest），compare 移除效率行 + 延迟门禁 SKIP，evaluate-compare / series 的效率段整段跳过。新增关键维度要同步三处：维度表、`Runner` 的元数据写入、文档。**`commit` 不同是 A/B 的被测变量，不得判为不可比。** 纪律：compare 只测量差异，不判定两组是否只差一个变量。
 4. **数据集政策**：仓库**不内置**开源大数据集。`office_dataset.jsonl` / `sample_dataset.jsonl` 是自造演示集；`locomo` / `longmemeval_*` / `gatemem_office` / `beam_*` 一律 `dataset fetch` 到 `~/.membench/datasets/`。
    - `membench/.gitignore` 已忽略这些文件：**绝不**加入 git，也绝不让它们进入 skill 包（`skill/build_skill.py` 自带自检，混入即报错）。
 5. **改 CLI 要三处同步**：`cli.py` 的参数定义、`cli.py` 顶部 docstring 用法、`membench/README.md`；`skill/src/SKILL.md` 里有命令示例时同样同步。

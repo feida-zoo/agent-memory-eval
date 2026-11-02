@@ -618,6 +618,8 @@ def fig_metric_diff(
     label_a: str,
     label_b: str,
     out_path: str,
+    *,
+    include_efficiency: bool = True,
 ) -> str:
     """compare 用：A vs B 分组条形图，左质量指标、右效率成本。
 
@@ -627,6 +629,9 @@ def fig_metric_diff(
     "明显变化"高亮：diff（B-A，stale_rate 反向）绝对值 >
     :data:`HIGHLIGHT_THRESHOLD` 时 B 条染绿（优化）/ 红（劣化），其余保持
     身份色。效率子图单位各异，仅看相对高低并直接标注数值。
+
+    ``include_efficiency=False``（两侧运行模式不同，回放不 ingest）时只画质量子图
+    一张——效率子图放着两套不同过程的延迟 / Token，读者只会误读。
     """
     _setup_fonts()
     # 双侧都有非 None 值的指标才画（任一侧"未计算"时不出柱，避免把 None 画成 0）。
@@ -649,7 +654,11 @@ def fig_metric_diff(
         Patch(facecolor=PALETTE[1], label=f"候选 · {label_b}"),
     ]
 
-    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(max(12, 1.4 * len(keys)), 4.8))
+    if include_efficiency:
+        fig, (ax, ax2) = plt.subplots(1, 2, figsize=(max(12, 1.4 * len(keys)), 4.8))
+    else:
+        fig, ax = plt.subplots(figsize=(max(7.0, 1.4 * len(keys)), 4.8))
+        ax2 = None
     width = 0.38
     x = list(range(len(keys)))
     ax.bar([i - width / 2 for i in x], vals_a, width, color=PALETTE[0])
@@ -684,6 +693,12 @@ def fig_metric_diff(
     for i, (va, vb) in enumerate(zip(vals_a, vals_b)):
         ax.text(i - width / 2, va + 0.01, f"{va:.2f}", ha="center", fontsize=8)
         ax.text(i + width / 2, vb + 0.01, f"{vb:.2f}", ha="center", fontsize=8)
+
+    if ax2 is None:
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
+        return out_path
 
     x2 = list(range(len(eff_keys)))
     ax2.bar([i - width / 2 for i in x2], eff_a, width, color=PALETTE[0])
@@ -2233,11 +2248,17 @@ def write_compare_report_md(
     gates: list[dict[str, Any]],
     verdict: str,
     comparability: "dict[str, Any] | None" = None,
+    replay_note: "str | None" = None,
+    efficiency_comparable: bool = True,
 ) -> str:
     """生成 comparison.md：逐指标 diff 表 + 门禁结论（中文）。
 
     ``comparability`` 非 None 时附加「可比性前置校验」小节：逐维度对照表 +
     不可比原因列表，说明 A/B 是否具备结果归因的前提。
+
+    ``replay_note`` 非 None 时在抬头写一行"哪侧全量 / 哪侧回放、状态等价性如何"；
+    ``efficiency_comparable=False``（两侧运行模式不同）时逐指标表**移除效率成本行**，
+    改在表下写明原因——回放不 ingest，拿它算 Δ 会得到"提升 100%"的假结论。
     """
     id_a = str(metrics_a.get("run_id", "A"))
     id_b = str(metrics_b.get("run_id", "B"))
@@ -2256,6 +2277,8 @@ def write_compare_report_md(
     rated_b = overall_rating(metrics_b.get("overall", {}))
     if rated_b is not None:
         lines.append(f"- B 综合评级：{rated_b[0]}（{rated_b[1]:.2f}/4.0）")
+    if replay_note:
+        lines.append(f"- 运行模式：{replay_note}")
     lines.append("")
     lines.append(
         "<sub>评级取四项质量指标（accuracy / evidence_recall / "
@@ -2270,7 +2293,12 @@ def write_compare_report_md(
     lines.append("## 逐指标 diff（B - A）")
     lines.append("")
     rows = []
+    hidden_efficiency = (
+        [] if efficiency_comparable else [k for k in EFFICIENCY_DIFF_METRICS]
+    )
     for key in sorted(diffs.keys()):
+        if key in hidden_efficiency:
+            continue
         d = diffs[key]
         rows.append(
             [
@@ -2282,6 +2310,14 @@ def write_compare_report_md(
         )
     lines.append(_md_table(["指标", "基线", "候选", "diff"], rows or [["(无)", "", "", ""]]))
     lines.append("")
+    if hidden_efficiency:
+        lines.append(
+            "<sub>⚠️ 效率成本（延迟 / Token / LLM 调用次数）已从本表移除：两侧运行模式"
+            "不同，回放不 ingest（token 记 0 并标 `ingest_skipped`），两边的延迟与消耗"
+            "不是同一条链路的测量，算出来的 Δ 没有意义。质量指标的可归因性见"
+            "「可比性前置校验」里的运行模式一行。</sub>"
+        )
+        lines.append("")
     lines.append(f"![关键指标对比]({FIG_METRIC_DIFF})")
     lines.append("")
     lines.append(f"![分题型准确率对比]({FIG_CATEGORY_DIFF})")
@@ -2368,6 +2404,8 @@ def render_compare_report(
     gates: list[dict[str, Any]],
     verdict: str,
     comparability: "dict[str, Any] | None" = None,
+    replay_note: "str | None" = None,
+    efficiency_comparable: bool = True,
 ) -> None:
     """生成对比报告目录下的 comparison.md 与两张对比图
     （fig_metric_diff.png 质量+效率、fig_category_diff.png 分题型）。
@@ -2382,6 +2420,7 @@ def render_compare_report(
         label_a,
         label_b,
         os.path.join(out_dir, FIG_METRIC_DIFF),
+        include_efficiency=efficiency_comparable,
     )
     fig_category_diff(
         metrics_a.get("by_category", {}),
@@ -2390,7 +2429,17 @@ def render_compare_report(
         label_b,
         os.path.join(out_dir, FIG_CATEGORY_DIFF),
     )
-    write_compare_report_md(out_dir, metrics_a, metrics_b, diffs, gates, verdict, comparability)
+    write_compare_report_md(
+        out_dir,
+        metrics_a,
+        metrics_b,
+        diffs,
+        gates,
+        verdict,
+        comparability,
+        replay_note=replay_note,
+        efficiency_comparable=efficiency_comparable,
+    )
 
 
 # ---------------------------------------------------------------------------

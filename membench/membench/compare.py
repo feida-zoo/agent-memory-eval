@@ -38,7 +38,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from typing import Any, Sequence
+from typing import Any, Sequence, Union
 
 from membench import layout, runtime
 from membench.layout import resolve_dataset_dir
@@ -91,6 +91,82 @@ CRITICAL_COMPARABILITY_DIMS: tuple[str, ...] = (
     # 拦不住；题型不同就是不同题目总体，分数不可归因（缺省 = 不过滤，旧产物两缺即同）。
     "categories",
 )
+
+#: 回放侧的 ``run_mode`` 取值（与 ``full`` 相对）。
+REPLAY_RUN_MODES: tuple[str, ...] = ("replay-restore", "replay-rebuild")
+
+
+def replay_equivalence(
+    metrics_a: dict[str, Any], metrics_b: dict[str, Any]
+) -> Union[dict[str, Any], None]:
+    """「一侧全量、另一侧回放」时判断状态等价性是否已被保真校验证明。
+
+    为什么需要这一层：回放不 ingest，与全量**方法不同**，但它恰恰是"只改读取侧、
+    不想重跑写入侧"的标准做法。一刀切判不可比会把这种合法对比也拦掉；反过来，
+    没证据就放行则等于把"状态不一致"的差异算到读取层头上。所以规则是**只认证据**：
+    回放侧的 ``metrics.replay_verify`` 必须
+
+    1. 没有 ``error``（确实做了保真校验）；
+    2. ``source_run`` 等于**对侧全量产物**的 ``run_id``（校验的就是这一次全量）；
+    3. 答案 / 检索 / 判分三项不一致数都为 0（``n_common > 0``）。
+
+    三条都满足才算"状态等价已验证"。任一不满足都退回"方法不同、不可归因"。
+
+    Args:
+        metrics_a: A 侧 metrics（数据集级）。
+        metrics_b: B 侧 metrics。
+
+    Returns:
+        ``None``：不是"全量 vs 回放"的组合（含两侧同为回放，或两侧同模式）。
+        否则 ``{"verified": bool, "full_side": "A"|"B", "replay_side": ...,
+        "mode": 回放侧 run_mode, "detail": 说明, "n_common": int|None}``。
+    """
+    mode_a = str(_comparability_value(metrics_a, "run_mode"))
+    mode_b = str(_comparability_value(metrics_b, "run_mode"))
+    if mode_a == mode_b:
+        return None
+    full_side = "A" if mode_a == "full" else ("B" if mode_b == "full" else None)
+    replay_side = "B" if full_side == "A" else ("A" if full_side == "B" else None)
+    if full_side is None or replay_side is None:
+        # 两侧都是回放、但 restore / rebuild 不同：方法仍不同，不在这里放行
+        return None
+    full = metrics_a if full_side == "A" else metrics_b
+    replay = metrics_b if replay_side == "B" else metrics_a
+    mode = str(_comparability_value(replay, "run_mode"))
+    verify = replay.get("replay_verify")
+    full_run_id = str(full.get("run_id") or "")
+    base = {
+        "full_side": full_side,
+        "replay_side": replay_side,
+        "mode": mode,
+        "n_common": None,
+        "side_note": f"{full_side} 全量 / {replay_side} 回放 `{mode}`",
+    }
+    if not isinstance(verify, dict) or not verify:
+        return {**base, "verified": False,
+                "detail": "回放侧没有保真校验（未传 --replay-verify-source），"
+                          "无法证明恢复出的状态与全量侧一致"}
+    if "error" in verify:
+        return {**base, "verified": False,
+                "detail": f"回放保真校验失败（{verify['error']}），状态等价性未证明"}
+    source_run = str(verify.get("source_run") or "")
+    if not full_run_id or source_run != full_run_id:
+        return {**base, "verified": False,
+                "detail": f"保真校验的源 run 是 {source_run or '（未记）'}，"
+                          f"不是对侧全量产物 {full_run_id or '（未记）'}"}
+    diffs = [int(verify.get(key) or 0)
+             for key in ("n_answer_diff", "n_retrieved_diff", "n_correct_diff")]
+    n_common = int(verify.get("n_common") or 0)
+    if not n_common:
+        return {**base, "verified": False, "detail": "保真校验没有共同题，状态等价性无从判断"}
+    if any(diffs):
+        return {**base, "verified": False, "n_common": n_common,
+                "detail": f"状态不等价：共同题 {n_common} 中答案不一致 "
+                          f"{diffs[0]} / 检索不一致 {diffs[1]} / 判分不一致 {diffs[2]}"}
+    return {**base, "verified": True, "n_common": n_common,
+            "detail": f"回放状态与全量侧等价（共同题 {n_common}，答案 / 检索 / 判分"
+                      "不一致均为 0，已验证）"}
+
 
 #: 次要维度：不一致仅降级为 WARN 门禁，不判 FAIL。
 WARN_COMPARABILITY_DIMS: tuple[str, ...] = (
@@ -166,8 +242,15 @@ def _eval_gates(
     acc_threshold: float,
     stale_threshold: float,
     latency_warn: float,
+    *,
+    efficiency_comparable: bool = True,
 ) -> list[dict[str, Any]]:
-    """按 SPEC 3.6 逐条评估门禁。"""
+    """按 SPEC 3.6 逐条评估门禁。
+
+    ``efficiency_comparable=False``（两侧运行模式不同，如全量 vs 回放）时，延迟门禁
+    记 SKIP 而不是拿两套不同过程产物的延迟去判 PASS/WARN——回放不 ingest，延迟与
+    Token 都不是同一条链路的测量。
+    """
     gates: list[dict[str, Any]] = []
 
     acc_a_raw = overall_a.get("accuracy")
@@ -214,6 +297,16 @@ def _eval_gates(
                 "detail": f"stale_rate diff={stale_diff:+.3f}，阈值 +{stale_threshold}",
             }
         )
+
+    if not efficiency_comparable:
+        gates.append(
+            {
+                "name": "latency_p95_regression",
+                "status": "SKIP",
+                "detail": "两侧运行模式不同（回放不 ingest），延迟不属同一过程，跳过判定",
+            }
+        )
+        return gates
 
     p95_a_raw = overall_a.get("latency_p95_ms")
     p95_b_raw = overall_b.get("latency_p95_ms")
@@ -343,7 +436,23 @@ def check_comparability(
     mismatches: list[dict[str, Any]] = []
     unverifiable: list[dict[str, Any]] = []
 
+    # 「全量 vs 回放」不是天然不可比：回放侧有保真校验、且校验对象正是对侧全量产物、
+    # 三项差异为 0 时，状态等价已被证明，差异可归因到读取层（:func:`replay_equivalence`）。
+    equivalence = replay_equivalence(metrics_a, metrics_b)
+
     for dim in _COMPARABILITY_DIMS:
+        if dim == "run_mode" and equivalence is not None and equivalence["verified"]:
+            checks.append(
+                {
+                    "dimension": dim,
+                    "a": _comparability_value(metrics_a, dim),
+                    "b": _comparability_value(metrics_b, dim),
+                    "same": True,
+                    "severity": "info",
+                    "detail": equivalence["detail"],
+                }
+            )
+            continue
         severity = "info" if dim in downgrade else _SEVERITY_BY_DIM[dim]
         a = _comparability_value(metrics_a, dim)
         b = _comparability_value(metrics_b, dim)
@@ -367,13 +476,16 @@ def check_comparability(
             }
             unverifiable.append(check)
         elif a != b:
+            detail = f"A={a} != B={b}"
+            if dim == "run_mode" and equivalence is not None:
+                detail += f"；{equivalence['detail']}"
             check = {
                 "dimension": dim,
                 "a": a,
                 "b": b,
                 "same": False,
                 "severity": severity,
-                "detail": f"A={a} != B={b}",
+                "detail": detail,
             }
             mismatches.append(check)
         else:
@@ -400,6 +512,18 @@ def check_comparability(
         "unverifiable": unverifiable,
         "reasons": reasons,
     }
+
+
+def _replay_note(equivalence: Union[dict[str, Any], None]) -> Union[str, None]:
+    """报告抬头的一行说明：哪一侧是全量、哪一侧是回放，状态等价性如何。"""
+    if equivalence is None:
+        return None
+    full, replay = equivalence["full_side"], equivalence["replay_side"]
+    state = "已证明等价" if equivalence["verified"] else "未证明等价"
+    return (
+        f"{full} 为全量、{replay} 为回放（`{equivalence['mode']}`）；"
+        f"回放状态{state}：{equivalence['detail']}。"
+    )
 
 
 def _comparability_gate(
@@ -604,9 +728,20 @@ def compare_runs(
 
     diffs = _diff_overall(overall_a, overall_b)
     comparability = check_comparability(metrics_a, metrics_b)
+    # 全量 vs 回放：效率成本（延迟 / Token / 调用次数）不是同一条链路的测量——
+    # 回放 ingest 记 0 并标 ingest_skipped，拿它算 Δ 会得到"提升 100%"的假结论。
+    equivalence = replay_equivalence(metrics_a, metrics_b)
+    efficiency_comparable = equivalence is None
     gates = [
         _comparability_gate(comparability, require_comparable),
-        *_eval_gates(overall_a, overall_b, acc_threshold, stale_threshold, latency_warn),
+        *_eval_gates(
+            overall_a,
+            overall_b,
+            acc_threshold,
+            stale_threshold,
+            latency_warn,
+            efficiency_comparable=efficiency_comparable,
+        ),
     ]
 
     if any(g["status"] == "FAIL" for g in gates):
@@ -653,7 +788,15 @@ def compare_runs(
     runtime.set_dir(compare_dir)
     reports_dir = layout.task_report_dir(compare_dir)
     render_compare_report(
-        reports_dir, metrics_a, metrics_b, diffs, gates, verdict, comparability=comparability
+        reports_dir,
+        metrics_a,
+        metrics_b,
+        diffs,
+        gates,
+        verdict,
+        comparability=comparability,
+        replay_note=_replay_note(equivalence),
+        efficiency_comparable=efficiency_comparable,
     )
     report_path = os.path.join(reports_dir, layout.FILE_COMPARISON_MD)
     sources = {
@@ -696,4 +839,6 @@ def compare_runs(
         "group_b": group_b,
         "sources": sources,
         "comparability": comparability,
+        "replay_equivalence": equivalence,
+        "efficiency_comparable": efficiency_comparable,
     }

@@ -869,6 +869,18 @@ def _num_cell(value: Any) -> str:
     return f"{float(value):.1f}" if isinstance(value, (int, float)) else "—"
 
 
+def _line_run_mode(line: "SeriesLine", dataset_keys: list[str]) -> str:
+    """一条线的运行模式：各数据集应一致；不一致记 ``mixed``（说明产物是拼出来的）。"""
+    modes = {
+        str(line.datasets[key].metrics.get("run_mode") or "full")
+        for key in dataset_keys
+        if key in line.datasets
+    }
+    if not modes:
+        return "full"
+    return modes.pop() if len(modes) == 1 else "mixed"
+
+
 def _category_profile(
     entries: list[dict[str, Any]], dataset_keys: list[str]
 ) -> dict[str, Any]:
@@ -942,6 +954,8 @@ def _write_series_report(
     fusion: str,
     fusion_cap: int,
     base_metrics: dict[str, Any],
+    cross_mode: bool = False,
+    run_modes: Sequence[str] = (),
 ) -> str:
     """生成 ``report.md``（中文；图片引用同目录相对文件名），返回报告路径。"""
     multi = len(dataset_keys) > 1
@@ -975,6 +989,14 @@ def _write_series_report(
         )
     else:
         lines.append("- 融合口径：单数据集（不融合，直接取该数据集的指标）")
+    if run_modes:
+        modes = "、".join(dict.fromkeys(run_modes))
+        note = (
+            "；**各线运行模式不同（含回放），效率成本与延迟不可比，相关门禁记 SKIP**"
+            if cross_mode
+            else ""
+        )
+        lines.append(f"- 运行模式：{modes}{note}")
     lines.append(
         "- 门禁阈值（与 compare 同口径）：accuracy 下降 > 0.02 或 stale_rate 上升 > 0.02 "
         "判 FAIL；latency_p95 上升 > 30% 记 WARN；--require-comparable 下关键维度"
@@ -1209,13 +1231,21 @@ def _write_series_report(
     # 3.3 效率成本：与 evaluate-compare 的「效率成本 diff」同口径（逐数据集、相对变化）
     lines.append("## 逐数据集效率成本（vs 基线）")
     lines.append("")
-    lines.append(
-        "<sub>逐数据集对照；括号内为相对变化（该线−基线）/基线，与 latency_p95 门禁的"
-        "阈值口径一致（基线为 0 或缺失时不给 Δ）；延迟单位 ms、Token 为每题均值。"
-        "效率成本依赖部署环境，不参与融合与评级。</sub>"
-    )
-    lines.append("")
-    for key in dataset_keys:
+    if cross_mode:
+        lines.append(
+            "<sub>⚠️ 跳过：各线的运行模式不同（一侧全量、一侧回放）。回放不 ingest"
+            "（token 记 0 并标 `ingest_skipped`），延迟与消耗不是同一条链路的测量，"
+            "算出来的 Δ 没有意义。</sub>"
+        )
+        lines.append("")
+    else:
+        lines.append(
+            "<sub>逐数据集对照；括号内为相对变化（该线−基线）/基线，与 latency_p95 门禁的"
+            "阈值口径一致（基线为 0 或缺失时不给 Δ）；延迟单位 ms、Token 为每题均值。"
+            "效率成本依赖部署环境，不参与融合与评级。</sub>"
+        )
+        lines.append("")
+    for key in ([] if cross_mode else dataset_keys):
         base_overall = base["datasets"][key].metrics.get("overall", {}) or {}
         headers = ["指标", base["name"]]
         for entry in entries[1:]:
@@ -1406,6 +1436,13 @@ def run_series(
         line.index: _overall_of(line, fused_by_line[line.index]) for line in lines
     }
 
+    # 线级运行模式：任一线与基线不同（典型是"基线全量 + 后续线回放"）时，
+    # 效率成本不是同一条链路的测量——延迟门禁 SKIP，效率表整段跳过。
+    base_modes = {
+        _line_run_mode(line, dataset_keys) for line in lines[:1]
+    }
+    cross_mode = any(_line_run_mode(line, dataset_keys) not in base_modes for line in lines[1:])
+
     entries: list[dict[str, Any]] = []
     for line in lines:
         gates: list[dict[str, Any]] = []
@@ -1428,6 +1465,7 @@ def run_series(
                     ACC_THRESHOLD,
                     STALE_THRESHOLD,
                     LATENCY_WARN,
+                    efficiency_comparable=not cross_mode,
                 )
             )
         entries.append(
@@ -1564,6 +1602,8 @@ def run_series(
         fusion=fusion,
         fusion_cap=fusion_cap,
         base_metrics=lines[0].datasets[dataset_keys[0]].metrics,
+        cross_mode=cross_mode,
+        run_modes=[_line_run_mode(line, dataset_keys) for line in lines],
     )
 
     verdict = _worst_verdict(entries)
@@ -1594,6 +1634,7 @@ def run_series(
         "verdict": verdict,
         "fusion": fusion,
         "dataset_keys": dataset_keys,
+        "cross_mode": cross_mode,
     }
 
 

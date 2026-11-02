@@ -47,7 +47,12 @@ from datetime import datetime
 from typing import Any, Union
 
 from membench import layout, runtime
-from membench.compare import _diff_overall, _eval_gates, check_comparability
+from membench.compare import (
+    _diff_overall,
+    _eval_gates,
+    check_comparability,
+    replay_equivalence,
+)
 from membench.data.schema import is_abstention
 from membench.evaluate import (
     FUSION_CHOICES,
@@ -538,13 +543,37 @@ def _fused_gates(
     acc_threshold: float,
     stale_threshold: float,
     latency_warn: float,
+    *,
+    efficiency_comparable: bool = True,
 ) -> list[dict[str, Any]]:
     """两组融合值的门禁评估（与 compare 口径一致）。"""
     a_overall = {k: v["value"] for k, v in fused_a.items() if v.get("value") is not None}
     b_overall = {k: v["value"] for k, v in fused_b.items() if v.get("value") is not None}
     if not a_overall or not b_overall:
         return []
-    return _eval_gates(a_overall, b_overall, acc_threshold, stale_threshold, latency_warn)
+    return _eval_gates(
+        a_overall,
+        b_overall,
+        acc_threshold,
+        stale_threshold,
+        latency_warn,
+        efficiency_comparable=efficiency_comparable,
+    )
+
+
+def _is_cross_mode(group: GroupDatasetResult) -> bool:
+    """该数据集两侧是否为「全量 vs 回放」：是则效率成本不可比（回放不 ingest）。
+
+    与 :func:`membench.compare.replay_equivalence` 同一判据的"是否跨模式"部分——
+    质量指标的可归因性（状态等价性是否已验证）由可比性校验单独判，这里只回答
+    "效率那几列能不能拿来看"。
+    """
+    return replay_equivalence(group.baseline, group.candidate) is not None
+
+
+def cross_mode_datasets(groups: list[GroupDatasetResult]) -> list[str]:
+    """两侧运行模式不同的数据集名（报告用来决定效率段是否整体跳过）。"""
+    return [group.spec.name for group in groups if _is_cross_mode(group)]
 
 
 def _per_dataset_gates(
@@ -562,7 +591,14 @@ def _per_dataset_gates(
     for group in groups:
         a_overall = group.baseline.get("overall", {})
         b_overall = group.candidate.get("overall", {})
-        gates = _eval_gates(a_overall, b_overall, acc_threshold, stale_threshold, latency_warn)
+        gates = _eval_gates(
+            a_overall,
+            b_overall,
+            acc_threshold,
+            stale_threshold,
+            latency_warn,
+            efficiency_comparable=not _is_cross_mode(group),
+        )
         verdict = "PASS"
         if any(g["status"] == "FAIL" for g in gates):
             verdict = "FAIL"
@@ -1034,8 +1070,14 @@ def evaluate_compare(
     fused_baseline, cap_sources_a = _side_fuse(baseline_results, fusion)
     fused_candidate, cap_sources_b = _side_fuse(candidate_results, fusion)
     fused_diffs = _fused_diff(fused_baseline, fused_candidate)
+    cross_mode = cross_mode_datasets(groups)
     gates = _fused_gates(
-        fused_baseline, fused_candidate, acc_threshold, stale_threshold, latency_warn
+        fused_baseline,
+        fused_candidate,
+        acc_threshold,
+        stale_threshold,
+        latency_warn,
+        efficiency_comparable=not cross_mode,
     )
     # 办公域槽位不参与基准融合，但业务红线仍要进顶层门禁：把 office 移出融合
     # 不等于把红线移出结论（否则陈旧率回归会因融合值为 None 而 SKIP）。
@@ -1047,6 +1089,7 @@ def evaluate_compare(
             acc_threshold,
             stale_threshold,
             latency_warn,
+            efficiency_comparable=not _is_cross_mode(office_group),
         ):
             gates.append(
                 {
@@ -1175,6 +1218,8 @@ def _write_evaluate_compare_report(
     「两侧可比性（逐数据集）」小节（逐数据集列出关键不一致 / 关键缺失 / 次要差异，
     口径与单数据集 compare 一致）。
     """
+    # 两侧运行模式不同的数据集（全量 vs 回放）：效率成本这一段整体跳过
+    cross_mode = cross_mode_datasets(groups)
     lines: list[str] = []
     lines.append(f"# membench 两组多数据集对比报告 — {baseline_name} vs {candidate_name}")
     lines.append("")
@@ -1199,6 +1244,18 @@ def _write_evaluate_compare_report(
         + version_display((groups[0].baseline if groups else {}).get("membench_version"))
     )
     lines.append(f"- 数据集数: {len(groups)}（{', '.join(r.spec.name for r in groups)}）")
+    # 运行模式差异：哪一侧全量 / 哪一侧回放、状态等价性是否已验证（逐数据集列出）
+    mode_notes = []
+    for group in groups:
+        equivalence = replay_equivalence(group.baseline, group.candidate)
+        if equivalence is not None:
+            state = "已证明等价" if equivalence["verified"] else "未证明等价"
+            mode_notes.append(
+                f"{group.spec.name}（{equivalence['side_note']}，{state}："
+                f"{equivalence['detail']}）"
+            )
+    if mode_notes:
+        lines.append(f"- 运行模式: {'；'.join(mode_notes)}")
     # 题型过滤：两侧各数据集的口径必须一致（可比性维度已校验），这里给一行汇总，
     # 读者不必逐份 metrics.json 去确认"这份报告只覆盖了哪几类题"。
     filter_sets = {
@@ -1388,12 +1445,21 @@ def _write_evaluate_compare_report(
     # 1.6 效率成本 diff：逐数据集 A/B/Δ（Δ 为相对变化，与门禁阈值口径一致）
     lines.append("## 效率成本 diff（A → B）")
     lines.append("")
-    lines.append(
-        "<sub>逐数据集对照；Δ 为相对变化（B−A）/A，与 latency_p95 门禁的阈值口径"
-        "一致（基线为 0 或缺失时不给 Δ；延迟单位 ms、Token 为每题均值）。</sub>"
-    )
-    lines.append("")
-    for group in groups:
+    if cross_mode:
+        # 回放不 ingest：两侧的延迟 / Token / 调用次数不是同一条链路的测量，
+        # 给 Δ 只会得到"提升 100%"这类假结论，整段跳过并说明。
+        lines.append(
+            f"<sub>⚠️ 跳过：{'、'.join(cross_mode)} 两侧运行模式不同（一侧全量、一侧回放），"
+            "回放的 ingest 记 0 并标 `ingest_skipped`，效率成本不是同一过程的测量。</sub>"
+        )
+        lines.append("")
+    else:
+        lines.append(
+            "<sub>逐数据集对照；Δ 为相对变化（B−A）/A，与 latency_p95 门禁的阈值口径"
+            "一致（基线为 0 或缺失时不给 Δ；延迟单位 ms、Token 为每题均值）。</sub>"
+        )
+        lines.append("")
+    for group in ([] if cross_mode else groups):
         a_ov = group.baseline.get("overall", {})
         b_ov = group.candidate.get("overall", {})
         rows_eff: list[list[str]] = []

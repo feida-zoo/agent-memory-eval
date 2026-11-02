@@ -1093,3 +1093,46 @@ def test_series_report_has_efficiency_table(tmp_path: Path, git_repo) -> None:
     metrics = [row[0] for row in rows]
     assert any("延迟 P95" in m for m in metrics)
     assert any("平均输入 Token" in m for m in metrics)
+
+
+def test_series_cross_mode_skips_efficiency(tmp_path: Path, git_repo) -> None:
+    """基线与后续线运行模式不同（全量 vs 回放）：效率段跳过、延迟门禁 SKIP。
+
+    回放不 ingest，效率成本不是同一条链路的测量；这条口径与 compare / evaluate-compare
+    共用同一判据（``cross_mode``）。质量指标仍照常比较（可归因性由保真校验决定）。
+    """
+    repo, shas = git_repo
+    runs = [_run(tmp_path, f"cm{i}", quality) for i, quality in enumerate((40, 80))]
+    # 把第二线改写成"回放产物"：run_mode + 一条通过的保真校验
+    metrics_path = Path(runs[1]) / "runs" / "sample_dataset" / "report" / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["run_mode"] = "replay-restore"
+    metrics["replay_verify"] = {
+        "source_run": json.loads(
+            (Path(runs[0]) / "runs" / "sample_dataset" / "report" / "metrics.json")
+            .read_text(encoding="utf-8")
+        )["run_id"],
+        "n_common": 27,
+        "n_answer_diff": 0,
+        "n_retrieved_diff": 0,
+        "n_correct_diff": 0,
+    }
+    metrics_path.write_text(json.dumps(metrics, ensure_ascii=False), encoding="utf-8")
+
+    result = series.run_series(
+        [f"{sha}={run}" for sha, run in zip(shas, runs)],
+        repo=repo,
+        report_out=str(tmp_path / "out"),
+    )
+    assert result["cross_mode"] is True
+    report = Path(result["report_path"]).read_text(encoding="utf-8")
+    assert "- 运行模式：" in report and "replay-restore" in report
+    assert "⚠️ 跳过：各线的运行模式不同" in report
+    # 效率表的表头不该再出现（整段跳过，只剩说明）
+    assert "| 指标 | 基线 |" not in report.split("## 逐数据集效率成本")[1].split("## ")[0]
+    latency = next(
+        gate
+        for gate in result["lines"][1]["gates"]
+        if gate["name"] == "latency_p95_regression"
+    )
+    assert latency["status"] == "SKIP"

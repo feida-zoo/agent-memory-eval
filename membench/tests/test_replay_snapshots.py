@@ -982,3 +982,56 @@ def test_replay_with_category_filter_needs_only_matching_dialogues(
     verify = metrics["replay_verify"]
     assert (verify["n_source"], verify["n_replay"], verify["n_common"]) == (2, 1, 1)
     assert verify["answer_match_rate"] == 1.0
+
+
+def test_compare_full_vs_verified_replay_is_comparable(tmp_path: Path) -> None:
+    """全量 vs 回放：保真校验证明状态等价后，strict compare 不再判"不可比"。
+
+    端到端回归：曾经 ``run_mode`` 无条件算关键维度，全量 vs 回放必然 FAIL，
+    而这恰是"只改读取侧、不想重跑写入侧"的标准做法。现在放行条件是有证据的
+    状态等价，且效率成本（回放不 ingest）整体退出比较。
+    """
+    from membench.compare import compare_runs
+
+    dataset = _dataset(tmp_path / "ds" / "ds.jsonl")
+    # 两侧都标注 adapter_version / driver_llm：strict 模式下"关键维度缺失"本身就会 FAIL，
+    # 会掩盖本用例真正要验的 run_mode 判定
+    meta = {"adapter_version": "v1", "driver_llm": "none"}
+    source = Path(
+        Runner(
+            _FileMemoryAdapter(tmp_path / "mem-full"),
+            str(dataset),
+            judge="heuristic",
+            out_dir=str(tmp_path / "full"),
+            **meta,
+        ).run()
+    )
+    replay_out = Runner(
+        _FileMemoryAdapter(tmp_path / "mem-replay2"),
+        str(dataset),
+        judge="heuristic",
+        out_dir=str(tmp_path / "replay"),
+        replay=str(source),
+        replay_verify_source=str(source),
+        **meta,
+    ).run()
+    assert replay_out is not None
+    replay_dir = Path(replay_out)
+
+    result = compare_runs(
+        str(source),
+        str(replay_dir),
+        out_dir=str(tmp_path / "cmp"),
+        require_comparable=True,
+    )
+    assert result["replay_equivalence"]["verified"] is True
+    assert result["efficiency_comparable"] is False
+    comp_gate = result["gates"][0]
+    assert comp_gate["name"] == "comparability"
+    assert comp_gate["status"] != "FAIL", comp_gate
+    latency = next(g for g in result["gates"] if g["name"] == "latency_p95_regression")
+    assert latency["status"] == "SKIP"
+    report = Path(result["report_path"]).read_text(encoding="utf-8")
+    assert "- 运行模式：" in report
+    assert "已证明等价" in report
+    assert "已从本表移除" in report
