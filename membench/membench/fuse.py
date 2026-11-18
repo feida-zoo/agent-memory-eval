@@ -28,7 +28,7 @@
   ``limit`` / 数据集指纹与账本逐项吻合；
 - **覆盖完整**：用 :func:`membench.runner.select_shard_questions` 复算每片"本该有哪些
   对话、哪些题"，与该片的实际产物逐项比对——dialogue 分片下每个对话恰好被一片覆盖
-  （缺 / 重都报），question 分片下逐题覆盖完整且无重复。源数据集不可读、或内容与各片
+  （缺 / 重都报），旧 question 分片下逐题覆盖完整且无重复。源数据集不可读、或内容与各片
   记录的数据集指纹不一致时降级为按账本核对并打印告警（不与数据集逐项比对）；
 - 各片账本记的题数合计必须等于融合产物的逐题明细条数（账本或产物被动过就报错）。
 
@@ -36,7 +36,7 @@
 
 - ``runs/<dataset>/<对话>/{runtime,memory_snapshot,report}/``：对话目录随对话并入
   （就地模式本来就在原位）。**跨目录模式**下逐对话 ``report/`` 由合并后的记录重建
-  （question 分片下同一对话的记录来自多个分片，各片自己的对话级报告都只是子集），
+  （旧 question 分片下同一对话的记录来自多个分片，各片自己的对话级报告都只是子集），
   ``report/`` 之外的内容（runtime / 快照）随对话并入——同一对话出现在多片时只取序号
   最小那一片的那一份；**就地模式**不重写对话级产物：那些目录本来就是各片各写各的
   （互不重叠），保留原样既留住了"哪个对话归哪一片"的证据，也让 fuse 可以安全地重复执行；
@@ -162,11 +162,11 @@ def _brief(items: Any, limit: int = 5) -> str:
     return "、".join(names[:limit]) + f" 等 {len(names)} 项"
 
 
-#: 就地融合下的对话目录前提：各片各写各的对话目录（dialogue 分片）。题目级分片会把同一
+#: 就地融合下的对话目录前提：各片各写各的对话目录（dialogue 分片）。旧 question 分片会把同一
 #: 对话的题目分散写进同一个对话目录并互相覆盖，只能各片独立成目录后跨目录融合；这条提示
 #: 只加在就地模式失败时，避免用户拿着"元数据对不上"去猜原因。
 _IN_PLACE_HINT = (
-    "；就地融合要求各片各写各的对话目录（--shard-by dialogue）——题目级分片会把同一对话"
+    "；就地融合要求各片各写各的对话目录——旧 question 分片会把同一对话"
     "的题目分散写进同一目录并互相覆盖，请给各片独立的实验目录后用 --runs 跨目录融合"
 )
 
@@ -616,7 +616,7 @@ def _check_coverage(
             raise _err(
                 f"分片 s{index} 多了不该它负责的对话：{_brief(actual_names - expected_names)}"
                 f"（{shard['dir']}）——同一个对话不该被两片重复覆盖，"
-                "请核对 --shards / --shard-by"
+                "请核对 --shards 与分片账本"
             )
         for name, expected_qids in sorted(expected.items()):
             actual_qids = {
@@ -731,7 +731,7 @@ def _merge_ingest_blocks(
 
     ``n`` 求和、``min`` / ``max`` 取极值、``median`` 取**各对话 median 的中位数**。
     这是**近似**：块级明细（每次 ingest 的消息条数）没有落进对话级 metrics，只有
-    汇总值，所以跨对话的中位数不是"全部块的真实中位数"；question 分片下同一对话
+    汇总值，所以跨对话的中位数不是"全部块的真实中位数"；旧 question 分片下同一对话
     被多片各自 ingest 时，``n`` 按各片实际调用次数相加（与 ``token_usage`` 同口径：
     各片自己的计数才是真实成本）。
 
@@ -842,7 +842,7 @@ def fuse_runs(
         as_of_questions = int(ref_metrics.get("as_of_questions") or 0)
         as_of_enforced = bool(ref_metrics.get("as_of_enforced", True))
 
-    # 逐对话合并记录：question 分片下同一对话的记录来自多个分片，按片序拼接后
+    # 逐对话合并记录：旧 question 分片下同一对话的记录来自多个分片，按片序拼接后
     # 再按源数据集的题目顺序重排（数据集不可读时保持拼接顺序）
     merged: dict[str, list[dict[str, Any]]] = {}
     copies: dict[str, list[dict[str, Any]]] = {}
@@ -965,7 +965,7 @@ def fuse_runs(
         if value is not None:
             base[task_key] = value
 
-    # 逐对话 token 记账：同一对话各片各记各的（question 分片下同一对话可能被多片
+    # 逐对话 token 记账：同一对话各片各记各的（旧 question 分片下同一对话可能被多片
     # ingest，只有各片自己的计数才是真实成本），故直接相加、不去重。
     dialogue_usage = {
         name: _sum_usage([block.get("token_usage") for block in copies[name]])

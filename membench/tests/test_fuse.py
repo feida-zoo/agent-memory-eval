@@ -26,8 +26,9 @@ from membench import layout
 from membench.adapters import MockStrongAdapter, MockWeakAdapter
 from membench.adapters.base import BaseMemoryAdapter, IngestStats, QueryResult
 from membench.data import SAMPLE_DATASET_PATH
+from membench.data.schema import load_dataset
 from membench.fuse import fuse_runs
-from membench.runner import Runner
+from membench.runner import Runner, select_shard_questions
 
 _DATASET = "sample_dataset"
 
@@ -87,45 +88,51 @@ class _SnapshotAdapter(BaseMemoryAdapter):
 
 
 def _stale_dataset(path: Path) -> Path:
-    """单 dialogue 两道 knowledge_update 题（gold=周五, gold_stale=周三）。"""
-    dialogue = {
-        "dialogue_id": "stale_d1",
-        "sessions": [[{"role": "user", "content": "截止日改到周五了。", "timestamp": None}]],
-        "questions": [
-            {
-                "qid": f"stale_q{i}",
-                "question": "现在项目截止日是哪天？",
-                "gold_answer": "周五",
-                "category": "knowledge_update",
-                "evidence": [],
-                "gold_stale": "周三",
-            }
-            for i in (1, 2)
-        ],
-    }
+    """两个 dialogue 各两道 knowledge_update 题（gold=周五, gold_stale=周三）。"""
     with path.open("w", encoding="utf-8") as f:
-        f.write(json.dumps(dialogue, ensure_ascii=False) + "\n")
+        for d in (1, 2):
+            dialogue = {
+                "dialogue_id": f"stale_d{d}",
+                "sessions": [
+                    [{"role": "user", "content": "截止日改到周五了。", "timestamp": None}]
+                ],
+                "questions": [
+                    {
+                        "qid": f"stale_d{d}_q{i}",
+                        "question": "现在项目截止日是哪天？",
+                        "gold_answer": "周五",
+                        "category": "knowledge_update",
+                        "evidence": [],
+                        "gold_stale": "周三",
+                    }
+                    for i in (1, 2)
+                ],
+            }
+            f.write(json.dumps(dialogue, ensure_ascii=False) + "\n")
     return path
 
 
 def _plain_dataset(path: Path) -> Path:
-    """单 dialogue 两道 single_hop 题（无 knowledge_update / gold_stale）。"""
-    dialogue = {
-        "dialogue_id": "plain_d1",
-        "sessions": [[{"role": "user", "content": "截止日是周五。", "timestamp": None}]],
-        "questions": [
-            {
-                "qid": f"plain_q{i}",
-                "question": "项目截止日是哪天？",
-                "gold_answer": "周五",
-                "category": "single_hop",
-                "evidence": ["截止日是周五"],
-            }
-            for i in (1, 2)
-        ],
-    }
+    """两个 dialogue 各两道 single_hop 题（无 knowledge_update / gold_stale）。"""
     with path.open("w", encoding="utf-8") as f:
-        f.write(json.dumps(dialogue, ensure_ascii=False) + "\n")
+        for d in (1, 2):
+            dialogue = {
+                "dialogue_id": f"plain_d{d}",
+                "sessions": [
+                    [{"role": "user", "content": "截止日是周五。", "timestamp": None}]
+                ],
+                "questions": [
+                    {
+                        "qid": f"plain_d{d}_q{i}",
+                        "question": "项目截止日是哪天？",
+                        "gold_answer": "周五",
+                        "category": "single_hop",
+                        "evidence": ["截止日是周五"],
+                    }
+                    for i in (1, 2)
+                ],
+            }
+            f.write(json.dumps(dialogue, ensure_ascii=False) + "\n")
     return path
 
 
@@ -204,7 +211,6 @@ def _shard_run(
     adapter: Any,
     shards: int,
     shard_index: int,
-    shard_by: str = "question",
     out_dir: str | None = None,
     dataset: Path = Path(SAMPLE_DATASET_PATH),
     **kwargs: Any,
@@ -217,7 +223,6 @@ def _shard_run(
         out_dir=out_dir or str(tmp_path / name),
         shards=shards,
         shard_index=shard_index,
-        shard_by=shard_by,
         **kwargs,
     )
     return runner.run()
@@ -240,7 +245,7 @@ def _full_run(tmp_path: Path, name: str, adapter: Any) -> tuple[str, dict, list[
 
 
 def test_fuse_two_shards_matches_full_run(tmp_path: Path) -> None:
-    """两个题目级分片融合后的题集与指标等同于全量 run，产物落完整实验树。"""
+    """两个对话分片融合后的题集与指标等同于全量 run，产物落完整实验树。"""
     s0 = _shard_run(tmp_path, "s0", MockStrongAdapter(), 2, 0)
     s1 = _shard_run(tmp_path, "s1", MockStrongAdapter(), 2, 1)
     _, full_metrics, full_records = _full_run(tmp_path, "full", MockStrongAdapter())
@@ -312,17 +317,16 @@ def test_fuse_two_shards_matches_full_run(tmp_path: Path) -> None:
         "n_ignored",
     ):
         assert metrics[key] == full_metrics[key], key
-    # token 记账：逐片逐对话求和（题目级分片下同一对话被两片各 ingest 一次，不去重——
-    # 各片自己的计数才是真实成本），题目与 query 侧不重复
+    # token 记账：逐片逐对话求和；对话只归属一个分片，ingest 与 query 都不重复。
     expected_usage = _sum_of_shard_usage(s0, s1)
     assert metrics["token_usage"] == expected_usage
     assert metrics["token_usage"]["n_questions"] == full_metrics["token_usage"]["n_questions"]
     assert expected_usage["query_input_tokens"] == full_metrics["token_usage"]["query_input_tokens"]
     assert expected_usage["query_output_tokens"] == full_metrics["token_usage"]["query_output_tokens"]
-    assert expected_usage["ingest_input_tokens"] > full_metrics["token_usage"]["ingest_input_tokens"]
+    assert expected_usage["ingest_input_tokens"] == full_metrics["token_usage"]["ingest_input_tokens"]
     assert metrics["fused"] is True
     assert len(metrics["fused_from"]) == 2
-    assert metrics["shards"] == 2 and metrics["shard_by"] == "question"
+    assert metrics["shards"] == 2 and metrics["shard_by"] == "dialogue"
     assert metrics["run_mode"] == "full" and metrics["limit"] is None
     # 落盘的数据集级 metrics 与返回值一致
     assert _read_metrics(result["dataset_dir"]) == metrics
@@ -347,7 +351,6 @@ def test_fuse_in_place_after_dialogue_shards_in_one_task_dir(tmp_path: Path) -> 
             MockStrongAdapter(),
             2,
             index,
-            shard_by="dialogue",
             out_dir=str(task),
             shared=True,
         )
@@ -398,7 +401,7 @@ def test_fuse_merges_dialogue_dirs_with_runtime_and_snapshot(tmp_path: Path) -> 
     """跨目录融合：对话目录随对话并入融合树，快照与运行时数据一并带过来。"""
     s0 = _shard_run(tmp_path, "s0", _SnapshotAdapter(), 2, 0)
     s1 = _shard_run(tmp_path, "s1", _SnapshotAdapter(), 2, 1)
-    # 题目级分片下两片都可能碰到同一个对话：并入的是**序号最小**那一片的那一份
+    # 每个对话只归属一个分片：融合产物保留归属分片写出的那一份快照
     expected_src = {
         d.name: _dialogue_metrics(s0, d.name)["run_id"] for d in _dialogue_dirs(s0)
     }
@@ -437,8 +440,8 @@ def test_fuse_merges_dialogue_dirs_with_runtime_and_snapshot(tmp_path: Path) -> 
 
 def test_fuse_dialogue_shards_matches_full_run(tmp_path: Path) -> None:
     """dialogue 分片的两个分片可融合为与全量一致的完整 run。"""
-    d0 = _shard_run(tmp_path, "d0", MockStrongAdapter(), 2, 0, shard_by="dialogue")
-    d1 = _shard_run(tmp_path, "d1", MockStrongAdapter(), 2, 1, shard_by="dialogue")
+    d0 = _shard_run(tmp_path, "d0", MockStrongAdapter(), 2, 0)
+    d1 = _shard_run(tmp_path, "d1", MockStrongAdapter(), 2, 1)
     _, full_metrics, full_records = _full_run(tmp_path, "full", MockStrongAdapter())
 
     result = fuse_runs([d0, d1], str(tmp_path / "fused"))
@@ -523,29 +526,45 @@ def test_fuse_rejects_adapter_mismatch(tmp_path: Path) -> None:
 
 
 def test_fuse_rejects_ledger_scope_mismatch(tmp_path: Path) -> None:
-    """账本口径不一致（shards / shard_by / limit / 分片数）逐项拒绝。"""
+    """账本口径不一致（如分片数不同）直接拒绝。"""
     s0 = _shard_run(tmp_path, "s0", MockStrongAdapter(), 2, 0)
     more = _shard_run(tmp_path, "more", MockStrongAdapter(), 4, 1)
     with pytest.raises(ValueError, match="shards 不一致"):
         fuse_runs([s0, more], str(tmp_path / "fused"))
-
-    dialogue = _shard_run(tmp_path, "d1", MockStrongAdapter(), 2, 1, shard_by="dialogue")
-    with pytest.raises(ValueError, match="shard_by 不一致"):
-        fuse_runs([s0, dialogue], str(tmp_path / "fused2"))
     assert not (tmp_path / "fused").exists()
-    assert not (tmp_path / "fused2").exists()
 
 
 def test_fuse_rejects_mixed_shard_by(tmp_path: Path) -> None:
-    """题目级分片与 dialogue 分片混合融合 → 明确报错（不允许混维）。"""
-    q0 = _shard_run(tmp_path, "q0", MockStrongAdapter(), 2, 0, shard_by="question")
-    d1 = _shard_run(tmp_path, "d1", MockStrongAdapter(), 2, 1, shard_by="dialogue")
+    """旧 question 分片与新 dialogue 分片混合融合 → 明确报错。"""
+    legacy = _shard_run(tmp_path, "q0", MockStrongAdapter(), 2, 0)
+    ledger_paths = [Path(legacy) / layout.FILE_SHARDS, *layout.shard_entry_files(legacy)]
+    for path in ledger_paths:
+        ledger = json.loads(Path(path).read_text(encoding="utf-8"))
+        if "header" in ledger:
+            ledger["header"]["shard_by"] = "question"
+        else:
+            ledger["shard_by"] = "question"
+        Path(path).write_text(json.dumps(ledger, ensure_ascii=False), encoding="utf-8")
+    d1 = _shard_run(tmp_path, "d1", MockStrongAdapter(), 2, 1)
     with pytest.raises(ValueError, match="shard_by 不一致"):
-        fuse_runs([q0, d1], str(tmp_path / "fused"))
+        fuse_runs([legacy, d1], str(tmp_path / "fused"))
 
 
-def test_fuse_rejects_incomplete_question_coverage(tmp_path: Path) -> None:
-    """题目级分片少一道题的明细 → 覆盖完整性校验拒绝（不做"看起来完整"的融合）。"""
+def test_legacy_question_selection_remains_reproducible_for_fuse() -> None:
+    """旧 question 账本仍可复算原题集；该分支不再用于生成新分片。"""
+    dialogues = load_dataset(str(SAMPLE_DATASET_PATH))
+    selected = select_shard_questions(dialogues, 2, 0, None, "question")
+    actual = [q.qid for dialogue in selected for q in dialogue.questions]
+    expected = [
+        q.qid
+        for index, q in enumerate(q for d in dialogues for q in d.questions)
+        if index % 2 == 0
+    ]
+    assert actual == expected
+
+
+def test_fuse_rejects_incomplete_dialogue_coverage(tmp_path: Path) -> None:
+    """对话分片少一道题的明细 → 覆盖完整性校验拒绝（不做"看起来完整"的融合）。"""
     s0 = _shard_run(tmp_path, "s0", MockStrongAdapter(), 2, 0)
     s1 = _shard_run(tmp_path, "s1", MockStrongAdapter(), 2, 1)
     name = _dialogue_dirs(s0)[0].name
@@ -773,10 +792,10 @@ def test_fuse_passes_limit_through_and_marks_run_id(tmp_path: Path) -> None:
 
     smoke_id = smoke["metrics"]["run_id"]
     assert "_fused" in smoke_id
-    assert "_shard2" in smoke_id  # 分片数进身份（无具体分片序号：这是整体融合产物）
+    assert "_dshard2" in smoke_id  # 分片数进身份（无具体分片序号：这是整体融合产物）
     assert "_limit3" in smoke_id
     full_id = full["metrics"]["run_id"]
-    assert "_fused" in full_id and "_shard2" in full_id
+    assert "_fused" in full_id and "_dshard2" in full_id
     assert "limit" not in full_id
     assert smoke_id != full_id
 
@@ -904,7 +923,6 @@ def test_fuse_rebuilds_ingest_blocks_and_trace_state(tmp_path: Path) -> None:
                 _TraceAdapter(),
                 2,
                 index,
-                shard_by="dialogue",
                 dataset=dataset,
                 trace_state=True,
             )
@@ -957,7 +975,6 @@ def test_fuse_omits_trace_state_without_trace_dirs(tmp_path: Path) -> None:
             _TraceAdapter(),
             2,
             index,
-            shard_by="dialogue",
             dataset=dataset,
         )
         for index in range(2)

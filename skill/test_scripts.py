@@ -446,10 +446,10 @@ def test_eval_dry_run_shards_are_parallel(
     assert "task init --groups 1 --name smoke" in out
     assert "--evidence-match substring" in out
     shard0 = next(
-        line for line in lines if "--shard-index 0 --shard-by dialogue" in line
+        line for line in lines if "--shard-index 0" in line
     )
     shard1 = next(
-        line for line in lines if "--shard-index 1 --shard-by dialogue" in line
+        line for line in lines if "--shard-index 1" in line
     )
     assert shard0.rstrip().endswith("&")
     assert shard1.rstrip().endswith("&")

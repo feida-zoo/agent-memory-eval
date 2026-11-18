@@ -20,7 +20,7 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
         [--report-out DIR | --task-dir DIR] \
         # 二选一，见下「--task-dir 语义」
         [--adapter-arg KEY=VALUE]...   # 适配器构造参数，如 base_url=http://127.0.0.1:8787 \
-        [--shards N|max --shard-index I --shard-by question|dialogue] \
+        [--shards N|max --shard-index I] \
         [--limit N] [--category 题型]... \
         # 只跑一部分题：先按题型过滤（--category，可重复）→ 再分片 → 再 --limit；
         # 过滤结果记 metrics.categories、run_id 带 _cat-<题型>、目录名带 _c<题型>，
@@ -31,7 +31,7 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
         # --trace-state：失败归因，interleaved 数据集在每个有提问的 as_of 导一份状态到
         #   <对话目录>/trace_state/t<as_of>/（sequence 用末尾 memory_snapshot/）。
         #   缺省=自动：有 interleaved 对话含 safety 题时开启，--no-trace-state 关闭
-        # interleaved 数据集（如 gatemem_office）要求 --shard-by dialogue，且不支持 --replay
+        # interleaved 数据集（如 gatemem_office）不支持 --replay
         # --dataset：key（office / sample / locomo…，按需下载集先 dataset fetch）或 JSONL 路径
     python -m membench.cli run --adapter mock-strong --dataset ... \
         --replay <实验目录|数据集目录|回放任务或它的组目录> \
@@ -127,9 +127,8 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
 （``task init`` 建的骨架，或它的某个组目录 ``A/`` / ``B/``），而不是新建 ``eval_*`` /
 ``compare_*`` 目录——同一次评测的多个分片因此能写进同一棵树：
 
-- ``run --task-dir DIR`` / ``evaluate --task-dir DIR``：产物直接落 DIR；共享目录下
-  只允许 ``--shard-by dialogue``（题目级分片会让多个分片写同一对话目录并互相覆盖），
-  同一分片重复跑直接拒绝；
+- ``run --task-dir DIR`` / ``evaluate --task-dir DIR``：产物直接落 DIR；多个分片按整段
+  对话写进同一棵树，同一分片重复跑直接拒绝；
 - ``evaluate-compare --task-dir DIR``：两组分别写 ``DIR/A``、``DIR/B``，对比报告落
   ``DIR/reports/``；
 - ``compare --task-dir DIR``：就地读 ``DIR/A`` 与 ``DIR/B``，``comparison.md`` 落
@@ -140,7 +139,7 @@ matrix / series / task / doctor / adapter / user-data / dataset / list-datasets�
 - ``sequence``（默认，旧数据兼容）：整段对话 ingest 完再提问，``Question.as_of``
   不强制；
 - ``interleaved``（如 gatemem_office）：按 ``as_of``（已 ingest 的消息条数）升序
-  分组，边 ingest 边提问；要求 ``--shard-by dialogue``、不支持 ``--replay``；
+  分组，边 ingest 边提问；不支持 ``--replay``；
 - ``run --trace-state`` 对 interleaved 的每个有提问 as_of 导出状态到
   ``<对话目录>/trace_state/t<as_of>/``；缺省**自动**——本次有 interleaved 对话含
   safety 题时开启（safety 的「真遗忘」要读提问时点的状态），``--no-trace-state``
@@ -214,8 +213,8 @@ def _build_parser() -> argparse.ArgumentParser:
     run_out.add_argument(
         "--task-dir",
         default=None,
-        help="已存在的任务目录（task init 建的骨架，或它的组目录 A/ / B/）：产物直接写进该目录，多个分片可共用同一棵树"
-        "（要求 --shard-by dialogue，同一分片重复跑会被拒绝）；与 --report-out 互斥",
+        help="已存在的任务目录（task init 建的骨架，或它的组目录 A/ / B/）：产物直接写进该目录，多个对话分片可共用同一棵树"
+        "（同一分片重复跑会被拒绝）；与 --report-out 互斥",
     )
     p_run.add_argument("--llm-base-url", default=None, help="judge=llm 时的 OpenAI 兼容 base_url")
     p_run.add_argument("--llm-api-key", default=None, help="judge=llm 时的 API key")
@@ -290,10 +289,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--shards",
         type=_parse_shards,
         default=1,
-        help="数据集分片总数（默认 1 不分片）；可传整数或 max（自动按数据集上限取最大：dialogue=对话数、question=题目数）；超过上限的整数按上限执行，越界分片索引安全跳过",
+        help="对话分片总数（默认 1 不分片）；可传整数或 max（自动按对话数取最大）；超过对话数的整数按对话数执行，越界分片索引安全跳过；分片间不重复 ingest，query 并发用 --jobs",
     )
     p_run.add_argument("--shard-index", type=int, default=0, help="本分片序号（从 0 开始，需 < --shards；与 --limit 组合时先分片再截断）")
-    p_run.add_argument("--shard-by", choices=["question", "dialogue"], default="question", help="分片维度：question 按题目（默认）；dialogue 整段选取对话、分片间不重复 ingest，适合几乎每个对话都有题的数据集（如 BEAM）")
     p_run.set_defaults(func=_cmd_run)
 
     # --- compare ---
@@ -1020,7 +1018,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 categories=getattr(args, "category", None) or (),
                 shards=args.shards,
                 shard_index=args.shard_index,
-                shard_by=args.shard_by,
                 adapter_meta=args.adapter_meta,
                 driver_llm=args.driver_llm,
                 adapter_version=args.adapter_version,
@@ -1486,8 +1483,8 @@ def _cmd_task_init(args: argparse.Namespace) -> int:
             f"python -m membench.cli run --adapter <适配器> --dataset <数据集> "
             f"--task-dir {first_group} --replay <源：实验目录 / 数据集目录 / 回放任务>"
             "（两组分别 --task-dir <任务>/A、<任务>/B 回放同一源时，状态相同的对话共用"
-            "同一个桶；同一组可再加 --shards <N> --shard-index <I> --shard-by dialogue "
-            "让多个进程并行回放，各进程只写自己对话的条目）；进度用 "
+            "同一个桶；同一组可再加 --shards <N> --shard-index <I> "
+            "让多个进程按对话并行回放，各进程只写自己对话的条目）；进度用 "
             f"python -m membench.cli task status {task_dir}",
             file=sys.stderr,
         )
@@ -1495,7 +1492,7 @@ def _cmd_task_init(args: argparse.Namespace) -> int:
         print(
             f"[membench] 下一步: 各分片写进同一任务目录 —— "
             f"python -m membench.cli run --adapter <适配器> --dataset <数据集> "
-            f"--task-dir {first_group} --shards <N> --shard-index <I> --shard-by dialogue"
+            f"--task-dir {first_group} --shards <N> --shard-index <I>"
             f"（I 取 0..N-1）；进度用 python -m membench.cli task status {task_dir}",
             file=sys.stderr,
         )
@@ -1553,7 +1550,7 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
             next_steps.append(
                 f"{where} 尚无产物：先跑分片，例如 python -m membench.cli run "
                 f"--adapter <适配器> --dataset <数据集> --task-dir {group_root} "
-                f"--shards 2 --shard-index 0 --shard-by dialogue"
+                f"--shards 2 --shard-index 0"
             )
             continue
         group_ready = True
@@ -1608,11 +1605,17 @@ def _cmd_task_status(args: argparse.Namespace) -> int:
                         f"分片 {'、'.join(sorted(running))} 仍在跑（running）：等它结束后再融合"
                     )
                 if missing:
-                    next_steps.append(
-                        f"还有 {len(missing)} 片未完成（{'、'.join(missing)}）：补跑 "
-                        f"python -m membench.cli run --task-dir {group_root} "
-                        f"--shards {shards_n} --shard-index <I> --shard-by {shard_by}"
-                    )
+                    if shard_by == "question":
+                        next_steps.append(
+                            f"数据集 {name} 是旧版 question 分片，当前版本不能补跑；"
+                            "请换一个新任务目录按对话分片重跑"
+                        )
+                    else:
+                        next_steps.append(
+                            f"还有 {len(missing)} 片未完成（{'、'.join(missing)}）：补跑 "
+                            f"python -m membench.cli run --task-dir {group_root} "
+                            f"--shards {shards_n} --shard-index <I>"
+                        )
                 elif not running and not ready:
                     next_steps.append(
                         f"数据集 {name} 的分片已跑齐：补齐数据集级与任务级产物 "

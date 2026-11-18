@@ -4,9 +4,8 @@
 
 - 一次评测 = 一个任务目录：单组 ``eval_<name>_<platform>_<ts>``，双组
   ``compare_<name>_<platform>_<ts>``（``A/`` ``B/`` 各是一个完整评测产物根）；
-- 多个分片可以写进**同一个**任务目录：共享目录下只允许 ``shard_by="dialogue"``
-  （题目级分片会让多片写同一对话目录），各片进度与归属记在分片账本
-  ``runs/<dataset>/shards.json``；
+- 多个分片可以写进**同一个**任务目录：每片只写自己负责的整段对话，各片进度与归属
+  记在分片账本 ``runs/<dataset>/shards.json``；
 - 分片只写本片负责的对话目录与账本，数据集级 ``report/`` 与任务级 ``reports/``
   由 ``fuse`` 补齐；同一分片重复跑、账本口径不一致一律在写盘前拒绝。
 """
@@ -119,7 +118,7 @@ def test_shared_task_dir_accepts_dialogue_shards_from_several_processes(tmp_path
     group_a = Path(layout.group_dir(str(task), layout.ROLE_BASELINE))
 
     for index in (0, 1):
-        _run_shard(str(group_a), dataset, index=index, shards=2, shard_by="dialogue", shared=True)
+        _run_shard(str(group_a), dataset, index=index, shards=2, shared=True)
 
     dataset_dir = Path(layout.dataset_dir(str(group_a), DATASET))
     ledger = _ledger(dataset_dir)
@@ -162,47 +161,34 @@ def test_shared_task_dir_rejects_repeat_shard(tmp_path: Path) -> None:
     dataset = _dataset(tmp_path / f"{DATASET}.jsonl")
     task = layout.init_task_dir(str(tmp_path), "one", "t", groups=1, ts="20260101-120000")
     dataset_dir = _run_shard(
-        task, dataset, index=0, shards=2, shard_by="dialogue", shared=True
+        task, dataset, index=0, shards=2, shared=True
     )
     ledger_before = _ledger(dataset_dir)
 
     with pytest.raises(SystemExit, match="已经在本实验目录下跑过"):
-        _run_shard(task, dataset, index=0, shards=2, shard_by="dialogue", shared=True)
+        _run_shard(task, dataset, index=0, shards=2, shared=True)
     assert _ledger(dataset_dir) == ledger_before
     assert _dialogues_of(dataset_dir) == ["dd0", "dd2"]
 
 
-def test_shared_task_dir_rejects_question_shard(tmp_path: Path) -> None:
-    """共享任务目录只收 dialogue 分片：题目级分片会让多片写同一对话目录。"""
-    dataset = _dataset(tmp_path / f"{DATASET}.jsonl")
-    task = layout.init_task_dir(str(tmp_path), "one", "t", groups=1, ts="20260101-120000")
-    with pytest.raises(SystemExit, match="只支持 --shard-by dialogue"):
-        _run_shard(task, dataset, index=0, shards=2, shard_by="question", shared=True)
-    # 拒绝在建任何产物之前（任务目录里只有 init_task_dir 建出的空骨架）
-    assert list(Path(layout.runs_root(task)).iterdir()) == []
-
-
 def test_shared_task_dir_rejects_ledger_mismatch(tmp_path: Path) -> None:
-    """账本与本次不一致（shards / shard_by / limit / 数据集指纹）逐项拒绝：混片不可归因。"""
+    """账本与本次不一致（shards / limit / 数据集指纹）逐项拒绝：混片不可归因。"""
     dataset = _dataset(tmp_path / f"{DATASET}.jsonl")
     task = layout.init_task_dir(str(tmp_path), "one", "t", groups=1, ts="20260101-120000")
     dataset_dir = _run_shard(
-        task, dataset, index=0, shards=2, shard_by="dialogue", shared=True
+        task, dataset, index=0, shards=2, shared=True
     )
 
     with pytest.raises(SystemExit, match=r"不一致（shards）"):
-        _run_shard(task, dataset, index=1, shards=3, shard_by="dialogue", shared=True)
-    # 非 shared 下 shard_by=question 本身合法，但与账本记录的分片维度冲突
-    with pytest.raises(SystemExit, match=r"不一致（shard_by）"):
-        _run_shard(task, dataset, index=1, shards=2, shard_by="question")
+        _run_shard(task, dataset, index=1, shards=3, shared=True)
     with pytest.raises(SystemExit, match=r"不一致（limit）"):
-        _run_shard(task, dataset, index=1, shards=2, shard_by="dialogue", shared=True, limit=2)
+        _run_shard(task, dataset, index=1, shards=2, shared=True, limit=2)
     # 同名数据集、内容变过 -> 指纹不一致
     drifted = _dataset(tmp_path / "elsewhere" / f"{DATASET}.jsonl", marker="（另一份数据集）")
     with pytest.raises(SystemExit, match="数据集指纹不一致"):
-        _run_shard(task, drifted, index=1, shards=2, shard_by="dialogue", shared=True)
+        _run_shard(task, drifted, index=1, shards=2, shared=True)
 
-    # 四种拒绝都发生在写盘之前：账本只有第一片，也没有多出对话目录
+    # 三种拒绝都发生在写盘之前：账本只有第一片，也没有多出对话目录
     assert sorted(_ledger(dataset_dir)["entries"]) == ["s0"]
     assert _dialogues_of(dataset_dir) == ["dd0", "dd2"]
 
@@ -219,7 +205,6 @@ def test_shard_ledger_marks_running_before_finish(tmp_path: Path) -> None:
             out_dir=task,
             shards=2,
             shard_index=0,
-            shard_by="dialogue",
             shared=True,
         ).run()
 
@@ -235,7 +220,7 @@ def test_non_shared_shard_also_writes_ledger_but_no_dataset_product(tmp_path: Pa
     dataset = _dataset(tmp_path / f"{DATASET}.jsonl")
     out_dir = tmp_path / "eval_shard_s0"
     dataset_dir = _run_shard(
-        str(out_dir), dataset, index=0, shards=2, shard_by="dialogue"
+        str(out_dir), dataset, index=0, shards=2
     )
     assert _dialogues_of(dataset_dir) == ["dd0", "dd2"]
     assert _ledger(dataset_dir)["entries"]["s0"]["status"] == "done"

@@ -5,7 +5,7 @@
 - interleaved 的调用顺序：按 as_of 升序切片 ingest、组内 query、全部组完成后补齐
   剩余消息、中间不 reset、结果按原始题序落盘；
 - GateMem 语义夹具：t60 问旧预算、t150 更新后仍答旧值（interleaved 对 / sequence 错）；
-- 约束：interleaved + 题目级分片 / --replay 直接 SystemExit；+ --snapshot 允许；
+- 约束：interleaved + --replay 直接 SystemExit；+ --snapshot 允许；
 - 失败归因四桶与 ``evidence_in_state``（无快照能力 → 全 unknown）。
 """
 
@@ -231,9 +231,14 @@ def test_interleaved_ingest_order_and_record_order(tmp_path: Path) -> None:
         ("query", "q2", 3),
         ("ingest", ["m4"]),
         ("query", "q_none", 4),
+        # 整场跑完后的清理 reset（与"每个对话开始前"的那次不是一回事）
+        ("reset", 4),
     ]
-    # 中间没有 reset（整段对话只 reset 一次）
-    assert [event for event in adapter.events if event[0] == "reset"] == [("reset", 0)]
+    # 中间没有 reset（整段对话只 reset 一次；末尾那次是整场跑完的清理）
+    assert [event for event in adapter.events if event[0] == "reset"] == [
+        ("reset", 0),
+        ("reset", 4),
+    ]
 
     # 落盘按原始题序，而不是按提问顺序
     assert [r["qid"] for r in _records(Path(dataset_dir))] == [
@@ -289,23 +294,6 @@ def test_interleaved_trace_state_dirs_and_final_snapshot(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 # 硬约束
 # ---------------------------------------------------------------------------
-
-
-def test_interleaved_rejects_question_sharding(tmp_path: Path) -> None:
-    """interleaved + 题目级分片：开跑前 SystemExit，且不留产物目录。"""
-    dataset = _order_dataset(tmp_path / "order.jsonl")
-    out_dir = tmp_path / "exp"
-    with pytest.raises(SystemExit, match="shard-by dialogue"):
-        Runner(
-            _StateFileAdapter(),
-            str(dataset),
-            judge="heuristic",
-            out_dir=str(out_dir),
-            shards=2,
-            shard_index=0,
-            shard_by="question",
-        ).run()
-    assert not out_dir.exists()
 
 
 def test_interleaved_rejects_replay(tmp_path: Path) -> None:

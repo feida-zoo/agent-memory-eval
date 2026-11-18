@@ -34,11 +34,11 @@
 门禁规则（默认，CLI 可调）：accuracy 降 >0.02 → FAIL；stale_rate 升 >0.02 → FAIL；p95 延迟升 >30% → WARN。
 
 **多分片 A/B（任务目录通路）**：大数据集上分片跑 A/B 时，`task init --name <名> --groups 2 --baseline-name 基线 --candidate-name 候选` 建一棵
-双组任务目录，两侧各片 `run --task-dir <任务目录>/A|B --shards N --shard-by dialogue`（每片独占
+双组任务目录，两侧各片 `run --task-dir <任务目录>/A|B --shards N`（每片独占
 一个记忆实例）→ 各自 `fuse --task-dir <任务目录>/A|B` 就地补齐数据集级与任务级产物 →
 `compare --task-dir <任务目录> --require-comparable` 就地出 `reports/comparison.md`。多数据集汇总
 仍走 `evaluate-compare --baseline-run/--candidate-run`。纪律：共享任务目录只允许**对话级**分片
-（题目级分片会让多片写同一对话目录互相覆盖），分片产物只写各片负责的对话目录 + **逐片条目
+（每片只写自己负责的整段对话），分片产物只写各片负责的对话目录 + **逐片条目
 `runs/<dataset>/shards.<i>.json`（真源）**；`runs/<dataset>/shards.json` 是物化视图（供人看/读），
 读账本以逐片条目为准。数据集级与任务级产物由 `fuse` 补齐；账本口径不一致（`shards` / `shard_by` /
 `limit` / 数据集指纹）或同片重复跑都会被拒绝。

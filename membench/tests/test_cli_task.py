@@ -114,8 +114,6 @@ def _run_shard(task_or_arm: Path, dataset: Path, *, shards: int, index: int) -> 
             str(shards),
             "--shard-index",
             str(index),
-            "--shard-by",
-            "dialogue",
         ]
     )
 
@@ -213,7 +211,8 @@ def test_task_status_fresh_task_dir(
     assert "组 基线（baseline）:" in out and "组 候选（candidate）:" in out
     assert out.count("数据集: （尚无产物）") == 2
     assert "下一步:" in out
-    assert "--task-dir" in out and "--shard-by dialogue" in out
+    assert "--task-dir" in out and "--shards 2" in out
+    assert "--shard-by" not in out
 
 
 def test_task_status_progress_then_fuse_in_place(
@@ -402,11 +401,11 @@ def test_run_task_dir_missing_dir_errors(tmp_path: Path) -> None:
     assert "task init" in str(excinfo.value)
 
 
-def test_run_task_dir_question_shard_rejected(tmp_path: Path) -> None:
-    """共享任务目录下题目级分片被拒（多片会写同一对话目录并互相覆盖）。"""
+def test_run_rejects_removed_shard_by(tmp_path: Path) -> None:
+    """旧 --shard-by 参数直接由 argparse 拒绝，且不会创建任何分片产物。"""
     dataset = _dataset(tmp_path / "dense.jsonl")
     task = _init_task(tmp_path / "out", "solo", groups=1)
-    with pytest.raises(SystemExit, match="只支持 --shard-by dialogue"):
+    with pytest.raises(SystemExit) as exc:
         cli.main(
             [
                 "run",
@@ -422,9 +421,11 @@ def test_run_task_dir_question_shard_rejected(tmp_path: Path) -> None:
                 "2",
                 "--shard-index",
                 "0",
+                "--shard-by",
+                "question",
             ]
         )
-    # 拒绝在建任何产物之前：runs/ 还是空的
+    assert exc.value.code == 2
     assert list((task / layout.DIR_RUNS).iterdir()) == []
 
 
@@ -487,8 +488,6 @@ def test_fuse_cross_dir_mode_still_works(tmp_path: Path) -> None:
                     "2",
                     "--shard-index",
                     str(index),
-                    "--shard-by",
-                    "dialogue",
                 ]
             )
             == 0

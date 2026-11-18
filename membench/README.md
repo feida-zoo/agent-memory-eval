@@ -89,7 +89,7 @@ python -m membench.cli task status "$TASK"   # 桶数 / 各组复用新写 / 两
 # 5. 多分片评测：先建任务目录，各分片写进同一棵树，再就地融合（见「大数据集：冒烟与分片」）
 TASK=$(python -m membench.cli task init --name beam --platform wx --groups 1)   # stdout 只有这一行路径
 python -m membench.cli run --adapter <你的适配器> --dataset <数据集> \
-    --task-dir "$TASK" --shards 4 --shard-index 0 --shard-by dialogue
+    --task-dir "$TASK" --shards 4 --shard-index 0
 # ... 各分片（--shard-index 1..3）同样写进 "$TASK"；再补齐数据集级与任务级产物：
 python -m membench.cli fuse --task-dir "$TASK"
 python -m membench.cli task status "$TASK"      # 只读进度：哪片跑完、还缺什么、下一步跑什么
@@ -190,11 +190,11 @@ python -m membench.cli evaluate-compare \
 - **门禁一票否决独立于基准评级**：办公域槽位 stale_rate > 0.03 → 总评"不达标"，退出码 1（可接 CI），无论基准评级多高；`evaluate-compare` 的顶层门禁同样包含办公域这一组红线（门禁名带「（办公域）」），office 移出融合不等于把红线移出结论。
 - **基准集为空**（只评测了 office）：基准评级显示 `n/a`，业务结论与门禁照常输出。
 - **按需下载的公开集必须先 fetch**：`locomo` / `longmemeval_oracle` / `gatemem_office` / `longmemeval_s` / `beam_1m`（或 `beam_10m`）都没有内置文件，`evaluate` 从 `~/.membench/datasets/` 解析可用路径，缺失时报错提示先 `python -m membench.cli dataset fetch <key>`（`--no-lme-s` / `--common` 不检查 LongMemEval-S；`--no-beam` / `--quick` / `--common --no-beam` 不检查 BEAM 槽位）。judge=heuristic 跑 BEAM 会警告（rubric 型题目规则判分失真，建议 llm/client）。
-  `gatemem_office` 的对话是 **interleaved**（按 checkpoint 的 as_of 边 ingest 边提问）：run 时必须 `--shard-by dialogue`，且不支持 `--replay`；逐时点状态与失败归因默认在「interleaved + safety 题」时自动开启，也可显式 `--trace-state` / `--no-trace-state`（见「interleaved 摄入与失败归因」）。
+  `gatemem_office` 的对话是 **interleaved**（按 checkpoint 的 as_of 边 ingest 边提问）：分片只按整段对话进行，且不支持 `--replay`；逐时点状态与失败归因默认在「interleaved + safety 题」时自动开启，也可显式 `--trace-state` / `--no-trace-state`（见「interleaved 摄入与失败归因」）。
 - **产物**：`--report-out DIR`（DIR 是实验目录的**父目录**，缺省 `output_root()`）落 `DIR/eval_<adapter>_<platform>_<ts>/`：各数据集产物在 `runs/<dataset>/`（数据集级报告 `report/{report.md,metrics.json,results.jsonl,fig_*.png}`，逐对话目录 `<对话>/` 内含 `report/`、`runtime/`、`memory_snapshot/`），任务级报告在 `reports/`（`report.md` + `metrics.json` + `evaluate_summary.json` + `fig_dataset_overview.png`）。
 
 run 产物（`runs/<dataset>/report/`）：`results.jsonl`（逐题原始记录）、`metrics.json`、`report.md`、`fig_category_accuracy.png`、`fig_latency_hist.png`；逐对话产物落 `runs/<dataset>/<对话目录>/report/`（纯文字，不出图）。
-run 报告含 **「Token 消耗（全流程）」** 小节，取自 `metrics.json` 的 `token_usage` 块（被测系统上报口径的累计值：`ingest_input_tokens` / `query_input_tokens` / `query_output_tokens` / `ingest_llm_calls` / `query_llm_calls` + `n_dialogues` / `n_questions`）；`evaluate` 报告给出**分数据集消耗与合计**（`evaluate_summary.json` 的 `token_usage` 同步落账，含 `datasets_reported` 标明合计覆盖范围）。ingest 按每次 reset 后的真实写入累计——题目级分片下同一对话被多个分片各自 ingest 也如实各记一次；分片融合时逐片相加，任一分片未落账则整体不落账。适配器不填 token 时记 0 并显式提示"未上报"，不读成真实零消耗；这不是指标，不参与评级与门禁。
+run 报告含 **「Token 消耗（全流程）」** 小节，取自 `metrics.json` 的 `token_usage` 块（被测系统上报口径的累计值：`ingest_input_tokens` / `query_input_tokens` / `query_output_tokens` / `ingest_llm_calls` / `query_llm_calls` + `n_dialogues` / `n_questions`）；`evaluate` 报告给出**分数据集消耗与合计**（`evaluate_summary.json` 的 `token_usage` 同步落账，含 `datasets_reported` 标明合计覆盖范围）。ingest 按每次 reset 后的真实写入累计；对话分片只 ingest 自己负责的整段对话，融合时逐片相加，任一分片未落账则整体不落账。适配器不填 token 时记 0 并显式提示"未上报"，不读成真实零消耗；这不是指标，不参与评级与门禁。
 单版本（`run` / `evaluate` 的逐数据集）报告在「分题型准确率」之后还有一节
 **「最需要优化的题型（TOP 5）」**：按准确率升序、只收题量 ≥10 的题型（小样本一两题翻转
 就是 25~50pt，会挤掉真正该修的大题型，它们仍留在分题型表里）；「主要问题」用逐题记录
@@ -239,9 +239,8 @@ runner 不再"整段 ingest 完再统一提问"，而是：sessions 按顺序展
 （与 `--jobs 1` 一致）。`sequence`（默认）保持旧口径：整段 ingest 后统一提问，
 `as_of` 不强制；数据带 as_of 却按 sequence 跑时，报告会明确提示"时点错位"。
 
-约束（开跑前硬拒绝，不留半成品）：`interleaved` 不支持题目级分片（请用
-`--shard-by dialogue`），也不支持 `--replay`（回放只有末尾快照，给不出每个
-as_of 的状态）。`--snapshot` 仍可用：快照在**全部 ingest 完成后**导出（末尾态）。
+约束（开跑前硬拒绝，不留半成品）：`interleaved` 不支持 `--replay`
+（回放只有末尾快照，给不出每个 as_of 的状态）；分片只按整段对话进行。`--snapshot` 仍可用：快照在**全部 ingest 完成后**导出（末尾态）。
 
 `run --trace-state` 在每个有提问的 as_of ingest 完成后、query 之前把状态导出到
 `<对话目录>/trace_state/t<as_of>/`（适配器需声明快照能力；不支持时警告一次并
@@ -341,10 +340,10 @@ reason 标 `近失复核=llm(PASS 覆盖 m/n 要点)`；FAIL 或调用失败保�
 judge 的红线判定里。
 
 ```bash
-# GateMem：interleaved 数据集；按对话分片（不能按题目分片）。它含 safety 题，
+# GateMem：interleaved 数据集；按整段对话分片。它含 safety 题，
 # --trace-state 默认自动开启（这里显式写出以便看清产物）；关掉用 --no-trace-state
 python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/gatemem_office.jsonl \
-    --shard-by dialogue --shards 4 --shard-index 0 --trace-state
+    --shards 4 --shard-index 0 --trace-state
 
 # 多数据集全量评估：逐数据集透传开关（sequence 数据集照常跑，只是不写 trace_state/）；
 # 不给该参数时由每个数据集的形状自动判定
@@ -415,13 +414,13 @@ TASK=$(python -m membench.cli task init --name beam --platform wx --groups 1)
 
 # 2) 各分片写进**同一棵**任务目录：整段对话归片 d % 4，分片间不重复 ingest；
 #    可多台机器/多进程并行跑（每片独占自己的记忆实例，见下「并行分片的实例隔离」）。
-#    共享任务目录只允许 --shard-by dialogue：题目级分片会让多片写同一个对话目录并互相覆盖，
-#    这种写法在开跑前就被拒绝；同一分片重复跑也直接拒绝（账本里查得到谁跑过）
+#    各片只写自己负责的整段对话，可安全共用任务目录；
+#    同一分片重复跑会直接拒绝（账本里查得到谁跑过）
 python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/beam_1m.jsonl \
-    --task-dir "$TASK" --shards 4 --shard-index 0 --shard-by dialogue
+    --task-dir "$TASK" --shards 4 --shard-index 0
 ...
 python -m membench.cli run --adapter my-sys --dataset ~/.membench/datasets/beam_1m.jsonl \
-    --task-dir "$TASK" --shards 4 --shard-index 3 --shard-by dialogue
+    --task-dir "$TASK" --shards 4 --shard-index 3
 
 # 3) 只读进度视图：骨架 / 各数据集的账本进度（几片跑完、哪片还在跑、题数与对话数）/
 #    数据集级产物齐备与否 / 快照目录数与体积 / 下一步该跑什么
@@ -458,7 +457,7 @@ python -m membench.cli fuse \
 只有旧产物没有逐片条目时才读 `shards.json` 本身）。头部记口径（`schema` / `dataset` /
 `shards` / `shard_by` / `limit` / 数据集指纹），`entries.s<i>` 记该片的 `status`
 （`running` / `done`）、负责的对话、实测题数、`run_id` 与起止时间。账本口径或数据集
-指纹与本次不一致（换了 `--shards` / `--shard-by` / `--limit` / `--category` / 数据集却写进
+指纹与本次不一致（换了 `--shards` / `--limit` / `--category` / 数据集却写进
 同一目录）会被拒绝：同一个任务目录里只能放同一次评测的分片。
 
 **分片 / 冒烟怎么进目录名**：分片用跨目录写法时（不带 `--task-dir`），实验目录名末尾追加
@@ -477,18 +476,18 @@ python -m membench.cli fuse \
 `14（分片 i/N，总量见融合报告）`——那是**本片**的题数，不是整场结论；
 fuse 的融合产物（`shard_index=None`）不带这个标注，它覆盖全部题目。
 
-**并行分片的实例隔离**：分片是进程级并行——每个分片必须独占一个记忆实例（HTTP 桥 → 每分片独立桥进程 / `BRIDGE_PORT` / `BRIDGE_DATA_DIR`；Python 适配器 → 每分片独立进程）。runner 对每个 dialogue 调 `reset()`，共享同一实例并行会互相清库（跨片串扰）；只有一个实例时请串行跑分片，`fuse` 结果不受影响。
+**并行分片的实例隔离**：分片是进程级并行——每个分片必须独占一个记忆实例（HTTP 桥 → 每分片独立桥进程 / `BRIDGE_PORT` / `BRIDGE_DATA_DIR`；Python 适配器 → 每分片独立进程）。runner 对每个 dialogue 调 `reset()`，共享同一实例并行会互相清库（跨片串扰）；只有一个实例时请串行跑分片，`fuse` 结果不受影响。**整场评测跑完还会再 `reset()` 一次**（清掉最后一段对话留在被测系统里的写入；快照与追踪状态早已落盘，清理不丢证据；清理失败只告警，不影响已产出的指标与报告）。
 
-**分片数上限与 `--shards max`**：`--shard-by dialogue` 上限为数据集对话数、`--shard-by question` 上限为题目数。传入超过上限的整数**按上限执行**（不报错，输出中会说明实际分片数）；`--shards max` 直接按上限取最大分片；分片索引越过有效分片数的进程**安全跳过**（不产生空 run——空分片纯浪费进程/内存与桥实例）。
+**分片数上限与 `--shards max`**：分片只按整段对话切，上限为数据集对话数。传入超过对话数的整数**按对话数执行**（不报错，输出中会说明实际分片数）；`--shards max` 直接按对话数取最大分片；分片索引越过有效分片数的进程**安全跳过**（不产生空 run——空分片纯浪费进程/内存与桥实例）。
 
-**分片 A/B 官方通路**：先 `task init --name <name>` 建一个**双组任务目录**（骨架 `A/` `B/` `reports/`）→ 两侧分别 `run --task-dir <任务目录>/A`（或 `B`）`--shards N --shard-by dialogue` 并行写进同一棵树 → 两侧各自 `fuse --task-dir <任务目录>/A|B` 就地补齐 → `compare --task-dir <任务目录>` 就地出对比报告（读 `A/` 与 `B/`，`comparison.md` 落任务目录的 `reports/`，不再新建 `compare_*`、也不复制两组）。也支持"各片各落实验目录 + 跨目录 `fuse`"的老写法，或用 `evaluate-compare --baseline-run <key>=<A 融合实验目录>` 汇总多数据集。融合产物与普通 run 同等可校验：可比性元数据（adapter_version / judge_model / driver_llm / 数据集指纹 / 检索口径）全部透传，可直接用 `compare --require-comparable` 复验。
+**分片 A/B 官方通路**：先 `task init --name <name>` 建一个**双组任务目录**（骨架 `A/` `B/` `reports/`）→ 两侧分别 `run --task-dir <任务目录>/A`（或 `B`）`--shards N` 并行写进同一棵树 → 两侧各自 `fuse --task-dir <任务目录>/A|B` 就地补齐 → `compare --task-dir <任务目录>` 就地出对比报告（读 `A/` 与 `B/`，`comparison.md` 落任务目录的 `reports/`，不再新建 `compare_*`、也不复制两组）。也支持"各片各落实验目录 + 跨目录 `fuse`"的老写法，或用 `evaluate-compare --baseline-run <key>=<A 融合实验目录>` 汇总多数据集。融合产物与普通 run 同等可校验：可比性元数据（adapter_version / judge_model / driver_llm / 数据集指纹 / 检索口径）全部透传，可直接用 `compare --require-comparable` 复验。
 
-**分片维度怎么选（`--shard-by`，重要）**：
+**分片口径（固定按对话）**：
 
-- `--shard-by question`（默认）按全局题号 `i % N == shard_index` 分片；不含入选题的对话整段跳过（ingest 也省掉）。适合"少量超长对话承载大量题"、能整块跳过对话的场景。
-- `--shard-by dialogue` 整段选取 `d % N == shard_index` 的对话、保留其全部题目，**分片之间 ingest 互不重复**。"几乎每个对话都有题"的 ingest 密集型数据集（内置 office：20 对话 / 86 题；BEAM-1M：35 对话 × 20 题）必须用它——题目级分片会让每个分片仍对全部对话 ingest，成本 ×N，分片反而更慢。
-- 多个分片写进**同一个任务目录**（`--task-dir`）时**只允许 `--shard-by dialogue`**：题目级分片下同一对话会被多片写进同一个对话目录、互相覆盖，所以在开跑前直接拒绝；题目级分片请各片各落一个实验目录（`--report-out`，目录名带 `_s<i>`）再跨目录 `fuse`。
-- 两种维度的分片都能用 `fuse` 融合回完整产物，但不许混维融合（fuse 会明确报错）。
+- 整段选取 `d % N == shard_index` 的对话、保留其全部题目，**分片之间 ingest 互不重复**。有效分片数上限 = 对话数（超出按上限执行、越界进程安全跳过）。
+- 更多 query 并行度用 `--jobs`：它在一次 ingest 后做对话内题目并发，不需要重复 ingest，也没有多进程各自 reset + ingest 的时序差异。question 分片与 `--shard-by` 已删除。
+- 多个分片写进**同一个任务目录**（`--task-dir`）时各写各的对话目录，不会互相覆盖；同一分片重复跑会被账本拒绝。
+- 分片口径记在账本头部与 `run_id`（`_dshard<i>of<n>`）里，`fuse` 按账本复算"每片本该有哪些题"。旧 question 分片产物只保留只读复算与融合校验，不能再生成，也不能与 dialogue 分片混融。
 
 ## 可复现性元数据
 
@@ -671,14 +670,14 @@ python -m membench.cli run --adapter <你的适配器> --dataset <同一个数�
   由 `layout.materialize_snapshot_index` 重算（`fuse --task-dir` 收尾、`task status`
   发现缺失/过期时都会刷新）。并行回放的各进程**不写**它，所以不会丢条目；`--replay`
   读源也优先读条目树，只有旧产物（没有 `entries/`）才回退读索引；
-- **并行分片回放**：同一组可以多进程并行，必须 `--shard-by dialogue`：
+- **并行分片回放**：同一组可以多进程按整段对话并行：
 
   ```bash
   TASK=$(python -m membench.cli task init --name replay --groups 2 --baseline-name 基线 --candidate-name 候选 --replay)
   for i in 0 1; do
     python -m membench.cli run --adapter <adapter> --dataset <数据集> \
         --task-dir "$TASK/A" --replay <源> \
-        --shards 2 --shard-index "$i" --shard-by dialogue &
+        --shards 2 --shard-index "$i" &
   done
   wait
   python -m membench.cli fuse --task-dir "$TASK/A"   # 收尾：物化快照池索引
@@ -973,7 +972,7 @@ DIR/series_<ts>/
 
 **`--task-dir`（与 `--report-out` 互斥，二选一）**：把产物写进**已存在的任务目录**（`task init` 建的目录，或它的某个组目录 `A/` / `B/`），而不是新建 `eval_*` / `compare_*`——同一次评测的多个分片因此能写进同一棵树：
 
-- `run --task-dir DIR` / `evaluate --task-dir DIR`：产物直接落 DIR；共享目录下**只允许 `--shard-by dialogue`**，同一分片重复跑直接拒绝（账本查得到谁跑过）；
+- `run --task-dir DIR` / `evaluate --task-dir DIR`：产物直接落 DIR；各分片只写自己负责的整段对话，同一分片重复跑直接拒绝（账本查得到谁跑过）；
 - `evaluate-compare --task-dir DIR`：两组分别写 `DIR/A`、`DIR/B`，对比报告落 `DIR/reports/`；
 - `compare --task-dir DIR`：就地读 `DIR/A`（基线）与 `DIR/B`（候选），`comparison.md` 落 `DIR/reports/`，不新建 `compare_*`、也不复制两组；
 - `fuse --task-dir DIR`：就地补齐数据集级与任务级产物（各片本来就写在这一棵树里），与 `--runs/--out` 互斥。
@@ -1031,6 +1030,7 @@ Runner(MyAdapter(), "membench/data/sample_dataset.jsonl", out_dir=exp_dir).run()
   可比性维度**。默认返回 `{}`（报告里整节不出现）；抛异常只警告一次，评测照常完成。
 
 完整可运行示例见 `examples/quickstart.py`。token / llm_calls 填不了就填 0（报告中视为 n/a /「未上报」）。框架在 reset 时给出可选上下文（本次对话目录 / 对话 id 与序号）：Python 适配器读 `MEMBENCH_RUN_DIR`（**本次对话目录**，即 `<实验目录>/runs/<dataset>/<对话目录>`）/ `MEMBENCH_DIALOGUE_ID` / `MEMBENCH_DIALOGUE_INDEX`；框架**不读不写**你的记忆存储，也**不内置** reset 前备份——需要回看记忆状态请用快照（默认导出到 `<对话目录>/memory_snapshot/`）；确实要自定义回溯的，由接入侧自行在 `reset()` 里处理。
+**reset 的调用时机**：每个对话开始前一次（带上下文）、**整场评测结束后一次**（不带上下文，清掉最后一段对话留下的写入）；因此 `reset()` 必须幂等，结束时那次失败只告警、不影响报告。
 
 `query` 返回的 `retrieved` 决定 `evidence_recall` / `recall@5` 是否成立，口径 = **注入即口径**：填实际拼进回答 prompt 的**记忆条目原文**，按注入优先级排序，多轮检索先合并去重再返回，报注入的那一份全量（框架不合并、不去重、不截断；空列表 = 静默按 0 召回计）。
 
@@ -1192,7 +1192,7 @@ evidence_recall / abstention_accuracy / stale_rate）、不参与门禁；`compa
 
 ```bash
 # 只看官方口径的三支柱题（utility / privacy / safety）
-python -m membench.cli run --adapter my-sys --dataset gatemem_office --shard-by dialogue --trace-state
+python -m membench.cli run --adapter my-sys --dataset gatemem_office --trace-state
 ```
 
 ## 指标说明
@@ -1311,7 +1311,7 @@ python -m membench.cli run --adapter mock-strong --dataset ~/.membench/datasets/
 **公开集重转与指纹变化（2026-10）**：LongMemEval / GateMem / LoCoMo 的转换口径都变了，重新转换会改变数据集指纹（`dataset_sha256`）——**历史分数不能与新产物直接对比**（`compare` 会按指纹判不可比）。已下载的 `~/.membench/datasets/<key>.jsonl` 不会自动更新，按新口径重跑前先删 `~/.membench/datasets/<key>.jsonl` 与同名 raw 缓存目录（如 `.longmemeval_oracle_raw/`、`.gatemem_office_raw/`、`.locomo_raw/`），再 `dataset fetch <key>`（或手动重转）。
 
 - **LongMemEval 的 session 级证据匹配**：session 证据很长（S/M/oracle 中位约 14k 字符），chunk 级记忆返回的本就是其中一段，严格子串判定会让 recall@5 / 证据召回系统性接近 0。因此 `membench/metrics/evidence.py` 对**长证据（> 500 字符）**在子串 / token 判定失败后追加 containment 兜底：检索条目去空白后 ≥ 20 字符、且是证据的子串（或证据是它的子串）即算命中，`recall_at_5` 用同一判定。短证据（office / LoCoMo 的裸值）行为不变，仍要求原文子串。这是**代理口径**，不是语义匹配——深度改写的摘要仍走 `--evidence-match llm`。
-- **GateMem 的确定性 rubric**：题目带 `judge_spec` 时，`heuristic` 与 `llm` judge 都不再做 token_f1 / 模型判分——`include` 逐条按正则（忽略大小写，原始数据里有 `no[- ]auto[- ]renewal` 这类写法）、`not_include` 与 `leak_targets` 按字面量 + ASCII 词边界校验（避免 `no` 命中 `not`、`active` 命中 `inactive`）；`leak_targets` 命中记为**红线泄露**并写进 reason。拒答题在 rubric 之上**仍要求系统确实拒答**（`gold_answer=<ABSTAIN>`），避免 include 为空的 safety 题被任意非泄露回答骗过；**`judge=llm` 且拒绝答时若词表判"未拒答"，会再发一次 YES/NO 复核**（见上面「拒答识别」），`yes/no/same` 这类答案形状 target 在已拒答时不计泄露。`gold_answer` 的 include 拼接只用于报告展示。**`as_of_turn_id` 已建模**：转换器把 checkpoint 时点写成 `Question.as_of`（已 ingest 的消息条数）并把对话标成 `ingest_strategy="interleaved"`，评测时按 as_of 边 ingest 边提问；但必须按 interleaved 的约束跑（`--shard-by dialogue`、不支持 `--replay`），按 sequence 跑会时点错位（报告会提示）。转换器同时把 rubric 要点回搜到 **`as_of` 之前已 ingest 的 episode 原文**作为 **evidence**（`include` 按正则、`leak_targets` 按词边界；`include` 每条 pattern 只取**最后一次命中**——问"当前值"时最近的更新优先；`leak_targets` 每条 pattern **保留首次与末次命中**——末次常是"remove the token ..."删除指令那轮，只留它会丢掉秘密串本身；不同 pattern 按 turn 顺序合并去重、每题最多 5 条、每条截断 2000 字符），CLI 打印 `evidence 覆盖 N/547` 与 `evidence 来自 as_of 之后的 turn：0 条`（越界条数按产物独立复算，作为回归断言）；时点之后的 turn 对被测系统不可见，拿它当证据会系统性压低 recall@5 并把"未来内容"误判成"当时没写"。带 `judge_spec` 的题 `token_f1` / `bleu1` 记 `null`（不是 0——gold 是正则拼接，没有字面参考答案），均值跳过 `null`，某题型 / 数据集无可计算值时报告显示「未定义」。**safety 题（`safety_no_memory`）另有状态红线**：拒答但提问时点状态仍含被删除的敏感串时判错并计入 `state_leak`（见「interleaved 摄入与失败归因」）。
+- **GateMem 的确定性 rubric**：题目带 `judge_spec` 时，`heuristic` 与 `llm` judge 都不再做 token_f1 / 模型判分——`include` 逐条按正则（忽略大小写，原始数据里有 `no[- ]auto[- ]renewal` 这类写法）、`not_include` 与 `leak_targets` 按字面量 + ASCII 词边界校验（避免 `no` 命中 `not`、`active` 命中 `inactive`）；`leak_targets` 命中记为**红线泄露**并写进 reason。拒答题在 rubric 之上**仍要求系统确实拒答**（`gold_answer=<ABSTAIN>`），避免 include 为空的 safety 题被任意非泄露回答骗过；**`judge=llm` 且拒绝答时若词表判"未拒答"，会再发一次 YES/NO 复核**（见上面「拒答识别」），`yes/no/same` 这类答案形状 target 在已拒答时不计泄露。`gold_answer` 的 include 拼接只用于报告展示。**`as_of_turn_id` 已建模**：转换器把 checkpoint 时点写成 `Question.as_of`（已 ingest 的消息条数）并把对话标成 `ingest_strategy="interleaved"`，评测时按 as_of 边 ingest 边提问；但必须按 interleaved 的约束跑（不支持 `--replay`），按 sequence 跑会时点错位（报告会提示）。转换器同时把 rubric 要点回搜到 **`as_of` 之前已 ingest 的 episode 原文**作为 **evidence**（`include` 按正则、`leak_targets` 按词边界；`include` 每条 pattern 只取**最后一次命中**——问"当前值"时最近的更新优先；`leak_targets` 每条 pattern **保留首次与末次命中**——末次常是"remove the token ..."删除指令那轮，只留它会丢掉秘密串本身；不同 pattern 按 turn 顺序合并去重、每题最多 5 条、每条截断 2000 字符），CLI 打印 `evidence 覆盖 N/547` 与 `evidence 来自 as_of 之后的 turn：0 条`（越界条数按产物独立复算，作为回归断言）；时点之后的 turn 对被测系统不可见，拿它当证据会系统性压低 recall@5 并把"未来内容"误判成"当时没写"。带 `judge_spec` 的题 `token_f1` / `bleu1` 记 `null`（不是 0——gold 是正则拼接，没有字面参考答案），均值跳过 `null`，某题型 / 数据集无可计算值时报告显示「未定义」。**safety 题（`safety_no_memory`）另有状态红线**：拒答但提问时点状态仍含被删除的敏感串时判错并计入 `state_leak`（见「interleaved 摄入与失败归因」）。
 - **LoCoMo 的说话人**：两个人类（speaker_a / speaker_b）此前被压成 user / assistant，抽取提示词分不清"谁说的"；现在每条消息额外带 `name`，渲染为 `[user:Caroline]` / `[assistant:Melanie]`（role 映射不变，保持历史兼容）。
 
 **`gold_stale` / `gold_stale_note` 字段口径**：

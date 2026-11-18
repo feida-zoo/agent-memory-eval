@@ -61,7 +61,7 @@ python -m membench.cli run --adapter my-system \
 ```bash
 TASK=$(python -m membench.cli task init --name office --arms 1 --report-out output/)   # stdout 只有路径
 python -m membench.cli run --adapter my-system --dataset <大数据集> \
-    --task-dir "$TASK" --shards 4 --shard-index 0 --shard-by dialogue    # 各片共享目录只用 dialogue 分片
+    --task-dir "$TASK" --shards 4 --shard-index 0    # 每片只写自己负责的整段对话
 # ... --shard-index 1..3；分片只写本片对话目录 + runs/<dataset>/shards.json 账本
 python -m membench.cli fuse --task-dir "$TASK"        # 补齐数据集级与任务级产物（指标重算 + 门禁）
 ```
@@ -146,9 +146,9 @@ python -m membench.cli compare \
 # 大数据集分片做 A/B：任务目录里就地跑两侧、就地出报告（A/B 两臂落在同一棵树下）
 TASK=$(python -m membench.cli task init --name update-on-ingest --arms 2 --report-out output/)
 python -m membench.cli run --adapter my-system --dataset <大数据集> \
-    --task-dir "$TASK/A" --shards 4 --shard-index 0 --shard-by dialogue   # A = 基线；各片共享目录只用 dialogue 分片
+    --task-dir "$TASK/A" --shards 4 --shard-index 0   # A = 基线；每片只写自己负责的整段对话
 python -m membench.cli run --adapter my-system --dataset <大数据集> \
-    --task-dir "$TASK/B" --shards 4 --shard-index 0 --shard-by dialogue   # B = 候选（其余分片同理）
+    --task-dir "$TASK/B" --shards 4 --shard-index 0   # B = 候选（其余分片同理）
 python -m membench.cli fuse --task-dir "$TASK/A" && python -m membench.cli fuse --task-dir "$TASK/B"
 python -m membench.cli compare --task-dir "$TASK" --require-comparable   # comparison.md 落 $TASK/reports/
 ```

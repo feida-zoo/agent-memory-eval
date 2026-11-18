@@ -72,12 +72,16 @@ class BaseMemoryAdapter(ABC):
 
     @abstractmethod
     def reset(self) -> None:
-        """清空全部记忆状态。每个 dialogue 开始前调用。
+        """清空全部记忆状态：每个 dialogue 开始前调用，整场评测结束后再调用一次。
 
         框架可能在调用前通过环境变量提供 reset 上下文（**可选提示**，可忽略）：
         ``MEMBENCH_RUN_DIR`` / ``MEMBENCH_DIALOGUE_ID`` / ``MEMBENCH_DIALOGUE_INDEX``，
         供日志、追踪或自定义回溯使用；框架不读也不写适配器的记忆存储，
         也不内置 reset 前备份（要回看状态请用快照导出）。
+
+        **整场评测跑完后框架还会再调一次**（结束时那次不带 reset 上下文）：让被测
+        系统里不残留本次评测写入的记忆。清理失败只告警、不中断评测（报告此时尚未落盘）。
+        **必须幂等**：对已清空的存储再调用一次应当立即成功。
         """
         raise NotImplementedError
 

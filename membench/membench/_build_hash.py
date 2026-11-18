@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 #: 打包时计算出的 membench 包内容指纹（sha256 前 12 位）；空 = 未打包。
-BUILD_HASH = "2c203cf2eaa1"
+BUILD_HASH = "8007bda0ebc4"
 
 #: 该哈希的生成时间（ISO 8601，本地时区）；空 = 未打包。
-BUILT_AT = "2026-11-02T14:05:08"
+BUILT_AT = "2026-11-18T12:15:14"

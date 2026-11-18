@@ -177,7 +177,7 @@ def test_runner_out_dir_is_experiment_dir(tmp_path: Path) -> None:
     assert metrics["dataset_dir"] == str(dataset_dir)
     assert metrics["dataset"] == "sample_dataset"
     assert metrics["run_mode"] == "full"
-    assert metrics["shards"] == 1 and metrics["shard_by"] == "question"
+    assert metrics["shards"] == 1 and metrics["shard_by"] == "dialogue"
 
     # 任务级 reports/：md + 两图 + metrics（内容 = 数据集级），不重复落逐题明细
     task_dir = exp_dir / "reports"

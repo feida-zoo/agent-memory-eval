@@ -216,7 +216,7 @@ DATASET_REGISTRY: dict[str, DatasetInfo] = {
             "（删除后遗忘，单用户同样适用）与 utility 154 题。"
             "**时点语义**：每个 checkpoint 的 as_of_turn_id 转成 as_of（已 ingest 的"
             "消息条数），episode 标 ingest_strategy=interleaved——评测边 ingest 边提问，"
-            "问的是「当时能看到什么」；因此需要 --shard-by dialogue，且不支持 --replay。"
+            "问的是「当时能看到什么」；分片按整段对话进行，且不支持 --replay。"
             "加 --trace-state 可逐 as_of 导出状态，产出失败归因（没写入 / 没检索到 / "
             "检索到但答错）。"
             "判分：checkpoint 的 judge_spec（include 正则 / not_include / leak_targets）"

@@ -59,6 +59,17 @@ def _dataset(path: Path, dialogue_id: str, qids: tuple[str, ...], sessions: int 
     return path
 
 
+def _two_dialogue_dataset(path: Path) -> Path:
+    """两个各含一道题的对话：可分两片，且合计仍是两次 query。"""
+    first = _dataset(path.with_name("first.jsonl"), "d1", ("q1",))
+    second = _dataset(path.with_name("second.jsonl"), "d2", ("q2",))
+    path.write_text(
+        first.read_text(encoding="utf-8") + second.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _report_metrics(report_owner: str) -> dict:
     """某层级的 ``report/metrics.json``（数据集目录或对话目录均可）。"""
     return json.loads(
@@ -132,8 +143,8 @@ def test_unreported_tokens_marked_as_such(tmp_path: Path, capsys: pytest.Capture
 
 
 def test_fuse_sums_token_usage_across_shards(tmp_path: Path) -> None:
-    """分片各自计自己的 ingest（题目分片下同一对话被多片写入是真实成本，求和不去重）。"""
-    ds = _dataset(tmp_path / "d.jsonl", "d1", ("q1", "q2"))
+    """各片只计自己对话的 ingest 与 query，融合后逐字段求和。"""
+    ds = _two_dialogue_dataset(tmp_path / "d.jsonl")
     shard_dirs = [
         Runner(
             _TokenAdapter(),
@@ -150,7 +161,7 @@ def test_fuse_sums_token_usage_across_shards(tmp_path: Path) -> None:
     assert fused["dataset_dir"] == str(tmp_path / "fused" / "runs" / "d")
     assert (tmp_path / "fused" / "reports" / "report.md").is_file()
     usage = _report_metrics(fused["dataset_dir"])["token_usage"]
-    assert usage["ingest_input_tokens"] == 40  # 两片各 ingest 一次该对话
+    assert usage["ingest_input_tokens"] == 40  # 两个对话各 ingest 一次（2 session × 10）
     assert usage["query_input_tokens"] == 200  # 题目不重复，2 题 × 100
     assert usage["query_output_tokens"] == 40
     assert usage["n_questions"] == 2
@@ -161,7 +172,7 @@ def test_fuse_sums_token_usage_across_shards(tmp_path: Path) -> None:
 
 def test_fuse_omits_token_usage_when_a_shard_lacks_it(tmp_path: Path) -> None:
     """任一分片未落账则不落账整体——避免"部分求和"被当成全量消耗。"""
-    ds = _dataset(tmp_path / "d.jsonl", "d1", ("q1", "q2"))
+    ds = _two_dialogue_dataset(tmp_path / "d.jsonl")
     shard_dirs = [
         Runner(
             _TokenAdapter(),
@@ -174,18 +185,22 @@ def test_fuse_omits_token_usage_when_a_shard_lacks_it(tmp_path: Path) -> None:
         for i in (0, 1)
     ]
     # 分片不再落数据集级产物：去掉第二片对话级 report/ 的 token_usage 账目
-    old = Path(shard_dirs[1]) / "d1" / layout.DIR_REPORT / layout.FILE_METRICS
+    old = Path(shard_dirs[1]) / "d2" / layout.DIR_REPORT / layout.FILE_METRICS
     metrics = json.loads(old.read_text(encoding="utf-8"))
     del metrics["token_usage"]
     old.write_text(json.dumps(metrics, ensure_ascii=False), encoding="utf-8")
 
     fused = fuse_runs(shard_dirs, str(tmp_path / "fused"))
     assert "token_usage" not in _report_metrics(fused["dataset_dir"])
-    # 对话级同样不落账（该对话的副本不全）
+    # 对话级只省略缺账的 d2；d1 的账目完整，应原样保留。
     for dialogue_dir in Path(fused["dataset_dir"]).glob("*/"):
         if dialogue_dir.name == layout.DIR_REPORT:
             continue
-        assert "token_usage" not in _report_metrics(str(dialogue_dir))
+        dialogue_metrics = _report_metrics(str(dialogue_dir))
+        if dialogue_dir.name == "d2":
+            assert "token_usage" not in dialogue_metrics
+        else:
+            assert "token_usage" in dialogue_metrics
 
 
 def test_fuse_gate_skips_when_stale_rate_none() -> None:
@@ -292,17 +307,53 @@ def test_runner_exports_reset_context(tmp_path: Path) -> None:
         _RecordingAdapter(), str(ds), judge="heuristic", out_dir=str(out_dir)
     ).run()
     assert dataset_dir == str(out_dir / "runs" / "d")
-    # MEMBENCH_RUN_DIR 指本对话目录（适配器把运行时数据就近落它的 runtime/ 下）
+    # MEMBENCH_RUN_DIR 指本对话目录（适配器把运行时数据就近落它的 runtime/ 下）；
+    # 末尾还有一次"整场跑完的清理 reset"——那时上下文已撤，三个变量都为空
     assert seen == [
         {
             "run_dir": layout.dialogue_dir(str(out_dir), "d", "d1"),
             "dialogue_id": "d1",
             "dialogue_index": "1",
-        }
+        },
+        {"run_dir": "", "dialogue_id": "", "dialogue_index": ""},
     ]
     assert (out_dir / "runs" / "d" / "d1" / "runtime").is_dir()
     assert "MEMBENCH_RUN_DIR" not in os.environ
     assert "MEMBENCH_DIALOGUE_ID" not in os.environ
+
+
+def test_final_reset_failure_does_not_discard_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """结束清理失败只告警：评测明细与报告照常落盘，并提示手动 reset。"""
+
+    class _FailFinalResetAdapter(BaseMemoryAdapter):
+        name = "mock-fail-final-reset"
+
+        def __init__(self) -> None:
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+            if self.reset_calls > 1:
+                raise RuntimeError("reset unavailable")
+
+        def ingest(self, messages: list[dict]) -> IngestStats:
+            return IngestStats()
+
+        def query(self, question: str) -> QueryResult:
+            return QueryResult(answer="周五", retrieved=["项目截止日是周五"])
+
+    ds = _dataset(tmp_path / "d.jsonl", "d1", ("q1",))
+    out_dir = tmp_path / "exp"
+    dataset_dir = Path(
+        Runner(
+            _FailFinalResetAdapter(), str(ds), judge="heuristic", out_dir=str(out_dir)
+        ).run()
+    )
+    assert (dataset_dir / layout.DIR_REPORT / layout.FILE_RESULTS).is_file()
+    assert (out_dir / layout.DIR_REPORTS / layout.FILE_REPORT_MD).is_file()
+    assert "评测结束后清理记忆失败" in capsys.readouterr().out
 
 
 def test_http_adapter_forwards_reset_context(monkeypatch: pytest.MonkeyPatch) -> None:

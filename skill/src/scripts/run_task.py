@@ -34,8 +34,8 @@
    ``evaluate --task-dir --from-runs`` 汇总任务级报告。**后一条分支是因为
    ``evaluate`` 不支持 ``--shards`` / ``--limit``；逐数据集 run 让多数据集也能
    分片与冒烟。**
-3. 分片（``--shards > 1`` 或 ``max``）时，每片 ``--shard-by dialogue`` 并行启动，
-   全部 wait；跑完对该数据集目录执行 ``fuse --task-dir`` 就地补齐。
+3. 分片（``--shards > 1`` 或 ``max``）时按整段对话并行启动，全部 wait；跑完对该
+   数据集目录执行 ``fuse --task-dir`` 就地补齐。
 4. 交付前自检（``verify_artifacts.verify_task``）。
 
 ``ab``：
@@ -899,8 +899,6 @@ def _run_argv(
             str(shards),
             "--shard-index",
             str(shard_index or 0),
-            "--shard-by",
-            "dialogue",
         ]
     return argv
 

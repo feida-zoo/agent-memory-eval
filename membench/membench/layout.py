@@ -370,7 +370,7 @@ def run_id_tags(
 
     ``shards`` 传**解析后**的有效分片数（``--shards max`` 由 Runner 按数据集上限
     结算），``<= 1`` 时不出分片标记；``shard_by="dialogue"`` 用 ``dshard`` 前缀与
-    题目级分片区分。``shard_index=None`` 表示这不是某一分片而是**整体融合产物**
+    旧 question 分片区分。``shard_index=None`` 表示这不是某一分片而是**整体融合产物**
     （fuse 把 0..N-1 各片合并成一份），此时出 ``shard<N>`` / ``dshard<N>``（只记
     片数、不记序号）——冒烟（``limitN``）、题型过滤（``cat-<题型>``）、分片与融合
     结果都不能被误当全量结果。

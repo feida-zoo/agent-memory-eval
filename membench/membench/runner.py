@@ -6,15 +6,16 @@
     -> 每题 adapter.query() + 文本/检索指标 + judge.grade()
     -> 逐对话聚合写对话级 report/ -> 全对话聚合写数据集级 report/（含图）
     -> write_task_reports 时把数据集级报告复制到 <实验目录>/reports/
+    -> 最后 adapter.reset() 一次（清掉本次写入，避免残留在被测系统里）
 
 **interleaved 摄入**（``Dialogue.ingest_strategy="interleaved"``，如 GateMem）：
 把 sessions 按顺序展平成消息列表，按 ``Question.as_of``（已 ingest 的消息条数）
 升序分组，同 as_of 一组、``as_of=None`` 的题排最后：逐组 ingest 到该时点（可跨
 session 边界）→ 组内并发 query → 下一组；中间**不 reset**，全部组完成后 ingest
 剩余消息。落盘顺序仍按原始题序（与 jobs=1 一致）；每题记录的 ``ingest_*`` 是
-截至该题提问时的累计写入成本。interleaved 与题目级分片、``--replay`` 互斥
-（开跑前硬拒绝：前者会让各片各自 reset，后者只有末尾快照、给不出每个 as_of 的
-状态）。``--snapshot`` 在 interleaved 下只导出**全部 ingest 完成后**的末尾态。
+截至该题提问时的累计写入成本。interleaved 与 ``--replay`` 互斥
+（开跑前硬拒绝：回放只有末尾快照，给不出每个 as_of 的状态）。
+``--snapshot`` 在 interleaved 下只导出**全部 ingest 完成后**的末尾态。
 
 **失败归因**（``--trace-state``）：interleaved 的每个有提问的 as_of 在 ingest
 完成后、query 之前导出一份状态到 ``<对话目录>/trace_state/t<as_of>/``（含
@@ -665,13 +666,6 @@ def _judge_result_to_dict(jr: Any) -> dict[str, Any]:
         return {"correct": bool(getattr(jr, "correct", False))}
 
 
-def _shard_units(dialogues: list[Any], shard_by: str) -> int:
-    """分片上限：dialogue 维度为对话数，question 维度为题目数。"""
-    if shard_by == "dialogue":
-        return len(dialogues)
-    return sum(len(dialogue.questions) for dialogue in dialogues)
-
-
 def category_key(value: Any) -> str:
     """题型比较口径：去空白 + 小写（数据里的 category 大小写不保证统一）。"""
     return str(value or "").strip().lower()
@@ -718,20 +712,16 @@ def select_shard_questions(
     shards: int,
     shard_index: int,
     limit: Union[int, None],
-    shard_by: str = "question",
+    shard_by: str = "dialogue",
 ) -> list[Any]:
     """对加载后的题目做确定性分片与截断（先分片再截断）。
 
-    ``shard_by="question"``：全局题号 ``i``（按 dialogue 顺序、题序展开）满足
-    ``i % shards == shard_index`` 的题入选，再取前 ``limit`` 道；不含入选题的
-    dialogue 整段跳过（ingest 也省掉）。
-
-    ``shard_by="dialogue"``：全局对话序号 ``d``（按数据集顺序）满足
+    新评测只按对话分片：全局对话序号 ``d``（按数据集顺序）满足
     ``d % shards == shard_index`` 的**整段对话**入选，保留其全部题目，再取前
-    ``limit`` 道。分片之间 ingest 互不重复——适合"几乎每个对话都有题"的
-    ingest 密集型数据集（如 BEAM-1M），避免题目级分片造成的 ingest 成本 ×N。
+    ``limit`` 道。分片之间 ingest 互不重复；题内 query 并发由 ``jobs`` 控制。
 
-    调用方（:meth:`Runner.run`）保证 ``shards`` 已按数据集上限解析过
+    ``shard_by="question"`` 分支仅供 ``fuse`` 复算并校验旧版产物，不再是新评测的
+    可选执行路径。调用方（:meth:`Runner.run`）保证 ``shards`` 已按对话数上限解析过
     （``max`` / 超限整数在此前收敛），本函数不做上限校验。
 
     本函数是分片选取口径的**唯一实现**：``fuse`` 用它复算"每一片本该有哪些对话 /
@@ -931,14 +921,10 @@ class Runner:
             query+judge 阶段并发，输出顺序与 jobs=1 一致。
             **jobs>1 要求 adapter.query 与 judge 线程安全。**
         limit: 冒烟模式：只评测（分片后的）前 N 道题；None 表示全量。
-        shards: 分片总数（默认 1 不分片）；可传 ``"max"`` 按数据集上限自动取最大
-            （dialogue=对话数、question=题目数）；超过上限的整数按上限执行，
-            越界分片索引安全跳过（不生成空 run）。与 limit 组合时先分片再截断。
+        shards: 对话分片总数（默认 1 不分片）；可传 ``"max"`` 按对话数自动取最大；
+            超过对话数的整数按对话数执行，越界分片索引安全跳过（不生成空 run）。
+            与 limit 组合时先分片再截断；题内 query 并发由 jobs 控制。
         shard_index: 本分片序号（从 0 开始，需 < shards）。
-        shard_by: 分片维度（默认 ``"question"``）——``"question"`` 按全局题号
-            ``i % shards == shard_index`` 分片；``"dialogue"`` 整段选取
-            ``d % shards == shard_index`` 的对话、保留其全部题目，分片间
-            ingest 互不重复，适合"几乎每个对话都有题"的 ingest 密集型数据集。
         adapter_meta: 适配器配置自由文本（如 ``"key=value;..."``），原样记入
             metrics.json 的 ``adapter_meta``。
         driver_llm: 驱动被测系统的 LLM 标识（如模型名），记入 metrics.json
@@ -952,8 +938,7 @@ class Runner:
             分片（``shards>1``）不写，由 ``fuse`` 补齐。
         shared: True 表示 ``out_dir`` 是多方共用的任务目录（CLI ``--task-dir``）：允许
             写进已存在且非空的实验目录，分片归属与进度按分片账本判重——同一个分片
-            重复跑直接拒绝。共用目录下只支持 ``shard_by="dialogue"``：题目级分片会让
-            多个分片写同一对话目录、互相覆盖。
+            重复跑直接拒绝。各分片只写自己负责的整段对话，不互相覆盖。
         snapshot: 默认 True：在每个对话 ingest 完成后（第一道 query 之前）调用适配器
             的 ``snapshot()`` 把状态导出到该对话的 ``memory_snapshot/`` 并写
             ``manifest.json``——之后改读取侧代码可用 ``replay`` 免重跑 ingest。
@@ -996,7 +981,6 @@ class Runner:
         limit: Union[int, None] = None,
         shards: Union[int, str] = 1,
         shard_index: int = 0,
-        shard_by: Union[str, None] = None,
         adapter_meta: Union[str, None] = None,
         driver_llm: Union[str, None] = None,
         judge_model: Union[str, None] = None,
@@ -1042,9 +1026,6 @@ class Runner:
             raise ValueError(
                 f"shard_index 必须满足 0 <= shard_index < shards，当前为 {shard_index}/{shards}"
             )
-        self.shard_by = shard_by or "question"
-        if self.shard_by not in ("question", "dialogue"):
-            raise ValueError(f"shard_by 必须是 'question' 或 'dialogue'，当前为 {self.shard_by!r}")
         self.limit = limit
         self.shards = shards  # int 或 "max"（run() 按数据集上限解析）
         self.shard_index = int(shard_index)
@@ -1091,6 +1072,26 @@ class Runner:
         self._suspect_state_files: dict[str, set[str]] = {}
         self._suspect_cache: dict[str, list[str]] = {}
         self._suspect_warned = False
+
+    def _reset_after_run(self) -> None:
+        """整场评测结束后清掉本次写入的记忆（best-effort，失败只告警）。
+
+        为什么单独一刀：``reset()`` 只在每个对话**开始前**调用（保证不复用上一个对话
+        的记忆），所以最后一段对话的写入会留在被测系统里。评测产物（含 ``memory_snapshot/``
+        / ``trace_state/``）都已落盘，清理不会丢证据。
+
+        失败只告警：清理发生在指标与报告落盘之前，不能让"清不干净"把整场评测的结果
+        一起丢掉；此时提示用户手动 reset 即可。
+        """
+        try:
+            self.adapter.reset()
+        except Exception as exc:  # noqa: BLE001 - 清理是 best-effort，不能影响报告
+            print(
+                f"[membench] ⚠️ 评测结束后清理记忆失败（{exc}）：被测系统里可能残留本次"
+                "评测写入的数据，请手动 reset；已产出的指标与报告不受影响"
+            )
+            return
+        print("[membench] 评测结束：已 reset 适配器，清掉本次写入的记忆")
 
     def _note_state_suspects(
         self, dialogue_id: str, state_dir: Union[str, None]
@@ -1317,18 +1318,17 @@ class Runner:
                 f"{len(dialogues)} 个对话 / {kept} 道题"
             )
 
-        # 分片解析：'max' 取数据集上限；超过上限的整数按上限执行（不报错）
-        shard_units = _shard_units(dialogues, self.shard_by)
-        unit_label = "对话数" if self.shard_by == "dialogue" else "题目数"
+        # 分片只按整段对话切：'max' 取对话数；超过对话数的整数按对话数执行。
+        shard_units = len(dialogues)
         if self.shards == "max":
             shards = shard_units
-            print(f"[membench] --shards max -> {shards}（按数据集{unit_label}）")
+            print(f"[membench] --shards max -> {shards}（按数据集对话数）")
         else:
             shards = min(int(self.shards), shard_units)
             if shards < int(self.shards):
                 print(
                     f"[membench] --shards {self.shards} 超过数据集上限 {shard_units}"
-                    f"（{unit_label}），按 {shards} 分片执行"
+                    f"（对话数），按 {shards} 分片执行"
                 )
         if shards == 0:
             print("[membench] 数据集为空（无可分片的对话/题目），本进程跳过、不产生产物。")
@@ -1341,13 +1341,11 @@ class Runner:
             return None
         if shards > 1 or self.limit is not None:
             dialogues = select_shard_questions(
-                dialogues, shards, self.shard_index, self.limit, self.shard_by
+                dialogues, shards, self.shard_index, self.limit
             )
 
-        # interleaved 的两条硬约束：都必须在建目录 / 写账本之前拒绝（不留半成品）。
-        # 题目级分片会让同一对话被多个分片各自从 reset 开始 ingest，各片只看到
-        # 自己那部分题——as_of 的时点语义直接失效；回放快照只存末尾态，给不出
-        # 每个 as_of 的状态。二者都不是"警告一下继续跑"能补救的。
+        # interleaved 回放必须在建目录 / 写账本之前拒绝（不留半成品）：回放快照只存
+        # 末尾态，给不出每个 as_of 的状态，不是"警告一下继续跑"能补救的。
         interleaved_ids = [
             str(d.dialogue_id) for d in dialogues if d.ingest_strategy == "interleaved"
         ]
@@ -1358,15 +1356,6 @@ class Runner:
                 f"（涉及对话：{'、'.join(interleaved_ids[:3])}"
                 + ("…" if len(interleaved_ids) > 3 else "")
                 + "）；请去掉 --replay 重新 ingest，或改用 ingest_strategy=sequence 的数据集"
-            )
-        if interleaved_ids and shards > 1 and self.shard_by != "dialogue":
-            raise SystemExit(
-                "interleaved ingest 策略不支持题目级分片：题目级分片会让每个分片各自"
-                "reset 并从第 0 条消息 ingest，as_of 的时点语义会失效"
-                f"（涉及对话：{'、'.join(interleaved_ids[:3])}"
-                + ("…" if len(interleaved_ids) > 3 else "")
-                + "）；请改用 --shard-by dialogue（整段对话归片、分片间不重复 ingest），"
-                "或去掉 --shards 全量跑"
             )
         # trace_state 三态：None（默认）= 自动——本次要跑的对话里只要有 interleaved
         # 且含 safety 题的对话就开启。safety 题的"真遗忘"只能靠提问时点的状态判定，
@@ -1422,14 +1411,6 @@ class Runner:
         adapter_name = str(getattr(self.adapter, "name", self.adapter.__class__.__name__))
         dataset_name = os.path.splitext(os.path.basename(self.dataset_path))[0]
         sharded = shards > 1
-        # 共用任务目录（CLI --task-dir）下多个分片写同一棵对话树：题目级分片会让多片
-        # 写同一对话目录并互相覆盖，只有对话级分片是"各写各的对话"。
-        if self.shared and sharded and self.shard_by != "dialogue":
-            raise SystemExit(
-                "共享任务目录下只支持 --shard-by dialogue：题目级分片会让多个分片写"
-                "同一对话目录并互相覆盖；请改用 --shard-by dialogue，"
-                "或给各分片独立的 --report-out"
-            )
         # 写入前的覆盖拒绝：分片不写数据集级报告，该位置有 metrics 只可能来自不分片的
         # 评测或 fuse 产物——两种情况下这棵树都已有完整结果，不该再往里写分片。
         existing_metrics = os.path.join(
@@ -1466,7 +1447,7 @@ class Runner:
             now.strftime("%Y%m%d_%H%M%S"),
             commit=self.commit,
             tags=layout.run_id_tags(
-                shards, self.shard_index, self.shard_by, self.limit, self.categories
+                shards, self.shard_index, "dialogue", self.limit, self.categories
             ),
         )
         dialogue_ids = [str(d.dialogue_id) for d in dialogues]
@@ -1482,7 +1463,7 @@ class Runner:
             ledger_header = layout.shard_ledger_header(
                 dataset=dataset_name,
                 shards=shards,
-                shard_by=self.shard_by,
+                shard_by="dialogue",
                 limit=self.limit,
                 fingerprint=dataset_fingerprint(self.dataset_path),
                 categories=self.categories,
@@ -1555,8 +1536,7 @@ class Runner:
         if ledger_path is not None:
             # 分片开跑：先把"哪片在跑"写进账本，跑的过程中就能看出进度
             print(
-                f"[membench] 分片 {self.shard_index}/{shards}"
-                f"（{self.shard_by}）写入 {experiment_dir}"
+                f"[membench] 分片 {self.shard_index}/{shards} 写入 {experiment_dir}"
             )
             shard_started_at = datetime.now().isoformat(timespec="seconds")
             layout.update_shard_ledger(
@@ -1607,7 +1587,7 @@ class Runner:
                     )
 
         # 全流程 token / LLM 调用记账（ingest 按对话真实调用计一次；query 逐题累加）：
-        # 与 records 的「每题归属」不同，这里是总量的唯一真相来源——question 分片下
+        # 与 records 的「每题归属」不同，这里是总量的唯一真相来源——旧 question 分片下
         # 同一对话可能被多个分片各自 ingest，只有各分片自己的计数才是真实成本。
         token_usage: dict[str, int] = {
             "ingest_input_tokens": 0,
@@ -1783,7 +1763,7 @@ class Runner:
                     **({"categories": list(self.categories)} if self.categories else {}),
                     "shards": shards,
                     "shard_index": self.shard_index,
-                    "shard_by": self.shard_by,
+                    "shard_by": "dialogue",
                     "adapter_meta": self.adapter_meta,
                     "adapter_describe": adapter_describe,
                     "schema_version": "0.2",
@@ -2221,6 +2201,11 @@ class Runner:
         # reset 上下文用完即撤（异常中断时残留也无害：下一次 reset 前会被覆写）
         for _key in ("MEMBENCH_RUN_DIR", "MEMBENCH_DIALOGUE_ID", "MEMBENCH_DIALOGUE_INDEX"):
             os.environ.pop(_key, None)
+
+        # 整场跑完再 reset 一次：reset 只发生在**每个对话开始前**，不补这一刀，最后一段
+        # 对话的记忆会一直留在被测系统里（真机接入时是真实存储 / 真实账号）。快照与追踪
+        # 状态都在 ingest 后、query 前导出并落在产物目录里，清理不丢证据。
+        self._reset_after_run()
 
         replay_verify: Union[dict, None] = None
         if verify_source:

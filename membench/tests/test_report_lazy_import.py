@@ -373,7 +373,6 @@ def test_shard_run_report_marks_partial_coverage(
         n_dialogues=2,
         shards=2,
         shard_index=0,
-        shard_by="dialogue",
     )
     md = (dataset_dir / "d1" / "report" / "report.md").read_text(encoding="utf-8")
 

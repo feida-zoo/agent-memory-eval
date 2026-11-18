@@ -182,7 +182,6 @@ def test_shard_ledger_records_categories(tmp_path: Path) -> None:
             categories=["single_hop"],
             shards=2,
             shard_index=0,
-            shard_by="dialogue",
         ).run()
     )
     ledger = json.loads(
@@ -205,7 +204,6 @@ def test_fuse_keeps_categories_and_covers_filtered_questions(tmp_path: Path) -> 
             categories=["single_hop"],
             shards=2,
             shard_index=index,
-            shard_by="dialogue",
         ).run()
     result = fuse_runs([str(out_dir)], str(out_dir))
     metrics = result["metrics"]

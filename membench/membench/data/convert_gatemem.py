@@ -64,8 +64,8 @@ speaker.role / turn_kind 显式为 assistant/agent/bot 一类时才映射为
 "该时点已 ingest 的消息条数"），并把整个 dialogue 标成
 ``ingest_strategy="interleaved"``——评测时 runner 边 ingest 边提问，问的是
 "当时能看到什么"。``as_of_turn_id`` 在 turns 里找不到时该 checkpoint 跳过并
-计数（不猜时点）。注意：interleaved 与题目级分片 / ``--replay`` 不兼容，
-评测时需 ``--shard-by dialogue``（见 ``membench.runner``）。
+计数（不猜时点）。注意：interleaved 与 ``--replay`` 不兼容；分片只按整段对话进行
+（见 ``membench.runner``）。
 
 **evidence（rubric 要点 → episode 片段映射）**：checkpoint 的 ``judge_spec.include``
 是判分要点（多为正则），不是对话原文子串，因此 evidence 由转换器在**该 checkpoint
@@ -526,7 +526,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"[convert_gatemem] 提问时点 as_of（已 ingest 消息条数）范围 "
             f"{stats['as_of_min']}..{stats['as_of_max']}；"
-            "ingest_strategy=interleaved（评测时请用 --shard-by dialogue）"
+            "ingest_strategy=interleaved（分片按整段对话进行，不支持 --replay）"
         )
     if stats["ignored"]:
         print(f"[convert_gatemem] 已标记忽略 {stats['ignored']} 道 (privacy, refuse) 题"

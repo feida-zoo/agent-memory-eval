@@ -773,8 +773,6 @@ def _spawn_shard(
             str(shards),
             "--shard-index",
             str(shard_index),
-            "--shard-by",
-            "dialogue",
             "--replay",
             str(source),
         ],
