@@ -272,8 +272,9 @@ join 才能复算命中，而数据集是按需下载、指纹会变的。`metri
 **无论状态扫描是否命中都优先落 `wrong_answer`**，因此没开 `--trace-state` 的运行里
 这一桶仍会有值；`unknown` 只覆盖"有 evidence 但检索也没命中、状态又读不到"的题。任务级 `evaluate` / `series` 报告另给
 「失败归因（按数据集）」表，`reports/metrics.json` 落 `attribution_by_dataset`
-（逐数据集保留四桶，不跨集池化）；某数据集全部判错都落在 `not_written` 时报告会
-提示摘要式记忆的高估风险。
+（逐数据集保留四桶，不跨集池化）。四桶单元格显示 `计数（百分比）`，分母是该数据集
+带 evidence 的判错题；数据集级报告另给「合计」行。某数据集全部判错都落在
+`not_written` 时报告会提示摘要式记忆的高估风险。
 
 **状态扫描的题面回显豁免**：`leak_targets` / `gold_answer` / include 要点里，
 **原样出现在题面**的 needle 不参与状态扫描——探针题会把待删值放回题面

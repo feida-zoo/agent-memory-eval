@@ -577,6 +577,9 @@ def test_attribution_four_buckets(tmp_path: Path) -> None:
     ).read_text(encoding="utf-8")
     assert "## 失败归因" in report
     assert "状态未字面命中" in report and "未检索到" in report and "检索到但答错" in report
+    assert "1（33.3%）" in report
+    assert "**合计**" in report
+    assert "该桶 / 本行带 evidence 的判错题" in report
     assert "### 归因样例" in report
 
 

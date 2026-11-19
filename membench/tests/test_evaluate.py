@@ -453,6 +453,8 @@ def test_report_contents(
     assert "状态未字面命中" in attribution_section
     assert "不等于语义上没写入" in attribution_section
     assert "检索到但答错" in attribution_section
+    assert "1（100.0%）" in attribution_section
+    assert "该桶 / 该数据集带 evidence 的判错题" in attribution_section
     task_metrics = json.loads(
         (reports_dir / layout.FILE_METRICS).read_text(encoding="utf-8")
     )
@@ -486,7 +488,7 @@ def test_attribution_rows_marks_all_not_written() -> None:
         },
     )
     rows, suspect = _attribution_rows([result])
-    assert rows[0][0] == "K" and rows[0][-4] == "2"  # not_written
+    assert rows[0][0] == "K" and rows[0][-4] == "2（100.0%）"  # not_written
     assert suspect == ["K"]
 
 

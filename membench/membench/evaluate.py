@@ -59,6 +59,7 @@ from membench.report import (
     WORST_CATEGORY_TOP,
     _md_table,
     _fmt_opt,
+    attribution_pct_cell,
     category_display,
     fig_dataset_overview,
     metric_label,
@@ -1496,6 +1497,7 @@ def _render_task_report_md(
             "「提问时点状态文本里**字面**找不到证据 / gold / rubric 要点」，"
             "**不等于语义上没写入**：摘要 / 改写式记忆会系统性高估该桶。"
             "`evidence_hit=true` 的题直接记「检索到但答错」，不依赖状态快照。"
+            "四桶单元格 = 计数（该桶 / 该数据集带 evidence 的判错题）；"
             "不做跨数据集池化——各集 evidence 覆盖率与状态可读率不同。</sub>"
         )
         lines.append("")
@@ -1761,7 +1763,10 @@ def _attribution_rows(
                 str(int(attribution.get("n_wrong_abstention") or 0)),
                 str(with_evidence),
                 str(int(attribution.get("n_state_readable") or 0)),
-                *(str(int(buckets.get(bucket) or 0)) for bucket in ATTRIBUTION_BUCKETS),
+                *(
+                    attribution_pct_cell(buckets.get(bucket, 0), with_evidence)
+                    for bucket in ATTRIBUTION_BUCKETS
+                ),
             ]
         )
     return rows, not_written_only

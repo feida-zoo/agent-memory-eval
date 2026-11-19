@@ -443,6 +443,14 @@ ATTRIBUTION_BUCKET_ZH: dict[str, str] = {
 ATTRIBUTION_SAMPLE_CHARS = 80
 
 
+def attribution_pct_cell(count: Any, denominator: int) -> str:
+    """归因桶单元格：``计数（占带 evidence 判错题的百分比）``；无分母显示 ``—``。"""
+    value = int(count or 0)
+    if denominator <= 0:
+        return "—" if value == 0 else f"{value}（—）"
+    return f"{value}（{value / denominator:.1%}）"
+
+
 def trace_role_display(role: Any) -> str:
     """追踪状态角色的显示文案；未知角色原样返回，缺失显示 ``n/a``。"""
     if role is None or role == "":
@@ -2086,6 +2094,7 @@ def write_run_report_md(
         cat_rows = []
         for cat in sorted(by_category):
             info = by_category[cat]
+            with_evidence = int(info.get("n_wrong_with_evidence") or 0)
             sample_qids = [
                 f"`{s.get('qid')}`（{ATTRIBUTION_BUCKET_ZH.get(str(s.get('bucket')), str(s.get('bucket')))}）"
                 for s in samples
@@ -2095,9 +2104,27 @@ def write_run_report_md(
                 [
                     category_display(cat),
                     str(info.get("n_wrong", 0)),
-                    str(info.get("n_wrong_with_evidence", 0)),
-                    *(str(info.get(bucket, 0)) for bucket in ATTRIBUTION_BUCKETS),
+                    str(with_evidence),
+                    *(
+                        attribution_pct_cell(info.get(bucket, 0), with_evidence)
+                        for bucket in ATTRIBUTION_BUCKETS
+                    ),
                     "、".join(sample_qids) or "—",
+                ]
+            )
+        total_with_evidence = int(attribution.get("n_wrong_with_evidence") or 0)
+        total_buckets = attribution.get("buckets") or {}
+        if cat_rows:
+            cat_rows.append(
+                [
+                    "**合计**",
+                    str(int(attribution.get("n_wrong") or 0)),
+                    str(total_with_evidence),
+                    *(
+                        attribution_pct_cell(total_buckets.get(bucket, 0), total_with_evidence)
+                        for bucket in ATTRIBUTION_BUCKETS
+                    ),
+                    "—",
                 ]
             )
         lines.append(
@@ -2109,11 +2136,16 @@ def write_run_report_md(
                     *[ATTRIBUTION_BUCKET_ZH[b] for b in ATTRIBUTION_BUCKETS],
                     "样例 qid（桶）",
                 ],
-                cat_rows or [["(无)", "0", "0", "0", "0", "0", "0", "—"]],
+                cat_rows or [["(无)", "0", "0", "—", "—", "—", "—", "—"]],
             )
         )
         lines.append("")
-        if not int(attribution.get("n_wrong_with_evidence") or 0):
+        lines.append(
+            "<sub>桶单元格 = 计数（该桶 / 本行带 evidence 的判错题）。"
+            "分母为 0 时显示「—」，不能把「无法归因」读成 0%。</sub>"
+        )
+        lines.append("")
+        if not total_with_evidence:
             lines.append(
                 "（本次判错题都没有 evidence 标注：四桶全为 0 是「无法归因」，"
                 "不是「没有失败」。）"
