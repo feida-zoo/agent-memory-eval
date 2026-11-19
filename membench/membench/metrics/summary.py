@@ -30,8 +30,9 @@ __all__ = [
 SAFETY_CATEGORY_PREFIX = "safety"
 
 #: 失败归因四桶（"为什么答错"）：
-#: - ``not_written``：证据不在该题提问时点的状态里（没写进去）；
-#: - ``not_retrieved``：证据在状态里，但没被检索进回答上下文；
+#: - ``not_written``：证据 / 要点在该题提问时点的状态文本里**字面未命中**——
+#:   不等于语义上没写入，摘要 / 改写式记忆会系统性高估该桶；
+#: - ``not_retrieved``：状态里字面命中了，但没被检索进回答上下文；
 #: - ``wrong_answer``：证据既写进去了也被检索到了，仍然答错（推理/表述问题）；
 #: - ``unknown``：状态不可读 / 没有快照，无法判定（不猜）。
 ATTRIBUTION_BUCKETS: tuple[str, ...] = (
@@ -102,6 +103,8 @@ def attribution_summary(
     - 四桶只覆盖**带 evidence 标注**的判错题——没有 evidence 就无从判断"证据
       是否已写入"，这些题另记 ``n_wrong_without_evidence``，不硬塞进
       ``unknown``（``unknown`` 专指"有证据可查、但状态读不到或没快照"）。
+    - ``not_written`` 的判据是**状态文本里字面找不到** evidence / gold / rubric
+      要点，不是语义判断；摘要 / 改写式记忆会把"写了但没保留原文"记进该桶。
     - ``evidence_hit=True`` 的判错题**不需要状态**就能落 ``wrong_answer``
       （证据进了上下文，失败在回答）——只有 evidence_hit 为 False / None 时
       才依赖 ``evidence_in_state``，因此没开 ``--trace-state`` 的运行里
@@ -120,7 +123,7 @@ def attribution_summary(
     Returns:
         ``{"n_wrong", "n_wrong_with_evidence", "n_wrong_without_evidence",
         "n_state_readable", "buckets": {...}, "by_category": {cat: {...}},
-        "samples": [...]}``。
+        "samples": [...], "state_scan": "literal-substring"}``。
     """
     buckets = _empty_attribution_counts()
     by_category: dict[str, dict[str, Any]] = {}
@@ -186,6 +189,8 @@ def attribution_summary(
         "buckets": buckets,
         "by_category": by_category,
         "samples": samples,
+        # 机器可读的扫描口径：当前只有字面子串，避免下游把 not_written 当语义结论。
+        "state_scan": "literal-substring",
     }
 
 

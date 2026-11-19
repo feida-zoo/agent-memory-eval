@@ -447,6 +447,48 @@ def test_report_contents(
     detail_section = report.split("## 分数据集明细")[1]
     assert "未定义" in detail_section
 
+    # 任务级失败归因：逐数据集四桶 + 明确字面扫描口径；同时落机器可读 metrics。
+    assert "## 失败归因（按数据集）" in report
+    attribution_section = report.split("## 失败归因（按数据集）")[1].split("## ")[0]
+    assert "状态未字面命中" in attribution_section
+    assert "不等于语义上没写入" in attribution_section
+    assert "检索到但答错" in attribution_section
+    task_metrics = json.loads(
+        (reports_dir / layout.FILE_METRICS).read_text(encoding="utf-8")
+    )
+    assert task_metrics["attribution_by_dataset"]["a"]["buckets"]["wrong_answer"] == 1
+    assert task_metrics["attribution_by_dataset"]["a"]["state_scan"] == "literal-substring"
+    # B 有判错题但无 evidence 标注：保留行，四桶无可归因项。
+    assert task_metrics["attribution_by_dataset"]["b"]["n_wrong_with_evidence"] == 0
+
+
+def test_attribution_rows_marks_all_not_written() -> None:
+    """全部带 evidence 的判错题都落 not_written 时，标记为摘要式记忆嫌疑。"""
+    from membench.evaluate import _attribution_rows
+
+    spec = DatasetSpec(key="k", name="K", path="/tmp/k.jsonl", source="user-specified")
+    result = DatasetResult(
+        spec=spec,
+        run_dir="/tmp/k",
+        metrics={
+            "attribution": {
+                "n_wrong": 2,
+                "n_wrong_abstention": 0,
+                "n_wrong_with_evidence": 2,
+                "n_state_readable": 2,
+                "buckets": {
+                    "not_written": 2,
+                    "not_retrieved": 0,
+                    "wrong_answer": 0,
+                    "unknown": 0,
+                },
+            }
+        },
+    )
+    rows, suspect = _attribution_rows([result])
+    assert rows[0][0] == "K" and rows[0][-4] == "2"  # not_written
+    assert suspect == ["K"]
+
 
 def test_fuse_metrics_empty_participants() -> None:
     """所有集都无某能力标注时，该指标融合值为 None、参与集为空。"""

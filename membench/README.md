@@ -257,14 +257,20 @@ runner 不再"整段 ingest 完再统一提问"，而是：sessions 按顺序展
 `null`，不猜），并**落 evidence 原文**（每题最多 5 条、每条截断 200 字符）与
 `include_hit_rate`（`judge_spec.include` 的逐条命中比例）——没有原文就只能回数据集
 join 才能复算命中，而数据集是按需下载、指纹会变的。`metrics.json` 的 `attribution` 与报告「失败归因」小节给出四桶：
-`not_written`（没写进去）/`not_retrieved`（写入但没检索到）/`wrong_answer`
-（检索到仍答错）/`unknown`（不可判定）。四桶只统计**判错、带 evidence 标注且非拒答**的
-题——没有 evidence 就无从判断"证据是否写入"，另记 `n_wrong_without_evidence`，
-不硬塞进 `unknown`；拒答题另记 `n_wrong_abstention`，失败原因见下面的 `state_leak`
-与 judge 红线，不按"检索缺失"解读。**`evidence_hit=true` 的判错题不需要状态快照
-就能落 `wrong_answer`**（证据已经被检索进回答上下文，失败只可能在回答），所以
-没开 `--trace-state` 的运行里这一桶仍会有值，`unknown` 只覆盖"有 evidence 但
-检索也没命中、状态又读不到"的题。
+`not_written`（状态文本里**字面**找不到证据 / gold / rubric 要点）/`not_retrieved`
+（字面命中但没检索到）/`wrong_answer`（检索到仍答错）/`unknown`（不可判定）。
+四桶只统计**判错、带 evidence 标注且非拒答**的题——没有 evidence 就无从判断
+"证据是否写入"，另记 `n_wrong_without_evidence`，不硬塞进 `unknown`；拒答题另记
+`n_wrong_abstention`，失败原因见下面的 `state_leak` 与 judge 红线，不按"检索缺失"
+解读。**`not_written` 是字面子串扫描，不是语义结论**：摘要 / 改写式记忆会把"写了
+但没保留证据原文"系统性记进该桶，不能据此断言未写入；状态扫描口径固定落
+`attribution.state_scan="literal-substring"`。**`evidence_hit=true` 的判错题不需要
+状态快照就能落 `wrong_answer`**（证据已经被检索进回答上下文，失败只可能在回答），
+所以没开 `--trace-state` 的运行里这一桶仍会有值，`unknown` 只覆盖"有 evidence 但
+检索也没命中、状态又读不到"的题。任务级 `evaluate` / `series` 报告另给
+「失败归因（按数据集）」表，`reports/metrics.json` 落 `attribution_by_dataset`
+（逐数据集保留四桶，不跨集池化）；某数据集全部判错都落在 `not_written` 时报告会
+提示摘要式记忆的高估风险。
 
 **状态扫描的题面回显豁免**：`leak_targets` / `gold_answer` / include 要点里，
 **原样出现在题面**的 needle 不参与状态扫描——探针题会把待删值放回题面

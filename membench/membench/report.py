@@ -433,7 +433,7 @@ TRACE_ROLE_ZH: dict[str, str] = {
 
 #: 失败归因四桶 -> 中文显示名。
 ATTRIBUTION_BUCKET_ZH: dict[str, str] = {
-    "not_written": "未写入",
+    "not_written": "状态未字面命中",
     "not_retrieved": "未检索到",
     "wrong_answer": "检索到但答错",
     "unknown": "不可判定",
@@ -2062,9 +2062,11 @@ def write_run_report_md(
         lines.append("")
         lines.append(
             "<sub>回答「为什么答错」：只有**判错**且带 evidence 标注的题进入四桶——"
-            "证据不在该题提问时点的状态里（`not_written`）→ 在状态里但没被检索进"
-            "回答上下文（`not_retrieved`）→ 两者都有仍答错（`wrong_answer`，推理 / 表述"
-            "问题）；状态读不到 / 没有快照记 `unknown`（不猜）。既然证据已经被检索进"
+            "状态文本里字面找不到证据 / 要点（`not_written`，**不等于语义上没写入**）→ "
+            "字面命中但没被检索进回答上下文（`not_retrieved`）→ 两者都有仍答错"
+            "（`wrong_answer`，推理 / 表述问题）；状态读不到 / 没有快照记 "
+            "`unknown`（不猜）。状态扫描是**字面 needle 子串匹配**，摘要 / 改写式记忆"
+            "会把“写了但没保留原文”记进 `not_written`，不能据此断言未写入。既然证据已经被检索进"
             "回答上下文（`evidence_hit=true`），失败就只可能在回答——这类题**不需要**"
             "状态快照也直接落 `wrong_answer`，所以没开 `--trace-state` 的运行里这一桶"
             "仍会有值。没有 evidence 标注的"

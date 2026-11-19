@@ -51,8 +51,10 @@ from membench import layout, runtime
 from membench.data.info import get_dataset_info, resolve_available_path
 from membench.data.schema import load_dataset, question_capabilities
 from membench.layout import resolve_dataset_dir
+from membench.metrics.summary import ATTRIBUTION_BUCKETS
 from membench.ratings import format_metric, overall_rating
 from membench.report import (
+    ATTRIBUTION_BUCKET_ZH,
     CATEGORY_MIN_N,
     WORST_CATEGORY_TOP,
     _md_table,
@@ -1481,6 +1483,46 @@ def _render_task_report_md(
     )
     lines.append("")
 
+    # 失败归因（按数据集）：逐数据集看四桶，不做跨集池化（覆盖率不同）。
+    attribution_results = [
+        r for r in results if isinstance(r.metrics.get("attribution"), dict)
+    ]
+    if attribution_results:
+        attribution_rows, not_written_only = _attribution_rows(results)
+        lines.append("## 失败归因（按数据集）")
+        lines.append("")
+        lines.append(
+            "<sub>只统计**判错且带 evidence 标注、非拒答**的题。`not_written` 是"
+            "「提问时点状态文本里**字面**找不到证据 / gold / rubric 要点」，"
+            "**不等于语义上没写入**：摘要 / 改写式记忆会系统性高估该桶。"
+            "`evidence_hit=true` 的题直接记「检索到但答错」，不依赖状态快照。"
+            "不做跨数据集池化——各集 evidence 覆盖率与状态可读率不同。</sub>"
+        )
+        lines.append("")
+        lines.append(
+            _md_table(
+                [
+                    "数据集",
+                    "判错",
+                    "拒答类（不计四桶）",
+                    "带 evidence",
+                    "状态可读",
+                    *(ATTRIBUTION_BUCKET_ZH[b] for b in ATTRIBUTION_BUCKETS),
+                ],
+                attribution_rows,
+            )
+        )
+        lines.append("")
+        if not_written_only:
+            lines.append(
+                "> ⚠️ "
+                + "、".join(not_written_only)
+                + " 的带 evidence 判错题全部落在「状态未字面命中」：可能确实没写入，"
+                "也可能是摘要 / 改写式记忆不含原文。结合 `--evidence-match` 与状态形态"
+                "判断，不要直接当作“未写入”结论。"
+            )
+            lines.append("")
+
     # 最需要优化的题型：跨数据集一张表，省得挨个数据集翻报告
     worst_rows = _worst_category_rows(results)
     if worst_rows:
@@ -1693,6 +1735,38 @@ def _load_dataset_records(run_dir: str) -> Union[list[dict[str, Any]], None]:
     return records
 
 
+def _attribution_rows(
+    results: list[DatasetResult],
+) -> tuple[list[list[str]], list[str]]:
+    """任务级失败归因表：逐数据集展开四桶，返回 ``(表行, 疑似摘要记忆的数据集)``。
+
+    数据源是各数据集融合后的 ``metrics.attribution``（fuse 已按全量记录重算）。
+    不做跨数据集池化：各集 evidence 覆盖率与状态可读率不同，相加后无法解释。
+    """
+    rows: list[list[str]] = []
+    not_written_only: list[str] = []
+    for res in results:
+        attribution = res.metrics.get("attribution")
+        if not isinstance(attribution, dict):
+            rows.append([res.spec.name, *["—"] * (4 + len(ATTRIBUTION_BUCKETS))])
+            continue
+        with_evidence = int(attribution.get("n_wrong_with_evidence") or 0)
+        buckets = attribution.get("buckets") or {}
+        if with_evidence and int(buckets.get("not_written") or 0) == with_evidence:
+            not_written_only.append(res.spec.name)
+        rows.append(
+            [
+                res.spec.name,
+                str(int(attribution.get("n_wrong") or 0)),
+                str(int(attribution.get("n_wrong_abstention") or 0)),
+                str(with_evidence),
+                str(int(attribution.get("n_state_readable") or 0)),
+                *(str(int(buckets.get(bucket) or 0)) for bucket in ATTRIBUTION_BUCKETS),
+            ]
+        )
+    return rows, not_written_only
+
+
 def _worst_category_rows(
     results: list[DatasetResult],
 ) -> list[list[str]]:
@@ -1754,8 +1828,8 @@ def write_task_reports(
 
     产物：``report.md``（全量评估报告，内链指向各数据集
     ``runs/<dataset>/report/report.md``）、``metrics.json``（任务级汇总：融合口径 +
-    融合值 + 门禁 + 身份 + token 消耗）、``evaluate_summary.json``（机器可消费的清单，
-    额外带各数据集相对路径）、``fig_dataset_overview.png``。
+    融合值 + 门禁 + 身份 + token 消耗 + 逐数据集失败归因）、``evaluate_summary.json``
+    （机器可消费的清单，额外带各数据集相对路径）、``fig_dataset_overview.png``。
     """
     reports_dir = layout.task_report_dir(experiment_dir)
     os.makedirs(reports_dir, exist_ok=True)
@@ -1781,6 +1855,11 @@ def write_task_reports(
         title=title,
     )
 
+    attribution_by_dataset = {
+        r.spec.key: r.metrics["attribution"]
+        for r in results
+        if isinstance(r.metrics.get("attribution"), dict)
+    }
     metrics = {
         "experiment_dir": experiment_dir,
         "reports_dir": reports_dir,
@@ -1796,6 +1875,8 @@ def write_task_reports(
         "fused": fused,
         "gate": gate,
         "token_usage": _token_usage_summary(results),
+        # 任务级失败归因：逐数据集保留四桶，不做跨集池化（覆盖率不同）。
+        **({"attribution_by_dataset": attribution_by_dataset} if attribution_by_dataset else {}),
         # GateMem 官方口径池化（参考视图，不参与融合/评级）；无三支柱题型时省略
         **({"official_pooled": pooled} if (pooled := pool_official(results)) else {}),
     }

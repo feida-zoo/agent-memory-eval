@@ -252,7 +252,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="失败归因：对 interleaved 数据集在每个有提问的 as_of ingest 完成后、query 之前"
         "导出状态到 <对话目录>/trace_state/t<as_of>/（sequence 对话用末尾 memory_snapshot/）；"
-        "用于判断答错是「没写入 / 写入但没检索到 / 检索到但答错」。默认自动：本次有 "
+        "用于判断答错是「状态未字面命中 / 字面命中但没检索到 / 检索到但答错」。默认自动：本次有 "
         "interleaved 对话含 safety 题时开启（safety 的「真遗忘」要读提问时点的状态），"
         "其余情况不开；可用 --no-trace-state 关闭",
     )

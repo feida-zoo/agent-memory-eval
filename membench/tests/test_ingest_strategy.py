@@ -576,7 +576,7 @@ def test_attribution_four_buckets(tmp_path: Path) -> None:
         result["dataset_dir"] / layout.DIR_REPORT / layout.FILE_REPORT_MD
     ).read_text(encoding="utf-8")
     assert "## 失败归因" in report
-    assert "未写入" in report and "未检索到" in report and "检索到但答错" in report
+    assert "状态未字面命中" in report and "未检索到" in report and "检索到但答错" in report
     assert "### 归因样例" in report
 
 
