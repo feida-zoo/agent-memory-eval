@@ -189,3 +189,67 @@ def test_clean_snapshot_has_no_warning(tmp_path: Path, capsys) -> None:
     assert "疑似日志" not in err
     assert "state_scan" not in metrics
     assert "疑似日志" not in report
+
+
+def test_question_echo_filter_is_safety_only(tmp_path: Path) -> None:
+    """普通题答案出现在题面里不剔除：它是记忆是否写入的有效 needle。"""
+
+    class _BookClubAdapter(BaseMemoryAdapter):
+        name = "book-club"
+
+        def reset(self) -> None:
+            pass
+
+        def ingest(self, messages: list[dict]) -> IngestStats:
+            return IngestStats()
+
+        def query(self, question: str) -> QueryResult:
+            return QueryResult(answer="不确定")
+
+        def snapshot_capabilities(self) -> dict:
+            return {"supported": True, "restore": False, "rebuild": False, "format_version": 1}
+
+        def snapshot(self, target_dir: str, tag: str) -> dict:
+            memory = Path(target_dir) / "memory"
+            memory.mkdir(parents=True, exist_ok=True)
+            (memory / "MEMORY.md").write_text(
+                "User joined the Page Turners book club.\n", encoding="utf-8"
+            )
+            return {"n_messages": 0}
+
+    dataset = tmp_path / "book.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "dialogue_id": "d1",
+                "sessions": [[{"role": "user", "content": "随便聊聊。", "timestamp": None}]],
+                "questions": [
+                    {
+                        "qid": "q1",
+                        "question": "Which group did I join, Page Turners?",
+                        "gold_answer": "Page Turners",
+                        "category": "single_hop",
+                        "evidence": ["The user joined a local book club."],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset_dir = Path(
+        Runner(
+            _BookClubAdapter(),
+            str(dataset),
+            judge=_AlwaysCorrectJudge(),
+            out_dir=str(tmp_path / "exp"),
+        ).run()
+    )
+    record = json.loads(
+        (dataset_dir / layout.DIR_REPORT / layout.FILE_RESULTS)
+        .read_text(encoding="utf-8")
+        .strip()
+    )
+    assert record["state_echo_skipped"] == 0
+    assert record["evidence_in_state"] is True

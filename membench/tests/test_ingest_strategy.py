@@ -580,6 +580,33 @@ def test_attribution_four_buckets(tmp_path: Path) -> None:
     assert "### 归因样例" in report
 
 
+def test_evidence_hit_precedes_state_scan_in_attribution() -> None:
+    """证据已检索进上下文时不能判 not_written，即使状态扫描没命中。"""
+    from membench.metrics.summary import attribution_bucket
+
+    base = {
+        "category": "single_hop",
+        "gold_answer": "答案",
+        "judge": {"correct": False},
+    }
+    assert (
+        attribution_bucket({**base, "evidence_hit": True, "evidence_in_state": False}, True)
+        == "wrong_answer"
+    )
+    assert (
+        attribution_bucket({**base, "evidence_hit": True, "evidence_in_state": None}, True)
+        == "wrong_answer"
+    )
+    assert (
+        attribution_bucket({**base, "evidence_hit": False, "evidence_in_state": False}, True)
+        == "not_written"
+    )
+    assert (
+        attribution_bucket({**base, "evidence_hit": False, "evidence_in_state": True}, True)
+        == "not_retrieved"
+    )
+
+
 def test_attribution_all_unknown_without_snapshot_support(tmp_path: Path) -> None:
     """适配器不支持快照：状态不可读，只有 evidence_hit 能证实的题可落桶。
 

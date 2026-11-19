@@ -262,12 +262,15 @@ join 才能复算命中，而数据集是按需下载、指纹会变的。`metri
 四桶只统计**判错、带 evidence 标注且非拒答**的题——没有 evidence 就无从判断
 "证据是否写入"，另记 `n_wrong_without_evidence`，不硬塞进 `unknown`；拒答题另记
 `n_wrong_abstention`，失败原因见下面的 `state_leak` 与 judge 红线，不按"检索缺失"
-解读。**`not_written` 是字面子串扫描，不是语义结论**：摘要 / 改写式记忆会把"写了
-但没保留证据原文"系统性记进该桶，不能据此断言未写入；状态扫描口径固定落
-`attribution.state_scan="literal-substring"`。**`evidence_hit=true` 的判错题不需要
-状态快照就能落 `wrong_answer`**（证据已经被检索进回答上下文，失败只可能在回答），
-所以没开 `--trace-state` 的运行里这一桶仍会有值，`unknown` 只覆盖"有 evidence 但
-检索也没命中、状态又读不到"的题。任务级 `evaluate` / `series` 报告另给
+解读。**`not_written` 是字面 needle 扫描，不是语义结论**：摘要 / 改写式记忆会把
+"写了但没保留证据原文"系统性记进该桶，不能据此断言未写入；状态扫描口径固定落
+`attribution.state_scan="literal-substring"`。扫描大小写不敏感；短 ASCII 答案
+（如 `Rome` / `2022`）从 2 字符起收并要求词边界，单字符和 yes/no 极性词仍排除；
+长 evidence 取「含 gold 的句子 Top5」与「最长句 Top5」的并集，避免只按长度丢掉
+答案句。**题面回显豁免只用于 safety 状态红线**：普通题的答案天然可能出现在题面里，
+不能当探针注入剔除。**`evidence_hit=true` 的判错题**——证据已经被检索进回答上下文，
+**无论状态扫描是否命中都优先落 `wrong_answer`**，因此没开 `--trace-state` 的运行里
+这一桶仍会有值；`unknown` 只覆盖"有 evidence 但检索也没命中、状态又读不到"的题。任务级 `evaluate` / `series` 报告另给
 「失败归因（按数据集）」表，`reports/metrics.json` 落 `attribution_by_dataset`
 （逐数据集保留四桶，不跨集池化）；某数据集全部判错都落在 `not_written` 时报告会
 提示摘要式记忆的高估风险。

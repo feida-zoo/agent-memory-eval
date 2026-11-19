@@ -277,7 +277,7 @@ def _needle_dataset(path: Path) -> Path:
             {
                 "qid": "q_short_gold",
                 "question": "短答案？",
-                "gold_answer": "无关内容",
+                "gold_answer": "42",
                 "category": "single_hop",
                 "evidence": [ABSENT_EVIDENCE],
             },
@@ -288,7 +288,7 @@ def _needle_dataset(path: Path) -> Path:
 
 
 def test_gold_answer_and_include_are_needles(tmp_path: Path) -> None:
-    """gold_answer / judge_spec.include 命中状态即算写入；短 gold 不当 needle。"""
+    """gold_answer / judge_spec.include 命中状态即算写入；短 gold 也做边界匹配。"""
     from membench.runner import STATE_NEEDLE_MIN_CHARS, state_needle_extras
 
     assert STATE_NEEDLE_MIN_CHARS == 8
@@ -299,6 +299,8 @@ def test_gold_answer_and_include_are_needles(tmp_path: Path) -> None:
     assert state_needle_extras(
         "旧值 9 percent", {"include": ["预算上限调整为 42 percent", "9%"]}
     ) == ["旧值 9 percent", "预算上限调整为 42 percent"]
+    assert state_needle_extras("42", None) == ["42"]
+    assert state_needle_extras("No", None) == []  # 极性词不当短答案 needle
 
     dataset = _needle_dataset(tmp_path / "needle.jsonl")
     dataset_dir = Path(
@@ -313,8 +315,8 @@ def test_gold_answer_and_include_are_needles(tmp_path: Path) -> None:
     # 证据长句全不在状态里，但 gold / include 在 → 判"已写入"
     assert records["q_gold"]["evidence_in_state"] is True
     assert records["q_include"]["evidence_in_state"] is True
-    # 短 gold（"无关内容" 4 字）不当 needle：证据全不在状态里 → False
-    assert records["q_short_gold"]["evidence_in_state"] is False
+    # 短 gold（"42"）按边界匹配：状态里有这个数 → True。
+    assert records["q_short_gold"]["evidence_in_state"] is True
 
 
 #: 状态里只剩秘密串、没有删除指令（删除指令那轮被系统遗忘了）。

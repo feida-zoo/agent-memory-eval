@@ -104,6 +104,24 @@ def test_short_evidence_uses_whole_text() -> None:
     assert evidence_needles("") == []
 
 
+def test_answer_sentence_wins_over_longer_unrelated_sentences() -> None:
+    """长证据选句优先保留含答案锚点的句子，不再只按长度取前 5 句。"""
+    answer_sentence = "The favorite dance style is contemporary dance."
+    longer = ["无关说明" + "甲" * 90, "背景补充" + "乙" * 80, "其他内容" + "丙" * 70]
+    evidence = "。".join(longer + [answer_sentence]) + "。"
+    assert len(_normalized(evidence)) > EVIDENCE_NEEDLE_CHARS
+    needles = evidence_needles(evidence, anchor="Contemporary")
+    assert answer_sentence.rstrip(".") in needles
+
+
+def test_state_scan_case_insensitive_and_short_answer_boundary(tmp_path: Path) -> None:
+    """状态扫描忽略大小写；短 ASCII 答案按词边界匹配，不命中更长数字。"""
+    state = _write_state(tmp_path, "Favorite dance: contemporary. Budget 420 dollars.")
+    assert scan_state_for_evidence(str(state), ["missing evidence"], ["Contemporary"]) is True
+    assert scan_state_for_evidence(str(state), ["missing evidence"], ["42"]) is False
+    assert scan_state_for_evidence(str(state), ["missing evidence"], ["420"]) is True
+
+
 # ---------------------------------------------------------------------------
 # 状态目录缓存
 # ---------------------------------------------------------------------------

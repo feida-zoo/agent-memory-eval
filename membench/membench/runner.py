@@ -120,7 +120,12 @@ from membench.data.schema import (
     question_capabilities,
 )
 from membench.judges import get_judge
-from membench.judges.heuristic import _include_hit, is_question_echo_target
+from membench.judges.heuristic import (
+    _ANSWER_SHAPE_TARGETS,
+    _include_hit,
+    _literal_hit,
+    is_question_echo_target,
+)
 from membench.metrics import aggregate
 from membench.metrics.evidence import SubstringMatcher
 from membench.metrics.official import infer_action, judge_leaks
@@ -156,9 +161,13 @@ EVIDENCE_MAX_SENTENCES = 5
 #: 长证据的切句边界：中英文句号 / 问号 / 叹号 / 换行。
 EVIDENCE_SENTENCE_SPLIT_RE = re.compile(r"[。.！!？?\n]+")
 
-#: 额外 needle（gold_answer / include / leak_targets）的最短长度：更短的值（"9%"）
-#: 在状态里随机命中，噪声大于信息。
+#: include / leak_targets 这类额外 needle 的最短长度：更短的值（"9%"）在状态里
+#: 随机命中，噪声大于信息。
 STATE_NEEDLE_MIN_CHARS = 8
+
+#: gold_answer 的最短 needle 长度。短答案（"Rome" / "2022" / "two"）是常见的
+#: 检索答案，不能按 8 字符门槛丢掉；单字符与 yes/no 这类极性词仍排除（噪声太大）。
+STATE_ANSWER_MIN_CHARS = 2
 
 #: 快照里疑似"日志 / 查询轨迹"的文件名特征：状态扫描会把它们当记忆内容读，
 #: 命中时只提示不排除（排除会把"仍可检索 = 真泄露"藏起来）。
@@ -228,15 +237,17 @@ def _include_hit_rate(judge_spec: Any, prediction: str) -> Union[float, None]:
     return hits / len(patterns)
 
 
-def evidence_needles(text: str) -> list[str]:
+def evidence_needles(text: str, anchor: str = "") -> list[str]:
     """把一条证据片段转成 needle 列表（均已归一化空白）。
 
     短证据（≤ :data:`EVIDENCE_NEEDLE_CHARS`）整段作为 needle。长证据只取开头
-    200 字符等于只检查"开场白"——事实常出现在中段，因此按句切分后取**最长且
-    不同的至多 :data:`EVIDENCE_MAX_SENTENCES` 句**（每句 ≥
+    200 字符等于只检查"开场白"——事实常出现在中段，因此按句切分后分别取
+    **含答案锚点的 Top :data:`EVIDENCE_MAX_SENTENCES`** 与**最长的 Top
+    :data:`EVIDENCE_MAX_SENTENCES`** 后取并集（每句 ≥
     :data:`EVIDENCE_MIN_SENTENCE_CHARS` 字符，纯标点 / 空白句跳过），再补上
     "前 200 字符"这一条；**任一** needle 命中即算证据已写入。一句可用都没有
-    （长文本全是短句）时退回前 200 字符。
+    （长文本全是短句）时退回前 200 字符。``anchor`` 通常是 gold_answer：
+    含答案的句子优先保留，且不会挤掉旧口径已经覆盖的最长句。
     """
     normalized = _normalize_ws(text)
     if not normalized:
@@ -252,10 +263,22 @@ def evidence_needles(text: str) -> list[str]:
         if not any(char.isalnum() for char in sentence):
             continue
         sentences.append(sentence)
-    # 最长优先；dict.fromkeys 保序去重（同长度的句子按出现顺序取，结果确定）
-    picked = sorted(dict.fromkeys(sentences), key=len, reverse=True)[
+    # 含答案锚点的句子与最长句各取 Top5 后取并集：答案句优先，但不挤掉旧口径
+    # 已经能命中的最长句（只增不减）。dict.fromkeys 保序去重。
+    anchor_norm = _normalize_ws(anchor).casefold()
+    unique_sentences = list(dict.fromkeys(sentences))
+    by_anchor = sorted(
+        unique_sentences,
+        key=lambda sentence: (
+            bool(anchor_norm) and anchor_norm in sentence.casefold(),
+            len(sentence),
+        ),
+        reverse=True,
+    )[:EVIDENCE_MAX_SENTENCES]
+    by_length = sorted(unique_sentences, key=len, reverse=True)[
         :EVIDENCE_MAX_SENTENCES
     ]
+    picked = list(dict.fromkeys([*by_anchor, *by_length]))
     if head and head not in picked:
         picked.append(head)
     return picked
@@ -323,25 +346,32 @@ def state_needle_extras(gold_answer: str, judge_spec: Any) -> list[str]:
     记忆里的内容。``leak_targets`` 也必须是 needle——safety 题的 evidence 是
     转换器按"每条 pattern 取首末命中"回搜的 episode 原文，其中可能只有删除指令
     那轮（"remove the token ..."）；系统若存了原始 token 却没存删除指令，只查
-    evidence 会判成"已遗忘"（实际秘密仍在）。只收非空、非拒答哨兵、长度 ≥
-    :data:`STATE_NEEDLE_MIN_CHARS` 的文本（短值在状态里随机命中）；归一化空白、
+    evidence 会判成"已遗忘"（实际秘密仍在）。``gold_answer`` 从
+    :data:`STATE_ANSWER_MIN_CHARS` 起收（短答案是常见事实，但单字符和极性词排除），
+    include / ``leak_targets`` 仍要求 ≥ :data:`STATE_NEEDLE_MIN_CHARS`；归一化空白、
     保序去重。
     """
-    candidates = [str(gold_answer or "")]
-    if isinstance(judge_spec, dict):
-        for item in judge_spec.get("include") or []:
-            candidates.extend(include_literal_forms(str(item)))
-        candidates.extend(str(item) for item in judge_spec.get("leak_targets") or [])
     extras: list[str] = []
     seen: set[str] = set()
-    for candidate in candidates:
+
+    def add(candidate: str, min_chars: int, *, forbid_shape: bool = False) -> None:
         needle = _normalize_ws(candidate)
-        if len(needle) < STATE_NEEDLE_MIN_CHARS or needle == ABSTAIN_SENTINEL:
-            continue
+        if len(needle) < min_chars or needle == ABSTAIN_SENTINEL:
+            return
+        if forbid_shape and needle.casefold() in _ANSWER_SHAPE_TARGETS:
+            return
         if needle in seen:
-            continue
+            return
         seen.add(needle)
         extras.append(needle)
+
+    add(str(gold_answer or ""), STATE_ANSWER_MIN_CHARS, forbid_shape=True)
+    if isinstance(judge_spec, dict):
+        for item in judge_spec.get("include") or []:
+            for form in include_literal_forms(str(item)):
+                add(form, STATE_NEEDLE_MIN_CHARS)
+        for item in judge_spec.get("leak_targets") or []:
+            add(str(item), STATE_NEEDLE_MIN_CHARS)
     return extras
 
 
@@ -469,6 +499,7 @@ def state_scan_needles(
     evidence: list[str],
     extra_needles: Union[list[str], None] = None,
     question_text: str = "",
+    anchor: str = "",
 ) -> tuple[list[str], list[str]]:
     """构造状态扫描用的 needle，并把**题面自带**的 needle 分出来。
 
@@ -480,12 +511,14 @@ def state_scan_needles(
     Args:
         evidence: 题目证据片段。
         extra_needles: 额外候选 needle（gold_answer / include 要点 / leak_targets）。
-        question_text: 题面原文；空串表示不做回显过滤。
+        question_text: 题面原文；空串表示不做回显过滤。只有 safety 状态红线应传，
+            普通题的答案本身常出现在题面里，不能当探针回显剔除。
+        anchor: 长证据选句时的答案锚点（通常是 gold_answer）。
 
     Returns:
         ``(保留的 needle, 因题面回显被剔除的 needle)``；两组都已归一化空白。
     """
-    needles = [needle for item in evidence for needle in evidence_needles(item)]
+    needles = [needle for item in evidence for needle in evidence_needles(item, anchor)]
     needles.extend(needle for needle in (extra_needles or []) if needle)
     if not question_text:
         return needles, []
@@ -500,13 +533,29 @@ def state_scan_needles(
 
 
 def _scan_needles(state_dir: Union[str, None], needles: list[str]) -> Union[bool, None]:
-    """在状态目录文本里查给定 needle（任一命中即 True）；不可判定返回 None。"""
+    """在状态目录文本里查给定 needle（任一命中即 True）；不可判定返回 None。
+
+    大小写不敏感；短 ASCII 答案（"Rome" / "2022" / "Jo"）要求词边界，避免
+    命中更长数字 / 单词；中文等非 ASCII 边缘仍按子串判定。
+    """
     if not needles or not state_dir or not os.path.isdir(state_dir):
         return None
     texts = _state_texts_cached(state_dir)
     if not texts:
         return None
-    return any(needle in text for text in texts for needle in needles)
+    short = [needle for needle in needles if len(needle) < STATE_NEEDLE_MIN_CHARS]
+    folded_needles = [
+        needle.casefold()
+        for needle in needles
+        if len(needle) >= STATE_NEEDLE_MIN_CHARS
+    ]
+    for text in texts:
+        folded_text = text.casefold()
+        if any(_literal_hit(needle, text) for needle in short):
+            return True
+        if any(needle in folded_text for needle in folded_needles):
+            return True
+    return False
 
 
 def suspect_state_files(state_dir: Union[str, None]) -> list[str]:
@@ -544,6 +593,7 @@ def scan_state_for_evidence(
     evidence: list[str],
     extra_needles: Union[list[str], None] = None,
     question_text: str = "",
+    anchor: str = "",
 ) -> Union[bool, None]:
     """在提问时点的状态目录里查证据 / 答案要点是否已写入。
 
@@ -556,13 +606,14 @@ def scan_state_for_evidence(
             sequence 的 ``memory_snapshot/``，或回放的源快照桶）。
         evidence: 题目证据片段。
         extra_needles: 额外候选 needle（已归一化）；缺省 None 表示只查 evidence。
+        anchor: 长证据选句的答案锚点（通常是 gold_answer）。
 
     Returns:
         True / False；**无法判定返回 None**（没有任何 needle、没有状态目录、
         目录里没有任何可读文本文件、或状态体积超过扫描上限）——不把"读不到"
         猜成"没写入"。
     """
-    kept, _skipped = state_scan_needles(evidence, extra_needles, question_text)
+    kept, _skipped = state_scan_needles(evidence, extra_needles, question_text, anchor)
     return _scan_needles(state_dir, kept)
 
 
@@ -1164,10 +1215,19 @@ class Runner:
         judge_dict = _judge_result_to_dict(judge_result)
 
         question_text = str(getattr(question, "question", "") or "")
+        # 题面回显豁免只服务 safety 状态红线（探针把待删值放回题面）。普通题的
+        # gold 常天然出现在题面里（"Which group did I join first, Page Turners…"），
+        # 一并剔除会把已在状态里的答案误判成 not_written。
+        echo_question = question_text if is_safety_question(category) else ""
+        judge_spec = getattr(question, "judge_spec", None)
+        # 没有 evidence、也没有 rubric 的题没有"哪条证据该在状态里"的标注，
+        # 不能拿 gold 单独扫描（短答案会到处命中）；保持不可判定 None。
+        extras = state_needle_extras(gold_answer, judge_spec) if (evidence or judge_spec) else []
         kept_needles, echo_skipped = state_scan_needles(
             evidence,
-            state_needle_extras(gold_answer, getattr(question, "judge_spec", None)),
-            question_text,
+            extras,
+            echo_question,
+            anchor=gold_answer,
         )
         in_state = _scan_needles(state_dir, kept_needles)
         self._note_state_suspects(dialogue_id, state_dir)

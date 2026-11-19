@@ -70,16 +70,18 @@ def attribution_bucket(record: dict[str, Any], has_evidence: bool) -> "str | Non
         return None
     if not has_evidence:
         return None
+    if record.get("evidence_hit") is True:
+        # 证据已经检索进回答上下文：无论状态扫描结果如何，都不能说"没写入"。
+        # 这是四桶的第一优先级（状态扫描只是无法检索时的补充证据）。
+        return "wrong_answer"
     in_state = record.get("evidence_in_state")
     if in_state is None:
         # 状态读不到（没开 --trace-state / 适配器不支持 / 状态是二进制）时，
-        # ``evidence_hit=True`` 本身已经证明"证据写进了记忆、也被检索进了回答
-        # 上下文"——失败只可能出在回答，不依赖状态就能判成 wrong_answer。
-        # 只有 evidence_hit 为 False/None 时才真的无从判断，记 unknown。
-        return "wrong_answer" if record.get("evidence_hit") is True else "unknown"
+        # evidence_hit 也为 False/None，确实无从判断，记 unknown（不猜）。
+        return "unknown"
     if not in_state:
         return "not_written"
-    return "wrong_answer" if bool(record.get("evidence_hit")) else "not_retrieved"
+    return "not_retrieved"
 
 
 def _empty_attribution_counts() -> dict[str, int]:
